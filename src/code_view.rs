@@ -1031,7 +1031,7 @@ impl CodeDocument {
                                             output.galley_pos
                                                 + egui::vec2(last.left(), last.bottom()),
                                         ],
-                                        egui::Stroke::new(1.0, foreground),
+                                        egui::Stroke::new(1.0_f32, foreground),
                                     );
                                 }
                                 if output.response.double_clicked() {

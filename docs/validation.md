@@ -1,6 +1,57 @@
 # Native-only migration validation
 
-## Latest: ancestor-owner superclass-call category
+## Latest: shared tails, interleaved catches and allocation expressions
+
+The reported `marketnotice.f` class now reconstructs all 11 concrete methods,
+including the three reported `d`, `f`, and `h7` methods. Backward address jumps
+are classified using reachability before loop summarization; acyclic shared tails
+retain their branch values and effects. Interleaved handlers remain separate from
+normal flow, retain the original catch type, and cannot pull unprotected effects
+into a protected region. The JSON checked-exception proof is limited to the exact
+Android `JSONObject(String)` signature.
+
+Allocation expressions preserve typed boolean/null arguments. Optimized no-argument
+constructor retargeting requires a declared equivalent body and proven superclass
+ancestry; arbitrary owner mismatches remain unsupported. Source navigation retains
+the original DEX method identity. APK regressions check all three reported methods,
+while independent fixtures check mutually exclusive effects, genuine cycles, and
+exception boundaries.
+
+Captured reference arguments now widen only through proven type relationships;
+ignored `StringBuilder.append(char)` results preserve the actual overload and
+receiver aliases. An allocation argument's DEX `check-cast` is an ordered throwing
+event, enabling the reported Play Store `ClassicApplication.e` method. Independent
+fixtures reject unused casts, reordered captures and unproven conversions.
+
+The reported Play Store `SubscriptionAskToPauseActivity.onClick` and coroutine
+allocation sample remain DEX: their string-resolution order cannot be represented
+by the current constructor-expression tree without moving effects. These are
+explicit remaining failures, not accepted Java methods.
+
+Forward navigation now complements Back in the toolbar and Navigate menu, with
+Alt+Right / Alt+Left. History retains source positions and source hashes, commits
+only successful async moves, discards cancelled completions, and resets on reload.
+New reference navigation clears forward history. UI tests cover cached and evicted
+classes/assets, failure cleanup and manifest round-trips.
+
+465 regular tests passed, 12 opt-in checks ignored. Reported Zoom and Play Store
+APK regressions passed separately; formatting, strict Clippy and release builds
+passed locally. CI compatibility fixes replace constant-size `chunks_exact` calls
+and type an egui stroke width explicitly for Rust 1.98.
+
+| Input | Java methods | DEX fallbacks | Acceptance | Gain this batch |
+| --- | ---: | ---: | ---: | ---: |
+| Zoom | 655,386 / 706,072 | 50,686 | 92.82% | 3,421 |
+| Expedia | 1,085,560 / 1,175,337 | 89,777 | 92.36% | 5,296 |
+| Vending | 227,733 / 268,289 | 40,556 | 84.88% | 10,232 |
+
+Gains use the initial synchronized commit as baseline. Detailed reports, input
+hashes and installed binary hashes: `target/validation/continuation-validation.json`.
+
+These changes extend bounded native lowering. They do not finish the general
+SSA-to-region port or establish semantic equivalence for every accepted method.
+
+## Previous: ancestor-owner superclass-call category
 
 All ten reported MeetingCommentActivity callbacks now emit Java; the class scan
 improves from 11/21 to 21/21 concrete methods accepted. One shared superclass-chain

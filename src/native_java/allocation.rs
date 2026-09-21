@@ -16,10 +16,18 @@ pub(crate) enum Expr {
     Local(String),
     #[allow(dead_code)] // constructed by production decoder, absent in standalone tests
     Boolean(bool),
+    #[allow(dead_code)] // production decoder emits exact char overload arguments
+    Char(i32),
     #[allow(dead_code)] // constructed by production decoder, absent in standalone tests
     Null,
     /// A typed input conversion; the operand retains its bound-local identity.
     Cast {
+        ty: Symbol,
+        value: Box<Expr>,
+    },
+    #[allow(dead_code)] // production decoder captures DEX check-cast effects
+    CheckCast {
+        site: usize,
         ty: Symbol,
         value: Box<Expr>,
     },
@@ -74,6 +82,7 @@ pub(crate) enum Event {
     Allocate { site: usize, ty: String },
     StringResolution { site: usize },
     ClassResolution { site: usize, ty: String },
+    CheckCast { site: usize, ty: String },
     Read { site: usize, field: String },
     Call { site: usize, method: String },
     Construct { site: usize, ty: String },
@@ -207,8 +216,8 @@ impl Allocation {
             Expr::Local(name) => {
                 ensure!(locals.contains(&name.as_str()), "unbound allocation local")
             }
-            Expr::Boolean(_) | Expr::Null => {}
-            Expr::Cast { ty, value } => {
+            Expr::Boolean(_) | Expr::Char(_) | Expr::Null => {}
+            Expr::Cast { ty, value } | Expr::CheckCast { ty, value, .. } => {
                 ensure!(
                     !ty.text.is_empty() && !ty.label.is_empty(),
                     "invalid allocation cast type"
@@ -302,11 +311,12 @@ impl Expr {
         match self {
             Self::Local(_)
             | Self::Boolean(_)
+            | Self::Char(_)
             | Self::Null
             | Self::StringConstant { .. }
             | Self::ClassConstant { .. }
             | Self::Capture(_) => Ok(()),
-            Self::Cast { value, .. } => value.declarations(out),
+            Self::Cast { value, .. } | Self::CheckCast { value, .. } => value.declarations(out),
             Self::FieldRead { receiver, .. } => receiver.declarations(out),
             Self::Call { target, args, .. } => {
                 target.declarations(out)?;
@@ -350,12 +360,25 @@ impl<'a> CaptureRenderer<'a> {
             Expr::Local(name) => Ok(Fragment::plain(name)),
             Expr::Boolean(value) => Ok(Fragment::plain(if *value { "true" } else { "false" })),
             Expr::Null => Ok(Fragment::plain("null")),
+            Expr::Char(value) => Ok(Fragment::plain(format!("(char) {value}"))),
             Expr::Cast { ty, value } => {
                 let mut result = Fragment::plain("((");
                 result.append(Fragment::symbol(ty));
                 result.append(Fragment::plain(") "));
                 result.append(self.expression(value)?);
                 result.append(Fragment::plain(")"));
+                Ok(result)
+            }
+            Expr::CheckCast { site, ty, value } => {
+                let mut result = Fragment::plain("((");
+                result.append(Fragment::symbol(ty));
+                result.append(Fragment::plain(") "));
+                result.append(self.expression(value)?);
+                result.append(Fragment::plain(")"));
+                self.events.push(Event::CheckCast {
+                    site: *site,
+                    ty: ty.label.clone(),
+                });
                 Ok(result)
             }
             Expr::StringConstant { site, literal } => {

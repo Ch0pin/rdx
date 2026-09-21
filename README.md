@@ -43,6 +43,8 @@ Theme and font attribution is in [third_party/themes](third_party/themes/README.
 and [third_party/fonts](third_party/fonts/README.md). Redistributed application
 bundles must include these license notices alongside the embedded assets.
 
+Use the toolbar arrows or **Navigate → Back / Forward** (**Alt+Left / Alt+Right**) to revisit reference jumps, including manifest references. A new reference jump clears forward history.
+
 Source tabs show the alpha native engine label. Links are enabled only where native metadata provides a target; unavailable symbol operations remain disabled or report an explicit unsupported operation. Full JADX navigation, usage-analysis, and Java reconstruction parity are still porting work.
 
 Text rendering previews at most 128 KiB or 5,000 lines. **Copy source** includes the retained text beyond the visible preview. Up to eight tabs are retained against an estimated 64 MiB tab budget; this is not a total application memory ceiling.

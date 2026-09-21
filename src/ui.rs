@@ -130,6 +130,11 @@ struct JumpLocation {
     target: Target,
     position: usize,
 }
+struct HistoryJump {
+    forward: bool,
+    destination: JumpLocation,
+    origin: Option<JumpLocation>,
+}
 struct Tab {
     loading_navigation: bool,
     source_hash: Option<String>,
@@ -232,6 +237,10 @@ pub struct App {
     tabs: Vec<Tab>,
     selected: usize,
     history: Vec<JumpLocation>,
+    future: Vec<JumpLocation>,
+    pending_history: Option<HistoryJump>,
+    cancelled_history: Option<Target>,
+    deferred_target: Option<Target>,
     theme: CodeTheme,
     font_size: f32,
     code_font: CodeFont,
@@ -314,6 +323,10 @@ impl App {
             tabs: Vec::new(),
             selected: 0,
             history: Vec::new(),
+            future: Vec::new(),
+            pending_history: None,
+            cancelled_history: None,
+            deferred_target: None,
             theme,
             font_size,
             code_font,
@@ -403,6 +416,10 @@ impl App {
         self.tree = Node::default();
         self.tabs.clear();
         self.history.clear();
+        self.future.clear();
+        self.pending_history = None;
+        self.cancelled_history = None;
+        self.deferred_target = None;
         self.selected = 0;
         self.filter.clear();
         self.plugin_output.clear();
@@ -433,6 +450,22 @@ impl App {
         });
     }
     fn choose_target(&mut self, target: Target, ctx: &egui::Context) {
+        if let Some(pending) = self.pending_history.take() {
+            if pending.destination.target == target {
+                self.pending_history = Some(pending);
+                return;
+            }
+            self.cancelled_history = Some(pending.destination.target);
+        }
+        if self.cancelled_history.is_some() {
+            if let Some(index) = self.tabs.iter().position(|tab| tab.target == target) {
+                self.selected = index;
+                self.deferred_target = None;
+            } else {
+                self.deferred_target = Some(target);
+            }
+            return;
+        }
         if let Some(index) = self.tabs.iter().position(|tab| tab.target == target) {
             self.selected = index;
             return;
@@ -581,29 +614,107 @@ impl App {
             }
         }
     }
+    fn discard_cancelled_history(&mut self, target: &Target, ctx: &egui::Context) -> bool {
+        if self.cancelled_history.as_ref() != Some(target) {
+            return false;
+        }
+        self.cancelled_history = None;
+        if let Some(target) = self.deferred_target.take() {
+            self.choose_target(target, ctx);
+        }
+        true
+    }
+    fn current_location(&self) -> Option<JumpLocation> {
+        let tab = self.tabs.get(self.selected)?;
+        Some(JumpLocation {
+            target: tab.target.clone(),
+            source_hash: tab.source_hash.clone(),
+            position: match &tab.content {
+                Content::Text(document) => document.navigation_position(),
+                Content::Image { .. } => 0,
+            },
+        })
+    }
+    fn can_history(&self, forward: bool) -> bool {
+        !self.busy
+            && !self.asset_busy
+            && self.pending_history.is_none()
+            && self.cancelled_history.is_none()
+            && !(if forward { &self.future } else { &self.history }).is_empty()
+    }
     fn go_back(&mut self, ctx: &egui::Context) {
-        let Some(location) = self.history.last().cloned() else {
+        self.go_history(false, ctx);
+    }
+    fn go_forward(&mut self, ctx: &egui::Context) {
+        self.go_history(true, ctx);
+    }
+    fn finish_history(&mut self) {
+        let Some(pending) = self.pending_history.take() else {
             return;
         };
-        if let Some(index) = self.tabs.iter().position(|tab| {
-            tab.target == location.target && tab.source_hash == location.source_hash
-        }) {
-            if let Content::Text(document) = &mut self.tabs[index].content {
-                match document.jump_to(location.position) {
-                    Ok(()) => {
-                        self.selected = index;
-                        self.history.pop();
-                    }
-                    Err(error) => self.error(error),
-                }
+        let Some(tab) = self.tabs.get_mut(self.selected) else {
+            return;
+        };
+        if tab.target != pending.destination.target
+            || tab.source_hash != pending.destination.source_hash
+        {
+            self.error(
+                "Source changed after cache eviction; reopen the reference before navigating"
+                    .into(),
+            );
+            return;
+        }
+        if let Content::Text(document) = &mut tab.content
+            && !document.text().is_empty()
+            && let Err(error) = document.jump_to(pending.destination.position)
+        {
+            self.error(error);
+            return;
+        }
+        let (from, to) = if pending.forward {
+            (&mut self.future, &mut self.history)
+        } else {
+            (&mut self.history, &mut self.future)
+        };
+        from.pop();
+        if let Some(origin) = pending.origin {
+            to.push(origin);
+            if to.len() > 100 {
+                to.remove(0);
             }
+        }
+    }
+    fn go_history(&mut self, forward: bool, ctx: &egui::Context) {
+        if !self.can_history(forward) {
+            return;
+        }
+        let location = (if forward { &self.future } else { &self.history })
+            .last()
+            .unwrap()
+            .clone();
+        let cached = self.tabs.iter().position(|tab| {
+            tab.target == location.target && tab.source_hash == location.source_hash
+        });
+        if cached.is_none()
+            && match &location.target {
+                Target::Class(_) => self.engine.is_none(),
+                Target::File(_) => self.archive.is_none(),
+            }
+        {
+            return;
+        }
+        self.pending_history = Some(HistoryJump {
+            forward,
+            destination: location.clone(),
+            origin: self.current_location(),
+        });
+        if let Some(index) = cached {
+            self.selected = index;
+            self.finish_history();
         } else {
             match location.target {
                 Target::Class(class) => self.decompile(class, Some(location.position), ctx),
-                Target::File(index) => {
-                    self.open_asset(index, ctx);
-                    self.history.pop();
-                }
+                Target::File(index) => self.open_asset(index, ctx),
             }
         }
     }
@@ -729,6 +840,11 @@ impl App {
         });
     }
     fn open_search_hit(&mut self, hit: SearchHit) {
+        if let Some(pending) = self.pending_history.take() {
+            self.cancelled_history = Some(pending.destination.target);
+        }
+        self.deferred_target = None;
+        self.future.clear();
         let mut reused = false;
         for (index, tab) in self.tabs.iter_mut().enumerate() {
             match tab.reuse_search_hit(&hit) {
@@ -876,6 +992,12 @@ impl App {
         self.tabs.push(tab);
         self.selected = self.tabs.len() - 1;
         self.refresh_manifest_links();
+        if self.pending_history.as_ref().is_some_and(|pending| {
+            matches!(pending.destination.target, Target::File(_))
+                && self.tabs[self.selected].target == pending.destination.target
+        }) {
+            self.finish_history();
+        }
     }
     fn error(&mut self, error: String) {
         self.status = error
@@ -922,26 +1044,37 @@ impl App {
                 {
                     self.busy = false;
                     self.engine = Some(engine);
+                    if self.discard_cancelled_history(&Target::Class(name.clone()), ctx) {
+                        continue;
+                    }
                     match result {
                         Ok(code)
                             if position.is_some()
-                                && self.history.last().is_some_and(|location| {
-                                    location.source_hash.as_ref() != Some(&code.source_hash)
+                                && self.pending_history.as_ref().is_some_and(|pending| {
+                                    pending.destination.source_hash.as_ref()
+                                        != Some(&code.source_hash)
                                 }) =>
                         {
-                            self.error("Source changed after cache eviction; reopen the reference before navigating back".into());
+                            self.pending_history = None;
+                            self.error("Source changed after cache eviction; reopen the reference before navigating".into());
                         }
                         Ok(code) => match self.display_code(name, code, position) {
                             Ok(()) => {
-                                if position.is_some() {
-                                    self.history.pop();
+                                if self.pending_history.is_some() {
+                                    self.finish_history();
                                 }
                                 self.status =
                                     "Source ready · double-click a linked symbol to jump".into();
                             }
-                            Err(error) => self.error(error),
+                            Err(error) => {
+                                self.pending_history = None;
+                                self.error(error);
+                            }
                         },
-                        Err(error) => self.error(format!("{error}. Reload if the engine stopped.")),
+                        Err(error) => {
+                            self.pending_history = None;
+                            self.error(format!("{error}. Reload if the engine stopped."));
+                        }
                     }
                 }
                 Event::Navigated(generation, origin, engine, result)
@@ -958,6 +1091,7 @@ impl App {
                             Some(target.position),
                         ) {
                             Ok(()) => {
+                                self.future.clear();
                                 self.history.push(origin);
                                 if self.history.len() > 100 {
                                     self.history.remove(0);
@@ -972,7 +1106,11 @@ impl App {
                 }
                 Event::Asset(generation, index, result) if generation == self.generation => {
                     self.asset_busy = false;
+                    if self.discard_cancelled_history(&Target::File(index), ctx) {
+                        continue;
+                    }
                     let Some(name) = self.entry_name(index) else {
+                        self.pending_history = None;
                         continue;
                     };
                     match result {
@@ -1032,7 +1170,10 @@ impl App {
                                 note,
                             });
                         }
-                        Err(error) => self.error(format!("{name}: {error}")),
+                        Err(error) => {
+                            self.pending_history = None;
+                            self.error(format!("{name}: {error}"));
+                        }
                     }
                 }
                 Event::Resource(generation, index, engine, result)
@@ -1040,9 +1181,13 @@ impl App {
                 {
                     self.busy = false;
                     self.engine = Some(engine);
+                    if self.discard_cancelled_history(&Target::File(index), ctx) {
+                        continue;
+                    }
                     match result {
                         Ok(text) => {
                             let Some(name) = self.entry_name(index) else {
+                                self.pending_history = None;
                                 continue;
                             };
                             self.push_tab(Tab {
@@ -1437,6 +1582,12 @@ impl eframe::App for App {
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
             self.open_file_find();
         }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft)) {
+            self.go_back(ctx);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight)) {
+            self.go_forward(ctx);
+        }
         let mut choose_file =
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O));
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -1548,12 +1699,16 @@ impl eframe::App for App {
                     ui.menu_button("Navigate", |ui| {
                         if ui
                             .add_enabled(
-                                !self.history.is_empty() && !self.busy,
-                                egui::Button::new("Back"),
+                                self.can_history(false),
+                                egui::Button::new("Back").shortcut_text("Alt+Left"),
                             )
                             .clicked()
                         {
                             self.go_back(ctx);
+                            ui.close_menu();
+                        }
+                        if ui.add_enabled(self.can_history(true), egui::Button::new("Forward").shortcut_text("Alt+Right")).clicked() {
+                            self.go_forward(ctx);
                             ui.close_menu();
                         }
                     });
@@ -1574,12 +1729,15 @@ impl eframe::App for App {
                 if icons::button(
                     ui,
                     Icon::Back,
-                    "Back to previous reference",
-                    !self.history.is_empty() && !self.busy,
+                    "Back to previous reference (Alt+Left)",
+                    self.can_history(false),
                 )
                 .clicked()
                 {
                     self.go_back(ctx);
+                }
+                if icons::button(ui, Icon::Forward, "Forward to next reference (Alt+Right)", self.can_history(true)).clicked() {
+                    self.go_forward(ctx);
                 }
                 if icons::button(ui, Icon::Plugin, "Manage plugins", true).clicked() {
                     self.show_plugins = true;
@@ -1709,6 +1867,10 @@ impl eframe::App for App {
                                     .selectable_label(self.selected == i, label)
                                     .on_hover_text(&tab.name);
                                 if response.clicked() {
+                                    if let Some(pending) = self.pending_history.take() {
+                                        self.cancelled_history = Some(pending.destination.target);
+                                    }
+                                    self.deferred_target = None;
                                     self.selected = i;
                                 }
                                 response.context_menu(|ui| {
@@ -1979,6 +2141,10 @@ mod settings_tests {
             tabs: Vec::new(),
             selected: 0,
             history: Vec::new(),
+            future: Vec::new(),
+            pending_history: None,
+            cancelled_history: None,
+            deferred_target: None,
             theme: CodeTheme::Ocean,
             font_size: 14.0,
             code_font: CodeFont::default(),
@@ -2094,9 +2260,148 @@ mod settings_tests {
                     panic!("manifest lost")
                 };
                 assert_eq!(document.link_at(position).unwrap().label, "sample.Target");
+                assert_eq!(app.future.len(), 1);
+                app.go_forward(&ctx);
+                assert_eq!(
+                    app.tabs[app.selected].target,
+                    Target::Class("sample.Target".into())
+                );
+                assert!(app.future.is_empty());
+                assert_eq!(app.history.len(), 1);
                 assert!(app.diagnostics.is_empty(), "{:?}", app.diagnostics);
             }
         }
+    }
+
+    fn wait_for_history(app: &mut App, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.pending_history.is_some() || app.cancelled_history.is_some() {
+            app.events(ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "history stalled: {}",
+                app.status
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    fn history_fixture() -> (App, usize, PathBuf) {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let archive = Arc::new(Archive::open(&fixture).unwrap());
+        let index = archive
+            .entries
+            .iter()
+            .find(|e| e.path == "AndroidManifest.xml")
+            .unwrap()
+            .index;
+        let mut engine = NativeEngine::start().unwrap();
+        let project = engine.open(&fixture).unwrap();
+        let code = engine.decompile_with_metadata("sample.Target").unwrap();
+        let mut app = navigation_test_app();
+        app.archive = Some(archive);
+        app.project = Some(project);
+        app.engine = Some(engine);
+        app.display_code("sample.Target".into(), code, Some(7))
+            .unwrap();
+        app.history.push(JumpLocation {
+            target: Target::File(index),
+            source_hash: None,
+            position: 10,
+        });
+        (app, index, fixture)
+    }
+    #[test]
+    fn forward_restores_evicted_class_and_back_restores_asset_position() {
+        let ctx = egui::Context::default();
+        let (mut app, index, _) = history_fixture();
+        app.go_back(&ctx);
+        assert!(app.pending_history.is_some());
+        assert_eq!(
+            app.history.len(),
+            1,
+            "pending action must not consume history"
+        );
+        wait_for_history(&mut app, &ctx);
+        assert_eq!(app.current_location().unwrap().position, 10);
+        assert_eq!(app.current_location().unwrap().target, Target::File(index));
+        assert_eq!(app.future.len(), 1);
+        app.tabs.retain(|tab| tab.target == Target::File(index));
+        app.selected = 0;
+        app.go_forward(&ctx);
+        wait_for_history(&mut app, &ctx);
+        assert_eq!(
+            app.current_location().unwrap().target,
+            Target::Class("sample.Target".into())
+        );
+        assert_eq!(app.current_location().unwrap().position, 7);
+        assert!(app.future.is_empty());
+        assert_eq!(app.history.len(), 1);
+        assert!(app.diagnostics.is_empty(), "{:?}", app.diagnostics);
+    }
+    #[test]
+    fn failed_history_display_preserves_stacks_and_allows_retry() {
+        let ctx = egui::Context::default();
+        let (mut app, _, _) = history_fixture();
+        let mut location = app.current_location().unwrap();
+        location.position = usize::MAX;
+        app.future.push(location.clone());
+        let mut engine = app.engine.take().unwrap();
+        let code = engine.decompile_with_metadata("sample.Target").unwrap();
+        app.pending_history = Some(HistoryJump {
+            forward: true,
+            destination: location,
+            origin: app.current_location(),
+        });
+        app.busy = true;
+        app.tx
+            .send(Event::Source(
+                0,
+                "sample.Target".into(),
+                Some(usize::MAX),
+                engine,
+                Ok(code),
+            ))
+            .unwrap();
+        app.events(&ctx);
+        assert!(app.pending_history.is_none());
+        assert_eq!(app.future.len(), 1);
+        assert!(app.can_history(true));
+        assert!(!app.diagnostics.is_empty());
+    }
+    #[test]
+    fn new_reference_clears_forward_and_project_reload_clears_both() {
+        let ctx = egui::Context::default();
+        let (mut app, _, fixture) = history_fixture();
+        app.go_back(&ctx);
+        wait_for_history(&mut app, &ctx);
+        let origin = app.current_location().unwrap();
+        let mut engine = app.engine.take().unwrap();
+        let target = engine.navigate_class("sample.Target").unwrap();
+        app.tx
+            .send(Event::Navigated(0, origin, Some(engine), Ok(target)))
+            .unwrap();
+        app.events(&ctx);
+        assert!(app.future.is_empty());
+        assert_eq!(app.history.len(), 1);
+        app.future.push(app.current_location().unwrap());
+        app.open(fixture, &ctx);
+        assert!(app.future.is_empty() && app.history.is_empty());
+        assert!(app.pending_history.is_none());
+    }
+    #[test]
+    fn choosing_another_cached_tab_discards_pending_history_completion() {
+        let ctx = egui::Context::default();
+        let (mut app, _, _) = history_fixture();
+        app.go_back(&ctx);
+        app.choose_target(Target::Class("sample.Target".into()), &ctx);
+        wait_for_history(&mut app, &ctx);
+        assert_eq!(
+            app.current_location().unwrap().target,
+            Target::Class("sample.Target".into())
+        );
+        assert_eq!(app.history.len(), 1);
+        assert!(app.future.is_empty());
     }
 
     #[test]

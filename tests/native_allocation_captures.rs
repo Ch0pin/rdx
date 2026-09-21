@@ -347,3 +347,44 @@ fn capture_cycles_reordering_and_unbound_locals_fail_closed() {
     };
     assert!(unbound.render_checked(&[], &["source"]).is_err());
 }
+
+#[test]
+fn explicit_check_cast_has_ordered_throwing_event() {
+    let allocation = Allocation {
+        site: 1,
+        constructor_site: 3,
+        ty: symbol("Holder", "sample.Holder"),
+        captures: vec![Capture {
+            ty: "Child".into(),
+            name: "castValue".into(),
+            expression: Expr::CheckCast {
+                site: 2,
+                ty: symbol("Child", "sample.Child"),
+                value: Box::new(Expr::Local("input".into())),
+            },
+        }],
+        arguments: vec![Expr::Capture(0)],
+    };
+    let events = [
+        Event::Allocate {
+            site: 1,
+            ty: "sample.Holder".into(),
+        },
+        Event::CheckCast {
+            site: 2,
+            ty: "sample.Child".into(),
+        },
+        Event::Construct {
+            site: 3,
+            ty: "sample.Holder".into(),
+        },
+    ];
+    let rendered = allocation.render_checked(&events, &["input"]).unwrap();
+    assert_eq!(
+        rendered.expression,
+        "new Holder((castValue = ((Child) input)))"
+    );
+    let mut reordered = events.clone();
+    reordered.swap(0, 1);
+    assert!(allocation.render_checked(&reordered, &["input"]).is_err());
+}

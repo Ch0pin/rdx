@@ -237,3 +237,49 @@ fn input_receiver_cast_is_a_structured_expression_not_an_unbound_local() {
     assert!(code.links.iter().any(|l| l.label == "sample.Source.f()I"));
     assert!(code.links.iter().any(|l| l.label == "sample.Source"));
 }
+
+#[test]
+fn ignored_char_append_preserves_overload_order_and_receiver_alias() {
+    let mut class = builder_fixture("Ljava/lang/StringBuilder;");
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols
+        .protos
+        .push(("Ljava/lang/StringBuilder;".into(), vec!["C".into()]));
+    symbols.methods.push((1, 5, 2));
+    let words = &mut class.methods[0].code.as_mut().unwrap().instructions;
+    words.splice(13..16, [0x0213, 46, 0x206e, 5, 0x0023]);
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert_eq!(
+        code.source.matches(".append(").count(),
+        2,
+        "{}",
+        code.source
+    );
+    assert_eq!(
+        code.source.matches(".append((char) 46)").count(),
+        1,
+        "{}",
+        code.source
+    );
+    assert_eq!(
+        code.source.matches("new java.lang.StringBuilder()").count(),
+        1
+    );
+    assert!(code.source.find(".mp4").unwrap() < code.source.find("(char) 46").unwrap());
+    assert!(code.source.find("(char) 46").unwrap() < code.source.find(".toString()").unwrap());
+    assert!(code.source.contains("return v3;"), "{}", code.source);
+    assert!(
+        code.links
+            .iter()
+            .any(|link| link.label == "java.lang.StringBuilder.append(C)Ljava/lang/StringBuilder;")
+    );
+}
+
+#[test]
+fn unknown_ignored_builder_overload_still_declines() {
+    let mut class = builder_fixture("Ljava/lang/StringBuilder;");
+    Arc::get_mut(&mut class.symbols).unwrap().protos[3].1[0] = "Ljava/lang/Object;".into();
+    let hierarchy = rdx::native_hierarchy::TypeHierarchy::from_classes([&class]).unwrap();
+    class.symbols.hierarchy.set(Arc::new(hierarchy)).unwrap();
+    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+}

@@ -362,3 +362,112 @@ fn optimized_constructor_with_extra_instructions_is_not_retargeted() {
     let c = optimized_noarg_allocation(vec![0x1070, 0, 0, 0x0000, 0x000e]);
     assert!(native_java::render_method("sample.Test", &c, &c.methods[0]).is_err());
 }
+
+fn captured_reference_argument(expected: &str, with_hierarchy: bool) -> DexClass {
+    // new v0; invoke-static {} -> Boolean; move-result v1; init(v0,v1); return v0.
+    let mut c = class(
+        vec![0x0022, 0, 0x0071, 0, 0, 0x010c, 0x2070, 1, 0x0010, 0x0011],
+        vec!["boxed", "<init>"],
+        vec![(1, 0, 0), (0, 1, 1)],
+    );
+    let symbols = Arc::get_mut(&mut c.symbols).unwrap();
+    symbols.protos[0] = ("Ljava/lang/Boolean;".into(), vec![]);
+    symbols.protos[1] = ("V".into(), vec![expected.into()]);
+    if with_hierarchy {
+        let hierarchy = rdx::native_hierarchy::TypeHierarchy::from_classes([&c]).unwrap();
+        c.symbols.hierarchy.set(Arc::new(hierarchy)).unwrap();
+    }
+    c
+}
+
+#[test]
+fn captured_reference_widening_keeps_declared_overload_and_single_evaluation() {
+    let c = captured_reference_argument("Ljava/lang/Object;", true);
+    let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    assert!(
+        code.source
+            .contains("((java.lang.Object) (v0 = sample.Source.boxed()))"),
+        "{}",
+        code.source
+    );
+    assert_eq!(code.source.matches("sample.Source.boxed()").count(), 1);
+    assert!(
+        code.links
+            .iter()
+            .any(|link| link.label == "sample.A.<init>(Ljava/lang/Object;)V")
+    );
+}
+
+#[test]
+fn captured_reference_conversion_rejects_unproven_or_missing_hierarchy() {
+    for (target, hierarchy) in [
+        ("Lunknown/Interface;", true),
+        ("Ljava/lang/Object;", false),
+        ("Ljava/lang/String;", true),
+    ] {
+        let c = captured_reference_argument(target, hierarchy);
+        assert!(
+            native_java::render_method("sample.Test", &c, &c.methods[0]).is_err(),
+            "{target}"
+        );
+    }
+}
+
+#[test]
+fn check_cast_argument_stays_after_allocation_and_preserves_link() {
+    let mut c = class(
+        vec![0x0022, 0, 0x021f, 1, 0x2070, 0, 0x0020, 0x0011],
+        vec!["<init>"],
+        vec![(0, 1, 0)],
+    );
+    Arc::get_mut(&mut c.symbols).unwrap().protos[1] =
+        ("V".into(), vec!["Ljava/lang/Object;".into()]);
+    c.methods[0].parameters = vec!["Ljava/lang/Object;".into()];
+    c.methods[0].code.as_mut().unwrap().ins = 1;
+    c.symbols
+        .hierarchy
+        .set(Arc::new(
+            rdx::native_hierarchy::TypeHierarchy::from_classes([&c]).unwrap(),
+        ))
+        .unwrap();
+    let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    assert!(
+        code.source
+            .contains("new sample.A(((java.lang.Object) (v0 = ((sample.Source) p0))))"),
+        "{}",
+        code.source
+    );
+    assert!(code.links.iter().any(|link| link.label == "sample.Source"));
+}
+
+#[test]
+fn unused_effectful_check_cast_cannot_be_dropped_or_hoisted() {
+    let mut c = class(
+        vec![0x0022, 0, 0x021f, 1, 0x1070, 0, 0, 0x0011],
+        vec!["<init>"],
+        vec![(0, 1, 0)],
+    );
+    Arc::get_mut(&mut c.symbols).unwrap().protos[1] = ("V".into(), vec![]);
+    c.methods[0].parameters = vec!["Ljava/lang/Object;".into()];
+    c.methods[0].code.as_mut().unwrap().ins = 1;
+    assert!(native_java::render_method("sample.Test", &c, &c.methods[0]).is_err());
+}
+
+#[test]
+fn unrelated_reference_check_cast_uses_nonthrowing_object_bridge() {
+    let mut c = class(
+        vec![0x0022, 0, 0x021f, 1, 0x2070, 0, 0x0020, 0x0011],
+        vec!["<init>"],
+        vec![(0, 1, 0)],
+    );
+    Arc::get_mut(&mut c.symbols).unwrap().protos[1] = ("V".into(), vec!["Lsample/Source;".into()]);
+    c.methods[0].parameters = vec!["Ljava/lang/String;".into()];
+    c.methods[0].code.as_mut().unwrap().ins = 1;
+    let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    assert!(
+        code.source
+            .contains("new sample.A((v0 = ((sample.Source) ((java.lang.Object) p0))))"),
+        "{}",
+        code.source
+    );
+}

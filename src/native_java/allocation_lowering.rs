@@ -36,8 +36,11 @@ fn atom_type(value: &Atom) -> &str {
         Atom::Expr { ty, .. } | Atom::Uninitialized { ty, .. } => ty,
     }
 }
-fn expression(value: Atom, expected: &str) -> Result<Expr> {
+fn expression(value: Atom, expected: &str, class: &DexClass) -> Result<Expr> {
     match value {
+        Atom::Input(value) if expected == "C" && value.literal.is_some() => {
+            Ok(Expr::Char(value.literal.unwrap()))
+        }
         Atom::Input(value) if expected == "Z" && value.literal.is_some() => {
             let literal = value.literal.unwrap();
             ensure!(matches!(literal, 0 | 1), "nonboolean allocation literal");
@@ -68,6 +71,26 @@ fn expression(value: Atom, expected: &str) -> Result<Expr> {
         }
         Atom::Input(value) => Ok(Expr::Local(super::argument(&value, expected)?)),
         Atom::Expr { expression, ty } => {
+            if ty != expected && super::reference(&ty) && super::reference(expected) {
+                ensure!(
+                    class
+                        .symbols
+                        .hierarchy
+                        .get()
+                        .is_some_and(|hierarchy| hierarchy.assignable(&ty, expected)
+                            == crate::native_hierarchy::Relation::Proven),
+                    "allocation reference widening requires proven hierarchy"
+                );
+                // Retain the declared DEX parameter type for overload resolution,
+                // while the operand keeps the capture's event and identity.
+                return Ok(Expr::Cast {
+                    ty: symbol(
+                        super::java_type(expected)?,
+                        super::class_label(expected).context("widening type label")?,
+                    ),
+                    value: Box::new(expression),
+                });
+            }
             ensure!(
                 ty == expected || (expected == "I" && matches!(ty.as_str(), "B" | "S" | "C")),
                 "allocation argument type mismatch"
@@ -346,6 +369,80 @@ pub(super) fn try_lower(
                         },
                     )?;
                 }
+                0x1f => {
+                    let descriptor = class
+                        .symbols
+                        .types
+                        .get(words[cursor + 1] as usize)
+                        .context("check-cast type")?;
+                    ensure!(
+                        super::reference(descriptor),
+                        "check-cast requires reference type"
+                    );
+                    let input = atom(&regs, a)?;
+                    let source_type = atom_type(&input).to_string();
+                    let null = matches!(&input, Atom::Input(value) if value.literal == Some(0));
+                    let operand = match input {
+                        Atom::Input(value) if value.literal == Some(0) => Expr::Null,
+                        Atom::Input(value) => {
+                            ensure!(
+                                super::reference(&value.ty),
+                                "check-cast requires reference value"
+                            );
+                            Expr::Local(value.text)
+                        }
+                        Atom::Expr { expression, ty } => {
+                            ensure!(super::reference(&ty), "check-cast requires reference value");
+                            expression
+                        }
+                        Atom::Uninitialized { .. } => {
+                            anyhow::bail!("check-cast of uninitialized allocation")
+                        }
+                    };
+                    // DEX permits runtime checks between unrelated reference
+                    // declarations that Java rejects directly. Object erasure is
+                    // nonthrowing; retain exactly one target check event.
+                    let related = source_type == descriptor.as_ref()
+                        || source_type == "Ljava/lang/Object;"
+                        || descriptor.as_ref() == "Ljava/lang/Object;"
+                        || class.symbols.hierarchy.get().is_some_and(|hierarchy| {
+                            hierarchy.assignable(&source_type, descriptor)
+                                == crate::native_hierarchy::Relation::Proven
+                                || hierarchy.assignable(descriptor, &source_type)
+                                    == crate::native_hierarchy::Relation::Proven
+                        });
+                    let operand = if related || null {
+                        operand
+                    } else {
+                        Expr::Cast {
+                            ty: symbol("java.lang.Object".into(), "java.lang.Object".into()),
+                            value: Box::new(operand),
+                        }
+                    };
+                    let label = super::class_label(descriptor).context("check-cast label")?;
+                    let index = captures.len();
+                    captures.push(Capture {
+                        ty: super::java_type(descriptor)?,
+                        name: format!("v{}", caller_out.sequence + index),
+                        expression: Expr::CheckCast {
+                            site: cursor,
+                            ty: symbol(super::java_type(descriptor)?, label.clone()),
+                            value: Box::new(operand),
+                        },
+                    });
+                    events.push(Event::CheckCast {
+                        site: cursor,
+                        ty: label,
+                    });
+                    put(
+                        &mut regs,
+                        a,
+                        Atom::Expr {
+                            expression: Expr::Capture(index),
+                            ty: descriptor.to_string(),
+                        },
+                    )?;
+                }
                 0x52..=0x58 | 0x60..=0x66 => {
                     let &(owner_i, field_ty_i, name_i) = class
                         .symbols
@@ -396,7 +493,7 @@ pub(super) fn try_lower(
                         local_names.push(owner.clone());
                         (a, Expr::Local(owner))
                     } else {
-                        (a & 15, expression(atom(&regs, a >> 4)?, owner)?)
+                        (a & 15, expression(atom(&regs, a >> 4)?, owner, class)?)
                     };
                     let read = Expr::FieldRead {
                         site: cursor,
@@ -440,6 +537,7 @@ pub(super) fn try_lower(
                         expression(
                             atom(&regs, *inputs.first().context("missing invoke receiver")?)?,
                             owner,
+                            class,
                         )?
                     };
                     let mut actual = Vec::new();
@@ -451,7 +549,7 @@ pub(super) fn try_lower(
                         let r = *inputs
                             .get(input_cursor)
                             .context("missing invoke argument")?;
-                        actual.push(expression(atom(&regs, r)?, arg_ty)?);
+                        actual.push(expression(atom(&regs, r)?, arg_ty, class)?);
                         input_cursor += if matches!(arg_ty.as_ref(), "J" | "D") {
                             2
                         } else {
@@ -626,7 +724,7 @@ pub(super) fn try_lower(
                         && raw_name == "append"
                         && ret == owner
                         && args.len() == 1
-                        && args[0].as_ref() == "Ljava/lang/String;"
+                        && matches!(args[0].as_ref(), "Ljava/lang/String;" | "C")
                     {
                         match atom(&regs, inputs[0])? {
                             Atom::Expr {

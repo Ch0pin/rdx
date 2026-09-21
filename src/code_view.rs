@@ -189,6 +189,8 @@ pub struct CodeDocument {
     line_start: usize,
     links: Vec<CodeLink>,
     jump: Option<usize>,
+    navigation_position: usize,
+    last_navigation_cursor: Option<usize>,
     highlight: Option<Range<usize>>,
     export_requested: bool,
     usages_requested: Option<usize>,
@@ -228,6 +230,8 @@ impl CodeDocument {
             line_start: 1,
             links: Vec::new(),
             jump: None,
+            navigation_position: 0,
+            last_navigation_cursor: None,
             highlight: None,
             export_requested: false,
             usages_requested: None,
@@ -460,6 +464,11 @@ impl CodeDocument {
         *self = current;
         matched
     }
+    pub fn navigation_position(&self) -> usize {
+        self.navigation_position
+            .min(self.source.chars().count().saturating_sub(1))
+    }
+
     /// Positions are Unicode scalar offsets, matching the engine protocol.
     pub fn jump_to(&mut self, position: usize) -> Result<(), String> {
         let byte = self
@@ -511,6 +520,7 @@ impl CodeDocument {
                 .any(|line| line.len() > LONG_LINE);
             self.cache = None;
         }
+        self.navigation_position = position;
         self.jump = Some(position);
         self.highlight = Some(self.symbol_range(position));
         Ok(())
@@ -910,6 +920,15 @@ impl CodeDocument {
                             {
                                 self.last_galley_pos = Some(output.galley_pos);
                                 self.last_editor_id = Some(editor_id);
+                            }
+                            if let Some(cursor) = output.state.cursor.char_range() {
+                                let position = self.char_start + cursor.primary.index;
+                                if self.jump.is_none()
+                                    && self.last_navigation_cursor != Some(position)
+                                {
+                                    self.navigation_position = position;
+                                }
+                                self.last_navigation_cursor = Some(position);
                             }
                             let selected = output
                                 .state

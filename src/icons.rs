@@ -6,6 +6,7 @@ pub enum Icon {
     Open,
     Reload,
     Back,
+    Forward,
     Settings,
     Classes,
     Package,
@@ -107,6 +108,10 @@ pub fn paint(ui: &egui::Ui, rect: Rect, icon: Icon) {
         }
         Icon::Back => {
             path(&[(10., 5.), (3., 12.), (10., 19.)], false, false);
+            line((3., 12.), (21., 12.));
+        }
+        Icon::Forward => {
+            path(&[(14., 5.), (21., 12.), (14., 19.)], false, false);
             line((3., 12.), (21., 12.));
         }
         Icon::Settings => {

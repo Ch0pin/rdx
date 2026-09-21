@@ -19,13 +19,17 @@ embed or execute JADX.
   Nested allocations use SSA constructor identities, shared captures and exact
   ordered effect checks, retaining aliases and overloaded constructor links.
   Structured caller-input casts retain operand validation and linked types.
-  Ignored StringBuilder.append(String) results preserve receiver aliases and
+  Captured reference widening requires proven ancestry and preserves the declared
+  overload. DEX check-casts in allocation arguments retain their runtime-check
+  event, original order and type link.
+  Ignored StringBuilder.append(String/char) results preserve receiver aliases and
   ordered mutations; arbitrary fluent methods are not assumed to return this.
   Unused/reordered effects, crossed lifetimes, live wide values and exception
   regions decline this lowering.
 - Forward conditional control flow and early returns, including integer,
-  boolean and reference equality tests. Shared continuations are emitted once;
-  typed merge locals preserve register values across branches.
+  boolean and reference equality tests. Typed merge locals preserve register
+  values across branches. Backward address edges that cannot form a cycle may
+  reuse shared tails; duplicated effects remain in mutually exclusive arms.
 - Simple single-entry while/do loops with parallel loop-carried register copies;
   guarded conditional-backedge loops can execute a one-time exit tail before a
   shared continuation. Exit-live values use separate locals from backedge-live
@@ -57,7 +61,9 @@ embed or execute JADX.
   symbol mappings. Field initializers with unsupported values or final-field
   reassignment remain DEX. UTF-16 string literals retain lone surrogates.
 - Single-region try/catch reconstruction preserves ordered effects and handler-
-  visible register state; unsupported exception control flow remains DEX.
+  visible register state. Interleaved handlers are accepted only when normal flow
+  bypasses them and no unprotected effects move inside the try; unsupported
+  exception control flow remains DEX.
   DEX catch regions and declared Throws metadata are decoded and displayed.
   A shared, bounded project hierarchy proves custom Throwable ancestry and
   catch ordering. Unknown type hierarchies and narrow checked catches without

@@ -251,12 +251,14 @@ impl DiskIndex {
                         .ok()?
                         .as_nanos()
                 ));
-                let mut builder = fs::DirBuilder::new();
+                let builder = fs::DirBuilder::new();
                 #[cfg(unix)]
-                {
+                let builder = {
                     use std::os::unix::fs::DirBuilderExt;
+                    let mut builder = builder;
                     builder.mode(0o700);
-                }
+                    builder
+                };
                 match builder.create(&path) {
                     Ok(()) => {
                         owned.paths.insert(path.clone());

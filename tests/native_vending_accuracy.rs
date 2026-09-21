@@ -47,7 +47,7 @@ fn allocation_casts_and_messages_render_with_ordered_temporary_values() {
                 .filter(|line| line.contains("= ((bdzh)") || line.contains("= ((wrt)"))
                 .collect();
             assert_eq!(checks.len(), 4, "{body}");
-            for pair in checks.chunks_exact(2) {
+            for pair in checks.as_chunks::<2>().0 {
                 assert!(pair[0].contains("bdzh"));
                 assert!(pair[1].contains("wrt"));
             }

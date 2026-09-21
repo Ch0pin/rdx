@@ -642,7 +642,11 @@ pub(super) fn try_lower(
                         };
                         let local_refs: Vec<&str> =
                             local_names.iter().map(String::as_str).collect();
-                        let mut rendered = allocation.render_checked(&events, &local_refs)?;
+                        let mut rendered = match allocation.render_checked(&events, &local_refs) {
+                            Ok(rendered) => rendered,
+                            Err(error) if nested => return Err(error),
+                            Err(_) => allocation.render_staged_checked(&events, &local_refs)?,
+                        };
                         // A constructor expression links its type token to the
                         // raw overloaded constructor identity.
                         rendered
@@ -655,8 +659,16 @@ pub(super) fn try_lower(
                             indent: caller_out.indent,
                             ..Output::default()
                         };
-                        for declaration in &rendered.declarations {
-                            out.line(declaration, &[]);
+                        for (declaration, links) in rendered
+                            .declarations
+                            .iter()
+                            .zip(&rendered.declaration_links)
+                        {
+                            let refs: Vec<_> = links
+                                .iter()
+                                .map(|link| (link.start, link.end - link.start, link.label.clone()))
+                                .collect();
+                            out.line(declaration, &refs);
                         }
                         out.sequence += rendered.declarations.len();
                         let refs: Vec<_> = rendered

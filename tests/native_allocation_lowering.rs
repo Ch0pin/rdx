@@ -471,3 +471,54 @@ fn unrelated_reference_check_cast_uses_nonthrowing_object_bridge() {
         code.source
     );
 }
+
+#[test]
+fn reversed_constructor_cast_arguments_use_ordered_temporary_statements() {
+    let mut c = class(
+        vec![0x0022, 0, 0x021f, 1, 0x011f, 3, 0x3070, 0, 0x0210, 0x0011],
+        vec!["<init>"],
+        vec![(0, 1, 0)],
+    );
+    Arc::get_mut(&mut c.symbols).unwrap().protos[1] = (
+        "V".into(),
+        vec!["Ljava/lang/String;".into(), "Lsample/Source;".into()],
+    );
+    c.methods[0].parameters = vec!["Ljava/lang/Object;".into(), "Ljava/lang/Object;".into()];
+    c.methods[0].code.as_mut().unwrap().ins = 2;
+    let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    assert!(
+        code.source
+            .contains("sample.Source v0 = ((sample.Source) p1);"),
+        "{}",
+        code.source
+    );
+    assert!(
+        code.source
+            .contains("java.lang.String v1 = ((java.lang.String) p0);"),
+        "{}",
+        code.source
+    );
+    assert!(
+        code.source.contains("new sample.A(v1, v0)"),
+        "{}",
+        code.source
+    );
+    assert!(
+        code.source.find("((sample.Source)").unwrap()
+            < code.source.find("((java.lang.String)").unwrap()
+    );
+    assert!(
+        code.source.find("((java.lang.String)").unwrap()
+            < code.source.find("new sample.A").unwrap()
+    );
+    for label in ["sample.Source", "java.lang.String"] {
+        let link = code.links.iter().find(|link| link.label == label).unwrap();
+        let token: String = code
+            .source
+            .chars()
+            .skip(link.start)
+            .take(link.end - link.start)
+            .collect();
+        assert_eq!(token, label);
+    }
+}

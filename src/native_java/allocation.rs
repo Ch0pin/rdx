@@ -96,6 +96,7 @@ pub(crate) struct Link {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Rendered {
     pub declarations: Vec<String>,
+    pub declaration_links: Vec<Vec<Link>>,
     pub expression: String,
     pub links: Vec<Link>,
     pub events: Vec<Event>,
@@ -154,7 +155,109 @@ impl Allocation {
             "allocation capture output exceeds budget"
         );
         Ok(Rendered {
+            declaration_links: vec![Vec::new(); declarations.len()],
             declarations,
+            expression: expression.text,
+            links: expression.links,
+            events,
+        })
+    }
+    /// JADX-compatible readable fallback: retain ordered capture statements,
+    /// then allocate at the constructor. This intentionally moves allocation
+    /// (including initialization/linkage/failure timing), not other effects.
+    #[allow(dead_code)] // production decoder and dedicated staged tests
+    pub(crate) fn render_staged_checked(
+        &self,
+        dex_events: &[Event],
+        locals: &[&str],
+    ) -> Result<Rendered> {
+        self.validate(locals, &mut HashSet::new(), 0, &mut 0)?;
+        let allocate = Event::Allocate {
+            site: self.site,
+            ty: self.ty.label.clone(),
+        };
+        let construct = Event::Construct {
+            site: self.constructor_site,
+            ty: self.ty.label.clone(),
+        };
+        ensure!(
+            dex_events.first() == Some(&allocate) && dex_events.last() == Some(&construct),
+            "staged allocation boundaries mismatch"
+        );
+        ensure!(
+            dex_events
+                .iter()
+                .filter(|event| matches!(event, Event::Allocate { .. } | Event::Construct { .. }))
+                .count()
+                == 2,
+            "nested staged allocation is unsupported"
+        );
+        // Only backward capture dependencies are allowed. All effects must be
+        // reachable from constructor arguments; overwritten captures still fail.
+        let mut used = HashSet::new();
+        for arg in &self.arguments {
+            arg.flat_dependencies(self.captures.len(), &mut used)?;
+        }
+        for index in (0..self.captures.len()).rev() {
+            let mut dependencies = HashSet::new();
+            self.captures[index]
+                .expression
+                .flat_dependencies(index, &mut dependencies)?;
+            if used.contains(&index) {
+                used.extend(dependencies);
+            }
+        }
+        ensure!(
+            used.len() == self.captures.len(),
+            "unconsumed effectful allocation capture"
+        );
+        let mut events = Vec::new();
+        let mut captures = CaptureRenderer::new(&self.captures, &mut events);
+        let mut declarations = Vec::new();
+        let mut declaration_links = Vec::new();
+        let mut chars = 0usize;
+        for (index, capture) in self.captures.iter().enumerate() {
+            let assignment = captures.capture(index)?;
+            let prefix = format!("{} ", capture.ty);
+            let declaration = format!(
+                "{}{};",
+                prefix,
+                &assignment.text[1..assignment.text.len() - 1]
+            );
+            let shift = prefix.chars().count() - 1;
+            declaration_links.push(
+                assignment
+                    .links
+                    .into_iter()
+                    .map(|link| Link {
+                        start: link.start + shift,
+                        end: link.end + shift,
+                        label: link.label,
+                    })
+                    .collect(),
+            );
+            chars = chars.saturating_add(declaration.chars().count());
+            ensure!(
+                chars <= MAX_CHARS,
+                "staged allocation output exceeds budget"
+            );
+            declarations.push(declaration);
+        }
+        let expression = self.render_shared(&mut captures)?;
+        ensure!(
+            chars.saturating_add(expression.text.chars().count()) <= MAX_CHARS,
+            "staged allocation output exceeds budget"
+        );
+        let mut expected = dex_events[1..dex_events.len() - 1].to_vec();
+        expected.push(allocate);
+        expected.push(construct);
+        ensure!(
+            events == expected,
+            "staged allocation changes nonallocation effect order"
+        );
+        Ok(Rendered {
+            declarations,
+            declaration_links,
             expression: expression.text,
             links: expression.links,
             events,
@@ -307,6 +410,32 @@ impl Allocation {
     }
 }
 impl Expr {
+    fn flat_dependencies(&self, before: usize, used: &mut HashSet<usize>) -> Result<()> {
+        match self {
+            Self::Capture(index) => {
+                ensure!(
+                    *index < before,
+                    "forward or cyclic staged capture dependency"
+                );
+                used.insert(*index);
+            }
+            Self::Cast { value, .. } | Self::CheckCast { value, .. } => {
+                value.flat_dependencies(before, used)?
+            }
+            Self::FieldRead { receiver, .. } => receiver.flat_dependencies(before, used)?,
+            Self::Call { target, args, .. } => {
+                target.flat_dependencies(before, used)?;
+                for arg in args {
+                    arg.flat_dependencies(before, used)?;
+                }
+            }
+            Self::New(_) | Self::SharedNew { .. } => {
+                anyhow::bail!("nested staged allocation is unsupported")
+            }
+            _ => {}
+        }
+        Ok(())
+    }
     fn declarations(&self, out: &mut Vec<String>) -> Result<()> {
         match self {
             Self::Local(_)

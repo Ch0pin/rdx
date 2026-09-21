@@ -543,12 +543,18 @@ fn allocation_precedes_class_resolution_and_constructor_preserves_resolution_ord
         }
     }
     let class = allocation(true, true);
-    let error =
-        native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap_err();
+    let rendered = native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
+    // Readable staging preserves resolution order while moving allocation after it.
+    let first = rendered.source.find("sample.First.class").unwrap();
+    let second = rendered.source.find("sample.Second.class").unwrap();
+    let constructor = rendered.source.find("new sample.Box(v1, v0)").unwrap();
     assert!(
-        error.to_string().contains("reorder class resolution"),
-        "{error}"
+        first < second && second < constructor,
+        "{}",
+        rendered.source
     );
+    assert_eq!(rendered.source.matches("sample.First.class").count(), 1);
+    assert_eq!(rendered.source.matches("sample.Second.class").count(), 1);
 }
 
 #[test]

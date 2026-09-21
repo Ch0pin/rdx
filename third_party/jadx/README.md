@@ -187,3 +187,21 @@ The receiver must still be the current instance. Interface defaults, enclosing
 class qualified-super calls and incomplete/ambiguous ancestry remain unsupported.
 Class/interface dispatch distinctions are specified by
 [AOSP's invoke-kind documentation](https://source.android.com/docs/core/runtime/dalvik-bytecode).
+
+## Readable allocation staging
+
+Pinned JADX `ConstructorVisitor.processInvoke` removes the originating
+`NEW_INSTANCE` and replaces the constructor invoke in place; `InsnGen` then emits
+`new Class(arguments)`. Relevant upstream sources:
+
+- [ConstructorVisitor lines 84–110](https://github.com/skylot/jadx/blob/28ff15e4ae69950aebea110a13e5ab895d234dfc/jadx-core/src/main/java/jadx/core/dex/visitors/ConstructorVisitor.java#L84-L110)
+- [InsnGen constructor output](https://github.com/skylot/jadx/blob/28ff15e4ae69950aebea110a13e5ab895d234dfc/jadx-core/src/main/java/jadx/core/codegen/InsnGen.java#L727-L785)
+- [InsnNode reorder classification](https://github.com/skylot/jadx/blob/28ff15e4ae69950aebea110a13e5ab895d234dfc/jadx-core/src/main/java/jadx/core/dex/nodes/InsnNode.java#L244-L283)
+
+RDX's native `allocation.rs` keeps its stricter expression reconstruction first.
+For flat windows only, it can stage ordered capture declarations and place `new`
+at the constructor position, matching the upstream readable reconstruction
+approach. Unlike upstream's broader reorder classifications, RDX still checks
+all recorded cast/call/read/string events in their original order. The intentional
+allocation relocation can change class-initialization, linkage and allocation
+failure timing; output coverage does not establish full semantic equivalence.

@@ -16,6 +16,14 @@ const PREVIEW_BYTES: usize = 128 * 1024;
 const PREVIEW_LINES: usize = 5_000;
 const LONG_LINE: usize = 4_000;
 
+fn exported_component_tint(theme: CodeTheme) -> Color32 {
+    if theme.is_light() {
+        Color32::from_rgba_unmultiplied(130, 65, 195, 45)
+    } else {
+        Color32::from_rgba_unmultiplied(190, 145, 255, 65)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CodeTheme {
     #[default]
@@ -188,6 +196,7 @@ pub struct CodeDocument {
     char_start: usize,
     line_start: usize,
     links: Vec<CodeLink>,
+    exported_components: Vec<Range<usize>>,
     jump: Option<usize>,
     navigation_position: usize,
     last_navigation_cursor: Option<usize>,
@@ -229,6 +238,7 @@ impl CodeDocument {
             char_start: 0,
             line_start: 1,
             links: Vec::new(),
+            exported_components: Vec::new(),
             jump: None,
             navigation_position: 0,
             last_navigation_cursor: None,
@@ -421,6 +431,14 @@ impl CodeDocument {
         self.links = links;
     }
 
+    pub fn set_exported_components(&mut self, mut ranges: Vec<Range<usize>>) {
+        let count = self.source.chars().count();
+        ranges.retain(|range| range.start < range.end && range.end <= count);
+        ranges.sort_by_key(|range| (range.start, range.end));
+        ranges.dedup();
+        self.exported_components = ranges;
+    }
+
     /// Replace a stale search snapshot with the annotated current source. Never
     /// transfer old offsets unless the entire matched line block is unique.
     pub fn refresh_search_source(&mut self, source: String, links: Vec<CodeLink>) -> bool {
@@ -598,12 +616,18 @@ impl CodeDocument {
     pub fn text(&self) -> &str {
         &self.source
     }
+    /// Release rendered glyphs without losing source, selection, or navigation.
+    pub fn discard_layout_cache(&mut self) {
+        self.cache = None;
+    }
+
     /// Conservative accounting includes source, styled text, glyphs, and mesh buffers.
     pub fn retained_bytes(&self) -> usize {
         let base = self.source.capacity()
             + self.syntax.capacity()
             + self.find.query.capacity()
             + self.selection_occurrences.capacity() * std::mem::size_of::<Range<usize>>()
+            + self.exported_components.capacity() * std::mem::size_of::<Range<usize>>()
             + self.links.capacity() * std::mem::size_of::<CodeLink>()
             + self
                 .links
@@ -948,6 +972,7 @@ impl CodeDocument {
                             } else {
                                 Color32::from_rgba_unmultiplied(100, 190, 230, 55)
                             };
+                            let mut hovered_exported = false;
                             let mut row_start = 0;
                             for row in &galley.rows {
                                 let row_end = row_start + row.glyphs.len();
@@ -955,6 +980,35 @@ impl CodeDocument {
                                     .clip_rect()
                                     .intersects(row.rect.translate(output.galley_pos.to_vec2()))
                                 {
+                                    let global_start = self.char_start + row_start;
+                                    let global_end = self.char_start + row_end;
+                                    let first = self
+                                        .exported_components
+                                        .partition_point(|range| range.end <= global_start);
+                                    for range in self.exported_components[first..]
+                                        .iter()
+                                        .take_while(|range| range.start < global_end)
+                                    {
+                                        let left =
+                                            row.x_offset(range.start.saturating_sub(global_start));
+                                        let right =
+                                            row.x_offset(range.end.min(global_end) - global_start);
+                                        let rect = egui::Rect::from_min_max(
+                                            egui::pos2(left, row.rect.top()),
+                                            egui::pos2(right, row.rect.bottom()),
+                                        )
+                                        .translate(output.galley_pos.to_vec2());
+                                        painter.rect_filled(
+                                            rect,
+                                            2.0,
+                                            exported_component_tint(theme),
+                                        );
+                                        hovered_exported |=
+                                            ui.ctx().pointer_hover_pos().is_some_and(|pointer| {
+                                                rect.intersect(painter.clip_rect())
+                                                    .contains(pointer)
+                                            });
+                                    }
                                     let first = self
                                         .selection_occurrences
                                         .partition_point(|range| range.end <= row_start);
@@ -1056,7 +1110,14 @@ impl CodeDocument {
                                 if output.response.double_clicked() {
                                     clicked = Some(link.start);
                                 }
-                                output.response.on_hover_text(&link.label);
+                                let label = if hovered_exported {
+                                    format!("{}\nExported Android component", link.label)
+                                } else {
+                                    link.label.clone()
+                                };
+                                output.response.on_hover_text(label);
+                            } else if hovered_exported {
+                                output.response.on_hover_text("Exported Android component");
                             }
                         });
                     });
@@ -1129,6 +1190,96 @@ mod tests {
         }
     }
     #[test]
+    fn exported_component_highlight_tracks_unicode_wrapping_and_themes() {
+        let name = "sample.AVeryLongExportedComponentName";
+        let source =
+            format!("<!-- 🦀 -->\n<activity android:name=\"{name}\" android:exported=\"true\"/>");
+        let start = source[..source.find(name).unwrap()].chars().count();
+        let range = start..start + name.chars().count();
+        for theme in CodeTheme::ALL {
+            for wrap in [false, true] {
+                let mut doc = CodeDocument::new(source.clone(), "xml");
+                doc.set_word_wrap(wrap);
+                doc.set_links(vec![CodeLink {
+                    start: range.start,
+                    end: range.end,
+                    label: name.into(),
+                }]);
+                doc.set_exported_components(vec![
+                    range.clone(),
+                    range.clone(),
+                    0..0,
+                    0..usize::MAX,
+                ]);
+                assert_eq!(doc.exported_components, vec![range.clone()]);
+                let context = egui::Context::default();
+                let output = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(260.0, 500.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            doc.show(ui, theme, 14.0);
+                        });
+                    },
+                );
+                let painted: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Rect(rect)
+                            if rect.fill == super::exported_component_tint(theme) =>
+                        {
+                            Some(rect)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert!(!painted.is_empty(), "{theme:?}, wrap={wrap}");
+                assert!(painted.iter().all(|rect| rect.rect.width() > 0.0));
+                if wrap {
+                    assert!(painted.len() > 1, "long name should wrap");
+                }
+                assert_eq!(doc.link_at(start).unwrap().label, name);
+                assert_eq!(doc.text(), source);
+                doc.set_links(vec![]);
+                assert_eq!(
+                    doc.exported_components,
+                    vec![range.clone()],
+                    "highlight is independent of available classes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exported_highlights_follow_the_visible_source_window() {
+        let prefix = "\n".repeat(6_000);
+        let mut doc = CodeDocument::new(format!("{prefix}sample.Target"), "xml");
+        doc.set_exported_components(std::iter::once(6_000..6_013).collect());
+        let ctx = egui::Context::default();
+        let draw = |doc: &mut CodeDocument| {
+            ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    doc.show(ui, CodeTheme::Ocean, 14.0);
+                });
+            })
+        };
+        let count = |out: &egui::FullOutput| {
+            out.shapes.iter().filter(|shape| matches!(&shape.shape,
+            egui::epaint::Shape::Rect(rect) if rect.fill == super::exported_component_tint(CodeTheme::Ocean))).count()
+        };
+        assert_eq!(count(&draw(&mut doc)), 0);
+        doc.jump_to(6_000).unwrap();
+        draw(&mut doc); // Apply the scroll request before checking the visible frame.
+        assert_eq!(count(&draw(&mut doc)), 1);
+    }
+
+    #[test]
     fn file_find_is_literal_unicode_aware_and_cycles_both_directions() {
         let mut doc = super::CodeDocument::new("🦀 CAFÉ café a.b axb".into(), "txt");
         doc.find.query = "café".into();
@@ -1180,6 +1331,7 @@ mod tests {
             end: start + 13,
             label: "sample.Target".into(),
         }]);
+        doc.set_exported_components(std::iter::once(start..start + 13).collect());
         let context = egui::Context::default();
         let render = |doc: &mut super::CodeDocument, width| {
             let _ = context.run(

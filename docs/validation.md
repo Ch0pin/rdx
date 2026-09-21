@@ -522,3 +522,39 @@ class-literal navigation, field declarations and exact field target identities.
 checks are recorded separately. See `target/validation/manifest-fields-static-tests.log`,
 `manifest-fields-static-expedia.log`, `manifest-navigation-ui.log`,
 `manifest-navigation-expedia.log`, and matching Clippy/build logs.
+
+### Readable staged allocation reconstruction
+
+Following the user's explicit choice of JADX-compatible readable output, flat
+allocation windows can fall back to ordered temporary declarations before the
+Java `new` expression. The original cast, call, field-read, and string-resolution
+sequence must still match exactly. Only the root allocation moves from its DEX
+location to the constructor location. This changes potential class-initialization,
+linkage, and allocation-failure timing; it is not an exact semantic-equivalence
+claim. The strict expression path remains preferred. Nested allocations, try
+regions, branch crossings, forward/cyclic dependencies, and unused captures
+remain excluded from this fallback.
+
+`tests/native_vending_accuracy.rs` validates Java output and original navigation
+for `ClassicApplication.e`, `SubscriptionAskToPauseActivity.onClick`, and
+`ScreenshotsActivityV2.x`. The latter retains `bdzh` then `wrt` checks as temporary
+statements before each construction. `onClick` retains both `String.valueOf`
+calls, then the prefix string, then `concat`, then construction. Baseline
+Screenshots evidence (5/6 methods) remains in
+`target/validation/screenshots-before.json` and `screenshots-before.txt`.
+After staging, the class renders 6/6 methods as Java; evidence is in
+`target/validation/screenshots-staged-after.json` and
+`target/validation/screenshots-staged-after.txt`. The three-method Vending
+regression passes with raw navigation links.
+
+The nested `_COROUTINE.b.b` example remains outside the staged fallback: its
+allocation nesting and reordered literal dependencies still require broader
+sequence reconstruction.
+
+Combined manifest, tab controls, and staged allocation validation: 486 regular
+tests pass (12 opt-in APK tests ignored), strict all-target Clippy passes, and
+the release binaries build. The Play Store corpus now renders 228,382 of
+268,289 concrete methods, up 649 from 227,733; 39,907 retain fallback output.
+These counts measure renderer acceptance, not semantic equivalence. Evidence:
+`target/validation/staged-vending-after.json` and
+`target/validation/manifest-tabs-staged-tests.log`.

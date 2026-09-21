@@ -7,6 +7,8 @@ pub enum Icon {
     Reload,
     Back,
     Forward,
+    Pin,
+    Bookmark,
     Settings,
     Classes,
     Package,
@@ -113,6 +115,36 @@ pub fn paint(ui: &egui::Ui, rect: Rect, icon: Icon) {
         Icon::Forward => {
             path(&[(14., 5.), (21., 12.), (14., 19.)], false, false);
             line((3., 12.), (21., 12.));
+        }
+        Icon::Pin => {
+            path(
+                &[
+                    (8., 3.),
+                    (16., 3.),
+                    (15., 11.),
+                    (19., 15.),
+                    (5., 15.),
+                    (9., 11.),
+                    (8., 3.),
+                ],
+                true,
+                false,
+            );
+            line((12., 15.), (12., 22.));
+        }
+        Icon::Bookmark => {
+            path(
+                &[
+                    (6., 3.),
+                    (18., 3.),
+                    (18., 21.),
+                    (12., 16.),
+                    (6., 21.),
+                    (6., 3.),
+                ],
+                true,
+                false,
+            );
         }
         Icon::Settings => {
             for (y, x) in [(6., 8.), (12., 16.), (18., 10.)] {

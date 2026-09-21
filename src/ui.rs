@@ -135,7 +135,19 @@ struct HistoryJump {
     destination: JumpLocation,
     origin: Option<JumpLocation>,
 }
+#[derive(Clone, Copy)]
+enum TabAction {
+    TogglePin,
+    UnpinAll,
+    ToggleBookmark,
+    UnbookmarkAll,
+    Close,
+    CloseOthers,
+    CloseAll,
+}
 struct Tab {
+    pinned: bool,
+    bookmarked: bool,
     loading_navigation: bool,
     source_hash: Option<String>,
     target: Target,
@@ -236,6 +248,9 @@ pub struct App {
     filter: String,
     tabs: Vec<Tab>,
     selected: usize,
+    revealed_tab: Option<Target>,
+    #[cfg(test)]
+    tab_ui_controls: Vec<(String, egui::Rect)>,
     history: Vec<JumpLocation>,
     future: Vec<JumpLocation>,
     pending_history: Option<HistoryJump>,
@@ -322,6 +337,9 @@ impl App {
             filter: String::new(),
             tabs: Vec::new(),
             selected: 0,
+            revealed_tab: None,
+            #[cfg(test)]
+            tab_ui_controls: Vec::new(),
             history: Vec::new(),
             future: Vec::new(),
             pending_history: None,
@@ -421,6 +439,7 @@ impl App {
         self.cancelled_history = None;
         self.deferred_target = None;
         self.selected = 0;
+        self.revealed_tab = None;
         self.filter.clear();
         self.plugin_output.clear();
         self.path = Some(path.clone());
@@ -502,14 +521,15 @@ impl App {
             document.jump_to(position)?;
         }
         self.push_tab(Tab {
+            pinned: false,
+            bookmarked: false,
             loading_navigation: false,
             source_hash: Some(code.source_hash),
             target: Target::Class(name.clone()),
             name,
             content: Content::Text(Box::new(document)),
             note: None,
-        });
-        Ok(())
+        })
     }
     fn find_usages(&mut self, class: String, offset: usize, hash: String, ctx: &egui::Context) {
         let Some(mut engine) = self.engine.take() else {
@@ -611,6 +631,9 @@ impl App {
                 && let Content::Text(document) = &mut tab.content
             {
                 document.set_links(crate::manifest_links::links(document.text(), classes));
+                document.set_exported_components(crate::manifest_links::exported_components(
+                    document.text(),
+                ));
             }
         }
     }
@@ -844,12 +867,12 @@ impl App {
             self.cancelled_history = Some(pending.destination.target);
         }
         self.deferred_target = None;
-        self.future.clear();
         let mut reused = false;
         for (index, tab) in self.tabs.iter_mut().enumerate() {
             match tab.reuse_search_hit(&hit) {
                 Ok(true) => {
                     self.selected = index;
+                    self.future.clear();
                     self.status = format!("Search match · {}:{}", hit.document.name, hit.line);
                     if tab.note.is_none() {
                         return;
@@ -889,14 +912,20 @@ impl App {
             SearchTarget::Class(name) => Target::Class(name.clone()),
             SearchTarget::Resource(index) => Target::File(*index),
         };
-        self.push_tab(Tab {
+        if let Err(error) = self.push_tab(Tab {
+            pinned: false,
+            bookmarked: false,
             loading_navigation: needs_metadata,
             source_hash: snapshot.source_hash.clone(),
             target,
             name: snapshot.name.clone(),
             content: Content::Text(Box::new(document)),
             note: None,
-        });
+        }) {
+            self.error(error);
+            return;
+        }
+        self.future.clear();
         self.status = if needs_metadata {
             format!("Opening result · {}", snapshot.name)
         } else {
@@ -978,16 +1007,85 @@ impl App {
             ctx.request_repaint();
         });
     }
-    fn push_tab(&mut self, tab: Tab) {
-        if let Some(index) = self.tabs.iter().position(|t| t.target == tab.target) {
-            self.tabs.remove(index);
+    fn select_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
         }
-        while !self.tabs.is_empty()
-            && (self.tabs.len() >= 8
-                || self.tabs.iter().map(Tab::retained_bytes).sum::<usize>() + tab.retained_bytes()
-                    > 64 * 1024 * 1024)
-        {
-            self.tabs.remove(0);
+        if let Some(pending) = self.pending_history.take() {
+            self.cancelled_history = Some(pending.destination.target);
+        }
+        self.deferred_target = None;
+        self.selected = index;
+    }
+    fn tab_action(&mut self, index: usize, action: TabAction) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        match action {
+            TabAction::TogglePin => self.tabs[index].pinned = !self.tabs[index].pinned,
+            TabAction::UnpinAll => self.tabs.iter_mut().for_each(|tab| tab.pinned = false),
+            TabAction::ToggleBookmark => self.tabs[index].bookmarked = !self.tabs[index].bookmarked,
+            TabAction::UnbookmarkAll => self.tabs.iter_mut().for_each(|tab| tab.bookmarked = false),
+            TabAction::Close | TabAction::CloseOthers | TabAction::CloseAll => {
+                if let Some(pending) = self.pending_history.take() {
+                    self.cancelled_history = Some(pending.destination.target);
+                }
+                self.deferred_target = None;
+                let selected = self.tabs.get(self.selected).map(|tab| tab.target.clone());
+                let context = self.tabs[index].target.clone();
+                self.tabs.retain(|tab| match action {
+                    TabAction::Close => tab.target != context,
+                    TabAction::CloseOthers => tab.pinned || tab.target == context,
+                    TabAction::CloseAll => tab.pinned,
+                    _ => unreachable!(),
+                });
+                self.selected = selected
+                    .and_then(|selected| self.tabs.iter().position(|tab| tab.target == selected))
+                    .unwrap_or(self.selected.min(self.tabs.len().saturating_sub(1)));
+            }
+        }
+    }
+    fn push_tab(&mut self, mut tab: Tab) -> Result<(), String> {
+        const BUDGET: usize = 64 * 1024 * 1024;
+        let existing = self.tabs.iter().position(|old| old.target == tab.target);
+        if let Some(index) = existing {
+            tab.pinned = self.tabs[index].pinned;
+            tab.bookmarked = self.tabs[index].bookmarked;
+        }
+        if tab.retained_bytes() > BUDGET {
+            return Err(
+                "View exceeds the 64 MiB tab budget; export it to inspect externally".into(),
+            );
+        }
+        // Plan before mutating: pin-blocked admission preserves every tab and selection.
+        let mut retained: usize = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != existing)
+            .map(|(_, tab)| tab.retained_bytes())
+            .sum();
+        let mut count = self.tabs.len() - usize::from(existing.is_some());
+        let mut evict = Vec::new();
+        for (index, old) in self.tabs.iter().enumerate() {
+            if count < 8 && retained + tab.retained_bytes() <= BUDGET {
+                break;
+            }
+            if Some(index) != existing && !old.pinned {
+                count -= 1;
+                retained -= old.retained_bytes();
+                evict.push(index);
+            }
+        }
+        if count >= 8 || retained + tab.retained_bytes() > BUDGET {
+            return Err("Pinned views fill the tab budget (8 views / 64 MiB). Unpin or close a view before opening another".into());
+        }
+        if let Some(index) = existing {
+            evict.push(index);
+        }
+        evict.sort_unstable();
+        for index in evict.into_iter().rev() {
+            self.tabs.remove(index);
         }
         self.tabs.push(tab);
         self.selected = self.tabs.len() - 1;
@@ -998,6 +1096,153 @@ impl App {
         }) {
             self.finish_history();
         }
+        Ok(())
+    }
+    fn tab_bar(&mut self, ui: &mut egui::Ui) -> Option<Target> {
+        let mut export = None;
+        #[cfg(test)]
+        self.tab_ui_controls.clear();
+        let mut action = None;
+        let mut selected = None;
+        let selected_target = self.tabs.get(self.selected).map(|tab| tab.target.clone());
+        let reveal = self.revealed_tab != selected_target;
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let views = ui
+                    .menu_button("▾", |ui| {
+                        let width = (ui.ctx().screen_rect().width() - 32.0).clamp(120.0, 420.0);
+                        ui.set_min_width(width.min(260.0));
+                        ui.set_max_width(width);
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        egui::ScrollArea::vertical()
+                            .max_height((ui.ctx().screen_rect().height() - 80.0).max(80.0))
+                            .show(ui, |ui| {
+                                for (index, tab) in self.tabs.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        if tab.pinned {
+                                            icons::small(ui, Icon::Pin);
+                                        }
+                                        if tab.bookmarked {
+                                            icons::small(ui, Icon::Bookmark);
+                                        }
+                                        let label = format!(
+                                            "{}{}",
+                                            if index == self.selected { "✓ " } else { "" },
+                                            tab.name
+                                        );
+                                        let response = ui
+                                            .selectable_label(index == self.selected, label)
+                                            .on_hover_text(&tab.name);
+                                        #[cfg(test)]
+                                        self.tab_ui_controls
+                                            .push((format!("view:{}", tab.name), response.rect));
+                                        if response.clicked() {
+                                            selected = Some(index);
+                                            ui.close_menu();
+                                        }
+                                    });
+                                }
+                            });
+                    })
+                    .response
+                    .on_hover_text("Open views — all tabs, including offscreen views");
+                #[cfg(test)]
+                self.tab_ui_controls.push(("views".into(), views.rect));
+                #[cfg(not(test))]
+                let _ = views;
+                egui::ScrollArea::horizontal()
+                    .id_salt("tabs")
+                    .max_width(ui.available_width())
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (i, tab) in self.tabs.iter().enumerate() {
+                                if tab.pinned {
+                                    icons::small(ui, Icon::Pin);
+                                }
+                                if tab.bookmarked {
+                                    icons::small(ui, Icon::Bookmark);
+                                }
+                                let label = match tab.target {
+                                    Target::Class(_) => tab.name.rsplit('.').next(),
+                                    Target::File(_) => tab.name.rsplit('/').next(),
+                                }
+                                .unwrap_or(&tab.name);
+                                let response = ui
+                                    .selectable_label(self.selected == i, label)
+                                    .on_hover_text(&tab.name);
+                                if reveal && self.selected == i {
+                                    response.scroll_to_me(Some(egui::Align::Center));
+                                }
+                                if response.clicked() {
+                                    selected = Some(i);
+                                }
+                                response.context_menu(|ui| {
+                                    if ui.button("Copy Name").clicked() {
+                                        ui.ctx().copy_text(tab.name.clone());
+                                        ui.close_menu();
+                                    }
+                                    ui.separator();
+                                    for (label, operation) in [
+                                        (
+                                            if tab.pinned { "Unpin" } else { "Pin" },
+                                            TabAction::TogglePin,
+                                        ),
+                                        ("Unpin All", TabAction::UnpinAll),
+                                        (
+                                            if tab.bookmarked {
+                                                "Unbookmark"
+                                            } else {
+                                                "Bookmark"
+                                            },
+                                            TabAction::ToggleBookmark,
+                                        ),
+                                        ("Unbookmark All", TabAction::UnbookmarkAll),
+                                    ] {
+                                        if ui.button(label).clicked() {
+                                            action = Some((i, operation));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                    ui.separator();
+                                    for (label, operation) in [
+                                        ("Close", TabAction::Close),
+                                        ("Close Others", TabAction::CloseOthers),
+                                        ("Close All", TabAction::CloseAll),
+                                    ] {
+                                        if ui.button(label).clicked() {
+                                            action = Some((i, operation));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                    ui.separator();
+                                    if ui
+                                        .add_enabled(
+                                            !self.export_busy,
+                                            egui::Button::new("Export…"),
+                                        )
+                                        .clicked()
+                                    {
+                                        export = Some(tab.target.clone());
+                                        ui.close_menu();
+                                    }
+                                });
+                                if ui.small_button("×").clicked() {
+                                    action = Some((i, TabAction::Close));
+                                }
+                                ui.separator();
+                            }
+                        });
+                    });
+            });
+        });
+        self.revealed_tab = selected_target;
+        if let Some(index) = selected {
+            self.select_tab(index);
+        }
+        if let Some((index, action)) = action {
+            self.tab_action(index, action);
+        }
+        export
     }
     fn error(&mut self, error: String) {
         self.status = error
@@ -1161,14 +1406,19 @@ impl App {
                             } else {
                                 "Asset ready".into()
                             };
-                            self.push_tab(Tab {
+                            if let Err(error) = self.push_tab(Tab {
+                                pinned: false,
+                                bookmarked: false,
                                 loading_navigation: false,
                                 source_hash: None,
                                 target: Target::File(index),
                                 name,
                                 content,
                                 note,
-                            });
+                            }) {
+                                self.pending_history = None;
+                                self.error(error);
+                            }
                         }
                         Err(error) => {
                             self.pending_history = None;
@@ -1190,14 +1440,20 @@ impl App {
                                 self.pending_history = None;
                                 continue;
                             };
-                            self.push_tab(Tab {
+                            if let Err(error) = self.push_tab(Tab {
+                                pinned: false,
+                                bookmarked: false,
                                 loading_navigation: false,
                                 source_hash: None,
                                 target: Target::File(index),
                                 name,
                                 content: Content::Text(Box::new(CodeDocument::new(text, "xml"))),
                                 note: Some("Android XML decoded natively".into()),
-                            });
+                            }) {
+                                self.pending_history = None;
+                                self.error(error);
+                                continue;
+                            }
                             self.status = "Android XML ready".into();
                         }
                         Err(error) => {
@@ -1852,52 +2108,8 @@ impl eframe::App for App {
                     ui.weak("Native Rust · alpha Java / DEX disassembly · assets");
                 });
             } else {
-                let mut close = None;
-                egui::ScrollArea::horizontal()
-                    .id_salt("tabs")
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            for (i, tab) in self.tabs.iter().enumerate() {
-                                let label = match tab.target {
-                                    Target::Class(_) => tab.name.rsplit('.').next(),
-                                    Target::File(_) => tab.name.rsplit('/').next(),
-                                }
-                                .unwrap_or(&tab.name);
-                                let response = ui
-                                    .selectable_label(self.selected == i, label)
-                                    .on_hover_text(&tab.name);
-                                if response.clicked() {
-                                    if let Some(pending) = self.pending_history.take() {
-                                        self.cancelled_history = Some(pending.destination.target);
-                                    }
-                                    self.deferred_target = None;
-                                    self.selected = i;
-                                }
-                                response.context_menu(|ui| {
-                                    if ui
-                                        .add_enabled(
-                                            !self.export_busy,
-                                            egui::Button::new("Export…"),
-                                        )
-                                        .clicked()
-                                    {
-                                        export = Some(tab.target.clone());
-                                        ui.close_menu();
-                                    }
-                                });
-                                if ui.small_button("×").clicked() {
-                                    close = Some(i);
-                                }
-                                ui.separator();
-                            }
-                        });
-                    });
-                if let Some(i) = close {
-                    self.tabs.remove(i);
-                    if i < self.selected {
-                        self.selected -= 1;
-                    }
-                    self.selected = self.selected.min(self.tabs.len().saturating_sub(1));
+                if let Some(target) = self.tab_bar(ui) {
+                    export = Some(target);
                 }
                 if let Some(tab) = self.tabs.get_mut(self.selected) {
                     ui.horizontal_wrapped(|ui| {
@@ -2023,7 +2235,22 @@ impl eframe::App for App {
         while self.tabs.len() > 1
             && self.tabs.iter().map(Tab::retained_bytes).sum::<usize>() > 64 * 1024 * 1024
         {
-            let index = if self.selected == 0 { 1 } else { 0 };
+            let Some(index) = self
+                .tabs
+                .iter()
+                .enumerate()
+                .position(|(index, tab)| index != self.selected && !tab.pinned)
+            else {
+                // Pinned source remains open; shed inactive layout caches rather than tabs.
+                for (index, tab) in self.tabs.iter_mut().enumerate() {
+                    if index != self.selected
+                        && let Content::Text(document) = &mut tab.content
+                    {
+                        document.discard_layout_cache();
+                    }
+                }
+                break;
+            };
             self.tabs.remove(index);
             if index < self.selected {
                 self.selected -= 1;
@@ -2140,6 +2367,9 @@ mod settings_tests {
             filter: String::new(),
             tabs: Vec::new(),
             selected: 0,
+            revealed_tab: None,
+            #[cfg(test)]
+            tab_ui_controls: Vec::new(),
             history: Vec::new(),
             future: Vec::new(),
             pending_history: None,
@@ -2271,6 +2501,160 @@ mod settings_tests {
                 assert!(app.diagnostics.is_empty(), "{:?}", app.diagnostics);
             }
         }
+    }
+
+    fn sample_tab(index: usize, bytes: usize) -> Tab {
+        Tab {
+            pinned: false,
+            bookmarked: false,
+            loading_navigation: false,
+            source_hash: None,
+            target: Target::File(index),
+            name: format!("assets/very-long-view-name-{index}.txt"),
+            content: Content::Text(Box::new(CodeDocument::new("x".repeat(bytes), "text"))),
+            note: None,
+        }
+    }
+    #[test]
+    fn pinned_tab_admission_is_transactional_and_refresh_keeps_flags() {
+        let mut app = navigation_test_app();
+        for index in 0..8 {
+            let mut tab = sample_tab(index, 64);
+            tab.pinned = true;
+            app.push_tab(tab).unwrap();
+        }
+        app.selected = 3;
+        let error = app.push_tab(sample_tab(8, 64)).unwrap_err();
+        assert!(error.contains("Unpin or close"));
+        assert_eq!(app.tabs.len(), 8);
+        assert_eq!(app.selected, 3);
+        assert!(app.tabs.iter().all(|tab| tab.pinned));
+        app.tabs[3].bookmarked = true;
+        app.push_tab(sample_tab(3, 128)).unwrap();
+        assert!(app.tabs[app.selected].pinned && app.tabs[app.selected].bookmarked);
+        app.tab_action(0, TabAction::TogglePin);
+        app.push_tab(sample_tab(8, 64)).unwrap();
+        assert_eq!(app.tabs.len(), 8);
+        assert!(!app.tabs.iter().any(|tab| tab.target == Target::File(0)));
+    }
+    #[test]
+    fn pinned_memory_budget_rejects_without_evicting_or_changing_selection() {
+        let mut app = navigation_test_app();
+        for index in 0..2 {
+            let mut tab = sample_tab(index, 24 * 1024 * 1024);
+            tab.pinned = true;
+            app.push_tab(tab).unwrap();
+        }
+        let selected = app.selected;
+        assert!(app.push_tab(sample_tab(2, 24 * 1024 * 1024)).is_err());
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.selected, selected);
+        assert!(app.tabs.iter().map(Tab::retained_bytes).sum::<usize>() <= 64 * 1024 * 1024);
+    }
+    #[test]
+    fn tab_context_actions_preserve_pins_selection_and_reference_history() {
+        let mut app = navigation_test_app();
+        for index in 0..4 {
+            app.push_tab(sample_tab(index, 64)).unwrap();
+        }
+        app.select_tab(2);
+        app.history.push(app.current_location().unwrap());
+        app.tab_action(0, TabAction::TogglePin);
+        app.tab_action(1, TabAction::ToggleBookmark);
+        assert!(app.tabs[1].bookmarked);
+        app.tab_action(1, TabAction::UnbookmarkAll);
+        assert!(app.tabs.iter().all(|tab| !tab.bookmarked));
+        app.tab_action(1, TabAction::Close);
+        assert_eq!(app.tabs[app.selected].target, Target::File(2));
+        app.tab_action(app.selected, TabAction::CloseOthers);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tabs[app.selected].target, Target::File(2));
+        app.tab_action(app.selected, TabAction::CloseAll);
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.tabs[0].pinned);
+        assert_eq!(app.history.len(), 1, "closed references remain reopenable");
+        app.tab_action(0, TabAction::Close);
+        assert!(app.tabs.is_empty(), "explicit close can close pinned tabs");
+        assert_eq!(app.selected, 0);
+        app.push_tab(sample_tab(4, 64)).unwrap();
+        app.tab_action(0, TabAction::TogglePin);
+        app.tab_action(0, TabAction::UnpinAll);
+        assert!(!app.tabs[0].pinned);
+    }
+    #[test]
+    fn overflow_menu_lists_full_names_and_selects_offscreen_tab() {
+        let ctx = egui::Context::default();
+        let mut app = navigation_test_app();
+        for index in 0..8 {
+            app.push_tab(sample_tab(index, 64)).unwrap();
+        }
+        app.selected = 0;
+        let render = |app: &mut App, events| {
+            let mut height = 0.0;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(320.0, 600.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let start = ui.cursor().min.y;
+                        app.tab_bar(ui);
+                        height = ui.cursor().min.y - start;
+                    });
+                },
+            );
+            assert!(height < 60.0, "tab strip wrapped: {height}");
+        };
+        let click = |position| {
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        render(&mut app, vec![]);
+        let button = app
+            .tab_ui_controls
+            .iter()
+            .find(|(name, _)| name == "views")
+            .unwrap()
+            .1;
+        assert!(
+            button.max.x < 320.0 && button.min.x > 250.0,
+            "dropdown must stay at the right edge: {button:?}"
+        );
+        render(&mut app, click(button.center()));
+        render(&mut app, vec![]); // Allow the popup to settle its measured size.
+        assert_eq!(
+            app.tab_ui_controls
+                .iter()
+                .filter(|(name, _)| name.starts_with("view:"))
+                .count(),
+            8
+        );
+        let last = app
+            .tab_ui_controls
+            .iter()
+            .find(|(name, _)| name == "view:assets/very-long-view-name-7.txt")
+            .unwrap()
+            .1;
+        render(&mut app, click(last.center()));
+        assert_eq!(app.selected, 7);
     }
 
     fn wait_for_history(app: &mut App, ctx: &egui::Context) {
@@ -2450,6 +2834,8 @@ mod settings_tests {
             label: "sample.Target".into(),
         }]);
         let mut tab = Tab {
+            pinned: false,
+            bookmarked: false,
             loading_navigation: false,
             source_hash: Some("original".into()),
             target: Target::Class("sample.Hello".into()),
@@ -2503,6 +2889,8 @@ mod settings_tests {
     #[test]
     fn deferred_search_metadata_refreshes_changed_source_and_rejects_stale_requests() {
         let mut tab = Tab {
+            pinned: false,
+            bookmarked: false,
             loading_navigation: true,
             source_hash: Some("original".into()),
             target: Target::Class("sample.Hello".into()),

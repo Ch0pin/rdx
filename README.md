@@ -43,6 +43,8 @@ Theme and font attribution is in [third_party/themes](third_party/themes/README.
 and [third_party/fonts](third_party/fonts/README.md). Redistributed application
 bundles must include these license notices alongside the embedded assets.
 
+The **▾ Open views** menu at the right edge of the tab strip lists every open view by full name, including offscreen tabs. Right-click a tab to copy its name, pin/unpin it, bookmark it, or close views. Pins protect tabs from automatic eviction and **Close Others / Close All**; explicit **Close** still works. Pins and bookmarks last for the current session. The 8-view / 64 MiB admission budget remains enforced; unpin or close a view when pinned tabs prevent opening another.
+
 Use the toolbar arrows or **Navigate → Back / Forward** (**Alt+Left / Alt+Right**) to revisit reference jumps, including manifest references. A new reference jump clears forward history.
 
 Source tabs show the alpha native engine label. Links are enabled only where native metadata provides a target; unavailable symbol operations remain disabled or report an explicit unsupported operation. Full JADX navigation, usage-analysis, and Java reconstruction parity are still porting work.
@@ -54,6 +56,12 @@ Right-click a project-tree file/class, an open tab, or a viewer and choose **Exp
 ## Assets
 
 Readable text includes UTF-8 and BOM-marked UTF-16: JSON, XML, HTML, JavaScript, CSS, configuration files, Markdown, and other text. HTML, JavaScript, and SVG are displayed as source, never executed. PNG, JPEG, GIF (first frame), WebP, and BMP have image previews.
+
+Exported manifest component names have a purple highlight and an **Exported
+Android component** hover label. Detection uses explicit `android:exported="true"`
+and known SDK-dependent defaults; unresolved resource values are not guessed.
+Highlighting is available before class loading finishes and preserves class jumps.
+It describes the exported flag, independently of enabled state or permissions.
 
 Compiled Android XML, including the manifest, is detected by its binary header and decoded in native Rust directly from the archive. Previews work while class loading is running or if it fails. Full resource-table expansion remains unavailable. Other binary data is accessible through hexadecimal previews and original-byte export. Unsupported decoding reports a clear error while preserving the raw preview.
 

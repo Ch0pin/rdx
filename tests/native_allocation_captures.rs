@@ -388,3 +388,126 @@ fn explicit_check_cast_has_ordered_throwing_event() {
     reordered.swap(0, 1);
     assert!(allocation.render_checked(&reordered, &["input"]).is_err());
 }
+
+#[test]
+fn staged_output_relocates_only_root_allocation_and_keeps_statement_links() {
+    let a = Allocation {
+        site: 1,
+        constructor_site: 4,
+        ty: symbol("Holder", "Holder"),
+        captures: vec![
+            Capture {
+                ty: "First".into(),
+                name: "first".into(),
+                expression: Expr::CheckCast {
+                    site: 2,
+                    ty: symbol("First", "First"),
+                    value: Box::new(Expr::Local("input1".into())),
+                },
+            },
+            Capture {
+                ty: "Second".into(),
+                name: "second".into(),
+                expression: Expr::CheckCast {
+                    site: 3,
+                    ty: symbol("Second", "Second"),
+                    value: Box::new(Expr::Local("input2".into())),
+                },
+            },
+        ],
+        arguments: vec![Expr::Capture(1), Expr::Capture(0)],
+    };
+    let events = [
+        Event::Allocate {
+            site: 1,
+            ty: "Holder".into(),
+        },
+        Event::CheckCast {
+            site: 2,
+            ty: "First".into(),
+        },
+        Event::CheckCast {
+            site: 3,
+            ty: "Second".into(),
+        },
+        Event::Construct {
+            site: 4,
+            ty: "Holder".into(),
+        },
+    ];
+    assert!(a.render_checked(&events, &["input1", "input2"]).is_err());
+    let output = a
+        .render_staged_checked(&events, &["input1", "input2"])
+        .unwrap();
+    assert_eq!(
+        output.declarations,
+        [
+            "First first = ((First) input1);",
+            "Second second = ((Second) input2);"
+        ]
+    );
+    assert_eq!(output.expression, "new Holder(second, first)");
+    assert_eq!(
+        output.events,
+        [
+            events[1].clone(),
+            events[2].clone(),
+            events[0].clone(),
+            events[3].clone()
+        ]
+    );
+    for (line, links) in output.declarations.iter().zip(&output.declaration_links) {
+        for link in links {
+            assert_eq!(
+                line.chars()
+                    .skip(link.start)
+                    .take(link.end - link.start)
+                    .collect::<String>(),
+                link.label
+            );
+        }
+    }
+    let mut wrong = events.clone();
+    wrong.swap(1, 2);
+    assert!(
+        a.render_staged_checked(&wrong, &["input1", "input2"])
+            .is_err()
+    );
+}
+
+#[test]
+fn staged_output_rejects_unused_and_forward_capture_dependencies() {
+    let mut a = Allocation {
+        site: 1,
+        constructor_site: 3,
+        ty: symbol("Holder", "Holder"),
+        captures: vec![Capture {
+            ty: "Child".into(),
+            name: "first".into(),
+            expression: Expr::CheckCast {
+                site: 2,
+                ty: symbol("Child", "Child"),
+                value: Box::new(Expr::Local("input".into())),
+            },
+        }],
+        arguments: vec![],
+    };
+    let events = [
+        Event::Allocate {
+            site: 1,
+            ty: "Holder".into(),
+        },
+        Event::CheckCast {
+            site: 2,
+            ty: "Child".into(),
+        },
+        Event::Construct {
+            site: 3,
+            ty: "Holder".into(),
+        },
+    ];
+    assert!(a.render_staged_checked(&events, &["input"]).is_err());
+    a.arguments.push(Expr::Capture(0));
+    a.captures[0].expression = Expr::Capture(0);
+    assert!(a.render_staged_checked(&events, &["input"]).is_err());
+}

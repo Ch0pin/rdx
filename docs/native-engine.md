@@ -139,3 +139,13 @@ be executable; unreachable payload alignment padding is permitted. It rejects ot
 unreachable instruction regions and limits analysis
 to 128 branches, nesting depth 32, 1,000,000 graph work steps and 4 MiB method output. These
 are conservative fallback limits, not claims of full DEX control-flow coverage.
+
+Flat allocation windows now have a JADX-compatible readable fallback: when the
+strict expression tree cannot preserve argument order, emit typed temporary
+values in their original order and then the Java constructor expression. This
+explicitly relocates the root allocation, including possible initialization,
+linkage and allocation-failure timing. Every other recorded effect must retain
+its original order and every capture must remain used. The fallback excludes
+nested allocations, exception regions, control-flow crossings and forward/cyclic
+capture dependencies. It generates no synthetic helper methods or conditional
+sequencing expressions; raw links also cover the temporary declarations.

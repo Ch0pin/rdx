@@ -1,0 +1,11 @@
+/target/
+__pycache__/
+.DS_Store
+*.apk
+*.dex
+!tests/fixtures/*.apk
+!tests/fixtures/*.dex
+.env
+.env.*
+*.pem
+*.key

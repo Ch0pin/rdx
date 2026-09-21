@@ -1,0 +1,17 @@
+[package]
+name = "rdx"
+version = "0.1.0"
+edition = "2024"
+default-run = "rdx"
+
+[dependencies]
+anyhow = "1"
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+quick-xml = "0.42"
+regex = "1"

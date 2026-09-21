@@ -1,0 +1,8 @@
+{
+  "protocol": 1,
+  "id": "dev.rdx.source-stats",
+  "name": "Source statistics",
+  "executable": "rdx-source-stats",
+  "executable_base": "application",
+  "capability": "source.analyze"
+}

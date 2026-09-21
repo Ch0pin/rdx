@@ -86,7 +86,9 @@ fn pool(b: &[u8], header: usize) -> Result<Vec<String>> {
             ensure!(u16_at(b, end)? == 0, "Missing XML string terminator");
             let raw = b.get(p..end).context("Invalid UTF16 string bounds")?;
             String::from_utf16(
-                &raw.chunks_exact(2)
+                &raw.as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect::<Vec<_>>(),
             )?

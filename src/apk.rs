@@ -242,7 +242,7 @@ fn decode_text(bytes: &[u8]) -> Result<Option<String>> {
     let text = if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) {
         ensure!(bytes.len().is_multiple_of(2), "odd-length UTF-16 data");
         let little = bytes[0] == 0xff;
-        let words = bytes[2..].chunks_exact(2).map(|b| {
+        let words = bytes[2..].as_chunks::<2>().0.iter().map(|b| {
             if little {
                 u16::from_le_bytes([b[0], b[1]])
             } else {

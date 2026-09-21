@@ -129,3 +129,45 @@ fn allocation_casts_and_messages_render_with_ordered_temporary_values() {
         }
     }
 }
+
+#[test]
+#[ignore = "Set RDX_TEST_APK to the reported Play Store APK and run --ignored"]
+fn app_discovery_readability_preserves_call_order_and_navigation() {
+    let path = std::env::var_os("RDX_TEST_APK").expect("RDX_TEST_APK required");
+    let mut engine = NativeEngine::start().unwrap();
+    engine.open(std::path::Path::new(&path)).unwrap();
+    let class = "com.google.android.finsky.appdiscoveryservice.AppDiscoveryLaunchActivity";
+    let code = engine.decompile_with_metadata(class).unwrap();
+    assert!(!code.source.contains(".end method"), "{}", code.source);
+    assert!(code.source.contains("if (this.a.e())"), "{}", code.source);
+    assert!(code.source.contains("if (v6 == null)"));
+    assert!(code.source.contains("if (v8 == null)"));
+    assert!(!code.source.contains("!= false"));
+    assert!(!code.source.contains("== false"));
+    assert!(!code.source.contains("((Object) v1)"));
+    let first = code.source.find("AppDiscoveryVulnerabilityFix").unwrap();
+    let second = code.source.find(".startsWith(").unwrap();
+    let branch = code.source.find("if (v11)").unwrap();
+    assert!(first < second && second < branch);
+    let mut checked = 0;
+    for link in &code.links {
+        if link.label.contains("aqtw.e(") || link.label.contains("java.lang.String.startsWith(") {
+            let visible: String = code
+                .source
+                .chars()
+                .skip(link.start)
+                .take(link.end - link.start)
+                .collect();
+            assert!(visible == "e" || visible == "startsWith", "{visible}");
+            assert_eq!(
+                engine
+                    .resolve_usage_target(class, link.start, &code.source_hash)
+                    .unwrap()
+                    .id,
+                link.label
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 2);
+}

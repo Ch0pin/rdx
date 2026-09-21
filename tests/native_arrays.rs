@@ -99,8 +99,7 @@ fn casts_are_materialized_before_register_overwrite_and_links_are_exact() {
     );
     let code = native_java::render_method("sample.Hello", &class, &class.methods[0]).unwrap();
     assert!(
-        code.source
-            .contains("((java.lang.String) ((java.lang.Object) p0))"),
+        code.source.contains("((java.lang.String) p0)"),
         "{}",
         code.source
     );

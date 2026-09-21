@@ -50,6 +50,8 @@ pub(super) fn emit(
                     );
                     let input = if input.literal == Some(0) {
                         "null".into()
+                    } else if input.ty == "Ljava/lang/Object;" || input.ty == ty.as_ref() {
+                        input.text
                     } else {
                         format!("((java.lang.Object) {})", input.text)
                     };

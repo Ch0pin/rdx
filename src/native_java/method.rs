@@ -5,6 +5,8 @@
 mod allocation;
 #[path = "allocation_lowering.rs"]
 mod allocation_lowering;
+#[path = "cleanup.rs"]
+mod cleanup;
 #[path = "numeric.rs"]
 mod numeric;
 #[path = "operations.rs"]
@@ -41,9 +43,11 @@ struct Output {
     sequence: usize,
     chars: usize,
     indent: usize,
+    receiver_locals: std::collections::HashSet<String>,
 }
 impl Output {
     fn append(&mut self, child: Output) {
+        self.receiver_locals.extend(child.receiver_locals);
         for mut link in child.links {
             link.start += self.chars;
             link.end += self.chars;
@@ -75,6 +79,9 @@ impl Output {
     ) -> Result<Value> {
         let name = format!("v{}", self.sequence);
         self.sequence += 1;
+        if expression != "null" && !expression.contains("new ") {
+            self.receiver_locals.insert(name.clone());
+        }
         let prefix = format!("{} {name} = ", java_type(ty)?);
         let mut adjusted: Vec<_> = refs
             .iter()
@@ -821,13 +828,28 @@ fn condition(op: u8, a: usize, regs: &[Option<Value>]) -> Result<String> {
                 Ok("null".into())
             } else {
                 ensure!(reference(&v.ty), "reference comparison with nonreference");
-                Ok(format!("((java.lang.Object) {})", v.text))
+                if lhs.literal == Some(0) || rhs.literal == Some(0) {
+                    Ok(v.text.clone())
+                } else {
+                    Ok(format!("((java.lang.Object) {})", v.text))
+                }
             }
         };
         (expr(&lhs)?, expr(&rhs)?)
     } else if (lhs.ty == "Z" || rhs.ty == "Z") && kind <= 1 {
         ensure!(kind <= 1, "ordered boolean comparison");
-        (argument(&lhs, "Z")?, argument(&rhs, "Z")?)
+        let left = argument(&lhs, "Z")?;
+        let right = argument(&rhs, "Z")?;
+        for (expression, constant) in [(&left, &right), (&right, &left)] {
+            if matches!(constant.as_str(), "true" | "false") {
+                return Ok(if (constant == "true") == (kind == 0) {
+                    expression.clone()
+                } else {
+                    format!("!({expression})")
+                });
+            }
+        }
+        (left, right)
     } else {
         (integral(&lhs)?, integral(&rhs)?)
     };
@@ -961,10 +983,12 @@ pub(super) fn reconstruct(
         None,
     )?;
     ensure!(returned, "method falls off end");
-    Ok(MethodBody {
+    let mut body = MethodBody {
         text: out.text,
         links: out.links,
-    })
+    };
+    cleanup::inline_receivers(&mut body, &out.receiver_locals);
+    Ok(body)
 }
 
 // Snapshot every carried value before assigning any loop slot: DEX moves can
@@ -3664,6 +3688,50 @@ mod tests {
                 .take(link.end - link.start)
                 .collect::<String>(),
             "a"
+        );
+    }
+}
+
+#[cfg(test)]
+mod readability_conditions {
+    use super::*;
+    #[test]
+    fn boolean_zero_tests_simplify_but_integer_tests_do_not() {
+        let boolean = Value {
+            text: "flag".into(),
+            ty: "Z".into(),
+            literal: None,
+            wide_literal: None,
+        };
+        let regs = [Some(boolean)];
+        assert_eq!(condition(0x39, 0, &regs).unwrap(), "flag");
+        assert_eq!(condition(0x38, 0, &regs).unwrap(), "!(flag)");
+        let integer = Value {
+            text: "number".into(),
+            ty: "I".into(),
+            literal: None,
+            wide_literal: None,
+        };
+        assert_eq!(condition(0x39, 0, &[Some(integer)]).unwrap(), "number != 0");
+    }
+    #[test]
+    fn null_checks_need_no_object_cast_but_unrelated_reference_equality_does() {
+        let value = |text: &str, ty: &str| {
+            Some(Value {
+                text: text.into(),
+                ty: ty.into(),
+                literal: None,
+                wide_literal: None,
+            })
+        };
+        let regs = [
+            value("left", "Lsample/Left;"),
+            value("right", "Lsample/Right;"),
+        ];
+        assert_eq!(condition(0x38, 0, &regs).unwrap(), "left == null");
+        assert_eq!(
+            condition(0x32, 0x10, &regs).unwrap(),
+            "((java.lang.Object) left) == ((java.lang.Object) right)"
         );
     }
 }

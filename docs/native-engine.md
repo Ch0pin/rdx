@@ -149,3 +149,20 @@ its original order and every capture must remain used. The fallback excludes
 nested allocations, exception regions, control-flow crossings and forward/cyclic
 capture dependencies. It generates no synthetic helper methods or conditional
 sequencing expressions; raw links also cover the temporary declarations.
+
+### Readability cleanup
+
+The renderer records its generated locals and performs up to eight bounded
+cleanup passes. A single-use local can move into an immediately adjacent receiver
+expression, or a boolean local into an immediately adjacent `if` condition.
+Exact token counts ignore quoted strings and comments. The pass does not cross
+statements, block boundaries, loop conditions, or short-circuit operands, and
+keeps locals used more than once or reassigned. Constructor allocations are not
+candidates. Moved expression references retain Unicode-scalar navigation spans.
+
+Null comparisons omit the Object bridge; reference-to-reference comparisons
+retain it when Java types might be unrelated. A check-cast omits the bridge only
+when the input is already Object or the target type. Boolean zero comparisons
+render as direct or negated conditions, while integer zero comparisons remain
+numeric. This does not yet provide variable naming, general argument inlining,
+varargs recovery, or nested-condition folding.

@@ -558,3 +558,26 @@ the release binaries build. The Play Store corpus now renders 228,382 of
 These counts measure renderer acceptance, not semantic equivalence. Evidence:
 `target/validation/staged-vending-after.json` and
 `target/validation/manifest-tabs-staged-tests.log`.
+
+### Readability regression
+
+`src/native_java/cleanup.rs` tests adjacent call-chain inlining, effect and block
+boundaries, repeated/reassigned uses, literal token handling, parentheses,
+Unicode navigation, and the distinction between adjacent `if` and loop or
+short-circuit conditions. Typed condition tests preserve integer comparisons
+and bridges between unrelated reference types. The cast regression in
+`tests/native_arrays.rs` now expects removal of a redundant Object cast while
+retaining the runtime check and its type link.
+
+The opt-in `app_discovery_readability_preserves_call_order_and_navigation` test
+in `tests/native_vending_accuracy.rs` checks the reported Play Store activity:
+`if (this.a.e())`, plain Intent/Uri null checks, retained order of the feature
+flag and URL-prefix calls, and resolvable navigation on inlined calls. Both
+Play Store regression tests pass. Local evidence is under
+`target/validation/readability-*.log` and `readability-app-discovery.java`.
+
+The combined local suite passes 494 tests with 13 opt-in tests ignored; the two
+Play Store opt-in regressions also pass explicitly. Strict all-target Clippy and
+release builds pass. In the reported AppDiscoveryLaunchActivity, generated local
+declarations decrease from 38 to 27. This measures display cleanup, not a change
+to decompilation coverage or proof of full semantic equivalence.

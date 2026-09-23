@@ -6,6 +6,25 @@ fn words() -> &'static regex::Regex {
     WORDS.get_or_init(|| regex::Regex::new(r"[\p{L}\p{M}\p{N}_$]+").expect("word pattern"))
 }
 
+/// Return the complete word containing a glyph's Unicode scalar index.
+pub fn word_at(source: &str, index: usize) -> Option<Range<usize>> {
+    let byte = source.char_indices().nth(index)?.0;
+    let mut preceding_byte = 0;
+    let mut preceding_scalar = 0;
+    for token in words().find_iter(source) {
+        if token.start() > byte {
+            return None;
+        }
+        if token.end() > byte {
+            let start = preceding_scalar + source[preceding_byte..token.start()].chars().count();
+            return Some(start..start + token.as_str().chars().count());
+        }
+        preceding_scalar += source[preceding_byte..token.end()].chars().count();
+        preceding_byte = token.end();
+    }
+    None
+}
+
 pub fn selected_word(source: &str, selection: Range<usize>) -> Option<String> {
     if selection.start >= selection.end {
         return None;
@@ -51,6 +70,17 @@ pub fn occurrences(source: &str, word: &str) -> Vec<Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clicked_glyph_expands_unicode_word_and_rejects_separators() {
+        let source = "🎯 café $id e\u{301};";
+        assert_eq!(word_at(source, 2), Some(2..6));
+        assert_eq!(word_at(source, 5), Some(2..6));
+        assert_eq!(word_at(source, 7), Some(7..10));
+        assert_eq!(word_at(source, 12), Some(11..13));
+        for index in [0, 1, 6, 10, 13, 14, usize::MAX] {
+            assert_eq!(word_at(source, index), None);
+        }
+    }
     #[test]
     fn exact_unicode_case_and_identifier_boundaries() {
         let source = "🦀 café café2 CAFÉ\r\ncafé $id $id_more $id e\u{301} e\u{301}";

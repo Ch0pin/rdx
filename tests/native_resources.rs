@@ -13,6 +13,9 @@ fn words(v: &[u32]) -> Vec<u8> {
     v.iter().flat_map(|n| n.to_le_bytes()).collect()
 }
 fn compiled(wide: bool) -> Vec<u8> {
+    compiled_attribute(wide, "enabled", 1, 0x12, 1)
+}
+fn compiled_attribute(wide: bool, attribute: &str, namespace: u32, ty: u8, value: u32) -> Vec<u8> {
     let strings = [
         "android",
         "http://schemas.android.com/apk/res/android",
@@ -20,7 +23,7 @@ fn compiled(wide: bool) -> Vec<u8> {
         "package",
         "test.native",
         "application",
-        "enabled",
+        attribute,
         "label",
         "A & B",
     ];
@@ -66,7 +69,7 @@ fn compiled(wide: bool) -> Vec<u8> {
         u32::MAX,
         5,
         &[
-            [1, 6, u32::MAX, 0x12000008, 1],
+            [namespace, 6, u32::MAX, ((ty as u32) << 24) | 8, value],
             [1, 7, u32::MAX, 0x03000008, 8],
         ],
     ));
@@ -195,4 +198,58 @@ fn expedia_manifest_previews_without_dex_engine() {
     assert!(text.contains("package=\"com.expedia.bookings\""));
     assert!(text.contains("<application"));
     assert!(note.is_none());
+}
+
+#[test]
+fn compiled_reference_metadata_excludes_literal_strings() {
+    let mut bytes = compiled(false);
+    let literal = words(&[1, 7, u32::MAX, 0x03000008, 8]);
+    let offset = bytes
+        .windows(literal.len())
+        .position(|window| window == literal)
+        .unwrap();
+    let (_, refs) = native_resources::decode_with_references(&bytes).unwrap();
+    assert!(refs.is_empty());
+    bytes[offset + 12..offset + 16].copy_from_slice(&0x01000008u32.to_le_bytes());
+    bytes[offset + 16..offset + 20].copy_from_slice(&0x7f010000u32.to_le_bytes());
+    let (source, refs) = native_resources::decode_with_references(&bytes).unwrap();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(
+        source
+            .chars()
+            .skip(refs[0].start)
+            .take(refs[0].len())
+            .collect::<String>(),
+        "@0x7f010000"
+    );
+}
+
+#[test]
+fn compiled_manifest_enum_and_flags_decode_by_namespace_and_attribute() {
+    for wide in [false, true] {
+        for (attribute, value, expected) in [
+            ("protectionLevel", 2, "signature"),
+            ("protectionLevel", 0x12, "signature|privileged"),
+            ("windowSoftInputMode", 0x12, "stateHidden|adjustResize"),
+            ("launchMode", 2, "singleTask"),
+            ("protectionLevel", 0x80000002, "0x80000002"),
+        ] {
+            let xml =
+                native_resources::decode(&compiled_attribute(wide, attribute, 1, 0x11, value))
+                    .unwrap();
+            assert!(
+                xml.contains(&format!("android:{attribute}=\"{expected}\"")),
+                "{xml}"
+            );
+        }
+        let xml = native_resources::decode(&compiled_attribute(
+            wide,
+            "protectionLevel",
+            u32::MAX,
+            0x11,
+            2,
+        ))
+        .unwrap();
+        assert!(xml.contains("protectionLevel=\"0x2\""));
+    }
 }

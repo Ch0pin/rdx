@@ -12,8 +12,6 @@ use syntect::{
     easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet, util::LinesWithEndings,
 };
 
-const PREVIEW_BYTES: usize = 128 * 1024;
-const PREVIEW_LINES: usize = 5_000;
 const LONG_LINE: usize = 4_000;
 
 fn exported_component_tint(theme: CodeTheme) -> Color32 {
@@ -22,6 +20,25 @@ fn exported_component_tint(theme: CodeTheme) -> Color32 {
     } else {
         Color32::from_rgba_unmultiplied(190, 145, 255, 65)
     }
+}
+
+fn jump_accent(theme: CodeTheme) -> Color32 {
+    if theme.is_light() {
+        Color32::from_rgb(38, 91, 161)
+    } else {
+        Color32::from_rgb(125, 185, 245)
+    }
+}
+fn jump_gutter_tint(theme: CodeTheme) -> Color32 {
+    if theme.is_light() {
+        Color32::from_rgba_unmultiplied(220, 70, 70, 40)
+    } else {
+        Color32::from_rgba_unmultiplied(255, 135, 135, 55)
+    }
+}
+fn jump_tint(theme: CodeTheme) -> Color32 {
+    let c = jump_accent(theme);
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 48)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -186,6 +203,7 @@ struct FileFind {
 pub struct CodeDocument {
     selection_key: Option<(usize, usize, Option<Range<usize>>)>,
     selection_occurrences: Vec<Range<usize>>,
+    clicked_word: Option<(usize, Range<usize>)>,
     find: FileFind,
     word_wrap: bool,
     code_font: CodeFont,
@@ -203,6 +221,9 @@ pub struct CodeDocument {
     highlight: Option<Range<usize>>,
     export_requested: bool,
     usages_requested: Option<usize>,
+    subclasses_requested: Option<usize>,
+    implementations_requested: Option<usize>,
+    method_xrefs_requested: Option<(usize, bool)>,
     usages_enabled: bool,
     menu_link: Option<CodeLink>,
     menu_selection: Option<Range<usize>>,
@@ -217,17 +238,12 @@ pub struct CodeDocument {
 }
 impl CodeDocument {
     pub fn new(text: String, syntax: &str) -> Self {
-        let mut end = text.len().min(PREVIEW_BYTES);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        if let Some((offset, _)) = text[..end].match_indices('\n').nth(PREVIEW_LINES - 1) {
-            end = offset;
-        }
+        let end = text.len();
         let plain = text[..end].split('\n').any(|line| line.len() > LONG_LINE);
         Self {
             selection_key: None,
             selection_occurrences: Vec::new(),
+            clicked_word: None,
             find: FileFind::default(),
             word_wrap: false,
             code_font: CodeFont::default(),
@@ -245,6 +261,9 @@ impl CodeDocument {
             highlight: None,
             export_requested: false,
             usages_requested: None,
+            subclasses_requested: None,
+            implementations_requested: None,
+            method_xrefs_requested: None,
             usages_enabled: true,
             menu_link: None,
             menu_selection: None,
@@ -415,6 +434,15 @@ impl CodeDocument {
     pub fn take_usages_request(&mut self) -> Option<usize> {
         self.usages_requested.take()
     }
+    pub fn take_method_xrefs_request(&mut self) -> Option<(usize, bool)> {
+        self.method_xrefs_requested.take()
+    }
+    pub fn take_implementations_request(&mut self) -> Option<usize> {
+        self.implementations_requested.take()
+    }
+    pub fn take_subclasses_request(&mut self) -> Option<usize> {
+        self.subclasses_requested.take()
+    }
     pub fn set_usages_enabled(&mut self, enabled: bool) {
         self.usages_enabled = enabled;
     }
@@ -424,6 +452,13 @@ impl CodeDocument {
             .find(|link| link.start <= position && position < link.end)
     }
 
+    pub fn resource_links(&self) -> Vec<CodeLink> {
+        self.links
+            .iter()
+            .filter(|link| link.label.starts_with(rdx::resource_table::PREFIX))
+            .cloned()
+            .collect()
+    }
     pub fn set_links(&mut self, mut links: Vec<CodeLink>) {
         let count = self.source.chars().count();
         links.retain(|link| link.start < link.end && link.end <= count);
@@ -489,55 +524,10 @@ impl CodeDocument {
 
     /// Positions are Unicode scalar offsets, matching the engine protocol.
     pub fn jump_to(&mut self, position: usize) -> Result<(), String> {
-        let byte = self
-            .source
-            .char_indices()
+        self.source
+            .chars()
             .nth(position)
-            .map(|(byte, _)| byte)
             .ok_or_else(|| "Declaration position is outside the source".to_owned())?;
-        if byte < self.preview_start || byte >= self.preview_end {
-            // Leave context before the target, including inside exceptionally long lines.
-            let mut start = byte.saturating_sub(PREVIEW_BYTES / 4);
-            while !self.source.is_char_boundary(start) {
-                start += 1;
-            }
-            if let Some(newline) = self.source[start..byte].find('\n') {
-                start += newline + 1;
-            }
-            self.preview_start = start;
-            self.char_start = self.source[..start].chars().count();
-            self.line_start = self.source[..start].bytes().filter(|b| *b == b'\n').count() + 1;
-            let mut end = (start + PREVIEW_BYTES).min(self.source.len());
-            while !self.source.is_char_boundary(end) {
-                end -= 1;
-            }
-            // Bound the number of rows while ensuring the target remains visible.
-            let preceding_lines = self.source[start..byte]
-                .bytes()
-                .filter(|b| *b == b'\n')
-                .count();
-            if preceding_lines >= PREVIEW_LINES / 2 {
-                start = byte;
-                self.preview_start = start;
-                self.char_start = position;
-                self.line_start = self.source[..start].bytes().filter(|b| *b == b'\n').count() + 1;
-                end = (start + PREVIEW_BYTES).min(self.source.len());
-                while !self.source.is_char_boundary(end) {
-                    end -= 1;
-                }
-            }
-            if let Some((offset, _)) = self.source[start..end]
-                .match_indices('\n')
-                .nth(PREVIEW_LINES - 1)
-            {
-                end = start + offset;
-            }
-            self.preview_end = end;
-            self.plain = self.source[start..end]
-                .split('\n')
-                .any(|line| line.len() > LONG_LINE);
-            self.cache = None;
-        }
         self.navigation_position = position;
         self.jump = Some(position);
         self.highlight = Some(self.symbol_range(position));
@@ -589,7 +579,7 @@ impl CodeDocument {
         position - before..position + after
     }
 
-    fn link_at_pointer(&self, galley: &egui::Galley, position: egui::Vec2) -> Option<&CodeLink> {
+    fn glyph_at_pointer(galley: &egui::Galley, position: egui::Vec2) -> Option<usize> {
         let nearest = galley.cursor_from_pos(position).ccursor.index;
         for index in [Some(nearest), nearest.checked_sub(1)]
             .into_iter()
@@ -603,15 +593,18 @@ impl CodeDocument {
             let bounds =
                 egui::Rect::from_min_max(begin.min, egui::pos2(end.left(), begin.bottom()));
             if bounds.contains(position.to_pos2()) && bounds.width() > 0.0 {
-                let global = self.char_start + index;
-                let next = self.links.partition_point(|link| link.start <= global);
-                return next
-                    .checked_sub(1)
-                    .and_then(|index| self.links.get(index))
-                    .filter(|link| global < link.end);
+                return Some(index);
             }
         }
         None
+    }
+
+    fn link_at_pointer(&self, galley: &egui::Galley, position: egui::Vec2) -> Option<&CodeLink> {
+        let global = self.char_start + Self::glyph_at_pointer(galley, position)?;
+        let next = self.links.partition_point(|link| link.start <= global);
+        next.checked_sub(1)
+            .and_then(|index| self.links.get(index))
+            .filter(|link| global < link.end)
     }
     pub fn text(&self) -> &str {
         &self.source
@@ -730,9 +723,7 @@ impl CodeDocument {
                 wrap_width,
             });
         }
-        if self.preview_start != 0 || self.preview_end != self.source.len() {
-            ui.label("Large file: showing a bounded source window (128 KiB / 5,000 lines). Symbol jumps move the window. Copy source includes all loaded text.");
-        }
+
         if self.plain {
             ui.label("Very long lines: syntax coloring disabled to keep the viewer responsive.");
         }
@@ -759,202 +750,90 @@ impl CodeDocument {
                 } else {
                     Color32::from_rgb(62, 83, 112)
                 };
-                egui::ScrollArea::new([!self.word_wrap, true])
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.horizontal_top(|ui| {
-                            // Paint numbers at the actual laid-out row positions, avoiding font drift.
-                            let width = gutter_width;
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(width, galley.size().y),
-                                egui::Sense::hover(),
-                            );
-                            let mut line = self.line_start;
-                            let mut line_beginning = true;
-                            for row in &galley.rows {
-                                let point = rect.min + egui::vec2(width - 4.0, row.rect.min.y);
-                                if line_beginning
-                                    && ui.clip_rect().intersects(egui::Rect::from_min_size(
-                                        point,
-                                        egui::vec2(1.0, size * 1.45),
-                                    ))
-                                {
-                                    ui.painter().text(
-                                        point,
-                                        egui::Align2::RIGHT_TOP,
-                                        line.to_string(),
-                                        self.code_font.font_id(size),
-                                        foreground.gamma_multiply(0.65),
-                                    );
-                                }
-                                line_beginning = row.ends_with_newline;
-                                if row.ends_with_newline {
-                                    line += 1;
-                                }
-                            }
-                            let mut source = &self.source[self.preview_start..self.preview_end];
-                            let mut layouter = |_: &egui::Ui, _: &str, _: f32| Arc::clone(&galley);
-                            let editor_id = ui.make_persistent_id("source_editor");
-                            let preserve_selection = ui.input(|input| {
-                                input.pointer.button_pressed(egui::PointerButton::Secondary)
-                            });
-                            let previous_selection =
-                                egui::text_edit::TextEditState::load(ui.ctx(), editor_id)
-                                    .and_then(|state| state.cursor.char_range());
-                            let mut output = egui::TextEdit::multiline(&mut source)
-                                .id(editor_id)
-                                .font(self.code_font.font_id(size))
-                                .code_editor()
-                                .frame(false)
-                                .margin(0)
-                                .desired_width(if self.word_wrap {
-                                    wrap_width
-                                } else {
-                                    galley.size().x.max(ui.clip_rect().width() - width).max(1.0)
-                                })
-                                .min_size(egui::vec2(0.0, ui.clip_rect().height()))
-                                .layouter(&mut layouter)
-                                .show(ui);
-                            if preserve_selection {
-                                output.state.cursor.set_char_range(previous_selection);
-                                output.state.clone().store(ui.ctx(), editor_id);
-                            }
-                            if output.response.secondary_clicked() {
-                                self.menu_link = ui
-                                    .ctx()
-                                    .pointer_interact_pos()
-                                    .filter(|pointer| output.text_clip_rect.contains(*pointer))
-                                    .and_then(|pointer| {
-                                        self.link_at_pointer(
-                                            &output.galley,
-                                            pointer - output.galley_pos,
-                                        )
-                                    })
-                                    .cloned();
-                                self.menu_selection = output
-                                    .state
-                                    .cursor
-                                    .char_range()
-                                    .map(|range| {
-                                        let [start, end] = range.sorted();
-                                        start.index..end.index
-                                    })
-                                    .filter(|range| !range.is_empty())
-                                    .map(|range| {
-                                        range.start + self.char_start..range.end + self.char_start
-                                    });
-                            }
-                            output.response.context_menu(|ui| {
-                                // Popup text follows the interface theme, independently of code colors.
-                                ui.visuals_mut().override_text_color = None;
-                                #[cfg(test)]
-                                self.menu_items.clear();
-                                let go = ui.add_enabled(
-                                    self.menu_link.is_some(),
-                                    egui::Button::new("Go to declaration"),
-                                );
-                                #[cfg(test)]
-                                self.menu_items.push((
-                                    "Go to declaration".into(),
-                                    go.rect,
-                                    go.enabled(),
-                                ));
-                                if go.clicked() {
-                                    clicked = self.menu_link.as_ref().map(|link| link.start);
-                                    ui.close_menu();
-                                }
-                                let usages = ui.add_enabled(
-                                    self.usages_enabled && self.menu_link.is_some(),
-                                    egui::Button::new("Find usages"),
-                                );
-                                #[cfg(test)]
-                                self.menu_items.push((
-                                    "Find usages".into(),
-                                    usages.rect,
-                                    usages.enabled(),
-                                ));
-                                if usages.clicked() {
-                                    self.usages_requested =
-                                        self.menu_link.as_ref().map(|link| link.start);
-                                    ui.close_menu();
-                                }
-                                let symbol = ui.add_enabled(
-                                    self.menu_link.is_some(),
-                                    egui::Button::new("Copy symbol name"),
-                                );
-                                #[cfg(test)]
-                                self.menu_items.push((
-                                    "Copy symbol name".into(),
-                                    symbol.rect,
-                                    symbol.enabled(),
-                                ));
-                                if symbol.clicked() {
-                                    if let Some(link) = &self.menu_link {
-                                        ui.ctx().copy_text(link.label.clone());
-                                    }
-                                    ui.close_menu();
-                                }
-                                ui.separator();
-                                let selection = ui.add_enabled(
-                                    self.menu_selection.is_some(),
-                                    egui::Button::new("Copy selection"),
-                                );
-                                #[cfg(test)]
-                                self.menu_items.push((
-                                    "Copy selection".into(),
-                                    selection.rect,
-                                    selection.enabled(),
-                                ));
-                                if selection.clicked() {
-                                    if let Some(range) = &self.menu_selection {
-                                        ui.ctx().copy_text(
-                                            self.source
-                                                .chars()
-                                                .skip(range.start)
-                                                .take(range.len())
-                                                .collect(),
-                                        );
-                                    }
-                                    ui.close_menu();
-                                }
-                                let export = ui.button("Export…");
-                                #[cfg(test)]
-                                self.menu_items.push((
-                                    "Export…".into(),
-                                    export.rect,
-                                    export.enabled(),
-                                ));
-                                if export.clicked() {
-                                    self.export_requested = true;
-                                    ui.close_menu();
-                                }
-                                let source = ui.button("Copy source");
-                                #[cfg(test)]
-                                self.menu_items.push((
-                                    "Copy source".into(),
-                                    source.rect,
-                                    source.enabled(),
-                                ));
-                                if source.clicked() {
-                                    ui.ctx().copy_text(self.source.clone());
-                                    ui.close_menu();
-                                }
-                            });
-                            #[cfg(test)]
+                let mut scroll =
+                    egui::ScrollArea::new([!self.word_wrap, true]).auto_shrink([false, false]);
+                if let Some(position) = self.jump {
+                    let target = galley.pos_from_ccursor(egui::text::CCursor::new(position));
+                    scroll = scroll.vertical_scroll_offset(
+                        (target.center().y - ui.available_height() * 0.5).max(0.0),
+                    );
+                }
+                scroll.show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        // Paint numbers at the actual laid-out row positions, avoiding font drift.
+                        let width = gutter_width;
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(width, galley.size().y),
+                            egui::Sense::hover(),
+                        );
+                        let gutter_highlight = ui.painter().add(egui::Shape::Noop);
+                        let mut line = self.line_start;
+                        let mut line_beginning = true;
+                        for row in &galley.rows {
+                            let point = rect.min + egui::vec2(width - 4.0, row.rect.min.y);
+                            if line_beginning
+                                && ui.clip_rect().intersects(egui::Rect::from_min_size(
+                                    point,
+                                    egui::vec2(1.0, size * 1.45),
+                                ))
                             {
-                                self.last_galley_pos = Some(output.galley_pos);
-                                self.last_editor_id = Some(editor_id);
+                                ui.painter().text(
+                                    point,
+                                    egui::Align2::RIGHT_TOP,
+                                    line.to_string(),
+                                    self.code_font.font_id(size),
+                                    foreground.gamma_multiply(0.65),
+                                );
                             }
-                            if let Some(cursor) = output.state.cursor.char_range() {
-                                let position = self.char_start + cursor.primary.index;
-                                if self.jump.is_none()
-                                    && self.last_navigation_cursor != Some(position)
-                                {
-                                    self.navigation_position = position;
-                                }
-                                self.last_navigation_cursor = Some(position);
+                            line_beginning = row.ends_with_newline;
+                            if row.ends_with_newline {
+                                line += 1;
                             }
-                            let selected = output
+                        }
+                        let mut source = &self.source[self.preview_start..self.preview_end];
+                        let mut layouter = |_: &egui::Ui, _: &str, _: f32| Arc::clone(&galley);
+                        let editor_id = ui.make_persistent_id("source_editor");
+                        let preserve_selection = ui.input(|input| {
+                            input.pointer.button_pressed(egui::PointerButton::Secondary)
+                        });
+                        let previous_selection =
+                            egui::text_edit::TextEditState::load(ui.ctx(), editor_id)
+                                .and_then(|state| state.cursor.char_range());
+                        // Reserve a background slot before TextEdit paints selection and
+                        // glyphs. Highlights must never cover the user's selection.
+                        let highlight_layer = ui.painter().add(egui::Shape::Noop);
+                        let mut highlight_shapes = Vec::new();
+                        let mut output = egui::TextEdit::multiline(&mut source)
+                            .id(editor_id)
+                            .font(self.code_font.font_id(size))
+                            .code_editor()
+                            .frame(false)
+                            .margin(0)
+                            .desired_width(if self.word_wrap {
+                                wrap_width
+                            } else {
+                                galley.size().x.max(ui.clip_rect().width() - width).max(1.0)
+                            })
+                            .min_size(egui::vec2(0.0, ui.clip_rect().height()))
+                            .layouter(&mut layouter)
+                            .show(ui);
+                        if preserve_selection {
+                            output.state.cursor.set_char_range(previous_selection);
+                            output.state.clone().store(ui.ctx(), editor_id);
+                        }
+                        if output.response.secondary_clicked() {
+                            self.menu_link = ui
+                                .ctx()
+                                .pointer_interact_pos()
+                                .filter(|pointer| output.text_clip_rect.contains(*pointer))
+                                .and_then(|pointer| {
+                                    self.link_at_pointer(
+                                        &output.galley,
+                                        pointer - output.galley_pos,
+                                    )
+                                })
+                                .cloned();
+                            self.menu_selection = output
                                 .state
                                 .cursor
                                 .char_range()
@@ -962,165 +841,416 @@ impl CodeDocument {
                                     let [start, end] = range.sorted();
                                     start.index..end.index
                                 })
-                                .filter(|range| !range.is_empty());
-                            self.update_selection_occurrences(selected.clone());
-                            let painter = ui
-                                .painter()
-                                .with_clip_rect(output.text_clip_rect.intersect(ui.clip_rect()));
-                            let tint = if theme.is_light() {
-                                Color32::from_rgba_unmultiplied(40, 120, 180, 45)
-                            } else {
-                                Color32::from_rgba_unmultiplied(100, 190, 230, 55)
-                            };
-                            let mut hovered_exported = false;
-                            let mut row_start = 0;
-                            for row in &galley.rows {
-                                let row_end = row_start + row.glyphs.len();
-                                if painter
-                                    .clip_rect()
-                                    .intersects(row.rect.translate(output.galley_pos.to_vec2()))
-                                {
-                                    let global_start = self.char_start + row_start;
-                                    let global_end = self.char_start + row_end;
-                                    let first = self
-                                        .exported_components
-                                        .partition_point(|range| range.end <= global_start);
-                                    for range in self.exported_components[first..]
-                                        .iter()
-                                        .take_while(|range| range.start < global_end)
-                                    {
-                                        let left =
-                                            row.x_offset(range.start.saturating_sub(global_start));
-                                        let right =
-                                            row.x_offset(range.end.min(global_end) - global_start);
-                                        let rect = egui::Rect::from_min_max(
-                                            egui::pos2(left, row.rect.top()),
-                                            egui::pos2(right, row.rect.bottom()),
-                                        )
-                                        .translate(output.galley_pos.to_vec2());
-                                        painter.rect_filled(
-                                            rect,
-                                            2.0,
-                                            exported_component_tint(theme),
-                                        );
-                                        hovered_exported |=
-                                            ui.ctx().pointer_hover_pos().is_some_and(|pointer| {
-                                                rect.intersect(painter.clip_rect())
-                                                    .contains(pointer)
-                                            });
-                                    }
-                                    let first = self
-                                        .selection_occurrences
-                                        .partition_point(|range| range.end <= row_start);
-                                    for range in self.selection_occurrences[first..]
-                                        .iter()
-                                        .take_while(|range| range.start < row_end)
-                                    {
-                                        if selected.as_ref() == Some(range) {
-                                            continue;
+                                .filter(|range| !range.is_empty())
+                                .map(|range| {
+                                    range.start + self.char_start..range.end + self.char_start
+                                });
+                        }
+                        output.response.context_menu(|ui| {
+                            // Popup text follows the interface theme, independently of code colors.
+                            ui.visuals_mut().override_text_color = None;
+                            #[cfg(test)]
+                            self.menu_items.clear();
+                            ui.weak("Navigation");
+                            let go = ui.add_enabled(
+                                self.menu_link.is_some(),
+                                egui::Button::new("Go to declaration"),
+                            );
+                            #[cfg(test)]
+                            self.menu_items.push((
+                                "Go to declaration".into(),
+                                go.rect,
+                                go.enabled(),
+                            ));
+                            if go.clicked() {
+                                clicked = self.menu_link.as_ref().map(|link| link.start);
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            ui.weak("X-Refs");
+                            let usages = ui.add_enabled(
+                                self.usages_enabled && self.menu_link.as_ref().is_some_and(|link| !link.label.starts_with(rdx::resource_table::PREFIX)),
+                                egui::Button::new("Find usages"),
+                            );
+                            #[cfg(test)]
+                            self.menu_items.push((
+                                "Find usages".into(),
+                                usages.rect,
+                                usages.enabled(),
+                            ));
+                            if usages.clicked() {
+                                self.usages_requested =
+                                    self.menu_link.as_ref().map(|link| link.start);
+                                ui.close_menu();
+                            }
+                            let subclasses = ui.add_enabled(
+                                self.usages_enabled && self.menu_link.as_ref()
+                                    .is_some_and(|link| !link.label.contains(['(', ':'])),
+                                egui::Button::new("Find direct subclasses"),
+                            ).on_hover_text("Find classes whose immediate superclass is this type; excludes grandchildren and interface implementations.");
+                            #[cfg(test)]
+                            self.menu_items.push(("Find direct subclasses".into(), subclasses.rect, subclasses.enabled()));
+                            if subclasses.clicked() {
+                                self.subclasses_requested = self.menu_link.as_ref().map(|link| link.start);
+                                ui.close_menu();
+                            }
+                            let implementations = ui.add_enabled(
+                                self.usages_enabled && self.menu_link.as_ref().is_some_and(|link|
+                                    !link.label.contains(':') && !link.label.contains(".<init>(") && !link.label.contains(".<clinit>(")),
+                                egui::Button::new("Find implementations"),
+                            ).on_hover_text("Find concrete implementing classes or overriding method declarations across the loaded hierarchy.");
+                            #[cfg(test)]
+                            self.menu_items.push(("Find implementations".into(), implementations.rect, implementations.enabled()));
+                            if implementations.clicked() {
+                                self.implementations_requested = self.menu_link.as_ref().map(|link| link.start);
+                                ui.close_menu();
+                            }
+                            let method_enabled = self.usages_enabled && self.menu_link.as_ref()
+                                .is_some_and(|link| link.label.contains('(') && !link.label.starts_with(rdx::resource_table::PREFIX));
+                            ui.add_enabled_ui(method_enabled, |ui| {
+                                let submenu = ui.menu_button("Method references", |ui| {
+                                    for (label, callers) in [("Callers", true), ("Callees", false)] {
+                                        let response = ui.button(label);
+                                        #[cfg(test)]
+                                        self.menu_items.push((label.into(), response.rect, response.enabled()));
+                                        if response.clicked() {
+                                            self.method_xrefs_requested = self.menu_link.as_ref().map(|link| (link.start, callers));
+                                            ui.close_menu();
                                         }
-                                        let left =
-                                            row.x_offset(range.start.saturating_sub(row_start));
-                                        let right =
-                                            row.x_offset(range.end.min(row_end) - row_start);
-                                        let rect = egui::Rect::from_min_max(
-                                            egui::pos2(left, row.rect.top()),
-                                            egui::pos2(right, row.rect.bottom()),
-                                        )
-                                        .translate(output.galley_pos.to_vec2());
-                                        painter.rect_filled(rect, 1.0, tint);
                                     }
+                                });
+                                #[cfg(test)]
+                                self.menu_items.push(("Method references".into(), submenu.response.rect, submenu.response.enabled()));
+                                #[cfg(not(test))]
+                                let _ = submenu;
+                            });
+                            ui.separator();
+                            ui.weak("Copy");
+                            let symbol = ui.add_enabled(
+                                self.menu_link.is_some(),
+                                egui::Button::new("Copy symbol name"),
+                            );
+                            #[cfg(test)]
+                            self.menu_items.push((
+                                "Copy symbol name".into(),
+                                symbol.rect,
+                                symbol.enabled(),
+                            ));
+                            if symbol.clicked() {
+                                if let Some(link) = &self.menu_link {
+                                    ui.ctx().copy_text(link.label.clone());
                                 }
-                                row_start = row_end + usize::from(row.ends_with_newline);
+                                ui.close_menu();
                             }
-                            if let Some(target) = &self.highlight {
-                                let local_start = target.start.saturating_sub(self.char_start);
-                                let local_end = target
-                                    .end
-                                    .saturating_sub(self.char_start)
-                                    .min(galley.job.text.chars().count());
-                                let first = output
-                                    .galley
-                                    .pos_from_ccursor(egui::text::CCursor::new(local_start));
-                                let last = output
-                                    .galley
-                                    .pos_from_ccursor(egui::text::CCursor::new(local_end));
-                                for row in &output.galley.rows {
-                                    if row.rect.bottom() <= first.top()
-                                        || row.rect.top() > last.top()
-                                    {
-                                        continue;
-                                    }
-                                    let left = if row.rect.top() <= first.top() {
-                                        first.left()
-                                    } else {
-                                        row.rect.left()
-                                    };
-                                    let right = if row.rect.top() >= last.top() {
-                                        last.left()
-                                    } else {
-                                        row.rect.right()
-                                    };
-                                    if right > left {
-                                        let rect = egui::Rect::from_min_max(
-                                            egui::pos2(left, row.rect.top()),
-                                            egui::pos2(right, row.rect.bottom()),
-                                        )
-                                        .translate(output.galley_pos.to_vec2());
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            1.0,
-                                            Color32::from_rgba_unmultiplied(255, 190, 40, 100),
-                                        );
-                                    }
-                                }
-                                if self.jump.take().is_some() {
-                                    ui.scroll_to_rect(
-                                        first.translate(output.galley_pos.to_vec2()),
-                                        Some(egui::Align::Center),
+                            let snippet = self.menu_link.as_ref().and_then(|link| rdx::frida_snippet::for_method(&link.label));
+                            let frida = ui.add_enabled(snippet.is_some(), egui::Button::new("Copy as Frida snippet"));
+                            #[cfg(test)]
+                            self.menu_items.push(("Copy as Frida snippet".into(), frida.rect, frida.enabled()));
+                            if frida.clicked() {
+                                if let Some(snippet) = snippet { ui.ctx().copy_text(snippet); }
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            let selection = ui.add_enabled(
+                                self.menu_selection.is_some(),
+                                egui::Button::new("Copy selection"),
+                            );
+                            #[cfg(test)]
+                            self.menu_items.push((
+                                "Copy selection".into(),
+                                selection.rect,
+                                selection.enabled(),
+                            ));
+                            if selection.clicked() {
+                                if let Some(range) = &self.menu_selection {
+                                    ui.ctx().copy_text(
+                                        self.source
+                                            .chars()
+                                            .skip(range.start)
+                                            .take(range.len())
+                                            .collect(),
                                     );
                                 }
+                                ui.close_menu();
                             }
-                            if let Some(pointer) = ui.ctx().pointer_hover_pos()
-                                && output.response.rect.contains(pointer)
-                                && output.text_clip_rect.contains(pointer)
-                                && let Some(link) = self
-                                    .link_at_pointer(&output.galley, pointer - output.galley_pos)
-                            {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                let first =
-                                    output.galley.pos_from_ccursor(egui::text::CCursor::new(
-                                        link.start.saturating_sub(self.char_start),
-                                    ));
-                                let last =
-                                    output.galley.pos_from_ccursor(egui::text::CCursor::new(
-                                        link.end.saturating_sub(self.char_start),
-                                    ));
-                                if first.top() == last.top() {
-                                    ui.painter().line_segment(
-                                        [
-                                            output.galley_pos
-                                                + egui::vec2(first.left(), first.bottom()),
-                                            output.galley_pos
-                                                + egui::vec2(last.left(), last.bottom()),
-                                        ],
-                                        egui::Stroke::new(1.0_f32, foreground),
-                                    );
-                                }
-                                if output.response.double_clicked() {
-                                    clicked = Some(link.start);
-                                }
-                                let label = if hovered_exported {
-                                    format!("{}\nExported Android component", link.label)
-                                } else {
-                                    link.label.clone()
-                                };
-                                output.response.on_hover_text(label);
-                            } else if hovered_exported {
-                                output.response.on_hover_text("Exported Android component");
+                            let export = ui.button("Export…");
+                            #[cfg(test)]
+                            self.menu_items
+                                .push(("Export…".into(), export.rect, export.enabled()));
+                            if export.clicked() {
+                                self.export_requested = true;
+                                ui.close_menu();
+                            }
+                            let source = ui.button("Copy source");
+                            #[cfg(test)]
+                            self.menu_items.push((
+                                "Copy source".into(),
+                                source.rect,
+                                source.enabled(),
+                            ));
+                            if source.clicked() {
+                                ui.ctx().copy_text(self.source.clone());
+                                ui.close_menu();
                             }
                         });
+                        #[cfg(test)]
+                        {
+                            self.last_galley_pos = Some(output.galley_pos);
+                            self.last_editor_id = Some(editor_id);
+                        }
+                        if let Some(cursor) = output.state.cursor.char_range() {
+                            let position = self.char_start + cursor.primary.index;
+                            if self.jump.is_none() && self.last_navigation_cursor != Some(position)
+                            {
+                                self.navigation_position = position;
+                            }
+                            self.last_navigation_cursor = Some(position);
+                        }
+                        let selected = output
+                            .state
+                            .cursor
+                            .char_range()
+                            .map(|range| {
+                                let [start, end] = range.sorted();
+                                start.index..end.index
+                            })
+                            .filter(|range| !range.is_empty());
+                        let caret = output
+                            .state
+                            .cursor
+                            .char_range()
+                            .map(|range| range.primary.index);
+                        if selected.is_some()
+                            || self
+                                .clicked_word
+                                .as_ref()
+                                .is_some_and(|(position, _)| Some(*position) != caret)
+                        {
+                            self.clicked_word = None;
+                        }
+                        if selected.is_none()
+                            && output.response.clicked_by(egui::PointerButton::Primary)
+                        {
+                            self.clicked_word = output
+                                .response
+                                .interact_pointer_pos()
+                                .filter(|point| {
+                                    output
+                                        .text_clip_rect
+                                        .intersect(ui.clip_rect())
+                                        .contains(*point)
+                                })
+                                .and_then(|point| {
+                                    Self::glyph_at_pointer(
+                                        &output.galley,
+                                        point - output.galley_pos,
+                                    )
+                                })
+                                .and_then(|index| {
+                                    crate::word_occurrences::word_at(
+                                        &self.source[self.preview_start..self.preview_end],
+                                        index,
+                                    )
+                                })
+                                .zip(caret)
+                                .map(|(range, position)| (position, range));
+                        }
+                        let moved_focus = output.response.has_focus()
+                            && ui.input(|input| {
+                                input.pointer.primary_down()
+                                    || input.events.iter().any(|event| {
+                                        matches!(event, egui::Event::Key { pressed: true, .. })
+                                    })
+                            });
+                        if self.jump.is_none()
+                            && moved_focus
+                            && let (Some(caret), Some(target)) = (caret, &self.highlight)
+                        {
+                            let line =
+                                |at| self.source.chars().take(at).filter(|c| *c == '\n').count();
+                            if line(self.char_start + caret) != line(target.start) {
+                                self.highlight = None;
+                            }
+                        }
+                        let occurrence_word = selected
+                            .clone()
+                            .or_else(|| self.clicked_word.as_ref().map(|(_, range)| range.clone()));
+                        self.update_selection_occurrences(occurrence_word);
+                        let painter = ui
+                            .painter()
+                            .with_clip_rect(output.text_clip_rect.intersect(ui.clip_rect()));
+                        let tint = if theme.is_light() {
+                            Color32::from_rgba_unmultiplied(40, 120, 180, 45)
+                        } else {
+                            Color32::from_rgba_unmultiplied(100, 190, 230, 55)
+                        };
+                        let mut hovered_exported = false;
+                        let mut row_start = 0;
+                        for row in &galley.rows {
+                            let row_end = row_start + row.glyphs.len();
+                            if painter
+                                .clip_rect()
+                                .intersects(row.rect.translate(output.galley_pos.to_vec2()))
+                            {
+                                let global_start = self.char_start + row_start;
+                                let global_end = self.char_start + row_end;
+                                let first = self
+                                    .exported_components
+                                    .partition_point(|range| range.end <= global_start);
+                                for range in self.exported_components[first..]
+                                    .iter()
+                                    .take_while(|range| range.start < global_end)
+                                {
+                                    let left =
+                                        row.x_offset(range.start.saturating_sub(global_start));
+                                    let right =
+                                        row.x_offset(range.end.min(global_end) - global_start);
+                                    let rect = egui::Rect::from_min_max(
+                                        egui::pos2(left, row.rect.top()),
+                                        egui::pos2(right, row.rect.bottom()),
+                                    )
+                                    .translate(output.galley_pos.to_vec2());
+                                    highlight_shapes.push(egui::Shape::rect_filled(
+                                        rect,
+                                        2.0,
+                                        exported_component_tint(theme),
+                                    ));
+                                    hovered_exported |=
+                                        ui.ctx().pointer_hover_pos().is_some_and(|pointer| {
+                                            rect.intersect(painter.clip_rect()).contains(pointer)
+                                        });
+                                }
+                                let first = self
+                                    .selection_occurrences
+                                    .partition_point(|range| range.end <= row_start);
+                                for range in self.selection_occurrences[first..]
+                                    .iter()
+                                    .take_while(|range| range.start < row_end)
+                                {
+                                    if selected.as_ref() == Some(range) {
+                                        continue;
+                                    }
+                                    let left = row.x_offset(range.start.saturating_sub(row_start));
+                                    let right = row.x_offset(range.end.min(row_end) - row_start);
+                                    let rect = egui::Rect::from_min_max(
+                                        egui::pos2(left, row.rect.top()),
+                                        egui::pos2(right, row.rect.bottom()),
+                                    )
+                                    .translate(output.galley_pos.to_vec2());
+                                    highlight_shapes
+                                        .push(egui::Shape::rect_filled(rect, 1.0, tint));
+                                }
+                            }
+                            row_start = row_end + usize::from(row.ends_with_newline);
+                        }
+                        if let Some(target) = &self.highlight {
+                            let local_start = target.start.saturating_sub(self.char_start);
+                            let local_end = target
+                                .end
+                                .saturating_sub(self.char_start)
+                                .min(galley.job.text.chars().count());
+                            let first = output
+                                .galley
+                                .pos_from_ccursor(egui::text::CCursor::new(local_start));
+                            let last = output
+                                .galley
+                                .pos_from_ccursor(egui::text::CCursor::new(local_end));
+                            for row in &output.galley.rows {
+                                if row.rect.bottom() <= first.top() || row.rect.top() > last.top() {
+                                    continue;
+                                }
+                                let left = if row.rect.top() <= first.top() {
+                                    first.left()
+                                } else {
+                                    row.rect.left()
+                                };
+                                let right = if row.rect.top() >= last.top() {
+                                    last.left()
+                                } else {
+                                    row.rect.right()
+                                };
+                                if right > left {
+                                    let rect = egui::Rect::from_min_max(
+                                        egui::pos2(left, row.rect.top()),
+                                        egui::pos2(right, row.rect.bottom()),
+                                    )
+                                    .translate(output.galley_pos.to_vec2());
+                                    highlight_shapes.push(egui::Shape::rect_filled(
+                                        rect,
+                                        1.0,
+                                        jump_tint(theme),
+                                    ));
+                                }
+                            }
+                            // Mark the logical destination line, including wrapped lines.
+                            let line_start = galley
+                                .job
+                                .text
+                                .chars()
+                                .take(local_start)
+                                .enumerate()
+                                .filter(|(_, c)| *c == '\n')
+                                .map(|(i, _)| i + 1)
+                                .last()
+                                .unwrap_or(0);
+                            let line_rect =
+                                galley.pos_from_ccursor(egui::text::CCursor::new(line_start));
+                            let marker = egui::Rect::from_min_max(
+                                egui::pos2(rect.left(), rect.top() + line_rect.top()),
+                                egui::pos2(rect.right(), rect.top() + line_rect.bottom()),
+                            );
+                            ui.painter().set(
+                                gutter_highlight,
+                                egui::Shape::rect_filled(marker, 2.0, jump_gutter_tint(theme)),
+                            );
+                            if self.jump.take().is_some() {
+                                ui.scroll_to_rect_animation(
+                                    first.translate(output.galley_pos.to_vec2()),
+                                    Some(egui::Align::Center),
+                                    egui::style::ScrollAnimation::none(),
+                                );
+                            }
+                        }
+                        ui.painter()
+                            .with_clip_rect(painter.clip_rect())
+                            .set(highlight_layer, egui::Shape::Vec(highlight_shapes));
+                        if let Some(pointer) = ui.ctx().pointer_hover_pos()
+                            && output.response.rect.contains(pointer)
+                            && output.text_clip_rect.contains(pointer)
+                            && let Some(link) =
+                                self.link_at_pointer(&output.galley, pointer - output.galley_pos)
+                        {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            let first = output.galley.pos_from_ccursor(egui::text::CCursor::new(
+                                link.start.saturating_sub(self.char_start),
+                            ));
+                            let last = output.galley.pos_from_ccursor(egui::text::CCursor::new(
+                                link.end.saturating_sub(self.char_start),
+                            ));
+                            if first.top() == last.top() {
+                                ui.painter().line_segment(
+                                    [
+                                        output.galley_pos
+                                            + egui::vec2(first.left(), first.bottom()),
+                                        output.galley_pos + egui::vec2(last.left(), last.bottom()),
+                                    ],
+                                    egui::Stroke::new(1.0_f32, foreground),
+                                );
+                            }
+                            if output.response.double_clicked() {
+                                clicked = Some(link.start);
+                            }
+                            let label = if hovered_exported {
+                                format!("{}\nExported Android component", link.label)
+                            } else {
+                                link.label.split_once(" | ").map_or_else(|| link.label.clone(), |(_, preview)| preview.to_owned())
+                            };
+                            output.response.on_hover_text(label);
+                        } else if hovered_exported {
+                            output.response.on_hover_text("Exported Android component");
+                        }
                     });
+                });
             });
         clicked
     }
@@ -1128,6 +1258,118 @@ impl CodeDocument {
 
 #[cfg(test)]
 mod tests {
+    fn painted_shapes(output: &egui::FullOutput) -> Vec<egui::epaint::ClippedShape> {
+        fn append(
+            shape: &egui::Shape,
+            clip: egui::Rect,
+            out: &mut Vec<egui::epaint::ClippedShape>,
+        ) {
+            if let egui::Shape::Vec(shapes) = shape {
+                for shape in shapes {
+                    append(shape, clip, out);
+                }
+            } else {
+                out.push(egui::epaint::ClippedShape {
+                    clip_rect: clip,
+                    shape: shape.clone(),
+                });
+            }
+        }
+        let mut shapes = vec![];
+        for shape in &output.shapes {
+            append(&shape.shape, shape.clip_rect, &mut shapes);
+        }
+        shapes
+    }
+
+    #[test]
+    fn jump_markers_are_under_selection_and_clear_on_other_line_in_every_theme() {
+        for theme in CodeTheme::ALL {
+            let context = egui::Context::default();
+            let mut doc =
+                CodeDocument::new("// header\nclass Target {}\nnext line\n".into(), "java");
+            doc.jump_to_range(16, 22).unwrap();
+            let render = |doc: &mut CodeDocument, events| {
+                context.run(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            doc.show(ui, theme, 14.0);
+                        });
+                    },
+                )
+            };
+            render(&mut doc, vec![]);
+            let id = doc.last_editor_id.unwrap();
+            let mut state = egui::text_edit::TextEditState::load(&context, id).unwrap();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(16),
+                    egui::text::CCursor::new(22),
+                )));
+            state.store(&context, id);
+            context.memory_mut(|memory| memory.request_focus(id));
+            let output = render(&mut doc, vec![]);
+            let shapes = painted_shapes(&output);
+            let jump = shapes
+                .iter()
+                .position(|shape| {
+                    matches!(&shape.shape,
+                egui::Shape::Rect(rect) if rect.fill == super::jump_tint(theme))
+                })
+                .unwrap();
+            let selection_color = if theme.is_light() {
+                Color32::from_rgb(180, 211, 221)
+            } else {
+                Color32::from_rgb(62, 83, 112)
+            };
+            let selection = shapes
+                .iter()
+                .position(|shape| {
+                    matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.rows.iter().any(|row|
+                            row.visuals.mesh.vertices.iter().any(|vertex| vertex.color == selection_color)))
+                })
+                .unwrap();
+            assert!(
+                jump < selection,
+                "selection must paint over jump: {theme:?}"
+            );
+            assert!(shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Rect(rect) if rect.fill == super::jump_gutter_tint(theme)
+                    && rect.rect.width() > 14.0 && rect.rect.height() >= 14.0)));
+            assert!(
+                doc.highlight.is_some(),
+                "same-line selection preserves destination"
+            );
+            let output = render(
+                &mut doc,
+                vec![egui::Event::Key {
+                    key: egui::Key::ArrowDown,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert!(
+                doc.highlight.is_none(),
+                "other line clears destination: {theme:?}"
+            );
+            assert!(
+                !painted_shapes(&output)
+                    .iter()
+                    .any(|shape| matches!(&shape.shape,
+                egui::Shape::Rect(rect) if rect.fill == super::jump_gutter_tint(theme)
+                    || rect.fill == super::jump_tint(theme)))
+            );
+        }
+    }
+
     #[test]
     fn selected_word_highlights_other_occurrences_with_fonts_and_wrapping() {
         let context = egui::Context::default();
@@ -1172,9 +1414,8 @@ mod tests {
                 font.font_id(14.0)
             );
             let tint = egui::Color32::from_rgba_unmultiplied(40, 120, 180, 45);
-            let marks = output
-                .shapes
-                .iter()
+            let marks = painted_shapes(&output)
+                .into_iter()
                 .filter(|s| matches!(&s.shape, egui::Shape::Rect(rect) if rect.fill == tint))
                 .count();
             assert_eq!(marks, 2, "other whole words should be visibly marked");
@@ -1227,14 +1468,13 @@ mod tests {
                         });
                     },
                 );
-                let painted: Vec<_> = output
-                    .shapes
-                    .iter()
+                let painted: Vec<_> = painted_shapes(&output)
+                    .into_iter()
                     .filter_map(|shape| match &shape.shape {
                         egui::epaint::Shape::Rect(rect)
                             if rect.fill == super::exported_component_tint(theme) =>
                         {
-                            Some(rect)
+                            Some(rect.clone())
                         }
                         _ => None,
                     })
@@ -1257,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn exported_highlights_follow_the_visible_source_window() {
+    fn exported_highlights_remain_visible_after_full_document_jumps() {
         let prefix = "\n".repeat(6_000);
         let mut doc = CodeDocument::new(format!("{prefix}sample.Target"), "xml");
         doc.set_exported_components(std::iter::once(6_000..6_013).collect());
@@ -1270,13 +1510,15 @@ mod tests {
             })
         };
         let count = |out: &egui::FullOutput| {
-            out.shapes.iter().filter(|shape| matches!(&shape.shape,
+            painted_shapes(out).into_iter().filter(|shape| matches!(&shape.shape,
             egui::epaint::Shape::Rect(rect) if rect.fill == super::exported_component_tint(CodeTheme::Ocean))).count()
         };
         assert_eq!(count(&draw(&mut doc)), 0);
         doc.jump_to(6_000).unwrap();
         draw(&mut doc); // Apply the scroll request before checking the visible frame.
-        assert_eq!(count(&draw(&mut doc)), 1);
+        let result = draw(&mut doc);
+
+        assert_eq!(count(&result), 1);
     }
 
     #[test]
@@ -1306,13 +1548,14 @@ mod tests {
     }
 
     #[test]
-    fn file_find_reveals_matches_beyond_the_preview_and_refreshes_source() {
+    fn file_find_reaches_the_full_document_and_refreshes_source() {
         let source = format!("{}needle", "λ\n".repeat(90_000));
         let mut doc = super::CodeDocument::new(source, "txt");
         doc.open_find();
         doc.find.query = "needle".into();
         doc.update_find();
-        assert!(doc.preview_start > 0);
+        assert_eq!(doc.preview_start, 0);
+        assert_eq!(doc.preview_end, doc.source.len());
         assert_eq!(doc.highlight, Some(180_000..180_006));
         doc.set_word_wrap(true);
         doc.refresh_search_source("🦀 needle".into(), vec![]);
@@ -1464,7 +1707,12 @@ mod tests {
         for (action, blank, metadata, usages_enabled) in [
             ("Go to declaration", false, true, true),
             ("Find usages", false, true, true),
+            ("Callers", false, true, true),
+            ("Callees", false, true, true),
+            ("Find direct subclasses", false, true, true),
+            ("Find implementations", false, true, true),
             ("Copy symbol name", false, true, true),
+            ("Copy as Frida snippet", false, true, true),
             ("Copy selection", false, true, true),
             ("Copy source", true, true, true),
             ("Copy source", false, false, true),
@@ -1476,11 +1724,18 @@ mod tests {
                 "🎯 café = 1; // café\n".into(),
                 if metadata { "java" } else { "txt" },
             );
+            let label = match action {
+                "Find usages" | "Callers" | "Callees" | "Copy as Frida snippet" => {
+                    "pkg.Target.run()V"
+                }
+                "Copy symbol name" => "pkg.Target.café:I",
+                _ => "pkg.Target",
+            };
             if metadata {
                 doc.set_links(vec![CodeLink {
                     start: 2,
                     end: 6,
-                    label: "pkg.Target.café".into(),
+                    label: label.into(),
                 }]);
             }
             doc.set_usages_enabled(usages_enabled);
@@ -1538,10 +1793,41 @@ mod tests {
                 vec![button(point, egui::PointerButton::Secondary, false)],
             );
             render(&mut doc, 0.3, vec![]);
-            assert_eq!(doc.menu_items.len(), 6);
+            assert_eq!(doc.menu_items.len(), 10);
             assert_eq!(doc.menu_items[0].2, !blank && metadata);
             assert_eq!(doc.menu_items[1].2, !blank && metadata && usages_enabled);
+            assert_eq!(
+                doc.menu_items[2].2,
+                !blank && metadata && usages_enabled && !label.contains(['(', ':'])
+            );
+            assert_eq!(
+                doc.menu_items[3].2,
+                !blank && metadata && usages_enabled && !label.contains(':')
+            );
+            let frida = doc
+                .menu_items
+                .iter()
+                .find(|item| item.0 == "Copy as Frida snippet")
+                .unwrap();
+            assert_eq!(
+                frida.2,
+                !blank && metadata && rdx::frida_snippet::for_method(label).is_some()
+            );
             assert_eq!(doc.menu_selection, Some(2..6));
+            let submenu = doc
+                .menu_items
+                .iter()
+                .find(|item| item.0 == "Method references")
+                .unwrap();
+            assert_eq!(
+                submenu.2,
+                !blank && metadata && usages_enabled && label.contains('(')
+            );
+            if matches!(action, "Callers" | "Callees") {
+                let pos = submenu.1.center();
+                render(&mut doc, 0.31, vec![egui::Event::PointerMoved(pos)]);
+                render(&mut doc, 0.39, vec![]);
+            }
             let item = doc
                 .menu_items
                 .iter()
@@ -1564,16 +1850,33 @@ mod tests {
             );
             if action == "Go to declaration" {
                 assert_eq!(result, Some(2));
+            } else if matches!(action, "Callers" | "Callees") {
+                assert_eq!(
+                    doc.take_method_xrefs_request(),
+                    Some((2, action == "Callers"))
+                );
+                assert_eq!(doc.take_method_xrefs_request(), None);
             } else if action == "Find usages" {
                 assert_eq!(result, None);
                 assert_eq!(doc.take_usages_request(), Some(2));
                 assert_eq!(doc.take_usages_request(), None);
+            } else if action == "Find direct subclasses" {
+                assert_eq!(result, None);
+                assert_eq!(doc.take_subclasses_request(), Some(2));
+                assert_eq!(doc.take_subclasses_request(), None);
+                assert_eq!(doc.take_usages_request(), None);
+            } else if action == "Find implementations" {
+                assert_eq!(doc.take_implementations_request(), Some(2));
+                assert_eq!(doc.take_implementations_request(), None);
+            } else if action == "Copy as Frida snippet" {
+                let expected = rdx::frida_snippet::for_method(label).unwrap();
+                assert!(output.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(text) if text == &expected)));
             } else if action == "Export…" {
                 assert!(doc.take_export_request());
                 assert!(!doc.take_export_request());
             } else {
                 let expected = match action {
-                    "Copy symbol name" => "pkg.Target.café",
+                    "Copy symbol name" => label,
                     "Copy selection" => "café",
                     _ => doc.text(),
                 };
@@ -1592,7 +1895,7 @@ mod tests {
                 doc.show(ui, CodeTheme::Ocean, 14.0);
             });
         });
-        let highlights = output.shapes.iter().filter(|shape| matches!(&shape.shape, egui::epaint::Shape::Rect(rect) if rect.fill == Color32::from_rgba_unmultiplied(255,190,40,100))).count();
+        let highlights = painted_shapes(&output).into_iter().filter(|shape| matches!(&shape.shape, egui::epaint::Shape::Rect(rect) if rect.fill == super::jump_tint(CodeTheme::Ocean))).count();
         assert_eq!(highlights, 2);
         assert!(doc.jump_to_range(4, 4).is_err());
         assert!(doc.jump_to_range(0, 100).is_err());
@@ -1616,14 +1919,13 @@ mod tests {
         let galley = &doc.cache.as_ref().unwrap().galley;
         let expected_width = galley.pos_from_ccursor(egui::text::CCursor::new(25)).left()
             - galley.pos_from_ccursor(egui::text::CCursor::new(8)).left();
-        let painted = output
-            .shapes
-            .iter()
+        let painted = painted_shapes(&output)
+            .into_iter()
             .find_map(|shape| match &shape.shape {
                 egui::epaint::Shape::Rect(rect)
-                    if rect.fill == Color32::from_rgba_unmultiplied(255, 190, 40, 100) =>
+                    if rect.fill == super::jump_tint(CodeTheme::Ocean) =>
                 {
-                    Some(rect)
+                    Some(rect.clone())
                 }
                 _ => None,
             })
@@ -1640,9 +1942,102 @@ mod tests {
         assert_eq!(doc.highlight, Some(18..19));
     }
     #[test]
+    fn single_click_highlights_whole_words_without_selecting_or_navigating() {
+        for wrap in [false, true] {
+            let context = egui::Context::default();
+            let source = format!("🎯 café caféteria; {}café", "word ".repeat(20));
+            let mut doc = CodeDocument::new(source, "java");
+            doc.set_word_wrap(wrap);
+            doc.set_links(vec![CodeLink {
+                start: 2,
+                end: 6,
+                label: "café".into(),
+            }]);
+            let render = |doc: &mut CodeDocument, time: f64, events| {
+                let mut navigation = None;
+                let output = context.run(
+                    egui::RawInput {
+                        time: Some(time),
+                        events,
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(320.0, 600.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            navigation = doc.show(ui, CodeTheme::QuietLight, 14.0);
+                        });
+                    },
+                );
+                assert_eq!(navigation, None, "single click must not navigate");
+                output
+            };
+            render(&mut doc, 0.0, vec![]);
+            let point_at = |doc: &CodeDocument, index| {
+                let galley = &doc.cache.as_ref().unwrap().galley;
+                let a = galley.pos_from_ccursor(egui::text::CCursor::new(index));
+                let b = galley.pos_from_ccursor(egui::text::CCursor::new(index + 1));
+                doc.last_galley_pos.unwrap() + egui::vec2((a.left() + b.left()) / 2.0, a.center().y)
+            };
+            let event = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                pressed,
+                button: egui::PointerButton::Primary,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let point = point_at(&doc, 4);
+            render(
+                &mut doc,
+                0.1,
+                vec![egui::Event::PointerMoved(point), event(point, true)],
+            );
+            let output = render(&mut doc, 0.15, vec![event(point, false)]);
+            assert_eq!(doc.selection_occurrences.len(), 2);
+            let state = egui::text_edit::TextEditState::load(&context, doc.last_editor_id.unwrap())
+                .unwrap();
+            assert!(
+                state.cursor.char_range().unwrap().primary
+                    == state.cursor.char_range().unwrap().secondary,
+                "highlight must not alter selection"
+            );
+            let tint = Color32::from_rgba_unmultiplied(40, 120, 180, 45);
+            assert_eq!(
+                painted_shapes(&output)
+                    .into_iter()
+                    .filter(|s| matches!(&s.shape, egui::Shape::Rect(rect) if rect.fill == tint))
+                    .count(),
+                2
+            );
+            render(&mut doc, 0.3, vec![]);
+            assert_eq!(
+                doc.selection_occurrences.len(),
+                2,
+                "persist across idle frames"
+            );
+            let punctuation = point_at(&doc, 16);
+            render(
+                &mut doc,
+                1.0,
+                vec![
+                    egui::Event::PointerMoved(punctuation),
+                    event(punctuation, true),
+                ],
+            );
+            render(&mut doc, 1.1, vec![event(punctuation, false)]);
+            assert!(
+                doc.selection_occurrences.is_empty(),
+                "punctuation must clear occurrences"
+            );
+        }
+    }
+
+    #[test]
     fn real_double_click_navigates_only_metadata_links() {
         for (syntax, source, linked) in [
             ("java", "🎯 café(); // café\n", "café"),
+            ("java", "if (this.a.e()) {\n}\n", "e"),
             (
                 "xml",
                 "<!-- 🦀 --><a x=\"sample.Target\"/>",
@@ -1652,8 +2047,11 @@ mod tests {
             let byte = source.find(linked).unwrap();
             let start = source[..byte].chars().count();
             let end = start + linked.chars().count();
-            for (index, expected) in [(start + 1, Some(start)), (start - 1, None), (end + 1, None)]
-            {
+            for (index, expected) in [
+                (start + usize::from(end - start > 1), Some(start)),
+                (start - 1, None),
+                (end + 1, None),
+            ] {
                 let context = egui::Context::default();
                 let mut doc = CodeDocument::new(source.into(), syntax);
                 doc.set_usages_enabled(syntax != "xml");
@@ -1705,14 +2103,14 @@ mod tests {
         }
     }
     #[test]
-    fn jumps_rewindow_unicode_source_and_reject_invalid_positions() {
+    fn jumps_preserve_full_unicode_source_and_reject_invalid_positions() {
         let source = format!("{}class 🎯Café {{}}", "λ\n".repeat(90_000));
         let target = source.chars().count() - "Café {}".chars().count();
         let mut doc = CodeDocument::new(source, "java");
         doc.jump_to(target).unwrap();
-        assert!(doc.preview_start > 0);
+        assert_eq!(doc.preview_start, 0);
+        assert_eq!(doc.preview_end, doc.source.len());
         assert_eq!(doc.highlight, Some(target..target + 4));
-        assert!(doc.preview_end - doc.preview_start <= PREVIEW_BYTES);
         assert_eq!(
             doc.source[..doc.preview_start].chars().count(),
             doc.char_start
@@ -1870,20 +2268,19 @@ mod tests {
         assert!(doc.retained_bytes() > doc.text().len());
     }
     #[test]
-    fn limits_preview_without_losing_original_and_bounds_unicode() {
-        let source = "λ".repeat(PREVIEW_BYTES);
+    fn full_document_exceeds_old_byte_and_line_limits() {
+        let source = format!("{}\n", "a".repeat(100)).repeat(3_014);
+        assert!(source.len() > 128 * 1024);
+        let doc = CodeDocument::new(source.clone(), "txt");
+        assert_eq!(doc.job(CodeTheme::Ocean, 14.0).text, source);
+        assert_eq!(doc.job(CodeTheme::Ocean, 14.0).text.lines().count(), 3_014);
+        let source = "λ".repeat(128 * 1024);
         let doc = CodeDocument::new(source.clone(), "java");
         assert_eq!(doc.text(), source);
-        assert!(doc.preview_end <= PREVIEW_BYTES);
+        assert_eq!(doc.preview_end, source.len());
         assert!(doc.plain);
-        assert_eq!(
-            doc.job(CodeTheme::Ocean, 14.0).text,
-            source[..doc.preview_end]
-        );
+        assert_eq!(doc.job(CodeTheme::Ocean, 14.0).text, source);
         let doc = CodeDocument::new("x\n".repeat(10_000), "txt");
-        assert_eq!(
-            doc.job(CodeTheme::Ocean, 14.0).text.lines().count(),
-            PREVIEW_LINES
-        );
+        assert_eq!(doc.job(CodeTheme::Ocean, 14.0).text.lines().count(), 10_000);
     }
 }

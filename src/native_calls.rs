@@ -152,28 +152,80 @@ fn bind_invoke(insn: &Instruction, symbols: &DexSymbols) -> Result<Binding> {
         "invoke has non-method reference at {}",
         insn.pc
     );
-    let method_index = reference.index;
+    bind_invoke_words(
+        insn.opcode,
+        insn.pc,
+        reference.index,
+        insn.prototype,
+        insn.reads.iter().map(|word| usize::from(word.register)),
+        symbols,
+    )
+}
+
+/// Bind one ordinary invoke without decoding or analyzing the entire method.
+/// Used by the Java emitter and the full SSA pipeline through the same binder.
+/// Result placement/control-flow validation remains the caller's responsibility.
+pub fn bind_invocation(
+    opcode: u8,
+    pc: usize,
+    method_index: u32,
+    registers: &[usize],
+    symbols: &DexSymbols,
+) -> Result<BoundCall> {
+    ensure!(
+        matches!(opcode, 0x6e..=0x72 | 0x74..=0x78),
+        "unsupported ordinary invoke opcode"
+    );
+    ensure!(registers.len() <= 255, "invoke operand budget exceeded");
+    ensure!(
+        registers
+            .iter()
+            .all(|&register| u16::try_from(register).is_ok()),
+        "invoke register exceeds DEX range"
+    );
+    let (kind, target, receiver, arguments, return_type) = bind_invoke_words(
+        opcode,
+        pc,
+        method_index,
+        None,
+        registers.iter().copied(),
+        symbols,
+    )?;
+    Ok(BoundCall {
+        pc,
+        kind,
+        target,
+        receiver,
+        arguments,
+        return_type,
+        result: None,
+    })
+}
+
+fn bind_invoke_words(
+    opcode: u8,
+    pc: usize,
+    method_index: u32,
+    prototype: Option<u16>,
+    mut words: impl ExactSizeIterator<Item = usize>,
+    symbols: &DexSymbols,
+) -> Result<Binding> {
     let &(class_idx, declared_proto_idx, name_idx) = symbols
         .methods
         .get(method_index as usize)
-        .with_context(|| format!("method index {method_index} out of bounds at {}", insn.pc))?;
+        .with_context(|| format!("method index {method_index} out of bounds at {}", pc))?;
     let declaring_type = symbols
         .types
         .get(class_idx as usize)
-        .with_context(|| {
-            format!(
-                "declaring type index {class_idx} out of bounds at {}",
-                insn.pc
-            )
-        })?
+        .with_context(|| format!("declaring type index {class_idx} out of bounds at {}", pc))?
         .clone();
     validate_reference(&declaring_type)
-        .with_context(|| format!("invalid declaring type at {}", insn.pc))?;
+        .with_context(|| format!("invalid declaring type at {}", pc))?;
     let name = symbols
         .strings
         .get(name_idx as usize)
-        .with_context(|| format!("method name index {name_idx} out of bounds at {}", insn.pc))?;
-    ensure!(!name.is_empty(), "empty method name at {}", insn.pc);
+        .with_context(|| format!("method name index {name_idx} out of bounds at {}", pc))?;
+    ensure!(!name.is_empty(), "empty method name at {}", pc);
 
     // The method_id prototype remains required pool metadata even though a
     // polymorphic instruction uses its secondary prototype for argument/result
@@ -184,41 +236,40 @@ fn bind_invoke(insn: &Instruction, symbols: &DexSymbols) -> Result<Binding> {
         .with_context(|| {
             format!(
                 "declared prototype index {declared_proto_idx} out of bounds at {}",
-                insn.pc
+                pc
             )
         })?;
     validate_descriptor(declared_return, true)
-        .with_context(|| format!("invalid declared return descriptor at {}", insn.pc))?;
+        .with_context(|| format!("invalid declared return descriptor at {}", pc))?;
     for parameter in declared_parameters {
         validate_descriptor(parameter, false)
-            .with_context(|| format!("invalid declared parameter descriptor at {}", insn.pc))?;
+            .with_context(|| format!("invalid declared parameter descriptor at {}", pc))?;
     }
 
-    let polymorphic = matches!(insn.opcode, 0xfa | 0xfb);
+    let polymorphic = matches!(opcode, 0xfa | 0xfb);
     let proto_idx = if polymorphic {
-        insn.prototype
-            .context("polymorphic invoke is missing secondary prototype")?
+        prototype.context("polymorphic invoke is missing secondary prototype")?
     } else {
         ensure!(
-            insn.prototype.is_none(),
+            prototype.is_none(),
             "non-polymorphic invoke has secondary prototype at {}",
-            insn.pc
+            pc
         );
         declared_proto_idx
     };
     let (return_type, parameters) = symbols
         .protos
         .get(proto_idx as usize)
-        .with_context(|| format!("prototype index {proto_idx} out of bounds at {}", insn.pc))?;
+        .with_context(|| format!("prototype index {proto_idx} out of bounds at {}", pc))?;
     validate_descriptor(return_type, true)
-        .with_context(|| format!("invalid return descriptor at {}", insn.pc))?;
+        .with_context(|| format!("invalid return descriptor at {}", pc))?;
     for parameter in parameters {
         validate_descriptor(parameter, false)
-            .with_context(|| format!("invalid parameter descriptor at {}", insn.pc))?;
+            .with_context(|| format!("invalid parameter descriptor at {}", pc))?;
     }
 
-    let is_static = matches!(insn.opcode, 0x71 | 0x77);
-    let kind = match insn.opcode {
+    let is_static = matches!(opcode, 0x71 | 0x77);
+    let kind = match opcode {
         0x6e | 0x74 => CallKind::Virtual,
         0x6f | 0x75 => CallKind::Super,
         0x70 | 0x76 => CallKind::Direct,
@@ -227,15 +278,15 @@ fn bind_invoke(insn: &Instruction, symbols: &DexSymbols) -> Result<Binding> {
         0xfa | 0xfb => CallKind::Polymorphic,
         _ => unreachable!(),
     };
-    let mut words = insn.reads.iter();
+
     let receiver = if is_static {
         None
     } else {
         let word = words
             .next()
-            .with_context(|| format!("invoke receiver missing at {}", insn.pc))?;
+            .with_context(|| format!("invoke receiver missing at {}", pc))?;
         Some(TypedRegister {
-            register: word.register,
+            register: u16::try_from(word).context("invoke register exceeds DEX range")?,
             descriptor: declaring_type.clone(),
         })
     };
@@ -245,32 +296,32 @@ fn bind_invoke(insn: &Instruction, symbols: &DexSymbols) -> Result<Binding> {
     ensure!(
         parameters.len() <= words.len(),
         "too few invoke argument words at {}",
-        insn.pc
+        pc
     );
     let mut arguments = Vec::with_capacity(parameters.len());
     for parameter in parameters {
         let first = words
             .next()
-            .with_context(|| format!("too few invoke argument words at {}", insn.pc))?;
+            .with_context(|| format!("too few invoke argument words at {}", pc))?;
         if descriptor_words(parameter) == 2 {
             let second = words
                 .next()
-                .with_context(|| format!("wide invoke argument is truncated at {}", insn.pc))?;
+                .with_context(|| format!("wide invoke argument is truncated at {}", pc))?;
             ensure!(
-                first.register.checked_add(1) == Some(second.register),
+                first.checked_add(1) == Some(second),
                 "wide invoke argument is not a contiguous register pair at {}",
-                insn.pc
+                pc
             );
         }
         arguments.push(TypedRegister {
-            register: first.register,
+            register: u16::try_from(first).context("invoke register exceeds DEX range")?,
             descriptor: parameter.clone(),
         });
     }
     ensure!(
         words.next().is_none(),
         "too many invoke argument words at {}",
-        insn.pc
+        pc
     );
 
     Ok((

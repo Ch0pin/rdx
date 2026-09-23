@@ -1,15 +1,17 @@
 //! Native Android binary XML decoding. See third_party/jadx/README.md for reference mapping.
 use anyhow::{Context, Result, bail, ensure};
+#[path = "native_resource_attributes.rs"]
+mod attributes;
 const NONE: u32 = u32::MAX;
 const LIMIT: usize = 32 * 1024 * 1024;
-fn u16_at(b: &[u8], p: usize) -> Result<u16> {
+pub(crate) fn u16_at(b: &[u8], p: usize) -> Result<u16> {
     Ok(u16::from_le_bytes(
         b.get(p..p + 2)
             .context("Truncated binary XML")?
             .try_into()?,
     ))
 }
-fn u32_at(b: &[u8], p: usize) -> Result<u32> {
+pub(crate) fn u32_at(b: &[u8], p: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(
         b.get(p..p + 4)
             .context("Truncated binary XML")?
@@ -41,7 +43,41 @@ fn length(b: &[u8], p: &mut usize, wide: bool) -> Result<usize> {
     }
     Ok(n)
 }
-fn pool(b: &[u8], header: usize) -> Result<Vec<String>> {
+// Some aapt tables encode supplementary characters as CESU-8 surrogate pairs.
+// Accept those pairs without accepting malformed continuations or overlong UTF-8.
+fn resource_utf8(bytes: &[u8]) -> Result<String> {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return Ok(s.to_owned());
+    }
+    let mut units = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let first = bytes[i];
+        let n = match first {
+            0..=0x7f => 1,
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => bail!("Invalid resource UTF-8 lead byte"),
+        };
+        let part = bytes.get(i..i + n).context("Truncated resource UTF-8")?;
+        if n == 3 {
+            ensure!(
+                part[1] & 0xc0 == 0x80 && part[2] & 0xc0 == 0x80,
+                "Invalid resource UTF-8 continuation"
+            );
+            let unit =
+                ((first as u16 & 15) << 12) | ((part[1] as u16 & 63) << 6) | (part[2] as u16 & 63);
+            ensure!(unit >= 0x800, "Overlong resource UTF-8");
+            units.push(unit);
+        } else {
+            units.extend(std::str::from_utf8(part)?.encode_utf16());
+        }
+        i += n;
+    }
+    Ok(String::from_utf16(&units)?)
+}
+pub(crate) fn pool(b: &[u8], header: usize) -> Result<Vec<String>> {
     ensure!(header >= 28, "Invalid string pool header");
     let count = u32_at(b, 8)? as usize;
     let styles = u32_at(b, 12)? as usize;
@@ -73,12 +109,12 @@ fn pool(b: &[u8], header: usize) -> Result<Vec<String>> {
             let bytes = length(b, &mut p, false)?;
             let end = p.checked_add(bytes).context("String size overflow")?;
             ensure!(b.get(end) == Some(&0), "Missing XML string terminator");
-            let s = std::str::from_utf8(b.get(p..end).context("Invalid UTF8 string bounds")?)?;
+            let s = resource_utf8(b.get(p..end).context("Invalid UTF8 string bounds")?)?;
             ensure!(
                 s.encode_utf16().count() == units,
                 "Invalid XML string length"
             );
-            s.to_owned()
+            s
         } else {
             let end = p
                 .checked_add(units.checked_mul(2).context("String size overflow")?)
@@ -102,7 +138,7 @@ fn pool(b: &[u8], header: usize) -> Result<Vec<String>> {
     }
     Ok(output)
 }
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -139,7 +175,7 @@ fn qualified(strings: &[String], namespaces: &[(u32, u32)], ns: u32, id: u32) ->
         Ok(format!("{}:{local}", name(prefix)?))
     }
 }
-fn typed(strings: &[String], ty: u8, data: u32) -> Result<String> {
+pub(crate) fn typed(strings: &[String], ty: u8, data: u32) -> Result<String> {
     Ok(match ty {
         0 => if data == 1 { "@empty" } else { "@null" }.to_owned(),
         1 | 7 => format!("@0x{data:08x}"),
@@ -184,6 +220,11 @@ fn typed(strings: &[String], ty: u8, data: u32) -> Result<String> {
 /// Decode Android compiled XML without a JVM. Resource references remain numeric IDs.
 /// Plain UTF-8 XML is returned unchanged. Input and decoded output are limited to 32 MiB.
 pub fn decode(bytes: &[u8]) -> Result<String> {
+    Ok(decode_with_references(bytes)?.0)
+}
+/// Character spans of actual compiled reference attributes, excluding literal strings.
+pub fn decode_with_references(bytes: &[u8]) -> Result<(String, Vec<std::ops::Range<usize>>)> {
+    let mut references = Vec::new();
     ensure!(bytes.len() <= LIMIT, "XML input exceeds 32 MiB");
     if let Ok(text) = std::str::from_utf8(bytes)
         && text
@@ -191,7 +232,7 @@ pub fn decode(bytes: &[u8]) -> Result<String> {
             .trim_start()
             .starts_with('<')
     {
-        return Ok(text.to_owned());
+        return Ok((text.to_owned(), references));
     }
     ensure!(
         u16_at(bytes, 0)? == 3 && u16_at(bytes, 2)? == 8,
@@ -282,12 +323,30 @@ pub fn decode(bytes: &[u8]) -> Result<String> {
                     let value = if raw != NONE {
                         string(&strings, raw)?.to_owned()
                     } else {
-                        typed(&strings, b[a + 15], u32_at(b, a + 16)?)?
+                        let namespace = u32_at(b, a)?;
+                        let symbolic = if namespace != NONE {
+                            attributes::symbolic(
+                                string(&strings, namespace)?,
+                                string(&strings, u32_at(b, a + 4)?)?,
+                                b[a + 15],
+                                u32_at(b, a + 16)?,
+                            )
+                        } else {
+                            None
+                        };
+                        match symbolic {
+                            Some(value) => value,
+                            None => typed(&strings, b[a + 15], u32_at(b, a + 16)?)?,
+                        }
                     };
                     output.push(' ');
                     output.push_str(&key);
                     output.push_str("=\"");
+                    let start = output.len();
                     output.push_str(&escape(&value));
+                    if matches!(b[a + 15], 1 | 2) && raw == NONE {
+                        references.push(start..output.len());
+                    }
                     output.push('"');
                     ensure!(output.len() <= LIMIT, "Decoded XML exceeds 32 MiB");
                 }
@@ -320,5 +379,15 @@ pub fn decode(bytes: &[u8]) -> Result<String> {
         roots == 1 && stack.is_empty() && namespaces.is_empty() && pending.is_empty(),
         "Incomplete XML document"
     );
-    Ok(output)
+    // Translate sorted byte spans in one pass; metadata must not make decoding quadratic.
+    let mut previous = 0;
+    let mut chars = 0;
+    for range in &mut references {
+        chars += output[previous..range.start].chars().count();
+        let start = chars;
+        chars += output[range.start..range.end].chars().count();
+        previous = range.end;
+        *range = start..chars;
+    }
+    Ok((output, references))
 }

@@ -60,7 +60,11 @@ fn value(out: &mut Output, class: &DexClass, encoded: &DexValue) -> Result<()> {
         )?),
         DexValue::Type(index) => {
             let display = type_name(class, *index)?;
-            out.reference(&display, &display);
+            out.reference(
+                &display,
+                &super::names::label(&class.symbols.types[*index as usize])
+                    .unwrap_or_else(|| display.clone()),
+            );
             out.push(".class");
         }
         DexValue::Enum(index) => {
@@ -69,6 +73,14 @@ fn value(out: &mut Output, class: &DexClass, encoded: &DexValue) -> Result<()> {
                 .fields
                 .get(*index as usize)
                 .context("Annotation enum index")?;
+            let owner_label = super::names::label(
+                class
+                    .symbols
+                    .types
+                    .get(owner as usize)
+                    .context("Annotation enum owner index")?,
+            )
+            .context("Annotation enum owner")?;
             let owner = type_name(class, u32::from(owner))?;
             let member = class
                 .symbols
@@ -81,9 +93,12 @@ fn value(out: &mut Output, class: &DexClass, encoded: &DexValue) -> Result<()> {
                 .types
                 .get(field_type as usize)
                 .context("Annotation enum type")?;
-            out.reference(&owner, &owner);
+            out.reference(&owner, &owner_label);
             out.push(".");
-            out.reference(&display_member, &format!("{owner}.{member}:{descriptor}"));
+            out.reference(
+                &display_member,
+                &format!("{owner_label}.{member}:{descriptor}"),
+            );
         }
         DexValue::Array(values) => {
             out.push("{");
@@ -114,7 +129,10 @@ fn annotation_body(
 ) -> Result<()> {
     let ty = type_name(class, type_idx)?;
     out.push("@");
-    out.reference(&ty, &ty);
+    out.reference(
+        &ty,
+        &super::names::label(&class.symbols.types[type_idx as usize]).context("Annotation type")?,
+    );
     if !elements.is_empty() {
         out.push("(");
         for (i, (name, item)) in elements.iter().enumerate() {

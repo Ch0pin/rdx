@@ -21,6 +21,7 @@ fn unchecked(ty: &str) -> bool {
     matches!(
         ty,
         "Ljava/lang/RuntimeException;"
+            | "Landroid/content/ActivityNotFoundException;"
             | "Ljava/lang/Error;"
             | "Ljava/lang/IllegalArgumentException;"
             | "Ljava/lang/IllegalStateException;"
@@ -50,6 +51,7 @@ fn checked(ty: &str) -> bool {
     matches!(
         ty,
         "Ljava/lang/Throwable;"
+            | "Landroid/os/RemoteException;"
             | "Lorg/json/JSONException;"
             | "Ljava/lang/Exception;"
             | "Ljava/io/IOException;"
@@ -127,7 +129,9 @@ pub(super) fn expression(class: &DexClass, method: &DexMethod, value: &Value) ->
                 && method
                     .thrown_types
                     .iter()
-                    .any(|ty| ty.as_ref() == value.ty || subtype(class, &value.ty, ty))),
+                    .map(AsRef::as_ref)
+                    .chain(super::super::inherited_override_exception(class, method))
+                    .any(|ty| ty == value.ty || subtype(class, &value.ty, ty))),
         "Throw requires an established unchecked type or matching declared exception"
     );
     Ok(value.text.clone())
@@ -143,12 +147,22 @@ pub(super) fn known_call_throws(
     ret: &str,
     caught: &str,
 ) -> bool {
-    caught == "Lorg/json/JSONException;"
-        && owner == "Lorg/json/JSONObject;"
-        && name == "<init>"
-        && ret == "V"
-        && args.len() == 1
-        && args[0].as_ref() == "Ljava/lang/String;"
+    (caught == "Landroid/os/RemoteException;"
+        && owner == "Landroid/os/IBinder;"
+        && name == "transact"
+        && ret == "Z"
+        && args.iter().map(AsRef::as_ref).eq([
+            "I",
+            "Landroid/os/Parcel;",
+            "Landroid/os/Parcel;",
+            "I",
+        ]))
+        || caught == "Lorg/json/JSONException;"
+            && owner == "Lorg/json/JSONObject;"
+            && name == "<init>"
+            && ret == "V"
+            && args.len() == 1
+            && args[0].as_ref() == "Ljava/lang/String;"
 }
 
 #[cfg(test)]

@@ -1,10 +1,13 @@
 //! Conservative native Java reconstruction with exact emitted-source mappings.
 mod annotations;
+mod condition_cleanup;
+mod display_names;
 mod liveness;
 mod method;
 mod names;
 mod readable;
 mod strings;
+mod varargs_cleanup;
 use crate::{
     engine::{CodeDefinition, CodeLink, DecompiledCode},
     native_dex::{DexClass, DexField, DexMethod, DexValue},
@@ -34,11 +37,7 @@ pub(crate) fn java_type(descriptor: &str) -> Result<String> {
         .strip_prefix('L')
         .and_then(|s| s.strip_suffix(';'))
     {
-        ensure!(
-            name.split('/').all(identifier),
-            "Unsupported Java type name"
-        );
-        name.replace('/', ".")
+        names::qualified(name, '/')?
     } else {
         bail!("Unsupported Java descriptor {descriptor}");
     };
@@ -51,6 +50,13 @@ struct Output {
     chars: usize,
     links: Vec<CodeLink>,
     definitions: Vec<CodeDefinition>,
+}
+
+fn presentation(code: DecompiledCode, class: &DexClass) -> DecompiledCode {
+    let code = varargs_cleanup::simplify(code, class);
+    let code = method::readable_code(code);
+    let code = condition_cleanup::simplify(code);
+    display_names::rename(code)
 }
 impl Output {
     fn push(&mut self, text: &str) {
@@ -168,13 +174,57 @@ fn render_initializer(name: &str, class: &DexClass, method: &DexMethod) -> Resul
     Ok(out.finish())
 }
 
+// Exact inherited framework contracts, used identically by throw validation and
+// declaration emission. Only a direct framework parent is accepted: an unknown
+// intervening override may have narrowed its checked exception declaration.
+// AOSP android-15.0.0_r1 BackupAgent.java:346-347,380-381 and
+// BackupAgentHelper.java:64-75 declare these public instance contracts.
+// https://android.googlesource.com/platform/frameworks/base/+/refs/tags/android-15.0.0_r1/core/java/android/app/backup/BackupAgent.java
+pub(super) fn inherited_override_exception(
+    class: &DexClass,
+    method: &DexMethod,
+) -> Option<&'static str> {
+    if !method.thrown_types.is_empty()
+        || method.declaring_type != class.descriptor
+        || method.access_flags & 7 != 1
+        || method.access_flags & 8 != 0
+        || method.return_type.as_ref() != "V"
+        || !matches!(
+            class.superclass.as_deref(),
+            Some("Landroid/app/backup/BackupAgent;" | "Landroid/app/backup/BackupAgentHelper;")
+        )
+    {
+        return None;
+    }
+    let expected: &[&str] = match method.name.as_ref() {
+        "onRestore" => &[
+            "Landroid/app/backup/BackupDataInput;",
+            "I",
+            "Landroid/os/ParcelFileDescriptor;",
+        ],
+        "onBackup" => &[
+            "Landroid/os/ParcelFileDescriptor;",
+            "Landroid/app/backup/BackupDataOutput;",
+            "Landroid/os/ParcelFileDescriptor;",
+        ],
+        _ => return None,
+    };
+    (method.parameters.len() == expected.len()
+        && method
+            .parameters
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.as_ref() == *expected))
+    .then_some("Ljava/io/IOException;")
+}
+
 pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result<DecompiledCode> {
     if method.name.as_ref() == "<clinit>" {
         return render_initializer(name, class, method);
     }
     let constructor = method.name.as_ref() == "<init>";
-    let simple = name.rsplit('.').next().unwrap_or(name);
-    ensure!(identifier(simple), "Unsupported class name");
+    let display_class = names::qualified(name, '.')?;
+    let simple = display_class.rsplit('.').next().unwrap_or(&display_class);
     ensure!(
         method.access_flags & !0x31dff == 0,
         "Unsupported method modifiers"
@@ -288,9 +338,15 @@ pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result
         out.push(&format!("{display} p{index}"));
     }
     out.push(")");
-    if !method.thrown_types.is_empty() {
+    let declared_throws: Vec<&str> = method
+        .thrown_types
+        .iter()
+        .map(AsRef::as_ref)
+        .chain(inherited_override_exception(class, method))
+        .collect();
+    if !declared_throws.is_empty() {
         out.push(" throws ");
-        for (index, ty) in method.thrown_types.iter().enumerate() {
+        for (index, ty) in declared_throws.iter().enumerate() {
             method::validate_exception_type(class, ty)?;
             ensure!(
                 ty.starts_with('L') && ty.ends_with(';'),
@@ -300,7 +356,10 @@ pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result
                 out.push(", ");
             }
             let display = java_type(ty)?;
-            out.reference(&display, &display);
+            out.reference(
+                &display,
+                &names::label(ty).unwrap_or_else(|| display.clone()),
+            );
         }
     }
     if let Some(body) = body {
@@ -414,8 +473,8 @@ pub fn render_field(name: &str, class: &DexClass, field: &DexField) -> Result<De
         .and_then(|s| s.strip_suffix(';'))
     {
         let owner = owner.replace('/', ".");
-        out.reference(&owner, &owner);
-        out.push(&display[owner.len()..]);
+        out.reference(display.trim_end_matches("[]"), &owner);
+        out.push(&"[]".repeat(field.field_type.bytes().take_while(|b| *b == b'[').count()));
     } else {
         out.push(&display);
     }
@@ -500,8 +559,8 @@ pub fn render_field(name: &str, class: &DexClass, field: &DexField) -> Result<De
                     .and_then(|s| s.strip_suffix(';'))
                 {
                     let owner = owner.replace('/', ".");
-                    out.reference(&owner, &owner);
-                    out.push(&display[owner.len()..]);
+                    out.reference(display.trim_end_matches("[]"), &owner);
+                    out.push(&"[]".repeat(ty.bytes().take_while(|b| *b == b'[').count()));
                 } else {
                     out.push(&display);
                 }
@@ -568,8 +627,8 @@ fn render_mixed_field_fallback(name: &str, class: &DexClass, field: &DexField) -
             .and_then(|s| s.strip_suffix(';'))
         {
             let owner = owner.replace('/', ".");
-            out.reference(&owner, &owner);
-            out.push(&display[owner.len()..]);
+            out.reference(display.trim_end_matches("[]"), &owner);
+            out.push(&"[]".repeat(field.field_type.bytes().take_while(|b| *b == b'[').count()));
         } else {
             out.push(&display);
         }
@@ -605,7 +664,8 @@ fn render_mixed_field_fallback(name: &str, class: &DexClass, field: &DexField) -
 fn render_header(name: &str, class: &DexClass) -> Result<Output> {
     let interface = class.access_flags & 0x200 != 0;
     ensure!(
-        class.access_flags & !0x611 == 0,
+        // ACC_SYNTHETIC is compiler metadata, not a Java source modifier.
+        class.access_flags & !0x1611 == 0,
         "Unsupported class modifiers"
     );
     ensure!(
@@ -616,11 +676,10 @@ fn render_header(name: &str, class: &DexClass) -> Result<Output> {
         !interface || class.access_flags & 0x400 != 0,
         "Interface must be abstract"
     );
-    let (package, simple) = name.rsplit_once('.').unwrap_or(("", name));
-    ensure!(
-        identifier(simple) && (package.is_empty() || package.split('.').all(identifier)),
-        "Unsupported class name"
-    );
+    let display_class = names::qualified(name, '.')?;
+    let (package, simple) = display_class
+        .rsplit_once('.')
+        .unwrap_or(("", &display_class));
     let mut out = Output::default();
     if !package.is_empty() {
         out.push(&format!("package {package};\n\n"));
@@ -647,7 +706,7 @@ fn render_header(name: &str, class: &DexClass) -> Result<Output> {
         } else if parent.as_ref() != "Ljava/lang/Object;" {
             let ty = java_type(parent)?;
             out.push(" extends ");
-            out.reference(&ty, &ty);
+            out.reference(&ty, &names::label(parent).unwrap());
         }
     } else {
         ensure!(
@@ -666,8 +725,8 @@ fn render_header(name: &str, class: &DexClass) -> Result<Output> {
             if index > 0 {
                 out.push(", ");
             }
-            let ty = java_type(ty)?;
-            out.reference(&ty, &ty);
+            let display = java_type(ty)?;
+            out.reference(&display, &names::label(ty).unwrap());
         }
     }
     out.push(" {\n");
@@ -718,7 +777,7 @@ fn add_default_modifier(mut code: DecompiledCode) -> DecompiledCode {
     code
 }
 
-pub fn render(name: &str, class: &DexClass) -> Result<DecompiledCode> {
+fn class_prefix(name: &str, class: &DexClass) -> Result<Output> {
     ensure!(
         class.annotations_offset == 0 || annotation_directory(class).is_some(),
         "Annotations not reconstructed"
@@ -775,26 +834,144 @@ pub fn render(name: &str, class: &DexClass) -> Result<DecompiledCode> {
     for field in &class.fields {
         out.append(render_field(name, class, field)?);
     }
-    for method in &class.methods {
-        let mut code = render_method(name, class, method)?;
-        if interface && interface_method_default(method)? {
-            code = add_default_modifier(code);
-        }
-        out.append(code);
+    Ok(out)
+}
+
+fn append_presented_method(
+    out: &mut Output,
+    class: &DexClass,
+    method: &DexMethod,
+    code: DecompiledCode,
+) -> Result<()> {
+    let mut code = presentation(code, class);
+    if class.access_flags & 0x200 != 0 && interface_method_default(method)? {
+        code = add_default_modifier(code);
     }
+    out.append(code);
+    Ok(())
+}
+fn finish_class(name: &str, class: &DexClass, mut out: Output) -> DecompiledCode {
     out.push("}\n");
     let shortened = readable::shorten(name, class, vec![out.finish()]);
-    Ok(readable::add_imports(
+    readable::add_imports(
         shortened.codes.into_iter().next().unwrap(),
         &shortened.imports,
-    ))
+    )
+}
+
+pub fn render(name: &str, class: &DexClass) -> Result<DecompiledCode> {
+    let mut out = class_prefix(name, class)?;
+    for method in &class.methods {
+        append_presented_method(&mut out, class, method, render_method(name, class, method)?)?;
+    }
+    Ok(finish_class(name, class, out))
+}
+
+/// A failing class keeps its completed member work. Neither successful methods
+/// before the failure nor the failed method itself are decompiled a second time.
+pub(crate) fn render_mixed(name: &str, class: &DexClass) -> DecompiledCode {
+    render_mixed_with(name, class, |method| render_method(name, class, method))
+}
+fn render_mixed_with(
+    name: &str,
+    class: &DexClass,
+    render_member: impl FnMut(&DexMethod) -> Result<DecompiledCode>,
+) -> DecompiledCode {
+    render_mixed_controlled(name, class, render_member, &|| false)
+        .expect("non-cancellable class rendering")
+}
+
+pub(crate) fn render_mixed_cancellable(
+    name: &str,
+    class: &DexClass,
+    cancelled: &impl Fn() -> bool,
+) -> Result<DecompiledCode> {
+    render_mixed_controlled(
+        name,
+        class,
+        |method| render_method(name, class, method),
+        cancelled,
+    )
+}
+
+fn render_mixed_controlled(
+    name: &str,
+    class: &DexClass,
+    mut render_member: impl FnMut(&DexMethod) -> Result<DecompiledCode>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<DecompiledCode> {
+    ensure!(!cancelled(), "decompilation cancelled");
+    let mut attempted = Vec::new();
+    if let Ok(mut out) = class_prefix(name, class) {
+        for method in &class.methods {
+            ensure!(!cancelled(), "decompilation cancelled");
+            let result = render_member(method);
+            let failed = result.is_err();
+            attempted.push(Some(result));
+            if failed {
+                break;
+            }
+        }
+        if attempted.len() == class.methods.len()
+            && attempted
+                .iter()
+                .all(|result| result.as_ref().unwrap().is_ok())
+        {
+            for (method, result) in class.methods.iter().zip(attempted) {
+                ensure!(!cancelled(), "decompilation cancelled");
+                // Prefix validation already checked every interface modifier.
+                append_presented_method(&mut out, class, method, result.unwrap().unwrap())
+                    .expect("validated interface method");
+            }
+            ensure!(!cancelled(), "decompilation cancelled");
+            return Ok(finish_class(name, class, out));
+        }
+    }
+    ensure!(!cancelled(), "decompilation cancelled");
+    let raw = crate::native_engine::disassembly::render(name, class);
+    upgrade_methods_controlled(
+        name,
+        class,
+        raw,
+        |index, method| {
+            attempted
+                .get_mut(index)
+                .and_then(Option::take)
+                .unwrap_or_else(|| render_member(method))
+        },
+        cancelled,
+    )
 }
 
 /// Upgrade individual supported fields and methods without hiding remaining DEX code.
 /// Each instruction/reference is represented once, so usages are not duplicated.
+#[cfg(test)]
 pub(crate) fn upgrade_methods(name: &str, class: &DexClass, raw: DecompiledCode) -> DecompiledCode {
+    upgrade_methods_with(name, class, raw, |_, method| {
+        render_method(name, class, method)
+    })
+}
+#[cfg(test)]
+fn upgrade_methods_with(
+    name: &str,
+    class: &DexClass,
+    raw: DecompiledCode,
+    render_member: impl FnMut(usize, &DexMethod) -> Result<DecompiledCode>,
+) -> DecompiledCode {
+    upgrade_methods_controlled(name, class, raw, render_member, &|| false)
+        .expect("non-cancellable member rendering")
+}
+
+fn upgrade_methods_controlled(
+    name: &str,
+    class: &DexClass,
+    raw: DecompiledCode,
+    mut render_member: impl FnMut(usize, &DexMethod) -> Result<DecompiledCode>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<DecompiledCode> {
+    ensure!(!cancelled(), "decompilation cancelled");
     if raw.source.len() > 4 * 1024 * 1024 {
-        return raw;
+        return Ok(raw);
     }
     let boundaries: Vec<_> = raw
         .source
@@ -804,18 +981,20 @@ pub(crate) fn upgrade_methods(name: &str, class: &DexClass, raw: DecompiledCode)
         .collect();
     let mut replacements = Vec::new();
     let mut imports = std::collections::BTreeSet::new();
-    for (definition, method) in raw
+    for (index, (definition, method)) in raw
         .definitions
         .iter()
         .filter(|d| d.kind == "method")
         .zip(&class.methods)
+        .enumerate()
     {
+        ensure!(!cancelled(), "decompilation cancelled");
         let byte = boundaries[definition.start];
         let begin = raw.source[..byte].rfind('\n').map_or(0, |n| n + 1);
         let Ok(start) = boundaries.binary_search(&begin) else {
             continue;
         };
-        let Ok(mut code) = render_method(name, class, method) else {
+        let Ok(mut code) = render_member(index, method) else {
             let annotation = class
                 .methods
                 .iter()
@@ -828,6 +1007,7 @@ pub(crate) fn upgrade_methods(name: &str, class: &DexClass, raw: DecompiledCode)
             }
             continue;
         };
+        code = presentation(code, class);
         if class.access_flags & 0x200 != 0 {
             let Ok(default) = interface_method_default(method) else {
                 continue;
@@ -853,6 +1033,7 @@ pub(crate) fn upgrade_methods(name: &str, class: &DexClass, raw: DecompiledCode)
         .filter(|d| d.kind == "field")
         .zip(&class.fields)
     {
+        ensure!(!cancelled(), "decompilation cancelled");
         let code = render_field(name, class, field)
             .unwrap_or_else(|_| render_mixed_field_fallback(name, class, field));
         let byte = boundaries[definition.start];
@@ -868,6 +1049,7 @@ pub(crate) fn upgrade_methods(name: &str, class: &DexClass, raw: DecompiledCode)
         };
         replacements.push((start, end, code));
     }
+    ensure!(!cancelled(), "decompilation cancelled");
     replacements.sort_by_key(|(start, _, _)| *start);
     let (bounds, codes): (Vec<_>, Vec<_>) = replacements
         .into_iter()
@@ -939,6 +1121,7 @@ pub(crate) fn upgrade_methods(name: &str, class: &DexClass, raw: DecompiledCode)
         );
     };
     for (start, end, code) in replacements {
+        ensure!(!cancelled(), "decompilation cancelled");
         copy(&mut out, cursor, start);
         out.append(code);
         cursor = end;
@@ -947,7 +1130,8 @@ pub(crate) fn upgrade_methods(name: &str, class: &DexClass, raw: DecompiledCode)
     if java_header {
         out.push("}\n");
     }
-    readable::add_imports(out.finish(), &imports)
+    ensure!(!cancelled(), "decompilation cancelled");
+    Ok(readable::add_imports(out.finish(), &imports))
 }
 
 pub(crate) fn identifier(name: &str) -> bool {
@@ -1024,6 +1208,31 @@ pub(crate) fn identifier(name: &str) -> bool {
 #[cfg(test)]
 mod initializer_tests {
     use super::*;
+
+    #[test]
+    fn synthetic_classes_use_java_headers_and_short_types() {
+        let mut class = crate::native_dex::parse(include_bytes!("../../tests/fixtures/hello.dex"))
+            .unwrap()
+            .classes
+            .remove(0);
+        class.access_flags = 0x1011;
+        class.interfaces = vec!["Lsample/Callback;".into()];
+        let code = render_mixed("sample.Hello", &class);
+        assert!(
+            code.source
+                .contains("public final class Hello implements Callback {"),
+            "{}",
+            code.source
+        );
+        assert!(!code.source.contains(".class "));
+        assert!(!code.source.contains(".super "));
+        assert!(!code.source.contains(".implements "));
+        assert!(
+            code.definitions
+                .iter()
+                .any(|d| d.kind == "class" && d.name == "sample.Hello")
+        );
+    }
 
     #[test]
     fn interface_header_uses_extends_and_exact_navigation() {
@@ -1283,5 +1492,265 @@ mod initializer_tests {
         let link = code.links.iter().find(|link| link.label == symbol).unwrap();
         assert_eq!(link.start, definition.start);
         assert_eq!(link.end, definition.end);
+    }
+}
+
+#[cfg(test)]
+mod single_pass_tests {
+    use super::*;
+    fn legacy(name: &str, class: &DexClass) -> DecompiledCode {
+        render(name, class).unwrap_or_else(|_| {
+            upgrade_methods(
+                name,
+                class,
+                crate::native_engine::disassembly::render(name, class),
+            )
+        })
+    }
+    fn assert_same(left: &DecompiledCode, right: &DecompiledCode) {
+        assert_eq!(left.source, right.source);
+        assert_eq!(left.source_hash, right.source_hash);
+        assert_eq!(
+            left.links
+                .iter()
+                .map(|l| (l.start, l.end, &l.label))
+                .collect::<Vec<_>>(),
+            right
+                .links
+                .iter()
+                .map(|l| (l.start, l.end, &l.label))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            left.definitions
+                .iter()
+                .map(|d| (d.start, d.end, &d.name, &d.kind))
+                .collect::<Vec<_>>(),
+            right
+                .definitions
+                .iter()
+                .map(|d| (d.start, d.end, &d.name, &d.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+    fn fixture(failure: Option<usize>) -> DexClass {
+        let mut class = crate::native_dex::parse(include_bytes!("../../tests/fixtures/hello.dex"))
+            .unwrap()
+            .classes
+            .remove(0);
+        let mut second = crate::native_dex::parse(include_bytes!("../../tests/fixtures/hello.dex"))
+            .unwrap()
+            .classes
+            .remove(0)
+            .methods
+            .remove(0);
+        second.name = "later".into();
+        class.methods.push(second);
+        if let Some(index) = failure {
+            class.methods.insert(
+                index,
+                DexMethod {
+                    declaring_type: class.descriptor.clone(),
+                    name: "unsupported".into(),
+                    return_type: "V".into(),
+                    parameters: vec![],
+                    thrown_types: vec![],
+                    access_flags: 9,
+                    code: Some(crate::native_dex::DexCode {
+                        registers: 1,
+                        ins: 0,
+                        outs: 0,
+                        tries: 0,
+                        try_regions: vec![],
+                        instructions: vec![0x001d, 0x000e],
+                        offset: 0,
+                    }),
+                },
+            );
+        }
+        class
+    }
+    fn counted(class: &DexClass) -> DecompiledCode {
+        let mut counts = vec![0; class.methods.len()];
+        let code = render_mixed_with("sample.Hello", class, |method| {
+            let index = class
+                .methods
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, method))
+                .unwrap();
+            counts[index] += 1;
+            render_method("sample.Hello", class, method)
+        });
+        assert_eq!(
+            counts,
+            vec![1; class.methods.len()],
+            "each method must be attempted exactly once"
+        );
+        code
+    }
+    #[test]
+    fn each_method_is_rendered_once_across_success_and_early_or_late_failure() {
+        for class in [
+            fixture(None),
+            fixture(Some(0)),
+            fixture(Some(1)),
+            fixture(Some(2)),
+        ] {
+            assert_same(&counted(&class), &legacy("sample.Hello", &class));
+        }
+    }
+    #[test]
+    fn cancelled_class_stops_between_members_without_returning_partial_source() {
+        for mut class in [fixture(None), fixture(Some(0)), fixture(Some(1))] {
+            for invalid_header in [false, true] {
+                if invalid_header {
+                    class.access_flags |= 0x8000;
+                }
+                let calls = std::cell::Cell::new(0usize);
+                let result = render_mixed_controlled(
+                    "sample.Hello",
+                    &class,
+                    |method| {
+                        calls.set(calls.get() + 1);
+                        render_method("sample.Hello", &class, method)
+                    },
+                    &|| calls.get() >= 1,
+                );
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("decompilation cancelled")
+                );
+                assert_eq!(calls.get(), 1);
+                assert_same(
+                    &render_mixed("sample.Hello", &class),
+                    &legacy("sample.Hello", &class),
+                );
+            }
+        }
+    }
+    #[test]
+    fn invalid_class_header_still_renders_each_member_once_with_identical_mappings() {
+        let mut class = fixture(Some(1));
+        class.access_flags |= 0x8000;
+        assert_same(&counted(&class), &legacy("sample.Hello", &class));
+    }
+    #[test]
+    #[ignore = "Set RDX_TEST_APK to benchmark already-open Play Store VendingBackupAgent"]
+    fn benchmark_backup_class_without_repeated_method_generation() {
+        use crate::{engine::DecompilerEngine, native_engine::NativeDexEngine};
+        let path = std::env::var_os("RDX_TEST_APK").expect("RDX_TEST_APK required");
+        let mut engine = NativeDexEngine::default();
+        engine.open(std::path::Path::new(&path)).unwrap();
+        let name = "com.google.android.finsky.setup.VendingBackupAgent";
+        let class = engine.class(name).unwrap();
+        let expected = legacy(name, class);
+        assert_same(&render_mixed(name, class), &expected);
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for index in 0..20 {
+            for single in if index % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let start = std::time::Instant::now();
+                let code = if single {
+                    render_mixed(name, class)
+                } else {
+                    legacy(name, class)
+                };
+                let micros = start.elapsed().as_micros();
+                assert_same(&code, &expected);
+                if single {
+                    new.push(micros);
+                } else {
+                    old.push(micros);
+                }
+            }
+        }
+        old.sort_unstable();
+        new.sort_unstable();
+        let result = serde_json::json!({"class":name,"debug_assertions":cfg!(debug_assertions),"samples_each":20,"legacy_median_us":old[10],"single_pass_median_us":new[10],"source_bytes":expected.source.len(),"source_and_metadata_equal":true});
+        println!("{result}");
+        if let Some(path) = std::env::var_os("RDX_RENDER_BENCHMARK_OUTPUT") {
+            std::fs::write(path, serde_json::to_string_pretty(&result).unwrap()).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod cold_phase_profile {
+    use super::*;
+    #[test]
+    #[ignore = "Set RDX_TEST_APK and optionally RDX_PROFILE_CLASSES for renderer phase timings"]
+    fn profile_renderer_phases() {
+        use crate::{engine::DecompilerEngine, native_engine::NativeDexEngine};
+        use std::time::Instant;
+        let path = std::env::var_os("RDX_TEST_APK").expect("RDX_TEST_APK required");
+        let mut engine = NativeDexEngine::default();
+        engine.open(std::path::Path::new(&path)).unwrap();
+        for name in std::env::var("RDX_PROFILE_CLASSES")
+            .unwrap_or_else(|_| "abvc,absi,aefa".into())
+            .split(',')
+        {
+            let class = engine.class(name).unwrap();
+            let before = Instant::now();
+            let total = engine.render(name).unwrap();
+            let total_us = before.elapsed().as_micros();
+            let before = Instant::now();
+            let prefix = class_prefix(name, class);
+            let prefix_us = before.elapsed().as_micros();
+            let prefix_error = prefix.as_ref().err().map(ToString::to_string);
+            let mut raw_methods_us = 0;
+            let mut presentation_us = 0;
+            let mut failed = 0;
+            let mut codes = Vec::new();
+            let mut slow = Vec::new();
+            for method in &class.methods {
+                let before = Instant::now();
+                let code = render_method(name, class, method);
+                let elapsed = before.elapsed().as_micros();
+                raw_methods_us += elapsed;
+                if elapsed >= 10_000 {
+                    slow.push((
+                        elapsed,
+                        method.name.to_string(),
+                        code.as_ref().err().map(ToString::to_string),
+                    ));
+                }
+                if let Ok(code) = code {
+                    let before = Instant::now();
+                    codes.push(presentation(code, class));
+                    presentation_us += before.elapsed().as_micros();
+                } else {
+                    failed += 1;
+                }
+            }
+            let before = Instant::now();
+            for field in &class.fields {
+                codes.push(
+                    render_field(name, class, field)
+                        .unwrap_or_else(|_| render_mixed_field_fallback(name, class, field)),
+                );
+            }
+            let fields_us = before.elapsed().as_micros();
+            if let Ok(header) = render_header(name, class) {
+                codes.push(header.finish());
+            }
+            let before = Instant::now();
+            let raw = crate::native_engine::disassembly::render(name, class);
+            let disassembly_us = before.elapsed().as_micros();
+            let before = Instant::now();
+            let shortened = readable::shorten(name, class, codes);
+            let shorten_us = before.elapsed().as_micros();
+            std::hint::black_box(shortened);
+            std::hint::black_box(raw);
+            println!(
+                "PHASE {}",
+                serde_json::json!({"class":name,"total_us":total_us,"prefix_us":prefix_us,"prefix_error":prefix_error,"methods":class.methods.len(),"failed_methods":failed,"fields":class.fields.len(),"raw_methods_us":raw_methods_us,"presentation_us":presentation_us,"fields_us":fields_us,"disassembly_us":disassembly_us,"shorten_us":shorten_us,"source_bytes":total.source.len(),"source_hash":total.source_hash,"links":total.links.len(),"slow_methods":slow})
+            );
+        }
     }
 }

@@ -1,6 +1,8 @@
 //! Native DEX backend. Unsupported reconstruction is explicit, never fabricated source.
 #[path = "native_disassembly.rs"]
 pub(crate) mod disassembly;
+#[path = "native_implementations.rs"]
+mod implementations;
 use crate::{
     engine::{DecompiledCode, DecompilerEngine, DefinitionName, DefinitionNameIndex, Project},
     native_dex::{self, DexClass},
@@ -47,15 +49,19 @@ impl NativeDexEngine {
             .with_context(|| format!("Unknown class: {name}"))?;
         self.render_class(name, class)
     }
+    pub fn render_cancellable(
+        &self,
+        name: &str,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<DecompiledCode> {
+        let class = self
+            .classes
+            .get(name)
+            .with_context(|| format!("Unknown class: {name}"))?;
+        crate::native_java::render_mixed_cancellable(name, class, cancelled)
+    }
     fn render_class(&self, name: &str, class: &DexClass) -> Result<DecompiledCode> {
-        if let Ok(code) = crate::native_java::render(name, class) {
-            return Ok(code);
-        }
-        Ok(crate::native_java::upgrade_methods(
-            name,
-            class,
-            disassembly::render(name, class),
-        ))
+        Ok(crate::native_java::render_mixed(name, class))
     }
 
     pub fn definition_names(&self, names: &[String]) -> Result<DefinitionNameIndex> {
@@ -88,6 +94,20 @@ impl NativeDexEngine {
     }
     pub fn class(&self, name: &str) -> Option<&DexClass> {
         self.classes.get(name)
+    }
+    /// Immediate superclass edges only, including references to external parents.
+    /// Uses original DEX identity, independently of source reconstruction/aliases.
+    pub fn direct_subclasses(&self, name: &str) -> Vec<String> {
+        let descriptor = format!("L{};", name.replace('.', "/"));
+        self.classes
+            .iter()
+            .filter(|(_, class)| {
+                class.access_flags & 0x200 == 0
+                    && class.superclass.as_deref() == Some(descriptor.as_str())
+                    && class.descriptor.as_ref() != descriptor
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 }
 
@@ -276,6 +296,38 @@ impl DecompilerEngine for NativeDexEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_subclasses_use_exact_immediate_superclass_metadata() {
+        let mut engine = NativeDexEngine::default();
+        for (name, parent, interface) in [
+            ("sample.Child", "sample.Parent", false),
+            ("sample.Grandchild", "sample.Child", false),
+            ("sample.Other", "other.Parent", false),
+            ("sample.Implementer", "java.lang.Object", false),
+            ("sample.Contract", "java.lang.Object", true),
+            ("sample.ΔChild", "sample.Parent", false),
+        ] {
+            let mut class = native_dex::parse(include_bytes!("../tests/fixtures/hello.dex"))
+                .unwrap()
+                .classes
+                .remove(0);
+            class.descriptor = format!("L{};", name.replace('.', "/")).into();
+            class.superclass = Some(format!("L{};", parent.replace('.', "/")).into());
+            class.interfaces = vec!["Lsample/Parent;".into()];
+            class.access_flags = if interface { 0x601 } else { 1 };
+            engine.classes.insert(name.into(), class);
+        }
+        // Parent need not be defined in the APK; all DEX files share this catalog.
+        assert_eq!(
+            engine.direct_subclasses("sample.Parent"),
+            ["sample.Child", "sample.ΔChild"]
+        );
+        assert_eq!(
+            engine.direct_subclasses("java.lang.Object"),
+            ["sample.Implementer"]
+        );
+        assert!(engine.direct_subclasses("sample.Missing").is_empty());
+    }
     fn fixture(name: &str) -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")

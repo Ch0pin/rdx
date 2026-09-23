@@ -38,6 +38,9 @@ pub struct TypeHierarchy {
     ambiguous: Arc<HashSet<Arc<str>>>,
     cache: Arc<Mutex<RelationCache>>,
     trivial_constructors: Arc<HashMap<Arc<str>, Arc<str>>>,
+    object_varargs: Arc<HashSet<String>>,
+    object_calls: Arc<HashSet<String>>,
+    static_throws: Arc<HashMap<String, Arc<[Arc<str>]>>>,
 }
 
 #[derive(Debug, Default)]
@@ -88,8 +91,43 @@ impl RelationCache {
 }
 
 impl TypeHierarchy {
+    /// Exact loaded static declaration only; missing targets and overloads are not guessed.
+    pub fn static_call_declares(
+        &self,
+        owner: &str,
+        name: &str,
+        args: &[Arc<str>],
+        ret: &str,
+        caught: &str,
+    ) -> bool {
+        if self.ambiguous.contains(owner) {
+            return false;
+        }
+        let key = format!(
+            "{owner}->{name}({}){ret}",
+            args.iter().map(AsRef::as_ref).collect::<String>()
+        );
+        self.static_throws.get(&key).is_some_and(|types| {
+            types.iter().any(|ty| {
+                self.assignable(ty, "Ljava/lang/Throwable;") == Relation::Proven
+                    && self.assignable(ty, caught) == Relation::Proven
+            })
+        })
+    }
+
+    /// Exact static linked target, proven varargs with no competing local or inherited
+    /// method name. Unknown ancestry conservatively disables the display rewrite.
+    pub fn is_unambiguous_object_call(&self, signature: &str) -> bool {
+        self.object_calls.contains(signature)
+    }
+
+    pub fn is_unambiguous_object_varargs(&self, signature: &str) -> bool {
+        self.object_varargs.contains(signature)
+    }
+
     /// Optimizers can inline an empty constructor at an allocation site. Retarget
-    /// only when the allocated class still declares the exact same no-arg body.
+    /// only for an exact forwarding body, or a proven implicit default
+    /// constructor calling the accessible direct parent's no-arg constructor.
     pub fn equivalent_noarg_constructor(&self, allocated: &str, invoked: &str) -> bool {
         !self.ambiguous.contains(allocated)
             && self
@@ -129,6 +167,63 @@ impl TypeHierarchy {
     }
 
     pub fn from_classes<'a>(classes: impl IntoIterator<Item = &'a DexClass>) -> Result<Self> {
+        let classes: Vec<_> = classes.into_iter().take(MAX_CLASSES + 1).collect();
+        ensure!(
+            classes.len() <= MAX_CLASSES,
+            "native class hierarchy exceeds class limit"
+        );
+        let mut static_throws = HashMap::new();
+        let mut seen_owners = HashSet::new();
+        let mut duplicate_owners = HashSet::new();
+        for class in &classes {
+            if !seen_owners.insert(&class.descriptor) {
+                duplicate_owners.insert(&class.descriptor);
+            }
+        }
+        for class in &classes {
+            if duplicate_owners.contains(&class.descriptor)
+                || !class
+                    .methods
+                    .iter()
+                    .any(|method| method.access_flags & 8 != 0 && !method.thrown_types.is_empty())
+            {
+                continue;
+            }
+            let mut seen = HashSet::new();
+            let mut duplicates = HashSet::new();
+            for method in &class.methods {
+                if method.access_flags & 8 == 0 {
+                    continue;
+                }
+                let key = format!(
+                    "{}->{}({}){}",
+                    class.descriptor,
+                    method.name,
+                    method
+                        .parameters
+                        .iter()
+                        .map(AsRef::as_ref)
+                        .collect::<String>(),
+                    method.return_type
+                );
+                if !seen.insert(key.clone()) {
+                    duplicates.insert(key.clone());
+                }
+                if !method.thrown_types.is_empty() && method.declaring_type == class.descriptor {
+                    static_throws.insert(key, Arc::from(method.thrown_types.clone()));
+                    ensure!(
+                        static_throws.len() <= MAX_EDGES,
+                        "declared exception index exceeds limit"
+                    );
+                }
+            }
+            for key in duplicates {
+                static_throws.remove(&key);
+            }
+        }
+        let object_varargs = verified_object_calls(&classes, true);
+        let object_calls = verified_object_calls(&classes, false);
+        let implicit_constructors = verified_implicit_constructors(&classes);
         let mut entries = platform_entries();
         let mut ambiguous = HashSet::new();
         let mut trivial_constructors = HashMap::new();
@@ -147,7 +242,8 @@ impl TypeHierarchy {
                 "native class hierarchy exceeds class limit"
             );
             let descriptor = Arc::clone(&class.descriptor);
-            let constructor = trivial_noarg_constructor(class);
+            let constructor = trivial_noarg_constructor(class)
+                .or_else(|| implicit_constructors.get(&class.descriptor).cloned());
             if !constructor_seen.insert(Arc::clone(&descriptor)) {
                 if trivial_constructors.get(&descriptor) != constructor.as_ref() {
                     constructor_conflicts.insert(Arc::clone(&descriptor));
@@ -178,7 +274,10 @@ impl TypeHierarchy {
 
         trivial_constructors.retain(|descriptor, _| !constructor_conflicts.contains(descriptor));
         Ok(Self {
+            static_throws: Arc::new(static_throws),
             trivial_constructors: Arc::new(trivial_constructors),
+            object_varargs: Arc::new(object_varargs),
+            object_calls: Arc::new(object_calls),
             entries: Arc::new(entries),
             ambiguous: Arc::new(ambiguous),
             cache: Arc::new(Mutex::new(RelationCache::default())),
@@ -370,6 +469,26 @@ fn platform_entries() -> HashMap<Arc<str>, TypeEntry> {
             interfaces: Arc::from([]),
         },
     );
+    // Stable Java collection interface edges required for constructor arguments.
+    for (child, parents) in [
+        ("Ljava/lang/Iterable;", vec![]),
+        (
+            "Ljava/util/Collection;",
+            vec![Arc::from("Ljava/lang/Iterable;")],
+        ),
+        (
+            "Ljava/util/List;",
+            vec![Arc::from("Ljava/util/Collection;")],
+        ),
+    ] {
+        entries.insert(
+            Arc::from(child),
+            TypeEntry {
+                superclass: Some(Arc::from(OBJECT)),
+                interfaces: parents.into(),
+            },
+        );
+    }
     for (child, parent) in [
         ("Ljava/lang/Throwable;", OBJECT),
         ("Ljava/lang/Exception;", "Ljava/lang/Throwable;"),
@@ -597,4 +716,203 @@ fn trivial_noarg_constructor(class: &DexClass) -> Option<Arc<str>> {
         return None;
     }
     class.symbols.types.get(owner as usize).cloned()
+}
+
+// A class with no declared constructors receives Java's implicit no-arg
+// constructor. Reconstruct that only when it calls the exact DEX owner with no
+// hidden enclosing-instance argument and without inventing access or throws.
+fn verified_implicit_constructors(classes: &[&DexClass]) -> HashMap<Arc<str>, Arc<str>> {
+    let mut owners = HashMap::new();
+    let mut duplicates = HashSet::new();
+    let mut noarg = HashMap::new();
+    for &class in classes {
+        if owners.insert(class.descriptor.as_ref(), class).is_some() {
+            duplicates.insert(class.descriptor.as_ref());
+        }
+        let mut methods = class
+            .methods
+            .iter()
+            .filter(|method| method.name.as_ref() == "<init>" && method.parameters.is_empty());
+        let first = methods.next();
+        noarg.insert(
+            class.descriptor.as_ref(),
+            if methods.next().is_none() {
+                first
+            } else {
+                None
+            },
+        );
+    }
+    let package = |descriptor: &str| {
+        descriptor
+            .rsplit_once('/')
+            .map_or("", |(package, _)| package)
+            .to_string()
+    };
+    let mut result = HashMap::new();
+    for &class in classes {
+        if duplicates.contains(class.descriptor.as_ref())
+            || class.access_flags & (0x200 | 0x400 | 0x4000) != 0
+            || !matches!(class.access_flags & 7, 0 | 1)
+            || class.descriptor.contains('$')
+            || class
+                .methods
+                .iter()
+                .any(|method| method.name.as_ref() == "<init>")
+        {
+            continue;
+        }
+        let Some(parent_type) = &class.superclass else {
+            continue;
+        };
+        if duplicates.contains(parent_type.as_ref()) {
+            continue;
+        }
+        // java.lang.Object has an accessible, no-arg constructor even when
+        // platform classes are not bundled in the APK.
+        if parent_type.as_ref() == "Ljava/lang/Object;"
+            && !owners.contains_key(parent_type.as_ref())
+        {
+            result.insert(Arc::clone(&class.descriptor), Arc::clone(parent_type));
+            continue;
+        }
+        let Some(parent) = owners.get(parent_type.as_ref()) else {
+            continue;
+        };
+        if parent.access_flags & 0x200 != 0 {
+            continue;
+        }
+        let same_package = package(&class.descriptor) == package(parent_type);
+        if parent.access_flags & 1 == 0 && !same_package {
+            continue;
+        }
+        let Some(constructor) = noarg.get(parent_type.as_ref()).copied().flatten() else {
+            continue;
+        };
+        if constructor.declaring_type != *parent_type
+            || constructor.return_type.as_ref() != "V"
+            || constructor.access_flags & (0x8 | 0x100 | 0x400) != 0
+            || constructor.code.is_none()
+            || !constructor.thrown_types.is_empty()
+            || !match constructor.access_flags & 7 {
+                1 | 4 => true,
+                0 => same_package,
+                _ => false,
+            }
+        {
+            continue;
+        }
+        result.insert(Arc::clone(&class.descriptor), Arc::clone(parent_type));
+    }
+    result
+}
+
+// Retain only proven candidates, not a second project-wide method inventory.
+fn verified_object_calls(classes: &[&DexClass], varargs_only: bool) -> HashSet<String> {
+    let mut owners = HashMap::new();
+    let mut duplicates = HashSet::new();
+    for &class in classes {
+        if owners.insert(class.descriptor.as_ref(), class).is_some() {
+            duplicates.insert(class.descriptor.as_ref());
+        }
+    }
+    let mut ordered = classes.to_vec();
+    ordered.sort_by(|left, right| left.descriptor.cmp(&right.descriptor));
+    let mut result = HashSet::new();
+    let mut retained_bytes = 0usize;
+    let mut work = 0usize;
+    for class in ordered {
+        if duplicates.contains(class.descriptor.as_ref()) {
+            continue;
+        }
+        for method in &class.methods {
+            let candidate = if varargs_only {
+                method.access_flags & (0x80 | 0x8) == (0x80 | 0x8)
+                    && method.parameters.last().map(AsRef::as_ref) == Some("[Ljava/lang/Object;")
+            } else {
+                method.access_flags & (0x80 | 0x8) == 0x8
+                    && method.parameters.iter().any(|ty| ty.as_ref() == OBJECT)
+            };
+            if !candidate || method.name.starts_with('<') {
+                continue;
+            }
+            let mut queue = VecDeque::from([class.descriptor.as_ref()]);
+            let mut seen = HashSet::new();
+            let mut declarations = 0usize;
+            let mut proven = true;
+            while let Some(owner) = queue.pop_front() {
+                if !seen.insert(owner) {
+                    continue;
+                }
+                // Object's guaranteed method set cannot supply these names.
+                if owner == OBJECT && !owners.contains_key(owner) {
+                    if matches!(
+                        method.name.as_ref(),
+                        "clone"
+                            | "equals"
+                            | "finalize"
+                            | "getClass"
+                            | "hashCode"
+                            | "notify"
+                            | "notifyAll"
+                            | "toString"
+                            | "wait"
+                    ) {
+                        proven = false;
+                    }
+                    continue;
+                }
+                let Some(parent) = owners.get(owner) else {
+                    proven = false;
+                    break;
+                };
+                if duplicates.contains(owner) {
+                    proven = false;
+                    break;
+                }
+                work = work.saturating_add(parent.methods.len() + 1);
+                if work > 20_000_000 {
+                    return result;
+                }
+                declarations += parent
+                    .methods
+                    .iter()
+                    .filter(|m| m.name == method.name)
+                    .count();
+                if declarations != 1 {
+                    proven = false;
+                    break;
+                }
+                queue.extend(
+                    parent
+                        .superclass
+                        .iter()
+                        .chain(parent.interfaces.iter())
+                        .map(AsRef::as_ref),
+                );
+            }
+            if proven && declarations == 1 {
+                let Some(owner) = class
+                    .descriptor
+                    .strip_prefix('L')
+                    .and_then(|s| s.strip_suffix(';'))
+                else {
+                    continue;
+                };
+                let signature = format!(
+                    "{}.{}({}){}",
+                    owner.replace('/', "."),
+                    method.name,
+                    method.parameters.join(""),
+                    method.return_type
+                );
+                retained_bytes = retained_bytes.saturating_add(signature.len());
+                if retained_bytes > 16 * 1024 * 1024 || result.len() >= 65_536 {
+                    return result;
+                }
+                result.insert(signature);
+            }
+        }
+    }
+    result
 }

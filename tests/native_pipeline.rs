@@ -85,7 +85,7 @@ fn mixed_java_and_dex_keep_one_definition_and_exact_usage_per_instruction() {
     assert!(code.source.ends_with("}\n"));
     assert!(code.source.contains("public static int compute()"));
     assert!(code.source.contains("public static Class targetType()"));
-    assert!(code.source.contains("sample.Target.class"));
+    assert!(code.source.contains("Target.class"));
     let class_literal = code
         .links
         .iter()

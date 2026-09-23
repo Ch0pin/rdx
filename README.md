@@ -1,106 +1,87 @@
-# RDX
+<p align="center">
+  <img src="assets/icons/rdx.png" width="128" height="128" alt="RDX: a magnifying glass inspecting a bug">
+</p>
 
-A native Rust desktop application for APK/DEX inspection. The GUI and CLI both use the RDX Native DEX engine. There is no Java worker, JVM dependency, or Java fallback.
+<h1 align="center">RDX</h1>
+<p align="center"><strong>Explore Android apps. Follow the code. Understand what happens.</strong></p>
+<p align="center">Native Rust APK/DEX decompiler · macOS, Windows & Linux · Built-in MCP server</p>
 
-**Status: alpha native port.** DEX parsing and reconstruction are being implemented in Rust using upstream JADX algorithms as a reference. This is not a complete JADX replacement. Supported methods now reconstruct to Java, including parameters, integer arithmetic, fields, calls, constructor calls, forward `if`/`else`, early returns, simple loops, forward switches, arrays and type operations. Encoded field constants, straight-line wide arithmetic and supported single-region try/catch blocks also reconstruct natively. Complex cyclic control flow, wide control-flow joins and nested/multiple exception regions remain unsupported. Classes with unsupported parts use an explicitly labeled mixed Java/DEX view; it must not be mistaken for reconstructed Java source. No speed or memory advantage over JADX has been established for this native implementation.
+RDX is a desktop tool for Android reverse engineering and code review. Open an APK,
+read reconstructed Java, follow method calls, and inspect its manifest and resources
+in one place. Use the GUI yourself or connect an AI assistant through MCP.
 
-## Run from source
+## Why RDX?
 
-Requirements: stable Rust and Cargo. Python 3 is needed only for transport test fixtures. Initial builds download Rust dependencies.
+- **Native, self-contained engine.** Java reconstruction runs in Rust. No JVM, Java installation, or separate decompiler service to configure.
+- **Responsive search.** Background searches stream results as they arrive. A session index reuses cached source for repeat searches.
+- **Memory-conscious design.** Bounded source caches and a disk-backed search index control retained source data, without keeping every decompiled class in RAM.
+- **Built for investigation.** Move from a manifest component to its code, then follow declarations, usages, callers, and callees without leaving the viewer.
+- **Ready for agents.** The built-in MCP server lets assistants inspect local projects, with separate instances for parallel work.
 
-```sh
-cargo build --release --bins
-cargo run --release
-cargo run --release -- tests/fixtures/hello.apk
-```
+Search speed and total memory use depend on the APK, cache state, and enabled
+services. See [performance measurements](docs/search-performance.md) for the tested workloads.
 
-On Linux, install your distribution's C compiler, `pkg-config`, OpenGL, Wayland, and xkbcommon development packages. Windows builds require the Rust MSVC toolchain and Visual Studio C++ build tools; macOS builds require Xcode command-line tools.
+## What you can do
 
-## Headless commands
+| Task | Features |
+| --- | --- |
+| Read and navigate code | Reconstructed Java, exact DEX disassembly, declaration jumps, Back/Forward, tabs and bookmarks |
+| Trace relationships | Find usages, method callers/callees, direct subclasses and implementations |
+| Find what matters | Search classes, code, methods, fields and resources; exclude packages from searches |
+| Inspect the APK | Decoded manifest/XML, exported-component highlighting, resource names and values, image previews and file exports |
+| Customize your workflow | Light/dark themes, bundled code fonts, occurrence highlighting, Frida snippet copying and CLI access |
 
-```sh
-cargo run --release -- --engines
-cargo run --release -- --list tests/fixtures/hello.apk
-cargo run --release -- --engine native --decompile tests/fixtures/hello.dex sample.Hello
-cargo run --release -- --native-coverage tests/fixtures/hello.apk
-```
+**Status: alpha.** Java reconstruction is still expanding. Unsupported methods
+remain visible as labelled DEX disassembly. See [engine coverage and limitations](docs/native-engine.md).
 
-The default engine is native. `--engine jadx` and `--engine auto` are no longer accepted. Java heap settings and Java runtime environment variables no longer affect RDX. Old saved appearance/search settings remain readable; obsolete heap preferences are ignored.
+## Screenshots
 
-## Interface
+Click an image to view it at full size.
 
-The desktop has project navigation on the left, source and asset tabs in the center, and status/error information below. **File → Open APK / DEX** opens a project; **File → Reload** refreshes it. Cmd+O / Ctrl+O and drag-and-drop are supported. The project tree groups classes, manifest, assets, resources, libraries, DEX bytecode, signatures/metadata, and other files.
+| Light theme | Dark theme |
+| --- | --- |
+| [![Java source in RDX's light theme](docs/images/rdx-light.png)](docs/images/rdx-light.png) | [![Java source in RDX's dark theme](docs/images/rdx-dark.png)](docs/images/rdx-dark.png) |
 
-**View → Settings** contains interface theme (System, Light, Dark), code theme (Atom One Light, Quiet Light, Solarized light; Ocean, Eighties, Solarized dark, One Dark, Dracula), and font size (10–28 px). Code themes are grouped into Light and Dark; all palettes are bundled for offline use. Changes save automatically across sessions. Settings live at `~/Library/Application Support/rdx/settings.json` on macOS, `%APPDATA%/rdx/settings.json` on Windows, or `$XDG_CONFIG_HOME/rdx/settings.json` (default `~/.config/rdx/settings.json`) on Linux.
+**Manifest inspection with exported components highlighted**
 
-**View → Settings → Code font** offers default monospace, JetBrains Mono,
-Fira Code and Source Code Pro. Fonts are bundled with Unicode fallbacks; the
-choice saves automatically. Select a whole word in a source or text viewer to
-highlight its other exact, case-sensitive occurrences. Clicking to clear the
-selection clears these secondary highlights; find results remain separate.
+[![Decoded Android manifest with an exported receiver highlighted](docs/images/rdx-manifest.png)](docs/images/rdx-manifest.png)
 
-Theme and font attribution is in [third_party/themes](third_party/themes/README.md)
-and [third_party/fonts](third_party/fonts/README.md). Redistributed application
-bundles must include these license notices alongside the embedded assets.
+## MCP: connect your assistant
 
-The **▾ Open views** menu at the right edge of the tab strip lists every open view by full name, including offscreen tabs. Right-click a tab to copy its name, pin/unpin it, bookmark it, or close views. Pins protect tabs from automatic eviction and **Close Others / Close All**; explicit **Close** still works. Pins and bookmarks last for the current session. The 8-view / 64 MiB admission budget remains enforced; unpin or close a view when pinned tabs prevent opening another.
+Let an MCP-compatible assistant browse classes, read Java or DEX, inspect methods
+and fields, find direct subclasses, and retrieve manifests, resources and strings.
+The server runs locally and is included in RDX—no separate server installation.
 
-Use the toolbar arrows or **Navigate → Back / Forward** (**Alt+Left / Alt+Right**) to revisit reference jumps, including manifest references. A new reference jump clears forward history.
+1. Open an APK in RDX and select **Tools → MCP Server…**.
+2. Click **Start server**, then **Copy MCP client configuration**.
+3. Paste the configuration into your assistant's MCP settings and reconnect it.
 
-Source tabs show the alpha native engine label. Links are enabled only where native metadata provides a target; unavailable symbol operations remain disabled or report an explicit unsupported operation. Full JADX navigation, usage-analysis, and Java reconstruction parity are still porting work.
+Open multiple RDX instances to let agents work on different APKs in parallel.
+Requests identify both the instance and project to keep their work separate.
+See [MCP setup and available tools](docs/mcp.md).
 
-Text rendering previews at most 128 KiB or 5,000 lines. **Copy source** includes the retained text beyond the visible preview. Up to eight tabs are retained against an estimated 64 MiB tab budget; this is not a total application memory ceiling.
+## Get started
 
-Right-click a project-tree file/class, an open tab, or a viewer and choose **Export…**, then choose a directory. Archive entries export original bytes. Class exports contain the current native representation, including labeled disassembly where Java reconstruction is unavailable. Existing files receive numbered alternatives. Individual exports are limited to 1 GiB.
+**[Download RDX](https://github.com/Ch0pin/rdx/releases)** for macOS, Windows or Linux.
+Extract the archive and launch the app. No Java, Rust, Python or Android SDK is
+needed for prebuilt releases. See [installation and runtime requirements](docs/install.md)
+for platform dependencies and first-launch instructions.
 
-## Assets
-
-Readable text includes UTF-8 and BOM-marked UTF-16: JSON, XML, HTML, JavaScript, CSS, configuration files, Markdown, and other text. HTML, JavaScript, and SVG are displayed as source, never executed. PNG, JPEG, GIF (first frame), WebP, and BMP have image previews.
-
-Exported manifest component names have a purple highlight and an **Exported
-Android component** hover label. Detection uses explicit `android:exported="true"`
-and known SDK-dependent defaults; unresolved resource values are not guessed.
-Highlighting is available before class loading finishes and preserves class jumps.
-It describes the exported flag, independently of enabled state or permissions.
-
-Compiled Android XML, including the manifest, is detected by its binary header and decoded in native Rust directly from the archive. Previews work while class loading is running or if it fails. Full resource-table expansion remains unavailable. Other binary data is accessible through hexadecimal previews and original-byte export. Unsupported decoding reports a clear error while preserving the raw preview.
-
-Asset decompression is limited to 8 MiB per preview. Larger entries show their first 4 KiB as hexadecimal. Text retains at most 2 MiB with a truncation notice. Images are limited to 4096 × 4096 pixels and a 64 MiB decoder allocation budget. Archive browsing does not extract files.
-
-## Search
-
-**Search → Find in file…** (`Cmd+F` on macOS, `Ctrl+F` elsewhere) searches the
-current class or text asset, including text outside the visible source window.
-Use Enter / Shift+Enter or Next / Previous to move between highlighted matches;
-Escape closes the find bar. Match case is optional and queries are literal text.
-Project search remains available with `Cmd/Ctrl+Shift+F`.
-
-**View → Word wrap** wraps the viewer to the pane width and saves automatically
-across sessions. Line numbers remain source-line numbers, and code links and
-copied/exported text retain their original positions and content.
-
-**Search → Class / Code / Methods / Fields** opens a separate search window with one selected scope. Code search examines the native representation, which may include DEX disassembly; it cannot yet reproduce all searches against JADX-generated Java. Definition searches use native class/member metadata. Resources, Comments, case sensitivity, regex, Auto search, and Keep open remain separate options.
-
-**Excluded packages** contains editable defaults for Android, AndroidX, Kotlin, Java, and related namespaces. Remove an entry to include that package, add another pattern, restore defaults, or include all. Preferences save automatically. Nonstandard packages are searched first.
-
-The Node/Code divider is draggable. Auto search and Keep open appear in the bottom bar. Selecting a result brings the main window forward. Results are capped at 1,000 matches / 32 MiB retained matching source; skipped content and errors indicate partial coverage.
-
-The Rust session index uses a private packed temporary file up to 1 GiB, a conservative 96 MiB metadata admission budget, and a 64 MiB RAM tier. Capacity limits are not reserved allocations. The index is removed on project reset and normal shutdown; crashes can leave files for operating-system cleanup. It is not reused across launches.
-
-## Plugins
-
-Load `plugins/source-stats/plugin.json` through **Tools → Plugins**, explicitly enable it, and run it on an open text tab. The example is a native Rust executable built with `cargo build --release --bins`; place `rdx-source-stats` beside the main application binary. Plugins run as local processes with your user privileges; there is no operating-system sandbox or existing JADX plugin compatibility. The decompilation engine itself runs in native Rust.
-
-See [plugin protocol](docs/plugins.md) and [native engine scope](docs/native-engine.md).
-
-## Development
+To build from source, install [Rust](https://rustup.rs/), then run from the repository directory:
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo run --release -- /path/to/app.apk
 ```
 
-Native parser/reconstruction tests use checked-in APK/DEX fixtures and do not require Java. Interactive cross-platform GUI verification is separate from compilation. Remaining porting work includes full control-flow reconstruction, type inference, broad Java generation, complete native navigation/usages, and Android resources.
+Or launch with `cargo run --release` and drag an APK/DEX into the window.
+Platform build requirements, macOS app packaging and CLI commands are in the
+[user guide](docs/user-guide.md).
 
-The native parser adapts algorithms from pinned JADX sources. Preserve [upstream attribution and notices](third_party/jadx/README.md). Historical Java-worker performance results do not describe the native engine.
+## More
+
+[User guide](docs/user-guide.md) · [MCP tools](docs/mcp.md) ·
+[Validation](docs/validation.md) · [Plugins](docs/plugins.md)
+
+RDX uses JADX algorithms as a reference. See [JADX attribution](third_party/jadx/README.md),
+[Android notices](third_party/android/README.md), [font licenses](third_party/fonts/README.md)
+and [theme licenses](third_party/themes/README.md).

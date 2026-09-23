@@ -51,7 +51,14 @@ fn analyze(class: &DexClass) -> ConstructorAnalysis {
     let ssa = SsaMethod::build(code, &ir, &cfg).unwrap();
     let bound = BoundCalls::bind(code, &ir, &class.symbols).unwrap();
     let calls = SsaCalls::bind(&bound, &ssa).unwrap();
-    ConstructorAnalysis::analyze(class, m, &ir, &bound, &ssa, &calls).unwrap()
+    let independent = ConstructorAnalysis::analyze(class, m, &ir, &bound, &ssa, &calls).unwrap();
+    let context = rdx::native_method::MethodAnalysis::build(class, m).unwrap();
+    let shared = context.constructors().unwrap();
+    assert_eq!(format!("{independent:?}"), format!("{shared:?}"));
+    let expected = rdx::native_types::InferredTypes::infer(m, &ir, &ssa, &calls, &class.symbols);
+    let actual = context.infer_types();
+    assert_eq!(format!("{expected:?}"), format!("{actual:?}"));
+    shared
 }
 #[test]
 fn aliases_keep_exact_allocation_across_effects_and_register_reuse() {
@@ -314,4 +321,13 @@ fn unproven_ancestor_constructor_on_this_is_not_classified_as_super() {
         a.unresolved[0].reason,
         "chained constructor owner incompatible with this class"
     );
+}
+
+#[test]
+fn shared_analysis_rejects_missing_and_malformed_code() {
+    let mut c = class(&[0x000e], 0, 0, false);
+    c.methods[0].code = None;
+    assert!(rdx::native_method::MethodAnalysis::build(&c, &c.methods[0]).is_err());
+    let c = class(&[0x0022], 1, 0, false);
+    assert!(rdx::native_method::MethodAnalysis::build(&c, &c.methods[0]).is_err());
 }

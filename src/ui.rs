@@ -8,7 +8,7 @@ use crate::{
     },
     search_window::{SearchMode, SearchWindow},
     settings::{SearchPreferences, Settings, SettingsStore},
-    usages::{self, UsageSummary, UsageUpdate},
+    usages::{self, UsageMode, UsageSummary, UsageUpdate},
     usages_window::UsagesWindow,
 };
 use eframe::egui;
@@ -44,7 +44,8 @@ enum Event {
         Result<NavigationResult, String>,
     ),
     Asset(u64, usize, Result<Preview, String>),
-    Resource(u64, usize, NativeEngine, Result<String, String>),
+    Resource(u64, usize, NativeEngine, Result<DecompiledCode, String>),
+    ResourceRefresh(u64, usize, NativeEngine, Result<DecompiledCode, String>),
     Plugin(u64, Result<String, String>),
     Exported(u64, Option<NativeEngine>, Result<PathBuf, String>),
     SearchUpdate(u64, u64, SearchUpdate),
@@ -219,6 +220,10 @@ impl Tab {
 }
 
 pub struct App {
+    mcp_server: Option<rdx::mcp::Server>,
+    show_mcp: bool,
+    mcp_error: String,
+    mcp_auto_start: bool,
     search: SearchWindow,
     usages: UsagesWindow,
     usages_cancel: Option<Arc<AtomicBool>>,
@@ -304,6 +309,10 @@ impl App {
         });
         let (tx, rx) = mpsc::channel();
         Self {
+            mcp_server: None,
+            show_mcp: false,
+            mcp_error: String::new(),
+            mcp_auto_start: std::env::var_os("RDX_MCP_AUTO_START").is_some(),
             search,
             usages,
             usages_cancel: None,
@@ -356,6 +365,52 @@ impl App {
             diagnostics: settings_error.into_iter().collect(),
         }
     }
+    fn start_mcp(&mut self) {
+        if let Some(path) = self.path.clone() {
+            match rdx::mcp::Server::start(path) {
+                Ok(server) => {
+                    self.mcp_server = Some(server);
+                    self.mcp_error.clear();
+                }
+                Err(error) => self.mcp_error = format!("{error:#}"),
+            }
+        }
+    }
+
+    fn mcp_panel(&mut self, ctx: &egui::Context) {
+        if !self.show_mcp {
+            return;
+        }
+        let mut open = self.show_mcp;
+        egui::Window::new("MCP Server").open(&mut open).default_width(540.0).show(ctx, |ui| {
+            ui.label("Connect agents to this RDX instance. Each window has its own project.");
+            if let Some(server) = &self.mcp_server {
+                let status = server.status();
+                ui.label(format!("Status: {}", status.state));
+                ui.label(format!("Instance: {}", server.instance_id));
+                ui.label(format!("Project: {}", status.project_id));
+                ui.label(format!("APK SHA-256: {}", status.apk_sha256));
+                ui.label(format!("Requests served: {}", status.requests));
+                if !status.active.is_empty() { ui.label(format!("Current request: {}", status.active)); if ui.button("Cancel current request").clicked() { server.cancel_request(); } }
+                if !status.last_error.is_empty() { ui.colored_label(ui.visuals().error_fg_color, &status.last_error); }
+                if ui.button("Stop server").clicked() { self.mcp_server = None; }
+                ctx.request_repaint_after(std::time::Duration::from_millis(300));
+            } else {
+                ui.label("Status: Stopped");
+                if ui.add_enabled(self.project.is_some() && !self.loading_project, egui::Button::new("Start server")).clicked() { self.start_mcp(); }
+                if self.project.is_none() { ui.label("Open an APK or DEX to enable this instance."); }
+            }
+            if ui.button("Copy MCP client configuration").clicked() {
+                match rdx::mcp::client_config() { Ok(config) => ui.ctx().copy_text(config), Err(e) => self.mcp_error=e.to_string() }
+            }
+            if !self.mcp_error.is_empty() { ui.colored_label(ui.visuals().error_fg_color, &self.mcp_error); }
+            ui.separator();
+            ui.label("Available: classes, source, DEX, methods, fields, resource strings, DEX strings, manifest and direct subclasses.");
+            ui.label("Opening or reloading a project stops its server. Start it again to share the new project.");
+        });
+        self.show_mcp = open;
+    }
+
     fn open_file_find(&mut self) {
         if let Some(tab) = self.tabs.get_mut(self.selected)
             && let Content::Text(document) = &mut tab.content
@@ -404,7 +459,7 @@ impl App {
         }
         if self.usages.running {
             self.usages
-                .finish("Find usages stopped — partial results".into(), vec![]);
+                .finish("Results search stopped — partial results".into(), vec![]);
         }
         if let Some(cancel) = self.search_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
@@ -423,6 +478,7 @@ impl App {
         self.export_busy = false;
     }
     fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.mcp_server = None;
         self.stop();
         self.project = None;
         self.archive = None;
@@ -515,7 +571,8 @@ impl App {
         code: DecompiledCode,
         position: Option<usize>,
     ) -> Result<(), String> {
-        let mut document = CodeDocument::new(code.source, "java");
+        let resource = name.starts_with(rdx::resource_table::PREFIX);
+        let mut document = CodeDocument::new(code.source, if resource { "xml" } else { "java" });
         document.set_links(code.links);
         if let Some(position) = position {
             document.jump_to(position)?;
@@ -531,7 +588,14 @@ impl App {
             note: None,
         })
     }
-    fn find_usages(&mut self, class: String, offset: usize, hash: String, ctx: &egui::Context) {
+    fn find_usages(
+        &mut self,
+        class: String,
+        offset: usize,
+        hash: String,
+        mode: UsageMode,
+        ctx: &egui::Context,
+    ) {
         let Some(mut engine) = self.engine.take() else {
             self.usages.visible = true;
             self.usages
@@ -539,8 +603,15 @@ impl App {
             return;
         };
         self.busy = true;
-        self.status = "Finding symbol usages…".into();
-        self.usages.begin(class.clone());
+        match mode {
+            UsageMode::Subclasses => self.usages.begin_subclasses(class.clone()),
+            UsageMode::Implementations => self.usages.begin_implementations(class.clone()),
+            UsageMode::Usages => self.usages.begin(class.clone()),
+            UsageMode::Callers | UsageMode::Callees => {
+                self.usages.begin_method_xrefs(class.clone(), mode)
+            }
+        }
+        self.status = self.usages.status.clone();
         self.usages_id += 1;
         let cancel = Arc::new(AtomicBool::new(false));
         self.usages_cancel = Some(cancel.clone());
@@ -551,11 +622,36 @@ impl App {
             ctx.clone(),
         );
         thread::spawn(move || {
-            let summary = usages::collect(&mut engine, &class, offset, &hash, &cancel, |update| {
+            let emit = |update| {
                 let _ = tx.send(Event::UsagesUpdate(generation, id, update));
                 ctx.request_repaint();
                 ctx.request_repaint_of(UsagesWindow::viewport_id());
-            });
+            };
+            let summary = match mode {
+                UsageMode::Subclasses => {
+                    usages::collect_subclasses(&mut engine, &class, offset, &hash, &cancel, emit)
+                }
+                UsageMode::Implementations => usages::collect_implementations(
+                    &mut engine,
+                    &class,
+                    offset,
+                    &hash,
+                    &cancel,
+                    emit,
+                ),
+                UsageMode::Usages => {
+                    usages::collect(&mut engine, &class, offset, &hash, &cancel, emit)
+                }
+                UsageMode::Callers | UsageMode::Callees => usages::collect_method_xrefs(
+                    &mut engine,
+                    &class,
+                    offset,
+                    &hash,
+                    &cancel,
+                    mode,
+                    emit,
+                ),
+            };
             let _ = tx.send(Event::UsagesDone(generation, id, engine, summary));
             ctx.request_repaint();
         });
@@ -630,7 +726,9 @@ impl App {
             if tab.name == "AndroidManifest.xml"
                 && let Content::Text(document) = &mut tab.content
             {
-                document.set_links(crate::manifest_links::links(document.text(), classes));
+                let mut links = document.resource_links();
+                links.extend(crate::manifest_links::links(document.text(), classes));
+                document.set_links(links);
                 document.set_exported_components(crate::manifest_links::exported_components(
                     document.text(),
                 ));
@@ -789,7 +887,18 @@ impl App {
                                 .ok_or_else(|| anyhow::anyhow!("Decompiler is unavailable"))?
                                 .decompile(&name)?,
                         };
-                        let filename = format!("{}.java", name.rsplit('.').next().unwrap_or(&name));
+                        let filename = if name.starts_with(rdx::resource_table::PREFIX) {
+                            let last = name.rsplit('/').next().unwrap_or("resource");
+                            if last.ends_with(".xml") {
+                                last.to_owned()
+                            } else {
+                                format!("{last}.xml")
+                            }
+                        } else if name.starts_with("dex://") {
+                            format!("{}.smali", name.rsplit('.').next().unwrap_or(&name))
+                        } else {
+                            format!("{}.java", name.rsplit('.').next().unwrap_or(&name))
+                        };
                         rdx::export::write_source(&directory, &filename, &source)
                     }
                 }
@@ -992,6 +1101,9 @@ impl App {
         });
     }
     fn decode_resource(&mut self, index: usize, ctx: &egui::Context) {
+        self.decode_resource_mode(index, ctx, false);
+    }
+    fn decode_resource_mode(&mut self, index: usize, ctx: &egui::Context, refresh: bool) {
         let Some(name) = self.entry_name(index) else {
             return;
         };
@@ -1002,8 +1114,15 @@ impl App {
         self.status = format!("Decoding {name}…");
         let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
         thread::spawn(move || {
-            let result = engine.read_resource(&name).map_err(|e| format!("{e:#}"));
-            let _ = tx.send(Event::Resource(generation, index, engine, result));
+            let result = engine
+                .read_resource_with_metadata(&name)
+                .map_err(|e| format!("{e:#}"));
+            let event = if refresh {
+                Event::ResourceRefresh(generation, index, engine, result)
+            } else {
+                Event::Resource(generation, index, engine, result)
+            };
+            let _ = tx.send(event);
             ctx.request_repaint();
         });
     }
@@ -1163,10 +1282,20 @@ impl App {
                                     icons::small(ui, Icon::Bookmark);
                                 }
                                 let label = match tab.target {
+                                    Target::Class(_)
+                                        if tab.name.starts_with(rdx::resource_table::PREFIX) =>
+                                    {
+                                        tab.name.rsplit('/').next()
+                                    }
                                     Target::Class(_) => tab.name.rsplit('.').next(),
                                     Target::File(_) => tab.name.rsplit('/').next(),
                                 }
                                 .unwrap_or(&tab.name);
+                                let label = if tab.name.starts_with("dex://") {
+                                    format!("{label} [DEX]")
+                                } else {
+                                    label.to_owned()
+                                };
                                 let response = ui
                                     .selectable_label(self.selected == i, label)
                                     .on_hover_text(&tab.name);
@@ -1274,6 +1403,11 @@ impl App {
                                 project.classes.len(),
                                 self.archive.as_ref().map_or(0, |a| a.entries.len())
                             );
+                            if let Some(error) = engine.resource_error() {
+                                self.diagnostics.push(error.to_owned());
+                                self.status
+                                    .push_str(" · resource names unavailable (see diagnostics)");
+                            }
                             self.engine = Some(engine);
                             self.project = Some(project);
                             self.refresh_manifest_links();
@@ -1361,9 +1495,10 @@ impl App {
                     match result {
                         Ok(preview) => {
                             // Compiled Android XML is decoded natively when its index is ready.
-                            if matches!(&preview, Preview::Binary { .. })
-                                && is_android_xml(&name)
-                                && self.engine.is_some()
+                            if xml_preview_needs_resolution(&name, &preview)
+                                && self.engine.as_ref().is_some_and(|engine| {
+                                    !engine.resource_table().entries.is_empty()
+                                })
                             {
                                 self.decode_resource(index, ctx);
                                 continue;
@@ -1426,6 +1561,30 @@ impl App {
                         }
                     }
                 }
+                Event::ResourceRefresh(generation, index, engine, result)
+                    if generation == self.generation =>
+                {
+                    self.busy = false;
+                    self.engine = Some(engine);
+                    if let Some(tab) = self
+                        .tabs
+                        .iter_mut()
+                        .find(|t| t.target == Target::File(index))
+                    {
+                        match result {
+                            Ok(code) => {
+                                let mut document = CodeDocument::new(code.source, "xml");
+                                document.set_links(code.links);
+                                tab.content = Content::Text(Box::new(document));
+                                tab.note = Some("Android XML decoded natively".into());
+                            }
+                            Err(error) => {
+                                tab.note = Some(format!("Android XML decode failed. {error}"));
+                            }
+                        }
+                    }
+                    self.refresh_manifest_links();
+                }
                 Event::Resource(generation, index, engine, result)
                     if generation == self.generation =>
                 {
@@ -1435,11 +1594,24 @@ impl App {
                         continue;
                     }
                     match result {
-                        Ok(text) => {
+                        Ok(code) => {
                             let Some(name) = self.entry_name(index) else {
                                 self.pending_history = None;
                                 continue;
                             };
+                            let mut document = CodeDocument::new(code.source, "xml");
+                            let mut links = code.links;
+                            if name == "AndroidManifest.xml" {
+                                links.extend(crate::manifest_links::links(
+                                    document.text(),
+                                    &self
+                                        .project
+                                        .as_ref()
+                                        .map(|p| p.classes.clone())
+                                        .unwrap_or_default(),
+                                ));
+                            }
+                            document.set_links(links);
                             if let Err(error) = self.push_tab(Tab {
                                 pinned: false,
                                 bookmarked: false,
@@ -1447,7 +1619,7 @@ impl App {
                                 source_hash: None,
                                 target: Target::File(index),
                                 name,
-                                content: Content::Text(Box::new(CodeDocument::new(text, "xml"))),
+                                content: Content::Text(Box::new(document)),
                                 note: Some("Android XML decoded natively".into()),
                             }) {
                                 self.pending_history = None;
@@ -1473,6 +1645,10 @@ impl App {
                                                 note: Some(format!(
                                                     "Android XML decode failed. {note}"
                                                 )),
+                                            },
+                                            Preview::Text { text, syntax, .. } => Preview::Text {
+                                                text, syntax,
+                                                note: Some("Android XML decode failed. Showing archive preview.".into()),
                                             },
                                             p => p,
                                         })
@@ -1568,6 +1744,29 @@ impl App {
                 _ => {}
             }
         }
+        // Upgrade previews opened while the DEX/resource index was still loading.
+        // Keep tab selection and history intact, and never retry failed decodes each frame.
+        if !self.busy
+            && !self.asset_busy
+            && self
+                .engine
+                .as_ref()
+                .is_some_and(|engine| !engine.resource_table().entries.is_empty())
+            && let Some(index) = self.tabs.iter().find_map(|tab| {
+                if is_android_xml(&tab.name)
+                    && !tab.note.as_deref().is_some_and(|note| {
+                        note == "Android XML decoded natively"
+                            || note.starts_with("Android XML decode failed.")
+                    })
+                    && let Target::File(index) = tab.target
+                {
+                    return Some(index);
+                }
+                None
+            })
+        {
+            self.decode_resource_mode(index, ctx, true);
+        }
     }
     fn plugins_window(&mut self, ctx: &egui::Context) {
         let mut visible = self.show_plugins;
@@ -1645,6 +1844,17 @@ impl App {
             });
         self.show_plugins = visible;
     }
+}
+
+fn xml_preview_needs_resolution(name: &str, preview: &Preview) -> bool {
+    is_android_xml(name)
+        && match preview {
+            Preview::Text { note, .. } => !note
+                .as_deref()
+                .is_some_and(|n| n.starts_with("Android XML decode failed.")),
+            Preview::Binary { .. } => true,
+            Preview::Image { .. } => false,
+        }
 }
 
 fn is_android_xml(name: &str) -> bool {
@@ -1820,6 +2030,12 @@ fn plain_menu_bar(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.events(ctx);
+        if self.mcp_auto_start && self.project.is_some() && !self.loading_project {
+            self.mcp_auto_start = false;
+            self.start_mcp();
+            self.show_mcp = true;
+        }
+        self.mcp_panel(ctx);
         if let Some(path) = self.initial.take() {
             self.open(path, ctx);
         }
@@ -1947,6 +2163,10 @@ impl eframe::App for App {
                         }
                     });
                     ui.menu_button("Tools", |ui| {
+                        if ui.button("MCP Server…").clicked() {
+                            self.show_mcp = true;
+                            ui.close_menu();
+                        }
                         if ui.button("Plugins…").clicked() {
                             self.show_plugins = true;
                             ui.close_menu();
@@ -2139,6 +2359,31 @@ impl eframe::App for App {
                             }
                         }
                     });
+                    if let Some(owner) = tab.name.strip_prefix("dex://") {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("X-Refs: exact DEX call-site view, not Java source.");
+                            if ui
+                                .add_enabled(
+                                    !self.busy && self.engine.is_some(),
+                                    egui::Button::new("Open Java source"),
+                                )
+                                .clicked()
+                            {
+                                let position = match &tab.content {
+                                    Content::Text(document) => document.navigation_position(),
+                                    _ => 0,
+                                };
+                                manifest_jump = Some((
+                                    owner.to_owned(),
+                                    JumpLocation {
+                                        target: tab.target.clone(),
+                                        position,
+                                        source_hash: tab.source_hash.clone(),
+                                    },
+                                ));
+                            }
+                        });
+                    }
                     if let Some(note) = &tab.note {
                         ui.label(note);
                     }
@@ -2170,6 +2415,17 @@ impl eframe::App for App {
                             {
                                 if let Some(hash) = &tab.source_hash {
                                     jump = Some((tab.name.clone(), position, hash.clone()));
+                                } else if let Some(link) = document.link_at(position)
+                                    && link.label.starts_with(rdx::resource_table::PREFIX)
+                                {
+                                    manifest_jump = Some((
+                                        link.label.split(" | ").next().unwrap().to_owned(),
+                                        JumpLocation {
+                                            target: tab.target.clone(),
+                                            position,
+                                            source_hash: None,
+                                        },
+                                    ));
                                 } else if tab.name == "AndroidManifest.xml"
                                     && let Some(link) = document.link_at(position)
                                 {
@@ -2186,7 +2442,46 @@ impl eframe::App for App {
                             if let Some(offset) = document.take_usages_request()
                                 && let Some(hash) = &tab.source_hash
                             {
-                                usage_request = Some((tab.name.clone(), offset, hash.clone()));
+                                usage_request = Some((
+                                    tab.name.clone(),
+                                    offset,
+                                    hash.clone(),
+                                    UsageMode::Usages,
+                                ));
+                            }
+                            if let Some(offset) = document.take_subclasses_request()
+                                && let Some(hash) = &tab.source_hash
+                            {
+                                usage_request = Some((
+                                    tab.name.clone(),
+                                    offset,
+                                    hash.clone(),
+                                    UsageMode::Subclasses,
+                                ));
+                            }
+                            if let Some(offset) = document.take_implementations_request()
+                                && let Some(hash) = &tab.source_hash
+                            {
+                                usage_request = Some((
+                                    tab.name.clone(),
+                                    offset,
+                                    hash.clone(),
+                                    UsageMode::Implementations,
+                                ));
+                            }
+                            if let Some((offset, callers)) = document.take_method_xrefs_request()
+                                && let Some(hash) = &tab.source_hash
+                            {
+                                usage_request = Some((
+                                    tab.name.clone(),
+                                    offset,
+                                    hash.clone(),
+                                    if callers {
+                                        UsageMode::Callers
+                                    } else {
+                                        UsageMode::Callees
+                                    },
+                                ));
                             }
                             if document.take_export_request() {
                                 export = Some(tab.target.clone());
@@ -2219,8 +2514,8 @@ impl eframe::App for App {
                 }
             }
         });
-        if let Some((class, offset, hash)) = usage_request {
-            self.find_usages(class, offset, hash, ctx);
+        if let Some((class, offset, hash, mode)) = usage_request {
+            self.find_usages(class, offset, hash, mode, ctx);
         }
         if let Some((class, origin)) = manifest_jump {
             self.navigate_manifest(class, origin, ctx);
@@ -2279,7 +2574,7 @@ impl eframe::App for App {
             cancel.store(true, Ordering::Relaxed);
         }
         if let Some(hit) = actions.open {
-            let location = format!("Usage · {}:{}", hit.kind, hit.line);
+            let location = format!("{} · {}:{}", self.usages.mode.title(), hit.kind, hit.line);
             self.open_search_hit(hit);
             self.status = location;
         }
@@ -2334,10 +2629,139 @@ fn snapshot_preferences(
 
 #[cfg(test)]
 mod settings_tests {
+    #[test]
+    fn mcp_panel_exposes_controls_without_starting_a_service() {
+        let mut app = navigation_test_app();
+        app.show_mcp = true;
+        let ctx = egui::Context::default();
+        let mut labels = String::new();
+        for _ in 0..2 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 820.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.mcp_panel(ctx),
+            );
+            for shape in output.shapes {
+                if let egui::Shape::Text(text) = shape.shape {
+                    labels.push_str(&text.galley.job.text);
+                    labels.push('\n');
+                }
+            }
+        }
+        assert!(labels.contains("MCP Server"), "{labels}");
+        assert!(labels.contains("Start server"), "{labels}");
+        assert!(labels.contains("Copy MCP client configuration"), "{labels}");
+        assert!(app.mcp_server.is_none());
+    }
+
+    #[test]
+    fn decoded_manifest_preview_still_needs_resource_resolution() {
+        let preview = rdx::apk::Preview::Text {
+            text: "<manifest/>".into(),
+            syntax: "xml".into(),
+            note: None,
+        };
+        assert!(super::xml_preview_needs_resolution(
+            "AndroidManifest.xml",
+            &preview
+        ));
+        assert!(super::xml_preview_needs_resolution(
+            "res/layout/main.xml",
+            &preview
+        ));
+        assert!(!super::xml_preview_needs_resolution("notes.txt", &preview));
+        let fallback = rdx::apk::Preview::Text {
+            text: "<manifest/>".into(),
+            syntax: "xml".into(),
+            note: Some("Android XML decode failed. Showing archive preview.".into()),
+        };
+        assert!(!super::xml_preview_needs_resolution(
+            "AndroidManifest.xml",
+            &fallback
+        ));
+    }
+
     use super::*;
+    #[test]
+    #[ignore = "Set RDX_ZOOM_APK to the Zoom APK"]
+    fn manifest_resources_resolve_before_and_after_index_ready() {
+        let fixture = PathBuf::from(std::env::var_os("RDX_ZOOM_APK").unwrap());
+        for manifest_first in [false, true] {
+            let ctx = egui::Context::default();
+            let archive = Arc::new(Archive::open(&fixture).unwrap());
+            let index = archive
+                .entries
+                .iter()
+                .find(|e| e.path == "AndroidManifest.xml")
+                .unwrap()
+                .index;
+            let preview = archive.preview(index).unwrap();
+            assert!(matches!(preview, Preview::Text { .. }));
+            let mut engine = NativeEngine::start().unwrap();
+            let project = engine.open(&fixture).unwrap();
+            let mut app = navigation_test_app();
+            app.archive = Some(archive);
+            if manifest_first {
+                app.tx
+                    .send(Event::Asset(0, index, Ok(preview.clone())))
+                    .unwrap();
+                app.events(&ctx);
+                assert_eq!(app.tabs.len(), 1);
+            }
+            app.tx
+                .send(Event::Opened(0, Ok((engine, project))))
+                .unwrap();
+            app.events(&ctx);
+            if !manifest_first {
+                app.tx.send(Event::Asset(0, index, Ok(preview))).unwrap();
+                app.events(&ctx);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while app.busy && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                app.events(&ctx);
+            }
+            assert!(!app.busy, "resource refresh did not finish");
+            assert_eq!(app.tabs.len(), 1);
+            assert!(app.history.is_empty());
+            let Content::Text(document) = &app.tabs[app.selected].content else {
+                panic!("missing manifest")
+            };
+            assert!(
+                document
+                    .text()
+                    .contains("@us.zoom.videomeetings:style/ZMTheme.MainWindow")
+            );
+            assert!(
+                document
+                    .resource_links()
+                    .iter()
+                    .any(|link| link.label.starts_with("resource://7f1306f1"))
+            );
+            let offset = document
+                .text()
+                .find("com.zipow.videobox.IMActivity")
+                .unwrap();
+            assert!(
+                document
+                    .link_at(document.text()[..offset].chars().count())
+                    .is_some()
+            );
+        }
+    }
+
     fn navigation_test_app() -> App {
         let (tx, rx) = mpsc::channel();
         App {
+            mcp_server: None,
+            show_mcp: false,
+            mcp_error: String::new(),
+            mcp_auto_start: false,
             search: SearchWindow::default(),
             usages: UsagesWindow::default(),
             usages_cancel: None,
@@ -3007,5 +3431,43 @@ mod settings_tests {
                 }
             }
         }
+    }
+    #[test]
+    fn resource_navigation_uses_existing_back_forward_history() {
+        let ctx = egui::Context::default();
+        let (mut app, _, _) = history_fixture();
+        let origin = app.current_location().unwrap();
+        let source = "<resources><item name=\"title\">Hello</item></resources>".to_owned();
+        let target = "resource://7f010000/string/title";
+        let code = DecompiledCode {
+            source_hash: rdx::engine::source_identity(&source),
+            source,
+            links: vec![],
+            definitions: vec![],
+        };
+        app.tx
+            .send(Event::Navigated(
+                0,
+                origin.clone(),
+                None,
+                Ok(NavigationResult {
+                    class: target.into(),
+                    code,
+                    position: 0,
+                }),
+            ))
+            .unwrap();
+        app.events(&ctx);
+        assert_eq!(app.tabs[app.selected].target, Target::Class(target.into()));
+        app.go_back(&ctx);
+        wait_for_history(&mut app, &ctx);
+        assert_eq!(app.current_location().unwrap().target, origin.target);
+        app.go_forward(&ctx);
+        wait_for_history(&mut app, &ctx);
+        assert_eq!(
+            app.current_location().unwrap().target,
+            Target::Class(target.into())
+        );
+        assert!(app.diagnostics.is_empty(), "{:?}", app.diagnostics);
     }
 }

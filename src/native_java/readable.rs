@@ -14,7 +14,7 @@ fn descriptor_name(descriptor: &str) -> Option<String> {
         .trim_start_matches('[')
         .strip_prefix('L')
         .and_then(|s| s.strip_suffix(';'))
-        .map(|s| s.replace('/', "."))
+        .and_then(|s| super::names::qualified(s, '/').ok())
 }
 
 fn candidates(class: &DexClass, codes: &[DecompiledCode]) -> BTreeSet<String> {
@@ -43,9 +43,9 @@ fn candidates(class: &DexClass, codes: &[DecompiledCode]) -> BTreeSet<String> {
         };
         if let Some(possible) = possible
             && possible.contains('.')
-            && possible.split('.').all(super::identifier)
+            && let Ok(display) = super::names::qualified(possible, '.')
         {
-            names.insert(possible.to_owned());
+            names.insert(display);
         }
     }
     names
@@ -174,7 +174,22 @@ fn apply(mut code: DecompiledCode, mut edits: Vec<(usize, usize, String)>) -> De
     code
 }
 
+// Binary '$' is legal in top-level names, so only a proven member relationship
+// authorizes source nesting. Android's public API declares this exact type as
+// PackageInstaller.SessionInfo (API21+):
+// https://developer.android.com/reference/android/content/pm/PackageInstaller.SessionInfo
+fn platform_member_type(binary: &str) -> Option<(&'static str, &'static str)> {
+    match binary {
+        "android.content.pm.PackageInstaller$SessionInfo" => {
+            Some(("android.content.pm.PackageInstaller", "SessionInfo"))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn shorten(name: &str, class: &DexClass, codes: Vec<DecompiledCode>) -> Shortened {
+    let display_name = super::names::qualified(name, '.').unwrap_or_else(|_| name.to_owned());
+    let name = display_name.as_str();
     let package = name.rsplit_once('.').map_or("", |p| p.0);
     let own_simple = name.rsplit('.').next().unwrap_or(name);
     let mut blocked: BTreeSet<String> = class.fields.iter().map(|f| f.name.to_string()).collect();
@@ -182,6 +197,13 @@ pub(crate) fn shorten(name: &str, class: &DexClass, codes: Vec<DecompiledCode>) 
     blocked.insert(own_simple.to_owned());
     let mut candidates = candidates(class, &codes);
     candidates.insert(name.to_owned());
+    // Include outer owners in the ordinary ambiguity/shadow analysis. An
+    // unrelated PackageInstaller type or local prevents importing this owner.
+    let owners: Vec<_> = candidates
+        .iter()
+        .filter_map(|candidate| platform_member_type(candidate).map(|(owner, _)| owner.to_owned()))
+        .collect();
+    candidates.extend(owners);
     let tokenized: Vec<_> = codes.iter().map(|code| tokens(&code.source)).collect();
     for member_tokens in &tokenized {
         for (_, _, token) in member_tokens {
@@ -192,7 +214,11 @@ pub(crate) fn shorten(name: &str, class: &DexClass, codes: Vec<DecompiledCode>) 
     }
     let mut by_simple: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for fq in &candidates {
-        if fq.contains('$') {
+        if fq
+            .rsplit('.')
+            .next()
+            .is_some_and(|simple| simple.contains('$'))
+        {
             continue;
         }
         by_simple
@@ -210,6 +236,34 @@ pub(crate) fn shorten(name: &str, class: &DexClass, codes: Vec<DecompiledCode>) 
             }
         })
         .collect();
+    struct Display<'a> {
+        text: String,
+        import: Option<&'a str>,
+    }
+    let mut displays: BTreeMap<&str, Display<'_>> = allowed
+        .iter()
+        .map(|(&qualified, &simple)| {
+            (
+                qualified,
+                Display {
+                    text: simple.to_owned(),
+                    import: Some(qualified),
+                },
+            )
+        })
+        .collect();
+    for qualified in &candidates {
+        if let Some((owner, member)) = platform_member_type(qualified) {
+            let short = allowed.get(owner).copied();
+            displays.insert(
+                qualified,
+                Display {
+                    text: format!("{}.{member}", short.unwrap_or(owner)),
+                    import: short.map(|_| owner),
+                },
+            );
+        }
+    }
     let mut used = BTreeSet::new();
     let codes = codes
         .into_iter()
@@ -217,11 +271,24 @@ pub(crate) fn shorten(name: &str, class: &DexClass, codes: Vec<DecompiledCode>) 
         .map(|(code, member_tokens)| {
             let mut edits = Vec::new();
             for (start, end, token) in member_tokens {
-                if let Some(simple) = allowed.get(token.as_str()) {
-                    edits.push((start, end, (*simple).to_owned()));
-                    let fq_package = token.rsplit_once('.').map_or("", |p| p.0);
-                    if fq_package != package && fq_package != "java.lang" {
-                        used.insert(token);
+                let matched = displays
+                    .get(token.as_str())
+                    .map(|display| (display, end))
+                    .or_else(|| {
+                        token.match_indices('.').rev().find_map(|(at, _)| {
+                            let prefix = &token[..at];
+                            displays
+                                .get(prefix)
+                                .map(|display| (display, start + prefix.chars().count()))
+                        })
+                    });
+                if let Some((display, type_end)) = matched {
+                    edits.push((start, type_end, display.text.clone()));
+                    if let Some(owner) = display.import {
+                        let owner_package = owner.rsplit_once('.').map_or("", |p| p.0);
+                        if owner_package != package && owner_package != "java.lang" {
+                            used.insert(owner.to_owned());
+                        }
                     }
                 }
             }
@@ -403,7 +470,7 @@ mod tests {
                 .source
                 .starts_with("Hello self; example.Hello other;")
         );
-        assert!(result.source.contains("sample.Hello.FIELD"));
+        assert!(result.source.contains("Hello.FIELD"));
         let link = &result.links[0];
         assert_eq!(
             result
@@ -415,5 +482,179 @@ mod tests {
             "Hello"
         );
         assert!(shortened.imports.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod static_call_tests {
+    use super::*;
+    #[test]
+    fn shortens_static_call_owner_and_preserves_method_link() {
+        let class = crate::native_dex::parse(include_bytes!("../../tests/fixtures/hello.dex"))
+            .unwrap()
+            .classes
+            .remove(0);
+        let source = "com.example.Log.g(\"λ com.example.Log\");";
+        let owner = "com.example.Log";
+        let method = owner.len() + 1;
+        let code = DecompiledCode {
+            source: source.into(),
+            links: vec![
+                CodeLink {
+                    start: 0,
+                    end: owner.len(),
+                    label: owner.into(),
+                },
+                CodeLink {
+                    start: method,
+                    end: method + 1,
+                    label: "com.example.Log.g(Ljava/lang/String;)V".into(),
+                },
+            ],
+            definitions: vec![],
+            source_hash: String::new(),
+        };
+        let result = shorten("sample.Hello", &class, vec![code]);
+        assert_eq!(result.codes[0].source, "Log.g(\"λ com.example.Log\");");
+        assert!(result.imports.contains(owner));
+        let link = result.codes[0]
+            .links
+            .iter()
+            .find(|l| l.label.contains(".g("))
+            .unwrap();
+        assert_eq!(
+            result.codes[0]
+                .source
+                .chars()
+                .skip(link.start)
+                .take(link.end - link.start)
+                .collect::<String>(),
+            "g"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nested_member_tests {
+    use super::*;
+    const BINARY: &str = "android.content.pm.PackageInstaller$SessionInfo";
+    fn class() -> DexClass {
+        crate::native_dex::parse(include_bytes!("../../tests/fixtures/hello.dex"))
+            .unwrap()
+            .classes
+            .remove(0)
+    }
+    fn document(source: &str, names: &[&str]) -> DecompiledCode {
+        let links = names
+            .iter()
+            .map(|name| {
+                let start = source[..source.find(name).unwrap()].chars().count();
+                CodeLink {
+                    start,
+                    end: start + name.chars().count(),
+                    label: (*name).into(),
+                }
+            })
+            .collect();
+        DecompiledCode {
+            source: source.into(),
+            links,
+            definitions: vec![],
+            source_hash: crate::engine::source_identity(source),
+        }
+    }
+    #[test]
+    fn documented_member_imports_outer_owner_and_keeps_binary_navigation() {
+        let source = format!("String marker = \"λ\";\n{BINARY} info;\n");
+        let result = shorten("sample.Hello", &class(), vec![document(&source, &[BINARY])]);
+        assert_eq!(
+            result.imports,
+            BTreeSet::from(["android.content.pm.PackageInstaller".into()])
+        );
+        let code = add_imports(result.codes.into_iter().next().unwrap(), &result.imports);
+        assert!(code.source.contains("PackageInstaller.SessionInfo info;"));
+        assert!(
+            code.source
+                .contains("import android.content.pm.PackageInstaller;")
+        );
+        let link = code.links.iter().find(|link| link.label == BINARY).unwrap();
+        assert_eq!(
+            code.source
+                .chars()
+                .skip(link.start)
+                .take(link.end - link.start)
+                .collect::<String>(),
+            "PackageInstaller.SessionInfo"
+        );
+        assert_eq!(
+            code.source_hash,
+            crate::engine::source_identity(&code.source)
+        );
+    }
+    #[test]
+    fn outer_name_collisions_keep_canonical_member_fully_qualified() {
+        for source in [
+            format!("int PackageInstaller = 0;\n{BINARY} info;\n"),
+            format!("example.PackageInstaller other;\n{BINARY} info;\n"),
+        ] {
+            let mut names = vec![BINARY];
+            if source.contains("example.PackageInstaller") {
+                names.push("example.PackageInstaller");
+            }
+            let result = shorten("sample.Hello", &class(), vec![document(&source, &names)]);
+            assert!(result.imports.is_empty());
+            assert!(
+                result.codes[0]
+                    .source
+                    .contains("android.content.pm.PackageInstaller.SessionInfo info;")
+            );
+            assert!(
+                result.codes[0]
+                    .links
+                    .iter()
+                    .any(|link| link.label == BINARY)
+            );
+        }
+    }
+    #[test]
+    fn static_member_links_and_literal_binary_names_remain_exact() {
+        let source = format!("{BINARY}.CREATOR;\nString literal = \"{BINARY}\"; // {BINARY}\n");
+        let mut code = document(&source, &[BINARY]);
+        code.links.push(CodeLink {
+            start: BINARY.len() + 1,
+            end: BINARY.len() + 8,
+            label: format!("{BINARY}.CREATOR:Landroid/os/Parcelable$Creator;"),
+        });
+        let result = shorten("sample.Hello", &class(), vec![code]);
+        let code = &result.codes[0];
+        assert!(
+            code.source
+                .starts_with("PackageInstaller.SessionInfo.CREATOR;")
+        );
+        assert!(code.source.contains(&format!("\"{BINARY}\"; // {BINARY}")));
+        let link = code
+            .links
+            .iter()
+            .find(|link| link.label.contains(".CREATOR:"))
+            .unwrap();
+        assert_eq!(
+            code.source
+                .chars()
+                .skip(link.start)
+                .take(link.end - link.start)
+                .collect::<String>(),
+            "CREATOR"
+        );
+    }
+    #[test]
+    fn unproven_dollar_types_are_not_treated_as_members() {
+        let source = "example.Price$Tag item;\n";
+        let result = shorten(
+            "sample.Hello",
+            &class(),
+            vec![document(source, &["example.Price$Tag"])],
+        );
+        assert_eq!(result.codes[0].source, source);
+        assert!(result.imports.is_empty());
     }
 }

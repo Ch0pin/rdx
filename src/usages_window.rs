@@ -1,5 +1,5 @@
 //! Symbol-reference results in an independent native window.
-use crate::search::SearchHit;
+use crate::{search::SearchHit, usages::UsageMode};
 use eframe::egui;
 use std::collections::VecDeque;
 
@@ -10,6 +10,7 @@ pub struct UsagesActions {
 }
 pub struct UsagesWindow {
     pub visible: bool,
+    pub mode: UsageMode,
     pub label: String,
     pub status: String,
     pub running: bool,
@@ -25,6 +26,7 @@ impl Default for UsagesWindow {
     fn default() -> Self {
         Self {
             visible: false,
+            mode: UsageMode::Usages,
             label: String::new(),
             status: String::new(),
             running: false,
@@ -40,6 +42,7 @@ impl Default for UsagesWindow {
 }
 impl UsagesWindow {
     pub fn begin(&mut self, label: String) {
+        self.mode = UsageMode::Usages;
         self.visible = true;
         self.label = label;
         self.running = true;
@@ -50,14 +53,29 @@ impl UsagesWindow {
         self.selected_result = None;
         self.cancel_requested = false;
     }
+    pub fn begin_subclasses(&mut self, label: String) {
+        self.begin(label);
+        self.mode = UsageMode::Subclasses;
+        self.status = "Finding direct subclasses…".into();
+    }
+    pub fn begin_implementations(&mut self, label: String) {
+        self.begin(label);
+        self.mode = UsageMode::Implementations;
+        self.status = "Finding implementations…".into();
+    }
+    pub fn begin_method_xrefs(&mut self, label: String, mode: UsageMode) {
+        self.begin(label);
+        self.mode = mode;
+        self.status = format!("Finding {}…", mode.noun());
+    }
     pub fn append(&mut self, hits: Vec<SearchHit>) {
         let remaining = 1000_usize.saturating_sub(self.results.len());
         if hits.len() > remaining && self.errors.len() < 8 {
             self.errors
-                .push("Results limited to 1,000 references; coverage is partial.".into());
+                .push("Results limited to 1,000 entries; coverage is partial.".into());
         }
         self.results.extend(hits.into_iter().take(remaining));
-        self.status = format!("{} references found", self.results.len());
+        self.status = format!("{} {} found", self.results.len(), self.mode.noun());
     }
     pub fn finish(&mut self, status: String, errors: Vec<String>) {
         self.running = false;
@@ -70,7 +88,8 @@ impl UsagesWindow {
         );
     }
     pub fn error(&mut self, error: String) {
-        self.finish(format!("Find usages failed: {error}"), vec![error]);
+        let action = self.mode.title();
+        self.finish(format!("{action} failed: {error}"), vec![error]);
     }
     pub fn viewport_id() -> egui::ViewportId {
         egui::ViewportId::from_hash_of("rdx_find_usages")
@@ -82,7 +101,7 @@ impl UsagesWindow {
         ctx.show_viewport_immediate(
             Self::viewport_id(),
             egui::ViewportBuilder::default()
-                .with_title("RDX — Find usages")
+                .with_title(format!("RDX — {}", self.mode.title()))
                 .with_inner_size([1000.0, 560.0])
                 .with_min_inner_size([600.0, 280.0]),
             |ctx, _| self.show_contents(ctx),
@@ -97,7 +116,7 @@ impl UsagesWindow {
         egui::TopBottomPanel::bottom("rdx_usages_options").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.keep_open, "Keep open").on_hover_text(
-                    "Keep references available behind the code window when opening a result.",
+                    "Keep results available behind the code window when opening a result.",
                 );
                 if self.running
                     && ui
@@ -111,9 +130,18 @@ impl UsagesWindow {
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.strong("Usage for:");
+                ui.strong(match self.mode {
+                    UsageMode::Usages => "Usage for:",
+                    UsageMode::Subclasses => "Direct subclasses of:",
+                    UsageMode::Implementations => "Implementations of:",
+                    UsageMode::Callers => "Callers of:",
+                    UsageMode::Callees => "Callees of:",
+                });
                 ui.monospace(&self.label);
             });
+            if matches!(self.mode, UsageMode::Callers | UsageMode::Callees) {
+                ui.weak("DEX call sites · virtual/interface targets are declared targets. Reflection and invoke-custom targets are not resolved.");
+            }
             ui.horizontal(|ui| {
                 if self.running {
                     ui.spinner();
@@ -334,8 +362,16 @@ mod tests {
     use std::sync::Arc;
     #[test]
     fn result_click_focuses_code_and_respects_keep_open() {
-        check_result_click(true);
-        check_result_click(false);
+        for mode in [
+            UsageMode::Usages,
+            UsageMode::Subclasses,
+            UsageMode::Implementations,
+            UsageMode::Callers,
+            UsageMode::Callees,
+        ] {
+            check_result_click(true, mode);
+            check_result_click(false, mode);
+        }
     }
     #[test]
     fn viewport_is_independent_and_closing_cancels() {
@@ -358,10 +394,11 @@ mod tests {
         let _ = ctx.run(input, |ctx| assert!(window.show_contents(ctx).cancel));
         assert!(!window.visible);
     }
-    fn check_result_click(keep_open: bool) {
+    fn check_result_click(keep_open: bool, mode: UsageMode) {
         let ctx = egui::Context::default();
         let mut window = UsagesWindow {
             visible: true,
+            mode,
             keep_open,
             results: vec![SearchHit {
                 document: Arc::new(SearchDocument {
@@ -470,5 +507,12 @@ mod tests {
         assert!(!actions.cancel);
         window.begin("target".into());
         assert!(window.preview_cache.is_empty());
+        assert!(
+            window.mode == UsageMode::Usages,
+            "ordinary usages reset the result mode"
+        );
+        window.begin_subclasses("Parent".into());
+        assert!(window.mode == UsageMode::Subclasses && window.running);
+        assert!(window.status.contains("direct subclasses"));
     }
 }

@@ -52,6 +52,12 @@ pub(crate) enum Expr {
         method: Symbol,
         args: Vec<Expr>,
     },
+    #[allow(dead_code)] // constructed by the production decoder
+    FilledArray {
+        site: usize,
+        ty: Symbol,
+        elements: Vec<Expr>,
+    },
     Capture(usize),
     #[allow(dead_code)] // exercised by the standalone capture renderer tests
     New(Box<Allocation>),
@@ -115,6 +121,9 @@ impl Fragment {
         }
     }
     fn symbol(symbol: &Symbol) -> Self {
+        if symbol.label.is_empty() {
+            return Self::plain(&symbol.text);
+        }
         Self {
             text: symbol.text.clone(),
             links: vec![Link {
@@ -171,7 +180,20 @@ impl Allocation {
         dex_events: &[Event],
         locals: &[&str],
     ) -> Result<Rendered> {
+        self.render_staged_with_discarded(dex_events, locals, &[])
+    }
+
+    pub(crate) fn render_staged_with_discarded(
+        &self,
+        dex_events: &[Event],
+        locals: &[&str],
+        discarded: &[usize],
+    ) -> Result<Rendered> {
         self.validate(locals, &mut HashSet::new(), 0, &mut 0)?;
+        ensure!(
+            discarded.iter().all(|index| *index < self.captures.len()),
+            "invalid discarded capture"
+        );
         let allocate = Event::Allocate {
             site: self.site,
             ty: self.ty.label.clone(),
@@ -184,17 +206,10 @@ impl Allocation {
             dex_events.first() == Some(&allocate) && dex_events.last() == Some(&construct),
             "staged allocation boundaries mismatch"
         );
-        ensure!(
-            dex_events
-                .iter()
-                .filter(|event| matches!(event, Event::Allocate { .. } | Event::Construct { .. }))
-                .count()
-                == 2,
-            "nested staged allocation is unsupported"
-        );
         // Only backward capture dependencies are allowed. All effects must be
-        // reachable from constructor arguments; overwritten captures still fail.
-        let mut used = HashSet::new();
+        // reachable from constructor arguments or explicitly retained discarded
+        // effects (invoke results and check-casts). Other unused captures fail.
+        let mut used: HashSet<usize> = discarded.iter().copied().collect();
         for arg in &self.arguments {
             arg.flat_dependencies(self.captures.len(), &mut used)?;
         }
@@ -248,12 +263,33 @@ impl Allocation {
             chars.saturating_add(expression.text.chars().count()) <= MAX_CHARS,
             "staged allocation output exceeds budget"
         );
-        let mut expected = dex_events[1..dex_events.len() - 1].to_vec();
-        expected.push(allocate);
-        expected.push(construct);
+        // Readable staging may move allocation itself, including nested new,
+        // but must preserve every observable argument/constructor effect.
+        let effects = |events: &[Event]| {
+            events
+                .iter()
+                .filter(|event| !matches!(event, Event::Allocate { .. }))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         ensure!(
-            events == expected,
+            effects(&events) == effects(dex_events),
             "staged allocation changes nonallocation effect order"
+        );
+        let allocations = |events: &[Event]| {
+            let mut sites = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Allocate { site, ty } => Some((*site, ty.clone())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            sites.sort();
+            sites
+        };
+        ensure!(
+            allocations(&events) == allocations(dex_events),
+            "staged allocation changes allocation identities"
         );
         Ok(Rendered {
             declarations,
@@ -322,7 +358,21 @@ impl Allocation {
             Expr::Boolean(_) | Expr::Char(_) | Expr::Null => {}
             Expr::Cast { ty, value } | Expr::CheckCast { ty, value, .. } => {
                 ensure!(
-                    !ty.text.is_empty() && !ty.label.is_empty(),
+                    !ty.text.is_empty()
+                        && (!ty.label.is_empty()
+                            || (matches!(expression, Expr::Cast { .. })
+                                && ty.text.ends_with("[]")
+                                && matches!(
+                                    ty.text.trim_end_matches("[]"),
+                                    "boolean"
+                                        | "byte"
+                                        | "char"
+                                        | "short"
+                                        | "int"
+                                        | "long"
+                                        | "float"
+                                        | "double"
+                                ))),
                     "invalid allocation cast type"
                 );
                 Self::validate_expr(value, locals, names, depth + 1, nodes)?;
@@ -337,6 +387,12 @@ impl Allocation {
                 !ty.text.is_empty() && !ty.label.is_empty(),
                 "invalid allocation class literal"
             ),
+            Expr::FilledArray { ty, elements, .. } => {
+                ensure!(ty.text.ends_with("[]"), "invalid filled array type");
+                for element in elements {
+                    Self::validate_expr(element, locals, names, depth + 1, nodes)?;
+                }
+            }
             Expr::Capture(_) => {}
             Expr::FieldRead {
                 receiver, field, ..
@@ -429,9 +485,21 @@ impl Expr {
                     arg.flat_dependencies(before, used)?;
                 }
             }
-            Self::New(_) | Self::SharedNew { .. } => {
-                anyhow::bail!("nested staged allocation is unsupported")
+            Self::FilledArray { elements, .. } => {
+                for element in elements {
+                    element.flat_dependencies(before, used)?;
+                }
             }
+            Self::SharedNew { allocation, .. } => {
+                ensure!(
+                    allocation.captures.is_empty(),
+                    "shared allocation has private captures"
+                );
+                for argument in &allocation.arguments {
+                    argument.flat_dependencies(before, used)?;
+                }
+            }
+            Self::New(_) => anyhow::bail!("private nested staged allocation is unsupported"),
             _ => {}
         }
         Ok(())
@@ -451,6 +519,12 @@ impl Expr {
                 target.declarations(out)?;
                 for arg in args {
                     arg.declarations(out)?;
+                }
+                Ok(())
+            }
+            Self::FilledArray { elements, .. } => {
+                for element in elements {
+                    element.declarations(out)?;
                 }
                 Ok(())
             }
@@ -558,6 +632,23 @@ impl<'a> CaptureRenderer<'a> {
                     site: *site,
                     method: method.label.clone(),
                 });
+                Ok(result)
+            }
+            Expr::FilledArray { site, ty, elements } => {
+                let mut result = Fragment::plain("new ");
+                result.append(Fragment::symbol(ty));
+                result.append(Fragment::plain(" {"));
+                self.events.push(Event::Allocate {
+                    site: *site,
+                    ty: ty.text.clone(),
+                });
+                for (index, element) in elements.iter().enumerate() {
+                    if index != 0 {
+                        result.append(Fragment::plain(", "));
+                    }
+                    result.append(self.expression(element)?);
+                }
+                result.append(Fragment::plain("}"));
                 Ok(result)
             }
             Expr::Capture(index) => self.capture(*index),

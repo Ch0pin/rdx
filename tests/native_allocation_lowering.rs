@@ -402,7 +402,7 @@ fn captured_reference_widening_keeps_declared_overload_and_single_evaluation() {
 fn captured_reference_conversion_rejects_unproven_or_missing_hierarchy() {
     for (target, hierarchy) in [
         ("Lunknown/Interface;", true),
-        ("Ljava/lang/Object;", false),
+        ("Lunknown/Interface;", false),
         ("Ljava/lang/String;", true),
     ] {
         let c = captured_reference_argument(target, hierarchy);
@@ -441,7 +441,7 @@ fn check_cast_argument_stays_after_allocation_and_preserves_link() {
 }
 
 #[test]
-fn unused_effectful_check_cast_cannot_be_dropped_or_hoisted() {
+fn unused_effectful_check_cast_is_retained_under_readable_staging_policy() {
     let mut c = class(
         vec![0x0022, 0, 0x021f, 1, 0x1070, 0, 0, 0x0011],
         vec!["<init>"],
@@ -450,7 +450,11 @@ fn unused_effectful_check_cast_cannot_be_dropped_or_hoisted() {
     Arc::get_mut(&mut c.symbols).unwrap().protos[1] = ("V".into(), vec![]);
     c.methods[0].parameters = vec!["Ljava/lang/Object;".into()];
     c.methods[0].code.as_mut().unwrap().ins = 1;
-    assert!(native_java::render_method("sample.Test", &c, &c.methods[0]).is_err());
+    let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    let cast = code.source.find("((sample.Source) p0)").unwrap();
+    let construct = code.source.find("new sample.A()").unwrap();
+    assert!(cast < construct, "{}", code.source);
+    assert_eq!(code.source.matches("((sample.Source) p0)").count(), 1);
 }
 
 #[test]
@@ -520,5 +524,154 @@ fn reversed_constructor_cast_arguments_use_ordered_temporary_statements() {
             .take(link.end - link.start)
             .collect();
         assert_eq!(token, label);
+    }
+}
+
+#[test]
+fn object_typed_provider_capture_keeps_explicit_interface_cast() {
+    let mut class = class(
+        vec![
+            0x0022, 0, 0x0071, 0, 0, 0x010c, 0x1072, 1, 1, 0x010a, 0x2070, 2, 0x0010, 0x0011,
+        ],
+        vec!["provider", "value", "<init>"],
+        vec![(1, 5, 0), (1, 0, 1), (0, 1, 2)],
+    );
+    Arc::get_mut(&mut class.symbols)
+        .unwrap()
+        .protos
+        .push(("Ljava/lang/Object;".into(), vec![]));
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("sample.Source)"), "{}", code.source);
+    assert_eq!(code.source.matches(".provider()").count(), 1);
+    assert_eq!(code.source.matches(".value()").count(), 1);
+    assert!(
+        code.links
+            .iter()
+            .any(|link| link.label == "sample.Source.value()I")
+    );
+}
+
+#[test]
+fn long_allocation_window_remains_bounded() {
+    for (length, supported) in [(70, true), (130, true), (260, false)] {
+        let mut words = vec![0x0022, 0];
+        words.extend(std::iter::repeat_n(0x0112, length));
+        words.extend([0x0071, 0, 0, 0x010a, 0x2070, 1, 0x0010, 0x0011]);
+        let class = class(words, vec!["value", "<init>"], vec![(1, 0, 0), (0, 1, 1)]);
+        let result = native_java::render_method("sample.Test", &class, &class.methods[0]);
+        assert_eq!(result.is_ok(), supported, "{result:?}");
+    }
+}
+
+#[test]
+fn object_widening_does_not_require_platform_classes_in_apk() {
+    let class = captured_reference_argument("Ljava/lang/Object;", false);
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert_eq!(code.source.matches("sample.Source.boxed()").count(), 1);
+    assert!(
+        code.links
+            .iter()
+            .any(|link| link.label == "sample.A.<init>(Ljava/lang/Object;)V")
+    );
+}
+
+#[test]
+fn long_linear_allocation_window_is_bounded_and_preserves_call() {
+    fn fixture(padding: usize) -> DexClass {
+        let mut words = vec![0x0022, 0, 0x0071, 0, 0, 0x010a];
+        words.extend(std::iter::repeat_n(0x0212, padding));
+        words.extend([0x2070, 1, 0x0010, 0x0011]);
+        class(words, vec!["next", "<init>"], vec![(1, 0, 0), (0, 1, 1)])
+    }
+    let class = fixture(130);
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert_eq!(code.source.matches("sample.Source.next()").count(), 1);
+    assert!(code.source.contains("new sample.A("));
+    let over_budget = fixture(260);
+    assert!(
+        native_java::render_method("sample.Test", &over_budget, &over_budget.methods[0]).is_err()
+    );
+}
+
+#[test]
+fn overwritten_cast_in_constructor_arguments_is_still_executed() {
+    let mut class = class(
+        vec![
+            0x0022, 0, 0x0071, 0, 0, 0x010c, 0x011f, 3, 0x1112, 0x2070, 1, 0x0010, 0x0011,
+        ],
+        vec!["next", "<init>"],
+        vec![(1, 0, 0), (0, 1, 1)],
+    );
+    Arc::get_mut(&mut class.symbols).unwrap().protos[0].0 = "Ljava/lang/Object;".into();
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    let call = code.source.find("sample.Source.next()").unwrap();
+    let check = code.source.find("((java.lang.String)").unwrap();
+    let construct = code.source.find("new sample.A(").unwrap();
+    assert!(call < check && check < construct, "{}", code.source);
+    assert_eq!(code.source.matches("sample.Source.next()").count(), 1);
+}
+
+#[test]
+fn constructor_argument_guarded_integer_copy_and_add() {
+    // static make(int input): default=1; new A; if input!=0 copy input;
+    // subtract one and call A(int). The allocation cannot escape into the guard.
+    let words = vec![
+        0x1112, 0x0022, 0, 0x0239, 3, 0x0228, 0x2101, 0xf212, 0x21b0, 0x2070, 0, 0x0010, 0x0011,
+    ];
+    let mut c = class(words, vec!["<init>"], vec![(0, 1, 0)]);
+    c.methods[0].parameters = vec!["I".into()];
+    c.methods[0].code.as_mut().unwrap().ins = 1;
+    let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    assert!(code.source.contains("p0 != 0 ? p0 : 1"), "{}", code.source);
+    assert!(code.source.contains("+ -1"), "{}", code.source);
+    assert_eq!(code.source.matches("new sample.A").count(), 1);
+    assert!(code.links.iter().any(|l| l.label == "sample.A.<init>(I)V"));
+
+    // Both branch polarities preserve which path performs the copy.
+    c.methods[0].code.as_mut().unwrap().instructions[3] = 0x0238;
+    let inverse = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    assert!(inverse.source.contains("p0 == 0 ? p0 : 1"));
+
+    // Reference copy / use of the uninitialized allocation must stay rejected.
+    c.methods[0].code.as_mut().unwrap().instructions[6] = 0x0107;
+    assert!(native_java::render_method("sample.Test", &c, &c.methods[0]).is_err());
+}
+
+#[test]
+fn filled_array_arguments_preserve_order_in_both_dex_encodings() {
+    for array in [[0x2024, 5, 0x0021], [0x0225, 5, 1]] {
+        let mut words = vec![0x0022, 0, 0x011a, 1, 0x021a, 2];
+        words.extend(array);
+        words.extend([0x010c, 0x2070, 0, 0x0010, 0x0011]);
+        let mut c = class(words, vec!["<init>", "first", "second"], vec![(0, 0, 0)]);
+        let symbols = Arc::get_mut(&mut c.symbols).unwrap();
+        symbols.types.push("[Ljava/lang/String;".into());
+        symbols.protos[0] = ("V".into(), vec!["[Ljava/lang/String;".into()]);
+        let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+        assert!(
+            code.source.contains("new java.lang.String[]"),
+            "{}",
+            code.source
+        );
+        assert!(code.source.find("\"first\"").unwrap() < code.source.find("\"second\"").unwrap());
+        assert_eq!(code.source.matches("\"first\"").count(), 1);
+        assert_eq!(code.source.matches("\"second\"").count(), 1);
+        assert_eq!(code.source.matches("new sample.A").count(), 1);
+        Arc::get_mut(&mut c.symbols).unwrap().types[5] = "[J".into();
+        assert!(native_java::render_method("sample.Test", &c, &c.methods[0]).is_err());
+        let symbols = Arc::get_mut(&mut c.symbols).unwrap();
+        symbols.types[5] = "[I".into();
+        symbols.protos[0] = ("V".into(), vec!["[I".into()]);
+        let mut words = vec![0x0022, 0, 0x1112, 0x2212];
+        words.extend(array);
+        words.extend([0x010c, 0x2070, 0, 0x0010, 0x0011]);
+        c.methods[0].code.as_mut().unwrap().instructions = words;
+        let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+        assert!(code.source.contains("new int[]"), "{}", code.source);
+        assert!(
+            code.links
+                .iter()
+                .all(|link| link.label != "[I" && link.label != "int")
+        );
     }
 }

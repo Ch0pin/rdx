@@ -46,7 +46,12 @@ pub(super) fn run(
                 Some(value) => value,
                 None => {
                     cache.source_fetches += 1;
-                    match engine.decompile_with_metadata(name) {
+                    let rendered = engine.decompile_search_cancellable(name, cancel);
+                    if cancel.load(Ordering::Relaxed) {
+                        summary.cancelled = true;
+                        break;
+                    }
+                    match rendered {
                         Ok(code) => {
                             let document = Arc::new(SearchDocument {
                                 target: key.clone(),

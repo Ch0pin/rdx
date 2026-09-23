@@ -511,3 +511,184 @@ fn staged_output_rejects_unused_and_forward_capture_dependencies() {
     a.captures[0].expression = Expr::Capture(0);
     assert!(a.render_staged_checked(&events, &["input"]).is_err());
 }
+
+#[test]
+fn primitive_array_null_casts_preserve_overloads_without_fake_links() {
+    for base in [
+        "boolean", "byte", "char", "short", "int", "long", "float", "double",
+    ] {
+        for dimensions in [1, 2, 3] {
+            let ty = format!("{base}{}", "[]".repeat(dimensions));
+            let allocation = Allocation {
+                site: 1,
+                constructor_site: 2,
+                ty: symbol("Holder", "sample.Holder"),
+                captures: vec![],
+                arguments: vec![Expr::Cast {
+                    ty: symbol(&ty, ""),
+                    value: Box::new(Expr::Null),
+                }],
+            };
+            let events = [
+                Event::Allocate {
+                    site: 1,
+                    ty: "sample.Holder".into(),
+                },
+                Event::Construct {
+                    site: 2,
+                    ty: "sample.Holder".into(),
+                },
+            ];
+            let rendered = allocation.render_checked(&events, &[]).unwrap();
+            assert_eq!(rendered.expression, format!("new Holder((({ty}) null))"));
+            assert_eq!(rendered.events, events);
+            assert!(
+                rendered
+                    .links
+                    .iter()
+                    .all(|link| link.label == "sample.Holder")
+            );
+        }
+    }
+}
+
+#[test]
+fn explicitly_discarded_calls_are_emitted_once_in_order() {
+    let allocation = Allocation {
+        site: 1,
+        constructor_site: 4,
+        ty: symbol("Holder", "sample.Holder"),
+        captures: vec![
+            Capture {
+                ty: "boolean".into(),
+                name: "first".into(),
+                expression: call(2, "first", vec![]),
+            },
+            Capture {
+                ty: "boolean".into(),
+                name: "second".into(),
+                expression: call(3, "second", vec![]),
+            },
+        ],
+        arguments: vec![],
+    };
+    let events = [
+        Event::Allocate {
+            site: 1,
+            ty: "sample.Holder".into(),
+        },
+        Event::Call {
+            site: 2,
+            method: "first".into(),
+        },
+        Event::Call {
+            site: 3,
+            method: "second".into(),
+        },
+        Event::Construct {
+            site: 4,
+            ty: "sample.Holder".into(),
+        },
+    ];
+    assert!(
+        allocation
+            .render_staged_checked(&events, &["source"])
+            .is_err()
+    );
+    let rendered = allocation
+        .render_staged_with_discarded(&events, &["source"], &[0, 1])
+        .unwrap();
+    assert_eq!(
+        rendered.declarations,
+        [
+            "boolean first = source.first();",
+            "boolean second = source.second();"
+        ]
+    );
+    assert_eq!(rendered.expression, "new Holder()");
+    assert_eq!(
+        rendered.events,
+        [
+            events[1].clone(),
+            events[2].clone(),
+            events[0].clone(),
+            events[3].clone()
+        ]
+    );
+}
+
+#[test]
+fn nested_staging_preserves_constructor_and_call_order() {
+    let a = Allocation {
+        site: 1,
+        constructor_site: 8,
+        ty: symbol("Outer", "Outer"),
+        captures: vec![
+            Capture {
+                ty: "int".into(),
+                name: "arg".into(),
+                expression: call(3, "read", vec![]),
+            },
+            Capture {
+                ty: "Inner".into(),
+                name: "inner".into(),
+                expression: Expr::SharedNew {
+                    allocation: Box::new(Allocation {
+                        site: 2,
+                        constructor_site: 4,
+                        ty: symbol("Inner", "Inner"),
+                        captures: vec![],
+                        arguments: vec![Expr::Capture(0)],
+                    }),
+                    constructor_label: "Inner.<init>(I)V".into(),
+                },
+            },
+            Capture {
+                ty: "Object".into(),
+                name: "result".into(),
+                expression: call(6, "finish", vec![Expr::Capture(1)]),
+            },
+        ],
+        arguments: vec![Expr::Capture(2)],
+    };
+    let events = vec![
+        Event::Allocate {
+            site: 1,
+            ty: "Outer".into(),
+        },
+        Event::Allocate {
+            site: 2,
+            ty: "Inner".into(),
+        },
+        Event::Call {
+            site: 3,
+            method: "read".into(),
+        },
+        Event::Construct {
+            site: 4,
+            ty: "Inner".into(),
+        },
+        Event::Call {
+            site: 6,
+            method: "finish".into(),
+        },
+        Event::Construct {
+            site: 8,
+            ty: "Outer".into(),
+        },
+    ];
+    let result = a.render_staged_checked(&events, &["source"]).unwrap();
+    assert_eq!(result.declarations.len(), 3);
+    assert!(result.declarations[1].contains("new Inner(arg)"));
+    assert!(
+        result.declaration_links[1]
+            .iter()
+            .any(|l| l.label == "Inner.<init>(I)V")
+    );
+    let mut reordered = events.clone();
+    reordered.swap(2, 4);
+    assert!(a.render_staged_checked(&reordered, &["source"]).is_err());
+    let mut missing = events.clone();
+    missing.remove(1);
+    assert!(a.render_staged_checked(&missing, &["source"]).is_err());
+}

@@ -389,7 +389,13 @@ impl SearchWindow {
                                 self.query.excluded_packages =
                                     crate::settings::default_excluded_packages();
                             }
-                            if ui.button("Include all").clicked() {
+                            if ui
+                                .add_enabled(
+                                    !self.query.excluded_packages.is_empty(),
+                                    egui::Button::new("Remove All"),
+                                )
+                                .clicked()
+                            {
                                 self.query.excluded_packages.clear();
                             }
                         });
@@ -633,6 +639,24 @@ impl SearchWindow {
         }
         let mode_changed = std::mem::take(&mut self.mode_changed);
         if before != self.query || mode_changed || (self.auto_search && !auto_before) {
+            if before != self.query {
+                // The worker still owns the previous query until its cancellation
+                // completes. Do not present its queued batches as new-query hits.
+                self.stale_scope = self.running;
+                self.results.clear();
+                self.preview_cache.clear();
+                self.selected_result = None;
+                self.errors.clear();
+                self.scanned = 0;
+                self.total = 0;
+                self.hits = 0;
+                self.skipped = 0;
+                self.status = if self.auto_search {
+                    "Waiting to search updated query…".into()
+                } else {
+                    "Query changed — select Search to run it.".into()
+                };
+            }
             self.changed_at = self.auto_search.then(Instant::now);
             if self.running && !self.cancel_requested {
                 self.cancel_requested = true;
@@ -718,6 +742,65 @@ mod tests {
         window.finish(SearchSummary::default());
         assert!(!window.running);
         assert!(window.status.starts_with("Class search"));
+    }
+
+    #[test]
+    fn typing_cancels_old_query_ignores_updates_and_debounces_latest_text() {
+        let ctx = egui::Context::default();
+        let mut window = SearchWindow {
+            visible: true,
+            auto_search: true,
+            ..Default::default()
+        };
+        window.query.text = "ScreenshotsActivityV2".into();
+        window.begin();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            window.show_contents(ctx, false);
+            ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("rdx_search_query")));
+        });
+        for (index, suffix) in [" extends onj", " implements onm"].into_iter().enumerate() {
+            let input = egui::RawInput {
+                events: vec![egui::Event::Text(suffix.into())],
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                let actions = window.show_contents(ctx, false);
+                assert_eq!(actions.cancel, index == 0);
+                assert!(actions.start.is_none());
+            });
+            assert!(window.stale_scope);
+            window.update(SearchUpdate::Progress {
+                scanned: 14,
+                total: 100,
+                hits: 9,
+                skipped: 2,
+            });
+            assert_eq!(window.scanned, 0);
+            assert_eq!(window.hits, 0);
+        }
+        assert_eq!(
+            window.query.text,
+            "ScreenshotsActivityV2 extends onj implements onm"
+        );
+        // Even an elapsed debounce must not launch another engine-owning worker.
+        window.changed_at = Some(Instant::now() - Duration::from_secs(1));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            assert!(window.show_contents(ctx, false).start.is_none());
+        });
+        let mut summary = SearchSummary::default();
+        summary.cancelled = true;
+        summary.hits = 9;
+        window.finish(summary);
+        assert!(window.status.contains("updated query"));
+        let mut started = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            started = window.show_contents(ctx, true).start;
+        });
+        assert_eq!(started.unwrap().text, window.query.text);
+        assert!(window.changed_at.is_none());
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            assert!(window.show_contents(ctx, true).start.is_none());
+        });
     }
 
     #[test]

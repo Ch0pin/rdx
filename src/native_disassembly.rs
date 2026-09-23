@@ -81,10 +81,22 @@ impl Output {
     }
 }
 pub fn render(name: &str, class: &DexClass) -> DecompiledCode {
-    let mut out = Output::default();
-    out.push(
+    render_with_header(
+        name,
+        class,
         "// Native DEX disassembly. Java control-flow/type reconstruction is not yet available.\n",
-    );
+    )
+}
+pub fn render_call_sites(name: &str, class: &DexClass) -> DecompiledCode {
+    render_with_header(
+        name,
+        class,
+        "// Native DEX disassembly. Exact method call sites; Go to declaration opens Java source when available.\n",
+    )
+}
+fn render_with_header(name: &str, class: &DexClass, header: &str) -> DecompiledCode {
+    let mut out = Output::default();
+    out.push(header);
     out.push(".class ");
     out.definition("class", name, name);
     out.push(&format!("  // access=0x{:x}\n", class.access_flags));

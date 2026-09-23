@@ -205,3 +205,52 @@ approach. Unlike upstream's broader reorder classifications, RDX still checks
 all recorded cast/call/read/string events in their original order. The intentional
 allocation relocation can change class-initialization, linkage and allocation
 failure timing; output coverage does not establish full semantic equivalence.
+
+## Synchronized-region reconstruction
+
+`src/native_java/synchronized.rs` adapts the entry/body/monitor-exit reconstruction
+approach of pinned `jadx-core/src/main/java/jadx/core/dex/visitors/regions/maker/SynchronizedRegionMaker.java`.
+The Rust implementation adds bounded CFG traversal, decoded register-write and
+exception coverage checks, exact cleanup validation, and conservative rejection of
+nested/multiple-release/mixed exception shapes. It is a partial implementation,
+not a complete port of the upstream region maker. Original SPDX/license terms
+and notices remain covered by the files above.
+
+## Class and package display aliases
+
+`native_java/names.rs` follows the separation of original identity and valid
+source aliases in pinned JADX's
+[`RenameVisitor.java`](https://github.com/skylot/jadx/blob/28ff15e4ae69950aebea110a13e5ab895d234dfc/jadx-core/src/main/java/jadx/core/dex/visitors/rename/RenameVisitor.java),
+particularly `checkClassName` and `checkPackage`. RDX uses its existing injective
+UTF-8 hex alias scheme rather than JADX's configurable alias provider and global
+collision pass. Headers, constructors, type operands and imports use aliases;
+source links retain original DEX names. This is not a full RenameVisitor port.
+
+The synchronized-region subset additionally handles a nonthrowing loop latch
+outside the DEX protected interval and emits loops wholly inside a proven monitor
+region. It retains the pinned maker's monitor-region separation while requiring
+coverage for every throwing body instruction other than the proven release.
+
+## Nested duplicate-cleanup reconstruction
+
+`native_java/finally_regions.rs` uses the duplicated-cleanup recognition approach
+of pinned JADX's [MarkFinallyVisitor.java](https://github.com/skylot/jadx/blob/28ff15e4ae69950aebea110a13e5ab895d234dfc/jadx-core/src/main/java/jadx/core/dex/visitors/finaly/MarkFinallyVisitor.java).
+This is a bounded Rust subset, not a full visitor port: one stable-input void
+cleanup invocation, one normal copy, a catch-all rethrow, and an enclosing typed
+catch with terminal paths. It checks original per-instruction exception dispatch,
+control-flow boundaries, cleanup operands and source links before emitting.
+Unsupported nested layouts still fall back.
+
+Exact Android framework exception metadata is based on the platform declarations:
+[ActivityNotFoundException](https://developer.android.com/reference/android/content/ActivityNotFoundException),
+[RemoteException](https://developer.android.com/reference/android/os/RemoteException),
+and [IBinder.transact](https://developer.android.com/reference/android/os/IBinder#transact(int,android.os.Parcel,android.os.Parcel,int)).
+
+## Frida clipboard action
+
+The method-snippet UI and logging format in `src/frida_snippet.rs` follow
+[JADX FridaAction](https://github.com/skylot/jadx/blob/master/jadx-gui/src/main/java/jadx/gui/ui/action/FridaAction.java).
+The Rust generator reads exact DEX symbol descriptors, always selects the exact
+overload, uses positional argument names, and calls that captured overload.
+Each snippet is scoped inside `Java.perform` so pasted snippets cannot overwrite
+one another's method handles. Class-wide and field snippets are not implemented.

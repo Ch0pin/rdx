@@ -7,6 +7,36 @@ use std::sync::{
 };
 use std::time::Instant;
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum UsageMode {
+    #[default]
+    Usages,
+    Subclasses,
+    Implementations,
+    Callers,
+    Callees,
+}
+impl UsageMode {
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Usages => "references",
+            Self::Subclasses => "direct subclasses",
+            Self::Implementations => "implementations",
+            Self::Callers => "caller sites",
+            Self::Callees => "callee sites",
+        }
+    }
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Usages => "Find usages",
+            Self::Subclasses => "Find direct subclasses",
+            Self::Implementations => "Find implementations",
+            Self::Callers => "Find callers",
+            Self::Callees => "Find callees",
+        }
+    }
+}
+
 pub enum UsageUpdate {
     Target(String),
     Batch(Vec<SearchHit>),
@@ -44,6 +74,7 @@ pub fn collect(
     };
     emit(UsageUpdate::Target(target.label));
     collect_owners(
+        UsageMode::Usages,
         target.classes,
         cancel,
         started,
@@ -52,13 +83,110 @@ pub fn collect(
     )
 }
 
+pub fn collect_subclasses(
+    engine: &mut NativeEngine,
+    class: &str,
+    offset: usize,
+    hash: &str,
+    cancel: &AtomicBool,
+    mut emit: impl FnMut(UsageUpdate),
+) -> UsageSummary {
+    let started = Instant::now();
+    if cancel.load(Ordering::Relaxed) {
+        return UsageSummary {
+            status: "Subclass search cancelled".into(),
+            errors: vec![],
+        };
+    }
+    let (target, children) = match engine.direct_subclasses_at(class, offset, hash) {
+        Ok(result) => result,
+        Err(error) => {
+            return UsageSummary {
+                status: "Find direct subclasses failed".into(),
+                errors: vec![format!("{error:#}")],
+            };
+        }
+    };
+    emit(UsageUpdate::Target(target));
+    collect_owners(
+        UsageMode::Subclasses,
+        children,
+        cancel,
+        started,
+        |child| engine.class_declaration_result(child),
+        emit,
+    )
+}
+
+pub fn collect_implementations(
+    engine: &mut NativeEngine,
+    class: &str,
+    offset: usize,
+    hash: &str,
+    cancel: &AtomicBool,
+    mut emit: impl FnMut(UsageUpdate),
+) -> UsageSummary {
+    let started = Instant::now();
+    let (target, implementations) = match engine.implementations_at(class, offset, hash, cancel) {
+        Ok(result) => result,
+        Err(error) => {
+            return UsageSummary {
+                status: "Find implementations stopped".into(),
+                errors: vec![format!("{error:#}")],
+            };
+        }
+    };
+    emit(UsageUpdate::Target(target));
+    collect_owners(
+        UsageMode::Implementations,
+        implementations,
+        cancel,
+        started,
+        |symbol| engine.implementation_result(symbol),
+        emit,
+    )
+}
+
+pub fn collect_method_xrefs(
+    engine: &mut NativeEngine,
+    class: &str,
+    offset: usize,
+    hash: &str,
+    cancel: &AtomicBool,
+    mode: UsageMode,
+    mut emit: impl FnMut(UsageUpdate),
+) -> UsageSummary {
+    let started = Instant::now();
+    let callers = mode == UsageMode::Callers;
+    let target = match engine.resolve_method_xref_target(class, offset, hash, callers) {
+        Ok(target) => target,
+        Err(error) => {
+            return UsageSummary {
+                status: "Method references unavailable".into(),
+                errors: vec![format!("{error:#}")],
+            };
+        }
+    };
+    emit(UsageUpdate::Target(target.label));
+    collect_owners(
+        mode,
+        target.classes,
+        cancel,
+        started,
+        |owner| engine.method_xrefs_in_class(&target.id, owner, callers, cancel),
+        emit,
+    )
+}
+
 fn collect_owners(
+    mode: UsageMode,
     owners: Vec<String>,
     cancel: &AtomicBool,
     started: Instant,
     mut fetch: impl FnMut(&str) -> anyhow::Result<ClassUsages>,
     mut emit: impl FnMut(UsageUpdate),
 ) -> UsageSummary {
+    let noun = mode.noun();
     let total = owners.len();
     let (mut scanned, mut count, mut retained) = (0, 0, 0);
     let mut limited = false;
@@ -124,7 +252,7 @@ fn collect_owners(
         }
         scanned += 1;
         emit(UsageUpdate::Progress(format!(
-            "Finding references: {scanned}/{total} classes · {count} usages"
+            "Finding {noun}: {scanned}/{total} classes · {count} results"
         )));
         if count >= 1000 {
             limited |= scanned < total;
@@ -134,13 +262,23 @@ fn collect_owners(
     let state = if cancel.load(Ordering::Relaxed) {
         "Cancelled — partial results"
     } else if limited || !errors.is_empty() {
-        "Partial usage results"
+        match mode {
+            UsageMode::Usages => "Partial usage results",
+            UsageMode::Subclasses => "Partial subclass results",
+            UsageMode::Implementations => "Partial implementation results",
+            UsageMode::Callers | UsageMode::Callees => "Partial call references",
+        }
     } else {
-        "Usages complete"
+        match mode {
+            UsageMode::Usages => "Usages complete",
+            UsageMode::Subclasses => "Direct subclasses complete",
+            UsageMode::Implementations => "Implementations complete",
+            UsageMode::Callers | UsageMode::Callees => "Call references complete",
+        }
     };
     UsageSummary {
         status: format!(
-            "{state}: {count} references · {scanned}/{total} classes · {:.2} s",
+            "{state}: {count} {noun} · {scanned}/{total} classes · {:.2} s",
             started.elapsed().as_secs_f64()
         ),
         errors,
@@ -252,6 +390,7 @@ mod tests {
         let owners: Vec<_> = (0..41).map(|i| i.to_string()).collect();
         let mut hits = Vec::new();
         let summary = collect_owners(
+            UsageMode::Usages,
             owners,
             &AtomicBool::new(false),
             Instant::now(),
@@ -284,6 +423,7 @@ mod tests {
     fn actual_retained_sources_remain_bounded() {
         let mut batches = 0;
         let summary = collect_owners(
+            UsageMode::Usages,
             vec!["one".into(), "two".into()],
             &AtomicBool::new(false),
             Instant::now(),
@@ -313,6 +453,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let mut fetched = 0;
         let summary = collect_owners(
+            UsageMode::Usages,
             vec!["one".into(), "two".into()],
             &cancel,
             Instant::now(),

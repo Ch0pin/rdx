@@ -44,7 +44,7 @@ fn allocation_casts_and_messages_render_with_ordered_temporary_values() {
         if method == "x" {
             let checks: Vec<_> = body
                 .lines()
-                .filter(|line| line.contains("= ((bdzh)") || line.contains("= ((wrt)"))
+                .filter(|line| line.contains("= (bdzh)") || line.contains("= (wrt)"))
                 .collect();
             assert_eq!(checks.len(), 4, "{body}");
             for pair in checks.as_chunks::<2>().0 {
@@ -140,14 +140,24 @@ fn app_discovery_readability_preserves_call_order_and_navigation() {
     let code = engine.decompile_with_metadata(class).unwrap();
     assert!(!code.source.contains(".end method"), "{}", code.source);
     assert!(code.source.contains("if (this.a.e())"), "{}", code.source);
-    assert!(code.source.contains("if (v6 == null)"));
-    assert!(code.source.contains("if (v8 == null)"));
+    assert!(code.source.contains("onCreate(Bundle bundle)"));
+    assert!(code.source.contains("if (intent == null)"));
+    assert!(code.source.contains("if (data == null)"));
+    assert!(code.source.contains("((rdq) aqkw.e(rdq.class)).p(this);"));
+    assert!(
+        code.source
+            .contains("FinskyLog.e(\"Found suggestion intent: %s\", intent);")
+    );
+    assert!(
+        code.source
+            .contains("import com.google.android.finsky.utils.FinskyLog;")
+    );
     assert!(!code.source.contains("!= false"));
     assert!(!code.source.contains("== false"));
     assert!(!code.source.contains("((Object) v1)"));
     let first = code.source.find("AppDiscoveryVulnerabilityFix").unwrap();
     let second = code.source.find(".startsWith(").unwrap();
-    let branch = code.source.find("if (v11)").unwrap();
+    let branch = code.source.find("if (flag && !startsWith)").unwrap();
     assert!(first < second && second < branch);
     let mut checked = 0;
     for link in &code.links {
@@ -166,8 +176,98 @@ fn app_discovery_readability_preserves_call_order_and_navigation() {
                     .id,
                 link.label
             );
+            if link.label == "aqtw.e()Z" {
+                let destination = engine
+                    .navigate(class, link.start, &code.source_hash)
+                    .unwrap();
+                assert_eq!(destination.class, "aqtp");
+                assert!(destination.code.definitions.iter().any(|definition| {
+                    definition.start == destination.position && definition.name == "e"
+                }));
+                assert_eq!(
+                    engine
+                        .resolve_usage_target(
+                            &destination.class,
+                            destination.position,
+                            &destination.code.source_hash
+                        )
+                        .unwrap()
+                        .id,
+                    "aqtp.e()Z"
+                );
+            }
             checked += 1;
         }
     }
     assert!(checked >= 2);
+}
+
+#[test]
+#[ignore = "Set RDX_TEST_APK to the reported Play Store APK and run --ignored"]
+fn session_details_readability_and_navigation() {
+    let path = std::env::var_os("RDX_TEST_APK").expect("RDX_TEST_APK required");
+    let mut engine = NativeEngine::start().unwrap();
+    engine.open(std::path::Path::new(&path)).unwrap();
+    let class = "com.google.android.finsky.sessiondetailsactivity.SessionDetailsActivity";
+    let code = engine.decompile_with_metadata(class).unwrap();
+    println!("{}", code.source);
+    assert!(!code.source.contains(".end method"));
+    assert!(!code.source.contains("= aefa2.getClass()"));
+    assert!(code.source.contains("aefa2.getClass();"));
+    assert!(!code.source.contains("classValue"));
+    assert!(
+        code.source
+            .contains("aefa aefa2 = (aefa) aqkw.e(aefa.class);")
+    );
+    assert!(code.source.contains("cgtv.aI(aefa2, aefa.class);"));
+    assert!(
+        code.source
+            .contains("cgtv.aI(this, SessionDetailsActivity.class);")
+    );
+    assert!(code.source.contains("this.a = ceyw.b(atum2.d);"));
+    assert!(code.source.contains("this.b = ceyw.b(atum2.e);"));
+    assert!(code.source.contains("this.c = ceyw.b(atum2.f);"));
+    assert!(!code.source.contains("boolean flag"));
+    assert!(code.source.contains("PackageInstaller.SessionInfo"));
+    assert!(!code.source.contains("PackageInstaller$SessionInfo"));
+    let failure = code
+        .source
+        .find(").b();")
+        .expect("kill-switch failure call");
+    let normal = code
+        .source
+        .find("kill_switch_ignore_session_details_intents")
+        .unwrap();
+    assert!(
+        failure < normal,
+        "failure must be an early return before the normal path"
+    );
+    assert!(
+        code.source.contains(" ? "),
+        "null branch should use conditional assignment"
+    );
+    assert!(
+        !code
+            .source
+            .contains("String appPackageName = sessionInfo.getAppPackageName();")
+    );
+    assert!(!code.source.contains("((Object) this)"));
+
+    for link in &code.links {
+        assert!(link.start < link.end && link.end <= code.source.chars().count());
+        if link.label == "aqtw.e()Z" {
+            let visible: String = code
+                .source
+                .chars()
+                .skip(link.start)
+                .take(link.end - link.start)
+                .collect();
+            assert_eq!(visible, "e");
+            let destination = engine
+                .navigate(class, link.start, &code.source_hash)
+                .unwrap();
+            assert_eq!(destination.class, "aqtp");
+        }
+    }
+    assert!(code.links.iter().any(|l| l.label == "aqtw.e()Z"));
 }

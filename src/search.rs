@@ -104,10 +104,26 @@ impl CompiledQuery {
             .iter()
             .filter(|name| self.accepts_class(name))
             .collect();
-        // Stable ordering within each group; app and other nonstandard classes
-        // reach the UI before bundled platform libraries, including with a hit cap.
-        selected.sort_by_key(|name| is_standard_package(name));
+        // Code queries naming a class should show that class immediately, rather
+        // than wait behind unrelated source generation. This changes order only:
+        // every accepted class remains in the exhaustive search.
+        selected.sort_by_key(|name| {
+            (
+                self.query.code && !self.query.regex && !self.exact_class_match(name),
+                is_standard_package(name),
+            )
+        });
         selected
+    }
+
+    fn exact_class_match(&self, name: &str) -> bool {
+        [name, name.rsplit('.').next().unwrap_or(name)]
+            .iter()
+            .any(|candidate| {
+                self.matcher
+                    .find(candidate)
+                    .is_some_and(|m| m.start() == 0 && m.end() == candidate.len())
+            })
     }
 }
 
@@ -1240,6 +1256,182 @@ mod tests {
             "cancel stops individual retries"
         );
     }
+    #[test]
+    fn code_search_prioritizes_named_class_without_filtering_other_sources() {
+        let classes = vec![
+            "aaa.Other".into(),
+            "sample.VendingBackupAgent".into(),
+            "zzz.Referrer".into(),
+        ];
+        let query = CompiledQuery::new(SearchQuery {
+            text: "vendingbackupagent".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            query.ordered_classes(&classes),
+            vec![&classes[1], &classes[0], &classes[2]]
+        );
+        let excluded = CompiledQuery::new(SearchQuery {
+            excluded_packages: vec!["sample.*".into()],
+            ..query.query.clone()
+        })
+        .unwrap();
+        assert_eq!(
+            excluded.ordered_classes(&classes),
+            vec![&classes[0], &classes[2]]
+        );
+        let sensitive = CompiledQuery::new(SearchQuery {
+            case_sensitive: true,
+            ..query.query.clone()
+        })
+        .unwrap();
+        assert_eq!(
+            sensitive.ordered_classes(&classes),
+            classes.iter().collect::<Vec<_>>()
+        );
+        let qualified = CompiledQuery::new(SearchQuery {
+            text: "sample.VendingBackupAgent".into(),
+            ..query.query.clone()
+        })
+        .unwrap();
+        assert_eq!(qualified.ordered_classes(&classes)[0], &classes[1]);
+    }
+
+    #[test]
+    #[ignore = "Set RDX_TEST_APK to Play Store APK; measures cold time to first code-search result"]
+    fn vending_named_code_search_first_result() {
+        let path = std::env::var_os("RDX_TEST_APK").unwrap();
+        let mut engine = NativeEngine::start().unwrap();
+        let project = engine.open(std::path::Path::new(&path)).unwrap();
+        let query = CompiledQuery::new(SearchQuery {
+            text: "VendingBackupAgent".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut old_order: Vec<_> = project
+            .classes
+            .iter()
+            .filter(|name| query.accepts_class(name))
+            .collect();
+        old_order.sort_by_key(|name| is_standard_package(name));
+        let old_position = old_order
+            .iter()
+            .position(|name| name.ends_with(".VendingBackupAgent"))
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut cache = SearchCache::default();
+        let started = std::time::Instant::now();
+        let mut first = None;
+        let summary = run_search(
+            &mut engine,
+            &mut cache,
+            1,
+            &project.classes,
+            None,
+            &query,
+            &cancel,
+            |update| {
+                if let SearchUpdate::Batch(hits) = update {
+                    assert!(
+                        hits.iter()
+                            .any(|hit| hit.document.name.ends_with(".VendingBackupAgent"))
+                    );
+                    first = Some(started.elapsed());
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        assert!(first.is_some(), "{:?}", summary.errors);
+        assert_eq!(cache.source_fetches, 1);
+        eprintln!(
+            "Cold first result: {:?}; previous class position: {}; sources generated: {}",
+            first.unwrap(),
+            old_position + 1,
+            cache.source_fetches
+        );
+    }
+
+    #[test]
+    #[ignore = "Set RDX_TEST_APK to Play Store; bounded cold code phrase benchmark"]
+    fn screenshots_code_phrase_cold_search() {
+        let path = std::env::var_os("RDX_TEST_APK").unwrap();
+        let mut engine = NativeEngine::start().unwrap();
+        let project = engine.open(std::path::Path::new(&path)).unwrap();
+        let query = CompiledQuery::new(SearchQuery {
+            text: "ScreenshotsActivityV2 extends onj implements onm".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut cache = SearchCache::default();
+        let started = std::time::Instant::now();
+        let mut found = false;
+        let summary = run_search_interactive(
+            &mut engine,
+            &mut cache,
+            1,
+            &project.classes,
+            None,
+            &query,
+            &cancel,
+            |update| {
+                if let SearchUpdate::Batch(hits) = update {
+                    found |= hits
+                        .iter()
+                        .any(|hit| hit.document.name.ends_with(".ScreenshotsActivityV2"));
+                    if found {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+            },
+            |_| {
+                if started.elapsed().as_secs() >= 90 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        eprintln!(
+            "Phrase search: {:?}; scanned {}; source fetches {}; found {}; errors {:?}",
+            started.elapsed(),
+            summary.scanned,
+            cache.source_fetches,
+            found,
+            summary.errors
+        );
+        assert!(found, "phrase search failed within bounded benchmark");
+        cancel.store(false, Ordering::Relaxed);
+        let before = cache.source_fetches;
+        let warm_started = std::time::Instant::now();
+        let mut warm_found = false;
+        let warm = run_search(
+            &mut engine,
+            &mut cache,
+            1,
+            &project.classes,
+            None,
+            &query,
+            &cancel,
+            |update| {
+                if let SearchUpdate::Batch(hits) = update {
+                    warm_found |= hits
+                        .iter()
+                        .any(|hit| hit.document.name.ends_with(".ScreenshotsActivityV2"));
+                    if warm_found {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+            },
+        );
+        eprintln!(
+            "Warm phrase search: {:?}; scanned {}; new source fetches {}",
+            warm_started.elapsed(),
+            warm.scanned,
+            cache.source_fetches - before
+        );
+        assert!(warm_found);
+    }
+
     #[test]
     fn native_search_reuses_code_preserves_links_and_cancels() {
         let path =

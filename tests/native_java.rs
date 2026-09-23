@@ -169,7 +169,14 @@ fn malformed_registers_and_incomplete_instructions_do_not_emit_plausible_java() 
 // This is independent of the DEX decoder and catches operand reversal, signed
 // literals, register aliasing and Java's masked shift counts without a JVM.
 fn evaluate_integer_method(source: &str, input: i32) -> i32 {
-    let mut variables = std::collections::HashMap::from([("p0".to_owned(), input)]);
+    let parameter = source
+        .split_once("calculate(int ")
+        .unwrap()
+        .1
+        .split_once(')')
+        .unwrap()
+        .0;
+    let mut variables = std::collections::HashMap::from([(parameter.to_owned(), input)]);
     fn operand(word: &str, vars: &std::collections::HashMap<String, i32>) -> i32 {
         let word = word.trim_matches(['(', ')', ';']);
         word.parse()
@@ -270,7 +277,12 @@ fn invalid_return_categories_are_rejected_and_wide_parameters_are_preserved() {
     class.methods[0].return_type = Arc::from("J");
     class.methods[0].code.as_mut().unwrap().ins = 2;
     let code = native_java::render("sample.Arithmetic", &class).unwrap();
-    assert!(code.source.contains("return p0;"), "{}", code.source);
+    assert!(
+        code.source.contains("calculate(long value)"),
+        "{}",
+        code.source
+    );
+    assert!(code.source.contains("return value;"), "{}", code.source);
     // A wide return starting at the pair's high word remains invalid.
     class.methods[0].code.as_mut().unwrap().instructions = vec![0x0110];
     assert!(native_java::render("sample.Arithmetic", &class).is_err());
@@ -310,7 +322,7 @@ fn widened_invocation_argument_keeps_declared_overload_type() {
     });
     let code = native_java::render("sample.Arithmetic", &class).unwrap();
     assert!(
-        code.source.contains("accept(((int) p0))"),
+        code.source.contains("accept(((int) value))"),
         "{}",
         code.source
     );
@@ -365,14 +377,12 @@ fn invalid_member_names_alias_declarations_and_operands_but_keep_raw_navigation(
         code.source
     );
     assert!(
-        code.source
-            .contains("sample.Arithmetic._rdx_646f2d776f726b();"),
+        code.source.contains("Arithmetic._rdx_646f2d776f726b();"),
         "{}",
         code.source
     );
     assert!(
-        code.source
-            .contains("sample.Arithmetic._rdx_6261642d6669656c64"),
+        code.source.contains("Arithmetic._rdx_6261642d6669656c64"),
         "{}",
         code.source
     );
@@ -453,5 +463,116 @@ fn declared_exception_types_preserve_their_metadata_and_navigation_spans() {
         assert!(
             native_java::render_method("sample.Arithmetic", &class, &class.methods[0]).is_err()
         );
+    }
+}
+
+#[test]
+fn class_aliases_agree_across_headers_constructors_fields_calls_and_navigation() {
+    let mut class = synthetic(&[0x0071, 0, 0, 0x000e]);
+    class.descriptor = "Lbad-pkg/class;".into();
+    class.methods[0].declaring_type = class.descriptor.clone();
+    class.methods[0].return_type = "V".into();
+    class.symbols = Arc::new(DexSymbols {
+        strings: vec!["run".into(), "<init>".into()],
+        types: vec![class.descriptor.clone(), "Ljava/lang/Object;".into()],
+        protos: vec![("V".into(), vec![])],
+        methods: vec![(0, 0, 0), (1, 0, 1)],
+        ..Default::default()
+    });
+    class.fields.push(native_dex::DexField {
+        declaring_type: class.descriptor.clone(),
+        name: "items".into(),
+        field_type: "[[Lbad-pkg/class;".into(),
+        access_flags: 1,
+        is_static: false,
+    });
+    let mut constructor = synthetic(&[0x000e]).methods.remove(0);
+    constructor.declaring_type = class.descriptor.clone();
+    constructor.return_type = "V".into();
+    constructor.name = "<init>".into();
+    constructor.access_flags = 0x10001;
+    let code = constructor.code.as_mut().unwrap();
+    code.registers = 1;
+    code.ins = 1;
+    code.instructions = vec![0x1070, 1, 0, 0x000e];
+    class.methods.push(constructor);
+    let code = native_java::render("bad-pkg.class", &class).unwrap();
+    assert!(!code.source.contains(".method"), "{}", code.source);
+    assert!(
+        code.source.contains("package _rdx_6261642d706b67;"),
+        "{}",
+        code.source
+    );
+    assert!(code.source.contains("class _rdx_636c617373"));
+    assert!(code.source.contains("public _rdx_636c617373()"));
+    assert!(
+        code.source.contains("_rdx_636c617373[][] items;"),
+        "{}",
+        code.source
+    );
+    assert!(
+        code.source.contains("_rdx_636c617373.run();"),
+        "{}",
+        code.source
+    );
+    for link in code
+        .links
+        .iter()
+        .filter(|link| link.label == "bad-pkg.class")
+    {
+        assert_eq!(span(&code.source, link.start, link.end), "_rdx_636c617373");
+    }
+    assert!(
+        code.links
+            .iter()
+            .any(|link| link.label == "bad-pkg.class.run()V"
+                && span(&code.source, link.start, link.end) == "run")
+    );
+    assert!(
+        code.definitions
+            .iter()
+            .any(|d| d.kind == "class" && d.name == "bad-pkg.class")
+    );
+}
+
+#[test]
+fn desugared_type_alias_calls_use_imports_and_keep_original_targets() {
+    let mut class = synthetic(&[0x0071, 0, 0, 0x000e]);
+    class.methods[0].return_type = "V".into();
+    class.symbols = Arc::new(DexSymbols {
+        strings: vec!["run".into()],
+        types: vec!["Lj$/util/function/BiConsumer$-CC;".into()],
+        protos: vec![("V".into(), vec![])],
+        methods: vec![(0, 0, 0)],
+        ..Default::default()
+    });
+    let code = native_java::render("sample.Arithmetic", &class).unwrap();
+    assert!(!code.source.contains(".method"), "{}", code.source);
+    assert!(
+        code.source
+            .contains("import j$.util.function._rdx_4269436f6e73756d6572242d4343;"),
+        "{}",
+        code.source
+    );
+    assert!(code.links.iter().any(
+        |link| link.label == "j$.util.function.BiConsumer$-CC.run()V"
+            && span(&code.source, link.start, link.end) == "run"
+    ));
+}
+
+#[test]
+#[ignore = "Set RDX_TEST_APK to the Play Store APK"]
+fn desugared_companion_methods_render_from_apk() {
+    use rdx::engine::{DecompilerEngine, NativeEngine};
+    let path = std::env::var("RDX_TEST_APK").unwrap();
+    let mut engine = NativeEngine::start().unwrap();
+    engine.open(std::path::Path::new(&path)).unwrap();
+    for (name, method) in [("abfa", "andThen"), ("ablf", "and")] {
+        let source = engine.decompile(name).unwrap();
+        assert!(
+            !source.contains(&format!(".method {name}.{method}(")),
+            "{source}"
+        );
+        assert!(source.contains("$default$"), "{source}");
     }
 }

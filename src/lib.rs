@@ -17,3 +17,12 @@ pub mod native_ssa;
 pub mod native_types;
 pub mod plugin;
 pub mod transport;
+
+pub mod native_method;
+
+pub mod resource_table;
+
+pub mod native_xrefs;
+
+pub mod frida_snippet;
+pub mod mcp;

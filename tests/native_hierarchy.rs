@@ -52,6 +52,10 @@ fn resolves_transitive_apk_exception_ancestry() {
 fn missing_external_parent_keeps_negative_relationship_unknown() {
     let leaf = class("Lapp/LeafFailure;", Some("Lvendor/ExternalFailure;"), &[]);
     let hierarchy = TypeHierarchy::from_classes([&leaf]).unwrap();
+    assert!(
+        !hierarchy
+            .is_unambiguous_object_varargs("vendor.ExternalFailure.log([Ljava/lang/Object;)V")
+    );
 
     assert_eq!(
         hierarchy.assignable("Lapp/LeafFailure;", "Ljava/lang/Throwable;"),
@@ -330,7 +334,149 @@ fn strict_superclass_excludes_interfaces_self_and_unknown_paths() {
 
 #[test]
 fn missing_constructor_body_cannot_authorize_owner_retarget() {
-    let leaf = class("Lsample/Leaf;", Some("Ljava/lang/Object;"), &[]);
+    let mut leaf = class("Lsample/Leaf;", Some("Ljava/lang/Object;"), &[]);
+    leaf.methods.push(native_dex::DexMethod {
+        declaring_type: "Lsample/Leaf;".into(),
+        name: "<init>".into(),
+        return_type: "V".into(),
+        parameters: vec![],
+        thrown_types: vec![],
+        access_flags: 0x10001,
+        code: None,
+    });
     let hierarchy = TypeHierarchy::from_classes([&leaf]).unwrap();
     assert!(!hierarchy.equivalent_noarg_constructor("Lsample/Leaf;", "Ljava/lang/Object;"));
+}
+
+#[test]
+fn object_argument_cast_elision_requires_unique_static_target() {
+    fn method(owner: &str, ty: &str) -> native_dex::DexMethod {
+        native_dex::DexMethod {
+            declaring_type: owner.into(),
+            name: "accept".into(),
+            return_type: "V".into(),
+            parameters: vec![ty.into()],
+            thrown_types: vec![],
+            access_flags: 0x9,
+            code: None,
+        }
+    }
+    let mut owner = class("Lapp/Calls;", Some("Ljava/lang/Object;"), &[]);
+    owner
+        .methods
+        .push(method("Lapp/Calls;", "Ljava/lang/Object;"));
+    let signature = "app.Calls.accept(Ljava/lang/Object;)V";
+    assert!(
+        TypeHierarchy::from_classes([&owner])
+            .unwrap()
+            .is_unambiguous_object_call(signature)
+    );
+    owner
+        .methods
+        .push(method("Lapp/Calls;", "Ljava/lang/String;"));
+    assert!(
+        !TypeHierarchy::from_classes([&owner])
+            .unwrap()
+            .is_unambiguous_object_call(signature)
+    );
+    owner.methods.pop();
+    owner.superclass = Some("Lunknown/Base;".into());
+    assert!(
+        !TypeHierarchy::from_classes([&owner])
+            .unwrap()
+            .is_unambiguous_object_call(signature)
+    );
+}
+
+#[test]
+fn platform_list_widens_to_collection_but_conflicting_dex_does_not() {
+    let hierarchy = TypeHierarchy::from_classes([]).unwrap();
+    assert_eq!(
+        hierarchy.assignable("Ljava/util/List;", "Ljava/util/Collection;"),
+        Relation::Proven
+    );
+    assert_eq!(
+        hierarchy.assignable("Ljava/util/List;", "Ljava/lang/Iterable;"),
+        Relation::Proven
+    );
+    assert_ne!(
+        hierarchy.strict_superclass("Ljava/util/List;", "Ljava/util/Collection;"),
+        Relation::Proven
+    );
+    let conflict = class("Ljava/util/List;", Some("Ljava/lang/Object;"), &[]);
+    let hierarchy = TypeHierarchy::from_classes([&conflict]).unwrap();
+    assert_eq!(
+        hierarchy.assignable("Ljava/util/List;", "Ljava/util/Collection;"),
+        Relation::Unknown
+    );
+}
+
+#[test]
+fn static_checked_exceptions_require_exact_loaded_declarations() {
+    let mut parser = class("Lapp/Parser;", Some("Ljava/lang/Object;"), &[]);
+    parser.methods.push(native_dex::DexMethod {
+        declaring_type: "Lapp/Parser;".into(),
+        name: "parse".into(),
+        return_type: "Lapp/Parser;".into(),
+        parameters: vec!["[B".into()],
+        thrown_types: vec!["Ljava/io/IOException;".into()],
+        access_flags: 9,
+        code: None,
+    });
+    let h = TypeHierarchy::from_classes([&parser]).unwrap();
+    let args = vec![Arc::from("[B")];
+    assert!(h.static_call_declares(
+        "Lapp/Parser;",
+        "parse",
+        &args,
+        "Lapp/Parser;",
+        "Ljava/io/IOException;"
+    ));
+    assert!(h.static_call_declares(
+        "Lapp/Parser;",
+        "parse",
+        &args,
+        "Lapp/Parser;",
+        "Ljava/lang/Exception;"
+    ));
+    assert!(!h.static_call_declares(
+        "Lapp/Parser;",
+        "parse",
+        &[],
+        "Lapp/Parser;",
+        "Ljava/io/IOException;"
+    ));
+    assert!(!h.static_call_declares(
+        "Lapp/Other;",
+        "parse",
+        &args,
+        "Lapp/Parser;",
+        "Ljava/io/IOException;"
+    ));
+    assert!(!h.static_call_declares("Lapp/Parser;", "parse", &args, "V", "Ljava/io/IOException;"));
+    assert!(!h.static_call_declares(
+        "Lapp/Parser;",
+        "parse",
+        &args,
+        "Lapp/Parser;",
+        "Ljava/io/EOFException;"
+    ));
+    let duplicate = class("Lapp/Parser;", Some("Ljava/lang/Object;"), &[]);
+    let h = TypeHierarchy::from_classes([&parser, &duplicate]).unwrap();
+    assert!(!h.static_call_declares(
+        "Lapp/Parser;",
+        "parse",
+        &args,
+        "Lapp/Parser;",
+        "Ljava/io/IOException;"
+    ));
+    parser.methods[0].access_flags = 1;
+    let h = TypeHierarchy::from_classes([&parser]).unwrap();
+    assert!(!h.static_call_declares(
+        "Lapp/Parser;",
+        "parse",
+        &args,
+        "Lapp/Parser;",
+        "Ljava/io/IOException;"
+    ));
 }

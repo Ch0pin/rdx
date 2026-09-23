@@ -1,4 +1,4 @@
-//! Transactional decoder for a bounded, straight-line allocation region.
+//! Transactional decoder for bounded allocation regions and pure guarded copies.
 use super::{
     Graph, Output, Value,
     allocation::{Allocation, Capture, Event, Expr, Symbol},
@@ -50,7 +50,7 @@ fn expression(value: Atom, expected: &str, class: &DexClass) -> Result<Expr> {
             Ok(Expr::Cast {
                 ty: symbol(
                     super::java_type(expected)?,
-                    super::class_label(expected).context("null type label")?,
+                    super::class_label(expected).unwrap_or_default(),
                 ),
                 value: Box::new(Expr::Null),
             })
@@ -73,13 +73,15 @@ fn expression(value: Atom, expected: &str, class: &DexClass) -> Result<Expr> {
         Atom::Expr { expression, ty } => {
             if ty != expected && super::reference(&ty) && super::reference(expected) {
                 ensure!(
-                    class
-                        .symbols
-                        .hierarchy
-                        .get()
-                        .is_some_and(|hierarchy| hierarchy.assignable(&ty, expected)
-                            == crate::native_hierarchy::Relation::Proven),
-                    "allocation reference widening requires proven hierarchy"
+                    ty == "Ljava/lang/Object;"
+                        || expected == "Ljava/lang/Object;"
+                        || class
+                            .symbols
+                            .hierarchy
+                            .get()
+                            .is_some_and(|hierarchy| hierarchy.assignable(&ty, expected)
+                                == crate::native_hierarchy::Relation::Proven),
+                    "allocation reference widening requires proven hierarchy: {ty} to {expected}"
                 );
                 // Retain the declared DEX parameter type for overload resolution,
                 // while the operand keeps the capture's event and identity.
@@ -143,6 +145,84 @@ fn invoke_inputs(op: u8, a: usize, words: &[u16], pc: usize) -> Result<Vec<usize
     }
 }
 
+// A pure guarded integer copy can be evaluated before Java allocation. This
+// follows the readable-output policy, allowing allocation-related failure and
+// class-initialization timing to move.
+// No throwing instruction or uninitialized reference may enter the selection.
+fn guarded_copy(
+    graph: &Graph,
+    words: &[u16],
+    start: usize,
+    stop: usize,
+    allocation_register: usize,
+    regs: &mut [Option<Value>],
+    out: &mut Output,
+) -> Result<Option<usize>> {
+    if start >= stop || !matches!(words[start] as u8, 0x38 | 0x39) {
+        return Ok(None);
+    }
+    let target = graph.targets[start].context("guarded copy target")?;
+    let fall = start + 2;
+    // if (...) goto copy; goto join; copy: move; join:
+    // or if (...) goto join; move; join:
+    let (copy, join, copy_on_taken) =
+        if fall < stop && words[fall] as u8 == 0x28 && target == fall + 1 {
+            (
+                target,
+                graph.targets[fall].context("guarded copy join")?,
+                true,
+            )
+        } else {
+            (fall, target, false)
+        };
+    ensure!(
+        copy < stop && join < stop && join == copy + 1,
+        "nonlocal guarded copy"
+    );
+    ensure!(
+        words[copy] as u8 == 0x01,
+        "guarded copy must be an integer move"
+    );
+    let dst = ((words[copy] >> 8) & 15) as usize;
+    let src = (words[copy] >> 12) as usize;
+    let cond = (words[start] >> 8) as usize;
+    ensure!(
+        ![dst, src, cond].contains(&allocation_register),
+        "guard uses uninitialized allocation"
+    );
+    for (origin, target) in graph.targets.iter().enumerate() {
+        if target.is_some_and(|target| start <= target && target <= join) {
+            ensure!(
+                origin == start || (copy_on_taken && origin == fall),
+                "external entry into guarded copy"
+            );
+        }
+    }
+    let value = |r: usize| -> Result<&Value> {
+        let value = regs
+            .get(r)
+            .and_then(Option::as_ref)
+            .context("undefined guarded copy input")?;
+        ensure!(value.ty == "I", "guarded copy requires integer inputs");
+        Ok(value)
+    };
+    let predicate = if (words[start] as u8 == 0x39) == copy_on_taken {
+        "!="
+    } else {
+        "=="
+    };
+    let expression = format!(
+        "{} {} 0 ? {} : {}",
+        value(cond)?.text,
+        predicate,
+        value(src)?.text,
+        value(dst)?.text
+    );
+    let result = out.local("I", &expression, &[])?;
+    regs[dst] = Some(result);
+    Ok(Some(join))
+}
+
 /// Decode one allocation through its matching constructor. Unsupported regions
 /// decline without exposing any staged register or output mutation.
 #[allow(clippy::too_many_arguments)]
@@ -157,7 +237,9 @@ pub(super) fn try_lower(
     caller_out: &Output,
 ) -> Result<Option<Lowered>> {
     let attempt = || -> Result<Lowered> {
-        const MAX_INSTRUCTIONS: usize = 64;
+        // Large generated injection constructors can exceed 128 instructions.
+        // Keep a fixed linear scan cap plus expression-node/output budgets.
+        const MAX_INSTRUCTIONS: usize = 256;
         let dst = (words[pc] >> 8) as usize;
         let ty = class
             .symbols
@@ -174,7 +256,24 @@ pub(super) fn try_lower(
                 .all(|value| !matches!(value.ty.as_str(), "J" | "D" | "<wide-tail>")),
             "allocation decoder declines live wide registers"
         );
-        let mut regs: Vec<Option<Atom>> = caller_regs
+        let mut prelude = Output {
+            sequence: caller_out.sequence,
+            indent: caller_out.indent,
+            ..Output::default()
+        };
+        let mut selected_regs = caller_regs.to_vec();
+        let start = pc + graph.widths[pc];
+        let selected_join = guarded_copy(
+            graph,
+            words,
+            start,
+            stop,
+            dst,
+            &mut selected_regs,
+            &mut prelude,
+        )?;
+        let base_sequence = prelude.sequence;
+        let mut regs: Vec<Option<Atom>> = selected_regs
             .iter()
             .cloned()
             .map(|value| value.map(Atom::Input))
@@ -186,7 +285,8 @@ pub(super) fn try_lower(
         });
         let mut nested = false;
         let mut captures = Vec::new();
-        let mut local_names: Vec<String> = caller_regs
+        let mut discarded = Vec::new();
+        let mut local_names: Vec<String> = selected_regs
             .iter()
             .flatten()
             .map(|value| value.text.clone())
@@ -197,7 +297,7 @@ pub(super) fn try_lower(
             site: pc,
             ty: allocation_label.clone(),
         }];
-        let mut cursor = pc + graph.widths[pc];
+        let mut cursor = selected_join.unwrap_or(start);
         let mut instructions = 0;
         loop {
             instructions += 1;
@@ -210,13 +310,40 @@ pub(super) fn try_lower(
                 "allocation crosses control flow"
             );
             ensure!(
-                !incoming_targets.contains(&cursor),
+                !incoming_targets.contains(&cursor) || selected_join == Some(cursor),
                 "branch enters allocation window"
             );
             let word = words[cursor];
             let op = word as u8;
             let a = (word >> 8) as usize;
             match op {
+                0xb0 => {
+                    // Integer add/2addr is nonthrowing and wraps exactly as Java int.
+                    // Restrict operands to already materialized values; effectful
+                    // captures must keep their original evaluation position.
+                    let dst = a & 15;
+                    let (Atom::Input(left), Atom::Input(right)) =
+                        (atom(&regs, dst)?, atom(&regs, a >> 4)?)
+                    else {
+                        anyhow::bail!("allocation integer add requires materialized inputs");
+                    };
+                    ensure!(
+                        left.ty == "I" && right.ty == "I",
+                        "noninteger allocation add"
+                    );
+                    let text = format!("({} + {})", left.text, right.text);
+                    local_names.push(text.clone());
+                    put(
+                        &mut regs,
+                        dst,
+                        Atom::Input(Value {
+                            text,
+                            ty: "I".into(),
+                            literal: None,
+                            wide_literal: None,
+                        }),
+                    )?;
+                }
                 0x22 => {
                     let ty = class
                         .symbols
@@ -325,7 +452,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: "java.lang.String".into(),
-                        name: format!("v{}", caller_out.sequence + index),
+                        name: format!("v{}", base_sequence + index),
                         expression: string,
                     });
                     events.push(Event::StringResolution { site: cursor });
@@ -353,7 +480,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: "java.lang.Class".into(),
-                        name: format!("v{}", caller_out.sequence + index),
+                        name: format!("v{}", base_sequence + index),
                         expression: class_literal,
                     });
                     events.push(Event::ClassResolution {
@@ -423,7 +550,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: super::java_type(descriptor)?,
-                        name: format!("v{}", caller_out.sequence + index),
+                        name: format!("v{}", base_sequence + index),
                         expression: Expr::CheckCast {
                             site: cursor,
                             ty: symbol(super::java_type(descriptor)?, label.clone()),
@@ -434,6 +561,9 @@ pub(super) fn try_lower(
                         site: cursor,
                         ty: label,
                     });
+                    // A cast remains observable even if its result is overwritten.
+                    // Staged emission must retain the check and its dependencies.
+                    discarded.push(index);
                     put(
                         &mut regs,
                         a,
@@ -503,7 +633,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: super::java_type(&field_ty)?,
-                        name: format!("v{}", caller_out.sequence + index),
+                        name: format!("v{}", base_sequence + index),
                         expression: read,
                     });
                     events.push(Event::Read {
@@ -518,6 +648,57 @@ pub(super) fn try_lower(
                             ty: field_ty,
                         },
                     )?;
+                }
+                0x24 | 0x25 => {
+                    let array = class
+                        .symbols
+                        .types
+                        .get(words[cursor + 1] as usize)
+                        .context("array type")?;
+                    let component = array
+                        .strip_prefix('[')
+                        .context("filled array requires array type")?;
+                    ensure!(
+                        !matches!(component, "J" | "D"),
+                        "wide filled array unsupported"
+                    );
+                    let inputs =
+                        invoke_inputs(if op == 0x25 { 0x74 } else { op }, a, words, cursor)?;
+                    let elements = inputs
+                        .into_iter()
+                        .map(|r| expression(atom(&regs, r)?, component, class))
+                        .collect::<Result<Vec<_>>>()?;
+                    let next = cursor + graph.widths[cursor];
+                    ensure!(
+                        next < stop
+                            && !incoming_targets.contains(&next)
+                            && words[next] as u8 == 0x0c,
+                        "filled array must have an adjacent object result"
+                    );
+                    let label = super::class_label(array).unwrap_or_default();
+                    let index = captures.len();
+                    captures.push(Capture {
+                        ty: super::java_type(array)?,
+                        name: format!("v{}", base_sequence + index),
+                        expression: Expr::FilledArray {
+                            site: cursor,
+                            ty: symbol(super::java_type(array)?, label.clone()),
+                            elements,
+                        },
+                    });
+                    events.push(Event::Allocate {
+                        site: cursor,
+                        ty: super::java_type(array)?,
+                    });
+                    put(
+                        &mut regs,
+                        (words[next] >> 8) as usize,
+                        Atom::Expr {
+                            expression: Expr::Capture(index),
+                            ty: array.to_string(),
+                        },
+                    )?;
+                    cursor = next;
                 }
                 0x6e | 0x70..=0x72 | 0x74 | 0x76..=0x78 => {
                     let (owner, ret, args, raw_name) =
@@ -604,7 +785,7 @@ pub(super) fn try_lower(
                             let index = captures.len();
                             captures.push(Capture {
                                 ty: super::java_type(&allocation_ty)?,
-                                name: format!("v{}", caller_out.sequence + index),
+                                name: format!("v{}", base_sequence + index),
                                 expression: Expr::SharedNew {
                                     allocation: Box::new(Allocation {
                                         site,
@@ -644,8 +825,15 @@ pub(super) fn try_lower(
                             local_names.iter().map(String::as_str).collect();
                         let mut rendered = match allocation.render_checked(&events, &local_refs) {
                             Ok(rendered) => rendered,
-                            Err(error) if nested => return Err(error),
-                            Err(_) => allocation.render_staged_checked(&events, &local_refs)?,
+                            // Keep the existing strict nested-expression path for
+                            // ordinary allocations. Broader staging is enabled only
+                            // for the verified pure guarded-copy region above.
+                            Err(error) if nested && selected_join.is_none() => return Err(error),
+                            Err(_) => allocation.render_staged_with_discarded(
+                                &events,
+                                &local_refs,
+                                &discarded,
+                            )?,
                         };
                         // A constructor expression links its type token to the
                         // raw overloaded constructor identity.
@@ -654,11 +842,7 @@ pub(super) fn try_lower(
                             .first_mut()
                             .context("missing allocation type link")?
                             .label = label;
-                        let mut out = Output {
-                            sequence: caller_out.sequence,
-                            indent: caller_out.indent,
-                            ..Output::default()
-                        };
+                        let mut out = prelude;
                         for (declaration, links) in rendered
                             .declarations
                             .iter()
@@ -692,7 +876,7 @@ pub(super) fn try_lower(
                                     expression: Expr::Capture(index),
                                     ty,
                                 }) => Some(Value {
-                                    text: format!("v{}", caller_out.sequence + index),
+                                    text: format!("v{}", base_sequence + index),
                                     ty: ty.clone(),
                                     literal: None,
                                     wide_literal: None,
@@ -748,10 +932,7 @@ pub(super) fn try_lower(
                     } else {
                         None
                     };
-                    ensure!(
-                        has_result || fluent_receiver.is_some(),
-                        "nonvoid invoke requires immediate move-result"
-                    );
+
                     let call = Expr::Call {
                         site: cursor,
                         target: Box::new(target),
@@ -761,7 +942,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: super::java_type(ret)?,
-                        name: format!("v{}", caller_out.sequence + index),
+                        name: format!("v{}", base_sequence + index),
                         expression: call,
                     });
                     events.push(Event::Call {
@@ -781,9 +962,12 @@ pub(super) fn try_lower(
                                 *staged = Some(result.clone());
                             }
                         }
-                    } else {
+                    } else if has_result {
                         put(&mut regs, (words[next] >> 8) as usize, result)?;
                         cursor = next;
+                    } else {
+                        // An ignored invoke result still represents an observable call.
+                        discarded.push(index);
                     }
                 }
                 _ => anyhow::bail!("unsupported instruction in allocation window"),

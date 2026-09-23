@@ -52,7 +52,7 @@ fn initializer_block_omits_only_terminal_return_and_preserves_exact_links() {
     let code = native_java::render("sample.Init", &class).unwrap();
     assert!(
         code.source
-            .contains("    static {\n        sample.Init.count = 1;\n    }"),
+            .contains("    static {\n        Init.count = 1;\n    }"),
         "{}",
         code.source
     );

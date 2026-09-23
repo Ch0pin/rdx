@@ -151,3 +151,20 @@ fn renders_class_method_parameter_annotations_values_imports_and_spans() {
         "JavascriptInterface"
     );
 }
+
+#[test]
+fn aliased_annotation_names_keep_original_navigation_identity() {
+    let mut class = annotated_class();
+    Arc::get_mut(&mut class.symbols).unwrap().types[3] = "Lsample/Bad-Marker;".into();
+    let code = native_java::render("sample.Target", &class).unwrap();
+    let link = code
+        .links
+        .iter()
+        .find(|link| link.label == "sample.Bad-Marker")
+        .unwrap();
+    assert_eq!(
+        span(&code.source, link.start, link.end),
+        "_rdx_4261642d4d61726b6572"
+    );
+    assert!(!code.source.contains("@Bad-Marker"));
+}

@@ -32,7 +32,32 @@ fn symbols() -> DexSymbols {
 
 fn bind(code: &DexCode, symbols: &DexSymbols) -> anyhow::Result<BoundCalls> {
     let ir = DecodedMethod::decode(code)?;
-    BoundCalls::bind(code, &ir, symbols)
+    let bound = BoundCalls::bind(code, &ir, symbols)?;
+    for call in &bound.calls {
+        let instruction = ir
+            .instructions
+            .iter()
+            .find(|insn| insn.pc == call.pc)
+            .unwrap();
+        if matches!(instruction.opcode, 0x6e..=0x72 | 0x74..=0x78) {
+            let words: Vec<_> = instruction
+                .reads
+                .iter()
+                .map(|word| usize::from(word.register))
+                .collect();
+            let direct = rdx::native_calls::bind_invocation(
+                instruction.opcode,
+                call.pc,
+                instruction.reference.unwrap().index,
+                &words,
+                symbols,
+            )?;
+            let mut expected = call.clone();
+            expected.result = None;
+            assert_eq!(direct, expected);
+        }
+    }
+    Ok(bound)
 }
 
 #[test]
@@ -258,4 +283,23 @@ fn invoke_custom_is_explicitly_unsupported() {
     let error = bind(&code, &symbols()).unwrap_err().to_string();
     assert!(error.contains("invoke-custom"));
     assert!(error.contains("call-site metadata"));
+}
+
+#[test]
+fn emitter_binding_rejects_malformed_operands_and_keeps_duplicates() {
+    use rdx::native_calls::bind_invocation;
+    let mut symbols = symbols();
+    for registers in [&[1, 3, 5, 7][..], &[1, 3][..], &[1, 3, 4, 7, 8][..]] {
+        assert!(bind_invocation(0x6e, 0, 0, registers, &symbols).is_err());
+    }
+    assert!(bind_invocation(0xff, 0, 0, &[], &symbols).is_err());
+    assert!(bind_invocation(0x6e, 0, 99, &[], &symbols).is_err());
+    assert!(bind_invocation(0x6e, 0, 0, &[65536, 3, 4, 7], &symbols).is_err());
+    assert!(bind_invocation(0x71, 0, 0, &[65535, 65536, 7], &symbols).is_err());
+    symbols.protos[0] = ("Ljava/lang/Object;".into(), vec!["I".into(), "I".into()]);
+    let binding = bind_invocation(0x71, 12, 0, &[3, 3], &symbols).unwrap();
+    assert_eq!(binding.arguments[0], binding.arguments[1]);
+    assert_eq!(binding.return_type.as_ref(), "Ljava/lang/Object;");
+    symbols.protos[0].1[0] = "V".into();
+    assert!(bind_invocation(0x71, 0, 0, &[3, 3], &symbols).is_err());
 }

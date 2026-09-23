@@ -7,10 +7,14 @@ mod allocation;
 mod allocation_lowering;
 #[path = "cleanup.rs"]
 mod cleanup;
+#[path = "finally_regions.rs"]
+mod finally_regions;
 #[path = "numeric.rs"]
 mod numeric;
 #[path = "operations.rs"]
 mod operations;
+#[path = "synchronized.rs"]
+mod synchronized;
 #[path = "throwing.rs"]
 mod throwing;
 use super::{java_type, names};
@@ -28,6 +32,20 @@ pub(super) fn validate_exception_type(class: &DexClass, ty: &str) -> Result<()> 
 pub(super) struct MethodBody {
     pub text: String,
     pub links: Vec<CodeLink>,
+}
+
+pub(super) fn readable_code(
+    mut code: crate::engine::DecompiledCode,
+) -> crate::engine::DecompiledCode {
+    let mut body = MethodBody {
+        text: code.source,
+        links: code.links,
+    };
+    cleanup::readable(&mut body);
+    code.source = body.text;
+    code.links = body.links;
+    code.source_hash = crate::engine::source_identity(&code.source);
+    code
 }
 #[derive(Clone, PartialEq, Eq)]
 struct Value {
@@ -127,8 +145,17 @@ fn argument(value: &Value, ty: &str) -> Result<String> {
     {
         return Literal::Bits32(bits as u32).render(Kind::Float);
     }
-    if ty == "I" && value.ty == "Z" {
-        return Ok(format!("({} ? 1 : 0)", value.text));
+    if value.ty == "Z" && matches!(ty, "I" | "B" | "S" | "C") {
+        // DEX's narrow register family also holds boolean 0/1 values. A merge
+        // may choose boolean while a later byte/short/char use needs the same
+        // numeric bits. Java requires explicit boolean-to-number reification;
+        // both alternatives fit every narrow integral target exactly.
+        let numeric = format!("({} ? 1 : 0)", value.text);
+        return Ok(if ty == "I" {
+            numeric
+        } else {
+            format!("({}) {numeric}", java_type(ty)?)
+        });
     }
 
     if value.ty == ty || (ty == "I" && matches!(value.ty.as_str(), "B" | "S" | "C")) {
@@ -158,6 +185,9 @@ fn receiver(value: &Value, ty: &str) -> Result<String> {
     ensure!(reference(ty), "nonreference receiver owner");
     if value.literal == Some(0) {
         return Ok(format!("(({}) null)", java_type(ty)?));
+    }
+    if ty == "Ljava/lang/Object;" && reference(&value.ty) {
+        return Ok(value.text.clone());
     }
     argument(value, ty)
 }
@@ -254,6 +284,7 @@ fn loop_slots(
     graph: &Graph,
     start: usize,
     out: &mut Output,
+    written: Option<&[bool]>,
 ) -> Result<Vec<Option<Value>>> {
     validate_wide_frame(regs)?;
     let mut slots = vec![None; regs.len()];
@@ -264,7 +295,13 @@ fn loop_slots(
         }
         let live = graph.live_at(start, r) || (wide(&value.ty) && graph.live_at(start, r + 1));
         if live {
-            assign(&mut slots, r, out.local(&value.ty, &value.text, &[])?)?;
+            if (value.text == "this" || value.literal.is_some() || value.wide_literal.is_some())
+                && written.is_some_and(|writes| !writes[r])
+            {
+                assign(&mut slots, r, value.clone())?;
+            } else {
+                assign(&mut slots, r, out.local(&value.ty, &value.text, &[])?)?;
+            }
         }
     }
     Ok(slots)
@@ -308,11 +345,18 @@ struct Loop {
     // Conditional backedge with a forward guard and a one-time exit tail.
     tail: Option<usize>,
 }
+#[derive(Clone, Copy)]
+struct LoopContext<'a> {
+    start: usize,
+    slots: &'a [Option<Value>],
+}
 #[derive(Clone)]
 struct Switch {
     cases: Vec<(i32, usize)>,
 }
 struct Graph {
+    synchronized: Vec<synchronized::Region>,
+    caught_values: std::cell::RefCell<std::collections::HashSet<String>>,
     constructor_bindings: std::cell::OnceCell<
         Option<std::collections::HashMap<usize, crate::native_constructors::ConstructorBinding>>,
     >,
@@ -337,15 +381,8 @@ impl Graph {
     ) -> Option<&crate::native_constructors::ConstructorBinding> {
         self.constructor_bindings.get_or_init(|| {
             let analyze = || -> Result<std::collections::HashMap<usize, crate::native_constructors::ConstructorBinding>> {
-                let code = method.code.as_ref().context("method has no code")?;
-                let ir = crate::native_ir::DecodedMethod::decode(code)?;
-                let graph = crate::native_cfg::ControlFlowGraph::build(code)?;
-                let ssa = crate::native_ssa::SsaMethod::build(code, &ir, &graph)?;
-                let bound = crate::native_calls::BoundCalls::bind(code, &ir, &class.symbols)?;
-                let calls = crate::native_call_values::SsaCalls::bind(&bound, &ssa)?;
-                let constructors = crate::native_constructors::ConstructorAnalysis::analyze(
-                    class, method, &ir, &bound, &ssa, &calls,
-                )?;
+                let analysis = crate::native_method::MethodAnalysis::build(class, method)?;
+                let constructors = analysis.constructors()?;
                 Ok(constructors.bindings.into_iter().map(|binding| (binding.invoke_pc, binding)).collect())
             };
             analyze().ok()
@@ -356,6 +393,8 @@ impl Graph {
     }
     fn with_handlers(words: &[u16], handlers: &[usize]) -> Result<Self> {
         let mut graph = Self {
+            synchronized: Vec::new(),
+            caught_values: Default::default(),
             constructor_bindings: std::cell::OnceCell::new(),
             live: None,
             loops: Vec::new(),
@@ -393,6 +432,7 @@ impl Graph {
                 | 0x04
                 | 0x07
                 | 0x0a..=0x12
+                | 0x1d..=0x1e
                 | 0x21
                 | 0x27
                 | 0x28
@@ -571,11 +611,18 @@ impl Graph {
                 graph.acyclic_backwards.insert(from);
             }
         }
-        for (latch, target) in graph.targets.iter().enumerate() {
-            let Some(start) = *target else { continue };
-            if start >= latch || graph.acyclic_backwards.contains(&latch) {
-                continue;
+        // Multiple backedges to one header are continues of the same natural
+        // loop. The final address-order latch bounds its straight-line region.
+        let mut latches = std::collections::BTreeMap::new();
+        for (from, target) in graph.targets.iter().enumerate() {
+            if let Some(start) = *target
+                && start < from
+                && !graph.acyclic_backwards.contains(&from)
+            {
+                latches.insert(start, from);
             }
+        }
+        for (start, latch) in latches {
             let mut exit = latch + graph.widths[latch];
             let mut tail = None;
             ensure!(exit < words.len(), "loop has no exit instruction");
@@ -631,7 +678,17 @@ impl Graph {
                 if from == latch || Some(from) == guard {
                     continue;
                 }
+                if (start..latch).contains(&from) && to == start {
+                    // A conditional or unconditional continue, carrying the
+                    // current frame back to the header.
+                    continue;
+                }
                 if (start..exit).contains(&from) {
+                    // A shared bare return after the loop is a method exit,
+                    // not a second loop continuation. It can be emitted in place.
+                    if to >= exit && words[to] as u8 == 0x0e {
+                        continue;
+                    }
                     let limit = if tail.is_some_and(|tail| from >= tail) {
                         exit
                     } else {
@@ -667,11 +724,23 @@ impl Graph {
         self.work.set(n);
         Ok(())
     }
+    fn terminal_loop_escape(&self, pc: usize, stop: usize, words: &[u16]) -> bool {
+        pc > stop
+            && words.get(pc).is_some_and(|word| *word as u8 == 0x0e)
+            && self
+                .loops
+                .iter()
+                .any(|region| region.start <= stop && stop <= region.latch && pc >= region.exit)
+    }
+
     fn reachable(&self, start: usize, stop: usize, words: &[u16]) -> Result<Vec<bool>> {
         let mut seen = vec![false; self.widths.len() + 1];
         let mut pending = vec![start];
         while let Some(pc) = pending.pop() {
             self.tick()?;
+            if self.terminal_loop_escape(pc, stop, words) {
+                continue;
+            }
             ensure!(pc <= stop, "control flow crosses region boundary");
             if seen[pc] {
                 continue;
@@ -737,6 +806,9 @@ impl Graph {
         let mut pending = vec![start];
         while let Some(pc) = pending.pop() {
             self.tick()?;
+            if self.terminal_loop_escape(pc, stop, words) {
+                continue;
+            }
             if pc > stop {
                 return Ok(Some(pc));
             }
@@ -762,7 +834,11 @@ impl Graph {
             if let Some(switch) = &self.switches[pc] {
                 pending.extend(switch.cases.iter().map(|(_, target)| *target));
             }
-            if let Some(target) = self.targets[pc] {
+            if let Some(target) = self.targets[pc]
+                && !self.loops.iter().any(|region| {
+                    region.start == target && (region.start + 1..=region.latch).contains(&pc)
+                })
+            {
                 pending.push(target);
             }
             if !matches!(op, 0x28..=0x2a) {
@@ -863,7 +939,7 @@ pub(super) fn reconstruct(
 ) -> Result<MethodBody> {
     let code = method.code.as_ref().context("method has no code")?;
     ensure!(
-        usize::from(code.tries) == code.try_regions.len() && code.try_regions.len() <= 1,
+        usize::from(code.tries) == code.try_regions.len(),
         "nested or multiple try regions not reconstructed"
     );
     ensure!(
@@ -874,6 +950,15 @@ pub(super) fn reconstruct(
         code.instructions.len() <= 65_536,
         "method exceeds instruction budget"
     );
+    // A supported monitor region must start immediately after its one-word monitor-enter.
+    // This prefilter only selects candidates; the region analyzer proves them.
+    let monitor_candidate = code.try_regions.iter().any(|region| {
+        (region.start as usize)
+            .checked_sub(1)
+            .and_then(|pc| code.instructions.get(pc))
+            .is_some_and(|word| *word as u8 == 0x1d)
+    });
+
     ensure!(code.ins <= code.registers, "invalid incoming registers");
     let mut regs = vec![None; code.registers as usize];
     let mut r = (code.registers - code.ins) as usize;
@@ -910,6 +995,22 @@ pub(super) fn reconstruct(
         };
     }
     ensure!(r == regs.len(), "parameter register count mismatch");
+    // Separate typed regions use the ordinary renderer one at a time. Handler
+    // addresses need not follow their try: compilers often collect them at the
+    // end of the method. render_try proves their paths and joins independently.
+    // Nested cleanup and catch-all layouts still require their dedicated proof.
+    let separate_typed_regions = code.try_regions.len() <= 16
+        && code
+            .try_regions
+            .iter()
+            .all(|region| region.catches.iter().all(|(ty, _)| ty.is_some()))
+        && code
+            .try_regions
+            .windows(2)
+            .all(|pair| pair[0].end <= pair[1].start);
+    if code.try_regions.len() > 1 && !monitor_candidate && !separate_typed_regions {
+        return finally_regions::reconstruct(class, method, regs);
+    }
     let mut out = Output::default();
     let handlers: Vec<_> = code
         .try_regions
@@ -921,15 +1022,48 @@ pub(super) fn reconstruct(
     } else {
         Graph::with_handlers(&code.instructions, &handlers)?
     };
+    if monitor_candidate {
+        graph.synchronized = synchronized::analyze(code, &graph)?;
+    }
+    let monitor_try = |index: usize| {
+        graph
+            .synchronized
+            .iter()
+            .any(|region| region.tries.contains(&index))
+    };
+    let ordinary_tries = code
+        .try_regions
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !monitor_try(*index))
+        .count();
+    ensure!(
+        ordinary_tries <= 1 || separate_typed_regions,
+        "nested or multiple try regions not reconstructed"
+    );
+    ensure!(
+        graph.synchronized.is_empty() || ordinary_tries == 0,
+        "mixed monitor and ordinary exception regions not reconstructed"
+    );
     // Handler snapshots are mutable, unlike ordinary structured branch/loop
     // joins.  Wide handler-visible state still needs its own reconstruction.
-    if code.tries != 0 {
-        let mut has_wide = wide(&method.return_type) || method.parameters.iter().any(|ty| wide(ty));
+    if ordinary_tries != 0 {
+        // Only protected instructions can update exception snapshots. Wide
+        // computations before or after a protected range have ordinary state.
+        // The actual entry frame is still checked in render_try.
+        let mut protected = vec![false; code.instructions.len()];
+        for region in &code.try_regions {
+            protected
+                .get_mut(region.start as usize..region.end as usize)
+                .context("invalid protected range")?
+                .fill(true);
+        }
+        let mut has_wide = false;
         for (pc, width) in graph
             .widths
             .iter()
             .enumerate()
-            .filter(|(_, width)| **width != 0)
+            .filter(|(pc, width)| **width != 0 && protected[*pc])
         {
             let op = code.instructions[pc] as u8;
             has_wide |= matches!(op, 0x04..=0x06 | 0x0b | 0x10 | 0x16..=0x19 | 0x2f..=0x31 | 0x45 | 0x4c | 0x53 | 0x5a | 0x61 | 0x68);
@@ -1046,7 +1180,31 @@ fn render_loop(
     // Carry only values read before their next definition.  `loop_slots`
     // preserves wide heads and tails together while materializing Java locals
     // only for heads.
-    let slots = loop_slots(&regs, graph, region.start, out)?;
+    ensure!(
+        method
+            .code
+            .as_ref()
+            .unwrap()
+            .try_regions
+            .iter()
+            .enumerate()
+            .all(|(index, protected)| protected.end as usize <= region.start
+                || protected.start as usize >= region.exit
+                || graph
+                    .synchronized
+                    .iter()
+                    .any(|monitor| monitor.tries.contains(&index)
+                        && region.start > monitor.enter
+                        && region.exit <= monitor.exit)),
+        "loop overlaps protected region"
+    );
+    let written =
+        super::liveness::written_in(method.code.as_ref().unwrap(), region.start, region.exit);
+    let slots = loop_slots(&regs, graph, region.start, out, written.as_deref())?;
+    let context = LoopContext {
+        start: region.start,
+        slots: &slots,
+    };
     let exit_slots = if region.tail.is_some() {
         // Separate exit values from values required only by the next iteration.
         // In iterator loops the same DEX register may hold a String on the exit
@@ -1055,7 +1213,13 @@ fn render_loop(
             (0..regs.len()).all(|r| !graph.live_at(region.exit, r) || regs[r].is_some()),
             "loop exit value has no established entry type"
         );
-        Some(loop_slots(&regs, graph, region.exit, out)?)
+        Some(loop_slots(
+            &regs,
+            graph,
+            region.exit,
+            out,
+            written.as_deref(),
+        )?)
     } else {
         None
     };
@@ -1075,7 +1239,7 @@ fn render_loop(
             &mut body,
             depth,
             true,
-            Some(region.start),
+            Some(context),
             None,
         )?;
         ensure!(!returned, "loop header returns");
@@ -1104,7 +1268,7 @@ fn render_loop(
             &mut body,
             depth,
             true,
-            Some(region.start),
+            Some(context),
             None,
         )?
     } else {
@@ -1118,12 +1282,18 @@ fn render_loop(
             &mut body,
             depth,
             true,
-            Some(region.start),
+            Some(context),
             None,
         )?
     };
-    ensure!(!returned, "loop body has no continuation");
-    if let Some(tail) = region.tail {
+    if returned {
+        // Every body path ends in a return/throw or an explicit continue. The
+        // forward header guard still provides the loop's ordinary exit path.
+        ensure!(
+            region.guard.is_some() && region.tail.is_none(),
+            "loop body has no continuation"
+        );
+    } else if let Some(tail) = region.tail {
         let cond = condition(
             words[region.latch] as u8,
             (words[region.latch] >> 8) as usize,
@@ -1145,7 +1315,7 @@ fn render_loop(
             &mut body,
             depth,
             true,
-            Some(region.start),
+            Some(context),
             None,
         )?;
         ensure!(!returned, "loop exit tail has no common continuation");
@@ -1217,11 +1387,14 @@ fn sync_exception_registers(
 fn catch_parent(ty: &str) -> Option<&'static str> {
     Some(match ty {
         "Ljava/lang/Exception;" | "Ljava/lang/Error;" => "Ljava/lang/Throwable;",
-        "Ljava/lang/RuntimeException;" | "Ljava/io/IOException;" | "Lorg/json/JSONException;" => {
-            "Ljava/lang/Exception;"
-        }
+        "Ljava/lang/RuntimeException;"
+        | "Ljava/io/IOException;"
+        | "Lorg/json/JSONException;"
+        | "Landroid/util/AndroidException;" => "Ljava/lang/Exception;",
+        "Landroid/os/RemoteException;" => "Landroid/util/AndroidException;",
         "Ljava/io/FileNotFoundException;" => "Ljava/io/IOException;",
-        "Ljava/lang/ArithmeticException;"
+        "Landroid/content/ActivityNotFoundException;"
+        | "Ljava/lang/ArithmeticException;"
         | "Ljava/lang/ArrayStoreException;"
         | "Ljava/lang/ClassCastException;"
         | "Ljava/lang/IllegalArgumentException;"
@@ -1318,10 +1491,40 @@ fn protected_normal_exit(graph: &Graph, words: &[u16], start: usize, end: usize)
             pending.push(pc + graph.widths[pc]);
         }
     }
-    ensure!(
-        exits.len() <= 1,
-        "protected region has distinct effectful exits"
-    );
+    if exits.len() > 1 {
+        // Pure forward branches/moves ending in returns can be included in the
+        // Java try: none introduces a newly caught exception. Effectful tails
+        // must retain their original exception boundary.
+        let mut finish = end;
+        let mut pending: Vec<_> = exits.into_iter().collect();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(pc) = pending.pop() {
+            graph.tick()?;
+            ensure!(
+                pc >= end && pc < words.len() && graph.widths[pc] != 0,
+                "protected return tail is cyclic or invalid"
+            );
+            if !seen.insert(pc) {
+                continue;
+            }
+            let op = words[pc] as u8;
+            finish = finish.max(pc + graph.widths[pc]);
+            match op {
+                0x0e..=0x11 => {}
+                0x00..=0x09 | 0x12..=0x19 => pending.push(pc + graph.widths[pc]),
+                0x28..=0x2a | 0x32..=0x3d => {
+                    let target = graph.targets[pc].context("missing return tail target")?;
+                    ensure!(target > pc, "cyclic protected return tail");
+                    pending.push(target);
+                    if op >= 0x32 {
+                        pending.push(pc + graph.widths[pc]);
+                    }
+                }
+                _ => bail!("protected region has distinct effectful exits"),
+            }
+        }
+        return Ok(finish);
+    }
     Ok(exits.into_iter().next().unwrap_or(end))
 }
 
@@ -1345,6 +1548,12 @@ fn render_try(
     let start = region.start as usize;
     let end = region.end as usize;
     ensure!(
+        regs.iter()
+            .flatten()
+            .all(|value| !wide(&value.ty) && value.ty != "<wide-tail>"),
+        "wide exception snapshots not reconstructed"
+    );
+    ensure!(
         end <= stop && !region.catches.is_empty(),
         "try crosses enclosing region"
     );
@@ -1352,6 +1561,16 @@ fn render_try(
     ensure!(
         normal_end <= stop,
         "try continuation crosses enclosing region"
+    );
+    ensure!(
+        method
+            .code
+            .as_ref()
+            .unwrap()
+            .try_regions
+            .iter()
+            .all(|other| { other.start <= region.start || normal_end <= other.start as usize }),
+        "protected continuation crosses another exception region"
     );
     let normal_reachable = graph.reachable(start, normal_end, words)?;
     ensure!(
@@ -1393,6 +1612,11 @@ fn render_try(
                     && let Some(name) = class.symbols.strings.get(name as usize)
                 {
                     declared_throw |= throwing::known_call_throws(owner, name, args, ret, ty);
+                    if matches!(words[pc] as u8, 0x71 | 0x77) {
+                        declared_throw |= class.symbols.hierarchy.get().is_some_and(|hierarchy| {
+                            hierarchy.static_call_declares(owner, name, args, ret, ty)
+                        });
+                    }
                 }
             }
             throwing::validate_catch_type(class, ty, declared_throw)?;
@@ -1442,6 +1666,10 @@ fn render_try(
             )?;
             entry += 1;
         }
+        graph
+            .caught_values
+            .borrow_mut()
+            .insert("__rdx_caught__".into());
         let mut dry = Output::default();
         let (_, returned) = render(
             class,
@@ -1506,7 +1734,24 @@ fn render_try(
             *count += u16::from(seen);
         }
     }
-    let join = if roots.len() == 1 && !normal_return && roots[0] == normal_end {
+    // Terminating handlers with no path back to normal flow can stay in
+    // their catch arms. Keep the effectful normal continuation outside try.
+    let detached_handlers = !normal_return
+        && region
+            .catches
+            .iter()
+            .all(|(_, handler)| *handler as usize != normal_end && (*handler as usize) < stop)
+        && (!graph
+            .reachable(normal_end, stop, words)?
+            .iter()
+            .zip(&visits)
+            .any(|(seen, count)| *seen && *count > 1)
+            // A shared bare void return has no state or effects to merge.
+            // Emit it directly in catch, leaving normal effects outside try.
+            || region.catches.iter().all(|(_, handler)| words[*handler as usize] as u8 == 0x0e));
+    let join = if detached_handlers {
+        normal_end
+    } else if roots.len() == 1 && !normal_return && roots[0] == normal_end {
         roots[0]
     } else {
         visits
@@ -1547,12 +1792,23 @@ fn render_try(
             None,
         )?;
         // Moving effects from outside the DEX try would change which throws
-        // are caught. Only an empty goto path can be folded into the try arm.
+        // are caught. An empty goto path or a bare void return has no throwing
+        // expression and can be folded into the try arm. Pure move/constant/
+        // branch/return tails are safe too: they introduce no caught effects.
+        // Preserve the return
+        // so terminal normal paths never fall through into a shared tail.
         ensure!(
-            continuation.text.is_empty(),
+            continuation.text.is_empty()
+                || (normal_terminal && continuation.text.trim() == "return;")
+                || normal_reachable.iter().enumerate().all(|(pc, reachable)| {
+                    !reachable
+                        || matches!(words[pc] as u8,
+                        0x00..=0x09 | 0x0e..=0x19 | 0x28..=0x2a | 0x32..=0x3d)
+                }),
             "effectful normal continuation before exception join"
         );
         body.sequence = continuation.sequence;
+        body.append(continuation);
     }
     let mut sequence = body.sequence;
     paths.push((usize::MAX, body, normal_regs, normal_terminal));
@@ -1561,9 +1817,14 @@ fn render_try(
     for (index, (ty, handler)) in region.catches.iter().enumerate() {
         let ty = ty.as_deref().unwrap_or("Ljava/lang/Throwable;");
         ensure!(types.insert(ty), "duplicate catch type");
+        let handler_stop = if detached_handlers { stop } else { join };
         let mut entry = *handler as usize;
-        ensure!(entry <= join, "partially overlapping exception handlers");
+        ensure!(
+            entry <= handler_stop,
+            "partially overlapping exception handlers"
+        );
         let name = format!("e{sequence}");
+        graph.caught_values.borrow_mut().insert(name.clone());
         sequence += 1;
         let mut values = initial.clone();
         if words[entry] as u8 == 0x0d {
@@ -1580,7 +1841,7 @@ fn render_try(
             entry += 1;
         }
         ensure!(
-            entry <= join,
+            entry <= handler_stop,
             "move-exception intersects shared continuation"
         );
         let mut handler_body = Output {
@@ -1593,7 +1854,7 @@ fn render_try(
             method,
             graph,
             entry,
-            join,
+            handler_stop,
             values,
             &mut handler_body,
             depth,
@@ -1601,6 +1862,10 @@ fn render_try(
             None,
             None,
         )?;
+        ensure!(
+            !detached_handlers || terminal,
+            "detached handler does not terminate"
+        );
         sequence = handler_body.sequence;
         paths.push((index, handler_body, values, terminal));
         headers.push((
@@ -1788,11 +2053,40 @@ fn render_switch(
     }
     // Stop at the first overlapping instruction, not merely a join common to
     // every arm: otherwise partially shared tails could duplicate side effects.
-    let join = visits
+    let mut join = visits
         .iter()
         .enumerate()
         .find_map(|(pos, count)| (*count > 1).then_some(pos))
         .unwrap_or(stop);
+    if starts.iter().any(|start| *start > join) {
+        // String-switch lowering can send several failed equality tests back
+        // to the default selector assignment. It is an acyclic shared prefix,
+        // not the switch join. Find a closed region and only duplicate pure
+        // register operations on paths leading to its actual continuation.
+        join = *starts.iter().max().unwrap();
+        loop {
+            let mut next = join;
+            for start in &starts {
+                if let Some(escape) = graph.region_is_closed(*start, join, words)? {
+                    next = next.max(escape);
+                }
+            }
+            ensure!(next <= stop, "switch join crosses enclosing region");
+            if next == join {
+                break;
+            }
+            join = next;
+        }
+        ensure!(
+            visits.iter().enumerate().all(|(pc, count)| {
+                pc >= join
+                    || *count <= 1
+                    || matches!(words[pc] as u8,
+                0x00..=0x09 | 0x12..=0x19 | 0x28..=0x2a | 0x32..=0x3d)
+            }),
+            "switch has partially overlapping effectful arms"
+        );
+    }
     let mut arms = Vec::new();
     let mut sequence = out.sequence;
     for start in starts {
@@ -1859,7 +2153,7 @@ fn render(
     out: &mut Output,
     depth: usize,
     mut initialized: bool,
-    suppressed_loop: Option<usize>,
+    suppressed_loop: Option<LoopContext<'_>>,
     exception_slots: Option<&[Option<Value>]>,
 ) -> Result<(Vec<Option<Value>>, bool)> {
     ensure!(depth <= 32, "control flow nesting exceeds budget");
@@ -1878,14 +2172,35 @@ fn render(
     while pc < stop {
         graph.tick()?;
         ensure!(!returned, "instructions after return");
+        if let Some(region) = graph.synchronized.iter().find(|region| region.enter == pc) {
+            ensure!(
+                initialized
+                    && pending.is_none()
+                    && allocation.is_none()
+                    && exception_slots.is_none(),
+                "monitor interrupts instruction state"
+            );
+            ensure!(region.exit < stop, "monitor crosses enclosing region");
+            regs = synchronized::emit(class, method, graph, region, regs, out, depth)?;
+            pc = region.exit + 1;
+            previous_exception_values.clone_from_slice(&regs);
+            continue;
+        }
         if exception_slots.is_none()
-            && let Some(region) = method
+            && let Some((_, region)) = method
                 .code
                 .as_ref()
                 .unwrap()
                 .try_regions
                 .iter()
-                .find(|region| region.start as usize == pc)
+                .enumerate()
+                .find(|(index, region)| {
+                    region.start as usize == pc
+                        && !graph
+                            .synchronized
+                            .iter()
+                            .any(|monitor| monitor.tries.contains(index))
+                })
         {
             ensure!(
                 initialized && allocation.is_none() && pending.is_none(),
@@ -1900,7 +2215,7 @@ fn render(
             pc = next;
             continue;
         }
-        if Some(pc) != suppressed_loop
+        if Some(pc) != suppressed_loop.map(|context| context.start)
             && let Some(region) = graph.loops.iter().find(|l| l.start == pc)
         {
             ensure!(
@@ -1927,6 +2242,25 @@ fn render(
         if matches!(op, 0x28..=0x2a) {
             ensure!(initialized, "branch before constructor initialization");
             let target = graph.targets[pc].context("missing goto target")?;
+            if let Some(context) = suppressed_loop
+                && target == context.start
+            {
+                ensure!(
+                    allocation.is_none(),
+                    "continue interrupts instruction state"
+                );
+                carry_loop_values(context.slots, &regs, out)?;
+                out.line("continue;", &[]);
+                return Ok((regs, true));
+            }
+            if suppressed_loop.is_some() && target >= stop && words[target] as u8 == 0x0e {
+                ensure!(
+                    method.return_type.as_ref() == "V" && allocation.is_none(),
+                    "invalid loop return"
+                );
+                out.line("return;", &[]);
+                return Ok((regs, true));
+            }
             ensure!(
                 target > pc || graph.acyclic_backwards.contains(&pc),
                 "unstructured backward jump"
@@ -1955,9 +2289,42 @@ fn render(
         if matches!(op, 0x32..=0x3d) {
             ensure!(initialized, "branch before constructor initialization");
             let target = graph.targets[pc].context("missing branch target")?;
+            if let Some(context) = suppressed_loop
+                && target == context.start
+            {
+                ensure!(
+                    allocation.is_none(),
+                    "continue interrupts instruction state"
+                );
+                let test = condition(op, a, &regs)?;
+                out.line(&format!("if ({test}) {{"), &[]);
+                out.indent += 1;
+                carry_loop_values(context.slots, &regs, out)?;
+                out.line("continue;", &[]);
+                out.indent -= 1;
+                out.line("}", &[]);
+                pending = None;
+                pc += width;
+                continue;
+            }
+            if suppressed_loop.is_some() && target >= stop && words[target] as u8 == 0x0e {
+                ensure!(
+                    method.return_type.as_ref() == "V" && allocation.is_none(),
+                    "invalid loop return"
+                );
+                let test = condition(op, a, &regs)?;
+                out.line(&format!("if ({test}) {{"), &[]);
+                out.indent += 1;
+                out.line("return;", &[]);
+                out.indent -= 1;
+                out.line("}", &[]);
+                pending = None;
+                pc += width;
+                continue;
+            }
             ensure!(
-                target > pc && target <= stop,
-                "branch crosses region boundary"
+                (target > pc || graph.acyclic_backwards.contains(&pc)) && target <= stop,
+                "branch crosses region boundary at {pc:04x}: target {target:04x}, stop {stop:04x}"
             );
             let condition = condition(op, a, &regs)?;
             let inverse = self::condition(op ^ 1, a, &regs)?;
@@ -2158,7 +2525,8 @@ fn render(
                         1 => matches!(value.ty.as_str(), "J" | "D"),
                         _ => reference(&value.ty) || value.literal == Some(0),
                     },
-                    "move type mismatch"
+                    "move type mismatch at {pc:04x}: register v{src} has type {}",
+                    value.ty
                 );
                 ensure!(
                     dst == src
@@ -2185,9 +2553,16 @@ fn render(
             0x27 => {
                 ensure!(
                     initialized && allocation.is_none(),
-                    "throw before initialization"
+                    "throw before initialization: implicit super() would change construction/finalization effects"
                 );
-                let expression = throwing::expression(class, method, &register(&regs, a)?)?;
+                let value = register(&regs, a)?;
+                // Java precise rethrow preserves the exception from this catch.
+                // Only unchanged catch identities qualify, not arbitrary Throwable values.
+                let expression = if graph.caught_values.borrow().contains(&value.text) {
+                    value.text.clone()
+                } else {
+                    throwing::expression(class, method, &value)?
+                };
                 out.line(&format!("throw {expression};"), &[]);
                 returned = true;
             }
@@ -2211,6 +2586,29 @@ fn render(
                 );
                 let value = register(&regs, a)?;
                 let expr = argument(&value, &method.return_type)?;
+                if exception_slots.is_some()
+                    && reference(&method.return_type)
+                    && !method
+                        .code
+                        .as_ref()
+                        .unwrap()
+                        .try_regions
+                        .iter()
+                        .any(|region| region.start as usize <= pc && pc < region.end as usize)
+                {
+                    // An absorbed DEX return cannot throw. Do not introduce a
+                    // potentially failing Java downcast under a new catch.
+                    ensure!(
+                        expr == value.text
+                            || expr == "null"
+                            || method.return_type.as_ref() == "Ljava/lang/Object;"
+                            || class.symbols.hierarchy.get().is_some_and(|hierarchy| {
+                                hierarchy.assignable(&value.ty, &method.return_type)
+                                    == crate::native_hierarchy::Relation::Proven
+                            }),
+                        "return tail requires a potentially throwing conversion"
+                    );
+                }
                 out.line(&format!("return {expr};"), &[]);
                 returned = true;
             }
@@ -2352,14 +2750,17 @@ fn render(
             }
             0x22 => {
                 if initialized
-                    && exception_slots.is_none()
-                    && method
-                        .code
-                        .as_ref()
-                        .is_some_and(|code| code.try_regions.is_empty())
+                    // Staging is safe for handler state only when no entry
+                    // register needs a mutable exception snapshot.
+                    && exception_slots.is_none_or(|slots| slots.iter().all(Option::is_none))
                     && let Some(lowered) = allocation_lowering::try_lower(
                         class, method, graph, words, pc, stop, &regs, out,
                     )?
+                    && method.code.as_ref().is_some_and(|code| code.try_regions.iter().all(|region| {
+                        let start = region.start as usize;
+                        let end = region.end as usize;
+                        end <= pc || start >= lowered.next_pc || (start <= pc && lowered.next_pc <= end)
+                    }))
                 {
                     regs = lowered.regs;
                     out.sequence = lowered.out.sequence;
@@ -2433,7 +2834,10 @@ fn render(
                 );
                 let is_static = op >= 0x60;
                 let put = if is_static { op >= 0x67 } else { op >= 0x59 };
-                if !initialized {
+                if !(initialized || constructor && is_static && !put) {
+                    // Independent static reads do not touch the uninitialized receiver.
+                    // Emit them in DEX order; single-use adjacent delegation arguments
+                    // can be inlined later without repeating or moving a field read.
                     // Java 25 early construction permits assignments to fields
                     // declared in this class, but forbids reading/escaping this.
                     // Keep DEX order: superclass callbacks may observe the write.
@@ -2492,26 +2896,6 @@ fn render(
                 }
             }
             0x6e..=0x72 | 0x74..=0x78 => {
-                let &(owner, proto, name) = class
-                    .symbols
-                    .methods
-                    .get(words[pc + 1] as usize)
-                    .context("method index")?;
-                let owner = class
-                    .symbols
-                    .types
-                    .get(owner as usize)
-                    .context("method owner")?;
-                let (ret, args) = class
-                    .symbols
-                    .protos
-                    .get(proto as usize)
-                    .context("method prototype")?;
-                let name = class
-                    .symbols
-                    .strings
-                    .get(name as usize)
-                    .context("method name")?;
                 let kind = if op >= 0x74 { op - 6 } else { op };
                 let static_call = kind == 0x71;
                 let inputs: Vec<usize> = if op >= 0x74 {
@@ -2529,20 +2913,62 @@ fn render(
                     ];
                     all[..n].to_vec()
                 };
-                let mut cursor = 0;
+                let call = crate::native_calls::bind_invocation(
+                    op,
+                    pc,
+                    u32::from(words[pc + 1]),
+                    &inputs,
+                    &class.symbols,
+                )?;
+                let crate::native_calls::CallTarget::Method {
+                    declaring_type: owner,
+                    name,
+                    prototype_index,
+                    ..
+                } = &call.target
+                else {
+                    bail!("ordinary invoke has non-method target");
+                };
+                let name = name.as_ref();
+                let args = &class.symbols.protos[usize::from(*prototype_index)].1;
+                let ret = &call.return_type;
                 let target = if static_call {
                     java_type(owner)?
                 } else {
-                    let value =
-                        register(&regs, *inputs.first().context("missing invoke receiver")?)?;
-                    cursor = 1;
+                    let value = register(
+                        &regs,
+                        usize::from(
+                            call.receiver
+                                .as_ref()
+                                .context("missing invoke receiver")?
+                                .register,
+                        ),
+                    )?;
                     receiver(&value, owner)?
                 };
+                let label = format!(
+                    "{}.{}({}){}",
+                    owner
+                        .trim_start_matches('L')
+                        .trim_end_matches(';')
+                        .replace('/', "."),
+                    name,
+                    args.join(""),
+                    ret
+                );
+                let unambiguous_object_call = static_call
+                    && args.iter().any(|ty| ty.as_ref() == "Ljava/lang/Object;")
+                    && class
+                        .symbols
+                        .hierarchy
+                        .get()
+                        .is_some_and(|hierarchy| hierarchy.is_unambiguous_object_call(&label));
                 let mut actual = Vec::new();
                 let mut capture_count = 0;
                 let mut capture_refs = Vec::new();
-                for ty in args {
-                    let reg = *inputs.get(cursor).context("missing invoke arg")?;
+                for input in &call.arguments {
+                    let ty = &input.descriptor;
+                    let reg = usize::from(input.register);
                     let mut value = register(&regs, reg)?;
                     if let Some(index) = value
                         .text
@@ -2590,32 +3016,17 @@ fn render(
                     // overloads (including constructors and varargs arrays).
                     actual.push(if value.literal == Some(0) && reference(ty) {
                         format!("(({}) null)", java_type(ty)?)
+                    } else if unambiguous_object_call
+                        && ty.as_ref() == "Ljava/lang/Object;"
+                        && reference(&value.ty)
+                    {
+                        value.text.clone()
                     } else if ty.as_ref() == "I" && matches!(value.ty.as_str(), "B" | "S" | "C") {
                         format!("((int) {})", value.text)
                     } else {
                         argument(&value, ty)?
                     });
-                    if matches!(ty.as_ref(), "J" | "D") {
-                        ensure!(
-                            inputs.get(cursor + 1) == Some(&(reg + 1)),
-                            "nonconsecutive wide argument"
-                        );
-                        cursor += 2;
-                    } else {
-                        cursor += 1;
-                    }
                 }
-                ensure!(cursor == inputs.len(), "extra invoke args");
-                let label = format!(
-                    "{}.{}({}){}",
-                    owner
-                        .trim_start_matches('L')
-                        .trim_end_matches(';')
-                        .replace('/', "."),
-                    name,
-                    args.join(""),
-                    ret
-                );
                 ensure!(name != "<clinit>", "static initializer invocation");
                 if name == "<init>" {
                     if let Some((dst, ty)) = allocation.take() {
@@ -2782,7 +3193,10 @@ fn render(
                             class_label(owner).context("invalid owner")?,
                         ));
                     }
-                    if ret.as_ref() == "V" {
+                    let consumes_result = words
+                        .get(pc + width)
+                        .is_some_and(|word| matches!(word & 0xff, 0x0a..=0x0c));
+                    if ret.as_ref() == "V" || !consumes_result {
                         out.line(&format!("{expr};"), &refs);
                     } else {
                         pending = Some(out.local(ret, &expr, &refs)?);
@@ -2814,7 +3228,25 @@ fn render(
                 assign(&mut regs, dst, value)?;
             }
             0x90..=0x9a | 0xb0..=0xba | 0xd0..=0xe2 => {
-                let boolean_xor_literal = if matches!(op, 0xd7 | 0xdf) {
+                let boolean_xor_literal = if matches!(op, 0x97 | 0xb7) {
+                    let (dst, left, right) = if op == 0xb7 {
+                        (a & 15, a & 15, a >> 4)
+                    } else {
+                        (
+                            a,
+                            (words[pc + 1] & 255) as usize,
+                            (words[pc + 1] >> 8) as usize,
+                        )
+                    };
+                    let left = register(&regs, left)?;
+                    let right = register(&regs, right)?;
+                    [(left.clone(), right.clone()), (right, left)]
+                        .into_iter()
+                        .find_map(|(source, literal)| {
+                            (source.ty == "Z" && matches!(literal.literal, Some(0 | 1)))
+                                .then(|| (dst, source, literal.literal.unwrap()))
+                        })
+                } else if matches!(op, 0xd7 | 0xdf) {
                     let (source, literal) = if op == 0xd7 {
                         (a >> 4, words[pc + 1] as i16 as i32)
                     } else {
@@ -2880,6 +3312,7 @@ fn render(
                     assign(&mut regs, dst, value)?;
                 }
             }
+            0x1d | 0x1e => bail!("unmatched or unproven monitor instruction"),
             _ => unreachable!(),
         }
         ensure!(
@@ -2947,6 +3380,175 @@ mod tests {
         };
         (class, method)
     }
+    // Independent evaluator for this test's emitted straight-line Java subset.
+    // Unknown syntax fails rather than being treated as equivalent.
+    fn eval_narrow_java(body: &str, input: i32) -> i32 {
+        fn expr(text: &str, values: &std::collections::HashMap<String, i32>) -> i32 {
+            let text = text.trim();
+            if let Some((left, right)) = text.split_once('^') {
+                return expr(left, values) ^ expr(right, values);
+            }
+            if let Some(inner) = text.strip_prefix('!') {
+                return i32::from(expr(inner, values) == 0);
+            }
+            if let Some(inner) = text.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+                return expr(inner, values);
+            }
+            match text {
+                "true" => 1,
+                "false" => 0,
+                _ => text.parse().unwrap_or_else(|_| {
+                    *values
+                        .get(text)
+                        .unwrap_or_else(|| panic!("unsupported expression: {text}"))
+                }),
+            }
+        }
+        let mut values = std::collections::HashMap::from([("p0".to_owned(), input)]);
+        for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let line = line.strip_suffix(';').expect("Java statement");
+            if let Some(ret) = line.strip_prefix("return ") {
+                return expr(ret, &values);
+            }
+            let (declaration, rhs) = line.split_once(" = ").expect("Java assignment");
+            values.insert(
+                declaration.split_whitespace().last().unwrap().into(),
+                expr(rhs, &values),
+            );
+        }
+        panic!("missing return")
+    }
+
+    #[test]
+    fn focused_xor_behavior_truth_table_and_integer_boundaries() {
+        for mask in [0, 1] {
+            for (operation, result) in [
+                (vec![0x01b7], 1),
+                (vec![0x0097, 0x0001], 0),
+                (vec![0x10b7], 0),
+            ] {
+                let mut words = vec![(mask << 12) | 0x12];
+                words.extend(operation);
+                words.push((result << 8) | 0x0f);
+                for (ty, inputs) in [
+                    ("Z", vec![0, 1]),
+                    ("I", vec![i32::MIN, -1, 0, 1, 2, i32::MAX]),
+                ] {
+                    let (class, method) = fixture(words.clone(), 2, 1, vec![ty.into()], ty);
+                    let body = reconstruct("sample.Example", &class, &method).unwrap();
+                    for input in inputs {
+                        assert_eq!(
+                            eval_narrow_java(&body.text, input),
+                            input ^ i32::from(mask),
+                            "{ty} {input} mask={mask}: {}",
+                            body.text
+                        );
+                    }
+                    if ty == "Z" && mask == 1 {
+                        let mutant = body.text.replace("!(p0)", "p0");
+                        assert_ne!(
+                            eval_narrow_java(&mutant, 0),
+                            1,
+                            "negative control must detect lost negation"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn focused_super_dispatch_preserves_parent_target() {
+        let (mut class, mut method) =
+            fixture(vec![0x106f, 0, 0, 0x000a, 0x000f], 1, 1, vec![], "I");
+        class.superclass = Some("Lsample/Base;".into());
+        class.symbols = Arc::new(DexSymbols {
+            types: vec!["Lsample/Base;".into()],
+            strings: vec!["value".into()],
+            protos: vec![("I".into(), vec![])],
+            methods: vec![(0, 0, 0)],
+            ..Default::default()
+        });
+        method.access_flags = 1;
+        let body = reconstruct("sample.Example", &class, &method).unwrap();
+        // Model different overriding implementations so a virtual-call rewrite fails.
+        let eval = |source: &str| {
+            let line = source
+                .lines()
+                .find(|line| line.contains(".value()"))
+                .unwrap();
+            let (_, rhs) = line.trim().trim_end_matches(';').split_once(" = ").unwrap();
+            match rhs {
+                "super.value()" => (7, "Base.value"),
+                "this.value()" => (99, "Example.value"),
+                _ => panic!("unknown dispatch {rhs}"),
+            }
+        };
+        let dex = match method.code.as_ref().unwrap().instructions[0] as u8 {
+            0x6f => (7, "Base.value"),
+            0x6e => (99, "Example.value"),
+            _ => panic!("unknown invoke"),
+        };
+        assert_eq!(eval(&body.text), dex);
+        assert_ne!(
+            eval(&body.text.replace("super.value()", "this.value()")),
+            dex
+        );
+    }
+
+    #[test]
+    fn register_xor_preserves_boolean_type_for_zero_one_operands() {
+        for (operation, result) in [
+            (vec![0x01b7], 1),
+            (vec![0x0097, 0x0001], 0),
+            (vec![0x10b7], 0),
+        ] {
+            let mut words = vec![0x1012];
+            words.extend(operation);
+            words.push((result << 8) | 0x0f);
+            let (class, method) = fixture(words.clone(), 2, 1, vec!["Z".into()], "Z");
+            let body = reconstruct("sample.Example", &class, &method).unwrap();
+            assert!(body.text.contains("!(p0)"), "{}", body.text);
+            let (class, method) = fixture(words, 2, 1, vec!["I".into()], "I");
+            let body = reconstruct("sample.Example", &class, &method).unwrap();
+            assert!(body.text.contains(" ^ "));
+            assert!(!body.text.contains("!(p0)"));
+        }
+    }
+
+    #[test]
+    fn discarded_invoke_results_keep_calls_and_links_without_unused_locals() {
+        let (mut class, method) = fixture(
+            vec![0x0071, 0, 0, 0x0071, 0, 0, 0x000a, 0x000f],
+            1,
+            0,
+            vec![],
+            "I",
+        );
+        class.symbols = Arc::new(DexSymbols {
+            types: vec!["Lsample/Example;".into()],
+            strings: vec!["effect".into()],
+            protos: vec![("I".into(), vec![])],
+            methods: vec![(0, 0, 0)],
+            ..Default::default()
+        });
+        let body = reconstruct("sample.Example", &class, &method).unwrap();
+        assert_eq!(body.text.matches("sample.Example.effect()").count(), 2);
+        assert!(
+            body.text.starts_with("        sample.Example.effect();\n"),
+            "{}",
+            body.text
+        );
+        assert_eq!(
+            body.links
+                .iter()
+                .filter(|l| l.label == "sample.Example.effect()I")
+                .count(),
+            2
+        );
+        assert!(body.text.contains("return "));
+    }
+
     #[test]
     fn dead_incompatible_branch_values_do_not_block_reconstruction() {
         let (c, mut m) = fixture(
@@ -3179,7 +3781,7 @@ mod tests {
         ];
         let graph = Graph::new(&[0x000e]).unwrap();
         let mut out = Output::default();
-        let slots = loop_slots(&regs, &graph, 0, &mut out).unwrap();
+        let slots = loop_slots(&regs, &graph, 0, &mut out, None).unwrap();
         assert_eq!(slots[0].as_ref().unwrap().ty, "J");
         assert_eq!(slots[1].as_ref().unwrap().ty, "<wide-tail>");
         assert_eq!(slots[1].as_ref().unwrap().text, "0");
@@ -3195,7 +3797,7 @@ mod tests {
             wide_literal: None,
         })];
         let graph = Graph::new(&[0x000e]).unwrap();
-        assert!(loop_slots(&regs, &graph, 0, &mut Output::default()).is_err());
+        assert!(loop_slots(&regs, &graph, 0, &mut Output::default(), None).is_err());
     }
     #[test]
     fn wide_diamond_merges_a_single_long_head() {
@@ -3452,6 +4054,25 @@ mod tests {
         );
     }
     #[test]
+    fn switch_failed_tests_can_share_a_backward_default_selector() {
+        let (c, m) = fixture(
+            vec![
+                0x012b, 14, 0, 0x0928, 0x0138, 0xffff, 0x1012, 0x0628, 0x0138, 0xfffb, 0x2012,
+                0x0228, 0xf012, 0x000f, 0x0100, 2, 0, 0, 4, 0, 8, 0,
+            ],
+            2,
+            1,
+            vec!["I".into()],
+            "I",
+        );
+        let body = reconstruct("sample.Example", &c, &m).unwrap();
+        assert_eq!(body.text.matches("switch (").count(), 1, "{}", body.text);
+        assert!(body.text.contains("case 0:") && body.text.contains("case 1:"));
+        assert_eq!(body.text.matches("return ").count(), 1, "{}", body.text);
+        assert!(body.text.contains("= -1;"));
+    }
+
+    #[test]
     fn switch_payload_is_never_an_executable_target() {
         // A valid packed payload exists, but normal switch fallthrough enters it.
         assert!(Graph::new(&[0x012b, 4, 0, 0, 0x0100, 0, 0, 0]).is_err());
@@ -3575,7 +4196,11 @@ mod tests {
     #[test]
     fn loops_reject_interior_entries_and_overlapping_backedges() {
         assert!(Graph::new(&[0x0228, 0, 0x003c, 0xffff, 0x000e]).is_err());
-        assert!(Graph::new(&[0, 0x003c, 0xffff, 0x003c, 0xfffd, 0x000e]).is_err());
+        assert!(Graph::new(&[0, 0, 0x003c, 0xfffe, 0x003c, 0xfffd, 0x000e]).is_err());
+        // Same-header backedges are now one loop, not overlapping loops.
+        let shared = Graph::new(&[0, 0x003c, 0xffff, 0x003c, 0xfffd, 0x000e]).unwrap();
+        assert_eq!(shared.loops.len(), 1);
+        assert_eq!(shared.loops[0].latch, 3);
     }
     #[test]
     fn register_overwrites_do_not_rewrite_previous_values() {
@@ -3733,5 +4358,43 @@ mod readability_conditions {
             condition(0x32, 0x10, &regs).unwrap(),
             "((java.lang.Object) left) == ((java.lang.Object) right)"
         );
+    }
+}
+
+#[cfg(test)]
+mod boolean_numeric_arguments {
+    use super::*;
+    #[test]
+    fn boolean_zero_one_values_reify_for_all_narrow_integral_uses() {
+        let value = Value {
+            text: "flag".into(),
+            ty: "Z".into(),
+            literal: None,
+            wide_literal: None,
+        };
+        for (descriptor, expected) in [
+            ("I", "(flag ? 1 : 0)"),
+            ("B", "(byte) (flag ? 1 : 0)"),
+            ("S", "(short) (flag ? 1 : 0)"),
+            ("C", "(char) (flag ? 1 : 0)"),
+        ] {
+            assert_eq!(argument(&value, descriptor).unwrap(), expected);
+        }
+        assert_eq!(argument(&value, "Z").unwrap(), "flag");
+        for target in ["F", "J", "D", "Ljava/lang/Object;"] {
+            assert!(argument(&value, target).is_err());
+        }
+    }
+    #[test]
+    fn arbitrary_integer_values_are_not_narrowed_implicitly() {
+        let value = Value {
+            text: "number".into(),
+            ty: "I".into(),
+            literal: None,
+            wide_literal: None,
+        };
+        for target in ["B", "S", "C", "Z"] {
+            assert!(argument(&value, target).is_err());
+        }
     }
 }

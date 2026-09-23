@@ -1,4 +1,238 @@
+## Synthetic class display regression (2026-09-21)
+
+ACC_SYNTHETIC no longer rejects Java class headers. Previously this also bypassed
+import/type shortening, despite successful method reconstruction. Full displayed
+`aapj` now starts with `public final class aapj implements cgns`, uses Object,
+String and Boolean, and has no DEX class/super/interface directives. This is
+verified through NativeDexEngine.render, not only individual method rendering.
+Validation: 574 regular tests, the real-APK displayed-source regression, strict
+Clippy, release build, formatting and diff checks passed. Both app binaries were
+installed with matching SHA-256 hashes. Evidence: `target/validation/header-*`
+and `target/validation/aapj-displayed.java`.
+
+## Large provider-switch regression (2026-09-21)
+
+`aapj.a()` in the reported Play Store APK now reconstructs all 20 cases plus
+its default arm. The class has 2 reconstructed methods and 0 fallbacks. Boolean
+XOR with register-held 0/1 retains boolean type; ordinary integer XOR remains
+integer arithmetic. Captured Object values support explicit reference casts,
+while unrelated unproven reference conversions remain rejected. The allocation
+decoder accepts up to 128 instructions (formerly 64); its output and expression
+budgets remain enforced. Tests exercise both sides of the instruction limit.
+
+All original getClass calls are counted against decoded DEX invokes. All four
+long provider constructors and source identity checks pass. Validation: 573
+regular tests passed, 28 opt-in tests ignored; all five APK regression tests
+passed. Strict all-target Clippy, release build, format and diff checks passed.
+Both app binaries were installed and SHA-256 verified. Evidence:
+`target/validation/aapj-*`.
+
+## Callback, constructor and catch-layout regressions (2026-09-21)
+
+The reported Play Store APK now reconstructs `VendingBackupAgent.onBackup`,
+`txt.onClick`, and `pj`'s constructor, `reportFullyDrawn`, both reported
+picture-in-picture callbacks, and `onPanelClosed`. Existing `onRestore` coverage
+also passes. Terminating catch arms leave normal continuation effects outside
+protected ranges. Unchanged caught exceptions support precise rethrow; arbitrary
+checked replacements remain rejected. Wide operations outside protection no longer
+trigger the wide snapshot restriction. Primitive-array null casts retain overload
+types without fake class links. Explicitly discarded allocation-window calls are
+retained in order; implicit Object constructors use direct-parent evidence.
+Loop-invariant `this` stays available for subsequent super dispatch.
+
+Validation: 569 regular tests passed, 27 opt-in tests ignored; all four APK tests
+passed (the callback test covers five methods). Strict all-target Clippy, release
+build, formatting and diff checks passed. Both installed app binaries match the
+release SHA-256 hashes. Evidence: `target/validation/batch-*`, `pj-*.java`,
+`onbackup-after.java`, and `txt-onclick-after.java`. This is regression acceptance,
+not a claim of complete decompiler coverage.
+
+## Full-document viewer (2026-09-21)
+
+Removed the 128 KiB / 5,000-line source display cutoff and its warning. The full
+loaded document stays available to layout, scrolling, selection, find and symbol
+navigation. Explicit scroll offsets make long-distance jumps immediate; exported
+component highlighting is tested beyond line 5,000. Regression cases include a
+3,014-line document above 128 KiB, 10,000 lines, and a long Unicode line.
+All 20 viewer tests and all 94 GUI binary tests passed (2 opt-in tests ignored).
+Strict Clippy, release build and format/diff checks passed. Both app binaries
+were installed with matching SHA-256 hashes. Evidence: `target/validation/full-viewer-*`.
+
+## Class-literal cleanup acceptance (2026-09-21)
+
+SessionDetailsActivity's reported injection block now contains no `classValue`
+temporaries, renders `aefa aefa2 = (aefa) aqkw.e(aefa.class);`, retains
+`aefa2.getClass();`, and passes `aefa.class` and `SessionDetailsActivity.class`
+directly to the subsequent checks. The APK acceptance test checks those exact
+lines in addition to existing method navigation. Repeated literal uses retain
+class links; preceding effects, field receivers and reassignment reject inlining.
+Standalone cast parentheses are removed without stripping receiver-cast grouping.
+
+564 regular tests passed; 24 opt-in tests ignored. All three Play Store APK
+checks, strict Clippy, format/diff checks and release build passed. The exact
+search phrase reached its first match in 20.128 seconds cold and 170.806 ms cached
+(43,134 classes, no search errors, zero repeat source fetches). These are single-run
+first-match timings excluding APK load and GUI latency. The installed app binaries
+match release hashes. Evidence: `target/validation/literal-cleanup-*`; final source:
+`target/validation/session-details.java`.
+
+## SessionDetailsActivity readability (2026-09-21)
+
+Final result: 562 regular tests passed; 24 opt-in tests ignored.
+All three Play Store APK checks, strict Clippy, format/diff checks and release
+build passed. Both installed binaries match release SHA-256 hashes; see
+`target/validation/session-details-installed.json`.
+
+The reported Play Store activity now uses a positive kill-switch early return,
+direct provider-field assignments, a joined package-name ternary, and documented
+Java nested-type notation. Discarded invocation results retain their calls without
+unused locals. Object argument casts disappear only when project-wide metadata
+proves a unique static overload; unknown parents and competing overloads retain
+casts. The longer intent branch keeps its ordered call preparation and typed nulls.
+Class-literal locals are now cleaned up where the first-use and receiver checks
+permit it; this is not a claim of exact JADX output.
+
+The opt-in SessionDetailsActivity test checks these changes and resolves the
+inlined `aqtw.e()Z` jump to `aqtp.e()Z`. Synthetic tests cover call retention,
+short-circuit boundaries, nullable receivers, overload ambiguity, conditional
+numeric promotion, Unicode metadata relocation, and nested-type collisions.
+Final evidence is in `target/validation/session-details-verified-tests.log`,
+`session-details-verified-clippy.log`, `session-details-apk-final.log`, and
+`session-details.java`. The exact search phrase reached its first match in
+19.291 seconds cold and 163.989 ms cached in an otherwise idle test run, versus
+18.949 seconds and 177.389 ms in the prior batch. These single-run timings exclude
+APK loading and do not measure full search completion or GUI latency. The initial
+concurrent-check run measured 23.412 seconds; the idle repeat isolates that load.
+
+## Readability batch completion (2026-09-21)
+
+The reported AppDiscoveryLaunchActivity now has readable call chains, inferred
+local names, imported static owners, verified varargs syntax, simplified boolean
+and null guards, and `if (flag && !startsWith)` without redundant grouping.
+Guard folding retains grouping for disjunction, assignment, ternary expressions,
+and unclassified operators; evaluation order and Unicode source links are tested.
+Methods without a guard or parenthesized negation skip the condition syntax pass.
+
+Validation: 550 regular tests passed, 23 opt-in tests ignored; both Play Store
+accuracy/navigation tests passed explicitly. The exact ScreenshotsActivityV2
+phrase search passed: first match 18.949 seconds cold, 177.389 ms on the same
+cache, with zero new source fetches on the repeat. These timings exclude APK
+loading and measure first match, not complete search/UI latency. Strict Clippy,
+formatting, diff checks, and the release build passed. Both binaries were installed
+into `target/RDX.app` with matching SHA-256 hashes. Evidence:
+`target/validation/readability-finish-*`, including the emitted Java, test logs,
+search timings and installation hashes. This completes the bounded readability
+batch; it does not imply 100% Java reconstruction coverage or recovery of original
+source names. Existing conservative temporaries and casts remain where needed.
+
+## Search regression comparison (2026-09-21)
+
+Clean release rebuilds compared HEAD `a5e7f61` with the current working tree using
+`tests/native_search_profile.rs` on `com.android.vending.apk`, default standard
+package exclusions, and all 62,704 remaining classes. HEAD rendered them in
+19,165 ms; the current renderer took 26,326 ms (about 37% slower). These are
+single-run source-rendering measurements, excluding APK loading, search cache
+indexing, result matching, and GUI layout. They establish remaining renderer
+overhead, not the cause of the reported live search stall.
+
+Evidence: `target/validation/search-baseline-full.log` and
+`target/validation/search-current-full.log`. Each log records an explicit compile
+of its respective source directory. Earlier shared-target comparison runs were
+discarded because Cargo reused an artifact. No production change was made during
+this diagnostic pass. The running app was confirmed to use `target/RDX.app` and
+had started after the previous installation. A live stack sample could not be
+captured because that process had exited before sampling.
+
 # Native-only migration validation
+
+## Readability-pass search regression and typing cancellation
+
+Profiling isolated a regression in varargs presentation: every method rebuilt a
+formatted type set from the entire shared DEX table. Abstract/declaration-only
+methods paid that cost too. The pass now returns before token/type allocation
+unless an eligible Object-array initializer and proven varargs call exist; for
+candidates it resolves only the local types used by the method.
+
+Release phase measurements: `aefa` 465 ms to 0.683 ms, `abvc` 865 to 204 ms,
+`absi` 451 to 140 ms. The exact Code query `ScreenshotsActivityV2 extends onj
+implements onm` found its class after scanning 43,134 sources in 19.3 seconds
+with an empty cache (23.1 seconds in a repeat with concurrent test compilation).
+The repeat query reached the same match in 171 ms with zero new source fetches.
+These are first-match timings after APK loading, not complete-scan timings.
+The matched 4,833-class cold renderer prefix dropped from 45.0 seconds to
+2.776 seconds (about 16.2x for that measured prefix); both runs use the same
+alphabetical input sequence. This ratio is not an APK-wide search claim.
+
+Search cancellation now checks between member reconstruction/presentation steps;
+cancelled classes never enter the source cache as partial documents. Typing also
+invalidates queued results and progress from the old query, preserving the latest
+query's debounce until the previous worker returns. Tests cover both successful
+and mixed-render cancellation and real keyboard edits of the reported phrase.
+Evidence: `target/validation/search-phrase-after.log`, `search-regression-*`,
+`cold-renderer-phase-profile*.log`, and `cold-search-class-trace.tsv`.
+
+## Named-class Code search latency
+
+Literal Code queries that exactly match a simple or fully qualified class name
+now examine that class first, respecting case sensitivity and package exclusions.
+Other selected classes remain in the search to find references; this changes
+first-result order, not the set of candidates or the meaning of Code search.
+
+For `VendingBackupAgent` in the reported Play Store APK, the class previously sat
+at position 43,170. The release-mode cold-search regression measured 20.8 ms to
+the first result and one generated source document after APK loading. This is
+not a measurement of complete APK search time or an overall speedup ratio.
+Reproduce with `RDX_TEST_APK=... cargo test --release --bin rdx
+vending_named_code_search_first_result -- --ignored --nocapture`.
+Evidence: `target/validation/search-first-result.log`.
+
+Class fallback also reuses every completed method result instead of retrying
+already attempted methods. Counter and parity tests cover successful classes,
+early/middle/late failures and invalid class headers, including identical source,
+hashes, definitions and navigation links. A 20-pair debug benchmark of this small
+class showed no measurable latency improvement from that refactor alone; the
+measured first-result improvement comes from search ordering.
+
+## Restore loop with multiple continue edges
+
+`VendingBackupAgent.onRestore` now reconstructs from the reported Play Store APK.
+Backedges sharing a header form one loop; each continue preserves its current
+register values. Synthetic tests independently execute the generated loop for 27
+inputs, covering conditional and unconditional continues and interior-entry rejection.
+The APK regression checks all nine settings, field stores, seven boolean reads,
+the long read, source hashes and navigation, and the gRPC catch after the loop.
+
+Wide calculations before a try no longer reject the whole method when their
+register state is discarded before entering the try. Wide entry snapshots remain
+unsupported. Bare void-return continuations can finish a try arm; calls outside
+the protected region still cannot move inside it. Missing checked-exception
+declarations are recovered only for exact direct Android BackupAgent/BackupAgentHelper
+override contracts, preserving explicit declarations and original method metadata.
+
+544 regular tests and the real APK regression pass; strict Clippy, formatting,
+and release build pass. Class acceptance improves from 1/3 to 2/3; `onBackup`
+still fails on wide exception snapshots. Evidence: `target/validation/backup-*`.
+This is a local batch without a commit, push, or CI submission.
+
+## Constructor delegation and inherited navigation batch
+
+The reported Play Store `caso` inventory contains 343 constructors: 342 now
+reconstruct, including all 341 array overloads. Independent static reads before
+delegation retain their evaluation order; an adjacent single-use first argument
+can render directly in `this(...)`, preserving the exact overload and links.
+The no-argument constructor still falls back because it throws before superclass
+initialization. The renderer does not insert superclass effects into that path.
+Four other non-constructor methods in this class remain unsupported (539/544
+concrete methods accepted). These counts are acceptance, not equivalence coverage.
+
+`anfw` now renders 2/2 concrete methods using a proven implicit default constructor.
+`brgk.mw` preserves boolean 0/1 values when used as byte state, including its
+37-element schema array. Inherited navigation resolves `aqtw.e()Z` to `aqtp.e()Z`
+without changing the call-site identity used by Find usages.
+
+Validation: 535 regular tests pass (16 opt-in tests ignored), plus five real APK
+regressions pass separately. Logs are `target/validation/final-native-batch-*.log`.
+The batch remains local; no commit, push, or CI submission was performed.
 
 ## Latest: shared tails, interleaved catches and allocation expressions
 
@@ -581,3 +815,156 @@ Play Store opt-in regressions also pass explicitly. Strict all-target Clippy and
 release builds pass. In the reported AppDiscoveryLaunchActivity, generated local
 declarations decrease from 38 to 27. This measures display cleanup, not a change
 to decompilation coverage or proof of full semantic equivalence.
+
+### Complete readability presentation batch
+
+The AppDiscoveryLaunchActivity regression now verifies the complete injection
+call chain, inferred Bundle/Intent/Uri names, simplified null/boolean guards,
+ordered combined conditions, imported FinskyLog calls, and verified varargs
+expansion. Both Play Store opt-in regressions pass with exact navigation targets.
+
+New tests cover first-argument type matching and evaluation order, retained cast
+checks, collision-safe names and untouched member/literal text, conditional
+short-circuit behavior, primary expression precedence, static varargs overload
+and owner checks, cross-DEX metadata, and Unicode mapping/source hashes. The
+independent arithmetic evaluator reads the emitted parameter name rather than
+assuming p0, preserving its operand/wrapping checks after display renaming.
+Evidence: `target/validation/readability-batch-*` (local and untracked).
+
+### Inherited declaration navigation
+
+The AppDiscoveryLaunchActivity regression now performs the full navigation
+operation, not just call-site symbol lookup. The linked `aqtw.e()Z` reference
+resolves to the `aqtp.e()Z` declaration inherited by aqtw. Synthetic tests cover
+exact overload descriptors, superclass precedence, interface diamonds,
+most-specific declarations, ambiguous interface owners, and non-inherited private
+or static interface methods. The viewer double-click test also covers the
+one-character `e` glyph in `this.a.e()`.
+
+### Jump highlighting and selection layering (2026-09-22)
+
+Viewer highlight backgrounds now paint before the editor's selection and glyphs.
+Jump destinations use light/dark blue tints and a 5px gutter marker, replacing the
+fixed yellow overlay. Same-line selection preserves the destination; explicit
+caret focus movement to another logical line clears both jump indicators.
+
+All eight themes pass selection-layer ordering and marker lifecycle tests.
+22 viewer checks and all 97 UI tests passed (2 opt-in ignored), including single
+click occurrences, double-click navigation, wrapped layout, and find behavior.
+Strict Clippy, formatting and release build passed. Installed release hash and
+logs: `target/validation/jump-highlights/validation.json`.
+
+Line-number follow-up: replaced the 5px jump square with a lighter, full-width
+gutter background behind the destination number. It paints below the number and
+clears with the jump highlight. All 22 viewer tests, strict Clippy and release
+build passed; updated app installed. Evidence: `jump-highlights/gutter-validation.json`.
+
+
+### 2026-09-22: nested Parcel cleanup and activity-launch catch
+
+- `LaunchAppDeepLinkActivity`: 4/5 -> 5/5 reconstructed methods. The exact
+  ActivityNotFoundException hierarchy now permits the existing typed-catch path;
+  success true and logged failure false remain explicit.
+- `UnusedAppRestrictionsBackportService`: 3/4 -> 4/4. The callback emits one
+  Parcel.recycle in a finally inside the RemoteException catch. Original exception
+  dispatch, stable cleanup inputs, normal exits and navigation links are checked.
+- 603 regular tests passed (34 opt-in ignored), nine Play Store APK regressions
+  passed, strict Clippy and release build passed. Three focused cleanup tests
+  include 28 bounded normal/fault trace scenarios and rejection mutations.
+  These are fixture/model checks, not proof of arbitrary Android equivalence.
+- Search benchmark: identical matches over 2,000 classes; median 0.938 seconds
+  cold and 3.65 ms warm across three runs. Previous cold median was 0.967 seconds.
+- Evidence and generated source: `target/validation/nested-cleanup/validation.json`.
+  Release installed into `target/RDX.app/Contents/MacOS/rdx`, SHA-256
+  `d63eb235c1a977e3a0530c32a8e0920891c0f52c96596e2e4f7a69d160f8da23`.
+
+
+### 2026-09-22: Find direct subclasses
+
+Added a class-only viewer context-menu action. The native backend compares exact
+immediate DEX superclass identities across the loaded catalog; it excludes
+transitive descendants and interface implementations, and supports external
+parent references. Matching declarations use the existing results window and
+source-navigation path, with cancellation and explicit partial-result limits.
+
+Validation: 605 regular tests passed (35 opt-in ignored),
+two subclass integration checks passed including 44 direct children of `fu` in
+the Play Store APK. GUI tests exercise class/method/field menu enablement and
+result opening in both usages and subclass modes. Strict Clippy and release build
+passed. Evidence: `target/validation/direct-subclasses/validation.json`.
+Installed release SHA-256: `d8c0e03200fe45dfb1cedab1b46d6cd8d2cdb26d53198b942d79d7fbdf2e452c`.
+
+### 2026-09-22: Find implementations
+
+Added a viewer context-menu action for classes, interfaces and methods. Type
+queries follow transitive superclass/interface edges and return concrete classes.
+Method queries preserve parameter signatures, accept proven covariant returns,
+and include inherited implementation bodies and interface defaults. Results use
+the existing usages window and exact declaration navigation. Queries cover the
+loaded APK catalog, not reflection or dynamically loaded runtime classes.
+
+Validation: 608 regular tests passed (36 opt-in ignored), plus two integration
+checks including 11 concrete classes and 11 method implementations for `cewj`
+in the Play Store APK. Actual Java and DEX fallback declaration jumps passed.
+GUI tests cover menu requests and result opening across usages, subclasses and
+implementations modes. Strict Clippy, formatting and release build passed.
+Evidence: `target/validation/implementations/validation.json`.
+Installed release SHA-256:
+`76bcf13dcd98681013bde0a7aa2e0ff491cdc3ee86c6adc07b84603b0b49c22a`.
+
+### 2026-09-23: guarded subscription-response constructor
+
+`UpdateSubscriptionInstrumentActivity.x(Lcbjz;)V` now reconstructs as Java.
+The decoder handles a pure guarded integer copy before constructor arguments,
+materialized integer addition, and ordered nested staging in that proven region.
+Ordinary nested allocation rejection rules remain unchanged. All nonallocation
+events retain their order and allocation identities are checked; readable staging
+can move allocation-related failure and initialization timing.
+
+Validation: 610 regular tests passed (37 opt-in ignored),
+one Play Store APK regression passed, strict Clippy and release build passed.
+Fixtures cover branch polarity, unsafe reference-copy rejection, nested constructor
+links, reordered effects, and missing allocation identities. Evidence and generated
+Java: `target/validation/subscription-response/validation.json`.
+Installed release SHA-256: `1005aa9821c8835d9683789f9803b0886d90ebbe1380e9fcc40a9fd09bf57707`.
+
+### 2026-09-23: native resource resolution
+
+Native ARSC index, value/configuration documents, code ID annotations and
+compiled XML reference navigation are installed. Dense, sparse, offset16 and
+compact entries, UTF-8/UTF-16 pools and CESU-8 supplementary characters are
+covered. Malformed tables leave DEX navigation available with a diagnostic.
+Literal XML strings do not become links; source symbol offsets and hashes remain
+valid. Resource documents reuse Back/Forward, including XML file navigation.
+
+620 regular tests passed (38 opt-in ignored), and the Play Store APK
+indexed 23,257 resources with string/layout/XML and Java-ID navigation passing.
+Strict Clippy, formatting and release build passed. A bounded 2,000-class
+getIntent search retained identical matched texts: cold 1.271 -> 1.187 seconds,
+warm 3.27 -> 4.08 ms (one run, not a speedup claim).
+Evidence and generated source: `target/validation/resource-resolution/validation.json`.
+Installed release SHA-256: `29fd31abe96fae3a8463ddbf45799932aa7343efd9f1a9713bbf7cd36ee36721`.
+
+### 2026-09-23: IRIS DispatchReceiver control flow
+
+All four methods in `com.iris.intentmon.DispatchReceiver` reconstruct as Java,
+including the three reported fallbacks. Switch reconstruction now accepts a shared
+acyclic default-selector prefix only when duplicated instructions are pure register
+operations. Protected return tails may contain forward pure conditionals. Separate
+nonoverlapping typed try regions no longer require handlers to precede the next try.
+
+Regression fixtures cover the shared switch prefix, branching return tails, and
+out-of-line handlers. The handler fixture compares DEX and generated Java effects
+for success, matching exceptions, mismatched exceptions, and uncaught errors.
+The real APK regression is opt-in with `RDX_IRIS_APK`.
+
+Twenty original-versus-generated Java scenarios matched with host API stubs,
+including null/malformed input, describe/build/dispatch failures, all three dispatch
+types, unknown types and a string hash collision. Two nested DEX type spellings
+(`IntentBuilder$Result` and `IntentBuilder$DescribeResult`) were normalized to Java
+nested-type spelling for this compilation check. This is a focused control-flow
+comparison, not Android runtime validation or a claim of global semantic accuracy.
+Evidence: `target/validation/iris-dispatch-after.java` and
+`target/validation/iris-semantics/result.json`.
+
+Validation: 651 regular tests passed (47 opt-in tests ignored), the IRIS APK regression passed, strict Clippy and release build passed. Installed SHA-256: `ca4c2105338d9cda9156d0901d9432f6cb0ebca9dfec6356437e217013d786f6`.

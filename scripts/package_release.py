@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import tomllib
 import zipfile
 
@@ -21,8 +22,11 @@ def main():
     if args.tag != 'v' + version:
         raise SystemExit(f'Tag {args.tag} does not match Cargo version {version}')
     name = f'rdx-{args.tag}-{args.platform}'
-    stage = ROOT / 'target/release-packages' / name
-    stage.mkdir(parents=True, exist_ok=False)
+    staging_root = ROOT / 'target/release-packages'
+    staging_root.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(dir=staging_root))
+    stage = temporary / name
+    stage.mkdir()
     binary_dir = args.binary_dir.resolve()
     if args.platform.startswith('macos-'):
         subprocess.run(['python3', str(ROOT / 'scripts/package_macos.py'), '--binary-dir', str(binary_dir)], check=True)
@@ -57,6 +61,7 @@ def main():
                     output.write(file, arcname=file.relative_to(stage.parent))
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     archive.with_name(archive.name + '.sha256').write_text(f'{digest}  {archive.name}\n')
+    shutil.rmtree(temporary)
     print(archive)
 
 if __name__ == '__main__':

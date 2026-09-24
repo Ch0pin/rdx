@@ -21,7 +21,7 @@ in one place. Use the GUI yourself or connect an AI assistant through MCP.
 Search speed and total memory use depend on the APK, cache state, and enabled
 services. See [performance measurements](docs/search-performance.md) for the tested workloads.
 
-## What you can do
+## What RDX can do
 
 | Task | Features |
 | --- | --- |

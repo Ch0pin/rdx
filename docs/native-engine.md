@@ -320,3 +320,18 @@ X-Refs results use a separate `dex://` document to preserve exact instruction
 locations even when the class already has Java output. These tabs now show an
 explicit call-site-view label and **Open Java source** action; switching uses
 normal navigation history, so Back returns to the previous DEX position.
+
+Quiet float and double NaN constants are reconstructed with `Float.intBitsToFloat`
+and `Double.longBitsToDouble`, retaining the original sign and payload instead of
+substituting a canonical NaN. Signaling NaNs remain explicit fallbacks because
+Java can quiet them during value transfer. Numeric fixtures cover both signs,
+canonical and noncanonical payloads, and malformed widths. The optional
+`generated_quiet_nan_returns_preserve_raw_bits_on_jvm` test compiles generated
+methods and checks twelve raw-bit round trips on a host JVM.
+
+Typed try/catch reconstruction accepts `long` and `double` operations when no
+mutable wide value must be carried into a handler. Unchanged wide entry values
+remain available in catch paths. Writes to either register half are checked;
+handler-visible mutable wide values still fall back. JVM regression fixtures
+exercise successful wide results and throwing calls, checking exact long values,
+double signed zero, catch results, and call counts.

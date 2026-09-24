@@ -1,3 +1,4 @@
+mod call_graph_window;
 mod code_fonts;
 mod code_view;
 mod icons;

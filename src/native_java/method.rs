@@ -1045,47 +1045,6 @@ pub(super) fn reconstruct(
         graph.synchronized.is_empty() || ordinary_tries == 0,
         "mixed monitor and ordinary exception regions not reconstructed"
     );
-    // Handler snapshots are mutable, unlike ordinary structured branch/loop
-    // joins.  Wide handler-visible state still needs its own reconstruction.
-    if ordinary_tries != 0 {
-        // Only protected instructions can update exception snapshots. Wide
-        // computations before or after a protected range have ordinary state.
-        // The actual entry frame is still checked in render_try.
-        let mut protected = vec![false; code.instructions.len()];
-        for region in &code.try_regions {
-            protected
-                .get_mut(region.start as usize..region.end as usize)
-                .context("invalid protected range")?
-                .fill(true);
-        }
-        let mut has_wide = false;
-        for (pc, width) in graph
-            .widths
-            .iter()
-            .enumerate()
-            .filter(|(pc, width)| **width != 0 && protected[*pc])
-        {
-            let op = code.instructions[pc] as u8;
-            has_wide |= matches!(op, 0x04..=0x06 | 0x0b | 0x10 | 0x16..=0x19 | 0x2f..=0x31 | 0x45 | 0x4c | 0x53 | 0x5a | 0x61 | 0x68);
-            has_wide |= numeric::Unary::decode(op)
-                .is_some_and(|spec| spec.input.width() == 2 || spec.result.width() == 2);
-            has_wide |= numeric::Binary::decode(op).is_some_and(|spec| spec.result.width() == 2);
-            if matches!(op, 0x6e..=0x72 | 0x74..=0x78) && *width == 3 {
-                let (_, proto, _) = class
-                    .symbols
-                    .methods
-                    .get(code.instructions[pc + 1] as usize)
-                    .context("method index")?;
-                let (ret, args) = class
-                    .symbols
-                    .protos
-                    .get(*proto as usize)
-                    .context("method prototype")?;
-                has_wide |= wide(ret) || args.iter().any(|ty| wide(ty));
-            }
-        }
-        ensure!(!has_wide, "wide exception snapshots not reconstructed");
-    }
     if !code.try_regions.is_empty()
         || graph.switches.iter().any(Option::is_some)
         || graph.targets.iter().enumerate().any(|(pc, target)| {
@@ -1547,12 +1506,7 @@ fn render_try(
         .instructions;
     let start = region.start as usize;
     let end = region.end as usize;
-    ensure!(
-        regs.iter()
-            .flatten()
-            .all(|value| !wide(&value.ty) && value.ty != "<wide-tail>"),
-        "wide exception snapshots not reconstructed"
-    );
+    validate_wide_frame(&regs)?;
     ensure!(
         end <= stop && !region.catches.is_empty(),
         "try crosses enclosing region"
@@ -1624,6 +1578,8 @@ fn render_try(
     }
     // Identify entry values actually observed by handlers (including their
     // continuation). Unused entry registers may freely change type in the try.
+    // Wide operations are safe without snapshots; an immutable wide entry must
+    // have neither word overwritten. Tail text remains ownership metadata.
     let written = super::liveness::written_in(
         method.code.as_ref().context("missing try code")?,
         start,
@@ -1637,7 +1593,11 @@ fn render_try(
             .enumerate()
             .map(|(r, value)| {
                 value.as_ref().map(|v| {
-                    if written.as_ref().is_some_and(|writes| !writes[r]) {
+                    if v.ty == "<wide-tail>"
+                        || written
+                            .as_ref()
+                            .is_some_and(|writes| !writes[r] && (!wide(&v.ty) || !writes[r + 1]))
+                    {
                         // Immutable entry values need no exception snapshot.
                         // Keep literal typing (notably boolean/null constants).
                         v.clone()
@@ -1696,6 +1656,10 @@ fn render_try(
             let value = value
                 .as_ref()
                 .context("handler observes undefined entry register")?;
+            ensure!(
+                !wide(&value.ty) && value.ty != "<wide-tail>",
+                "wide exception snapshots not reconstructed"
+            );
             let slot = out.local(&value.ty, &value.text, &[])?;
             initial[r] = Some(slot.clone());
             slots[r] = Some(slot);

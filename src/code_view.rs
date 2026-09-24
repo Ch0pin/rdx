@@ -223,6 +223,7 @@ pub struct CodeDocument {
     usages_requested: Option<usize>,
     subclasses_requested: Option<usize>,
     implementations_requested: Option<usize>,
+    call_graph_requested: Option<usize>,
     method_xrefs_requested: Option<(usize, bool)>,
     usages_enabled: bool,
     menu_link: Option<CodeLink>,
@@ -263,6 +264,7 @@ impl CodeDocument {
             usages_requested: None,
             subclasses_requested: None,
             implementations_requested: None,
+            call_graph_requested: None,
             method_xrefs_requested: None,
             usages_enabled: true,
             menu_link: None,
@@ -436,6 +438,9 @@ impl CodeDocument {
     }
     pub fn take_method_xrefs_request(&mut self) -> Option<(usize, bool)> {
         self.method_xrefs_requested.take()
+    }
+    pub fn take_call_graph_request(&mut self) -> Option<usize> {
+        self.call_graph_requested.take()
     }
     pub fn take_implementations_request(&mut self) -> Option<usize> {
         self.implementations_requested.take()
@@ -909,6 +914,13 @@ impl CodeDocument {
                                 .is_some_and(|link| link.label.contains('(') && !link.label.starts_with(rdx::resource_table::PREFIX));
                             ui.add_enabled_ui(method_enabled, |ui| {
                                 let submenu = ui.menu_button("Method references", |ui| {
+                                    let graph_action = ui.button("Call graph…");
+                                    #[cfg(test)]
+                                    self.menu_items.push(("Call graph…".into(), graph_action.rect, graph_action.enabled()));
+                                    if graph_action.clicked() {
+                                        self.call_graph_requested = self.menu_link.as_ref().map(|link| link.start);
+                                        ui.close_menu();
+                                    }
                                     for (label, callers) in [("Callers", true), ("Callees", false)] {
                                         let response = ui.button(label);
                                         #[cfg(test)]
@@ -1709,6 +1721,7 @@ mod tests {
             ("Find usages", false, true, true),
             ("Callers", false, true, true),
             ("Callees", false, true, true),
+            ("Call graph…", false, true, true),
             ("Find direct subclasses", false, true, true),
             ("Find implementations", false, true, true),
             ("Copy symbol name", false, true, true),
@@ -1725,7 +1738,7 @@ mod tests {
                 if metadata { "java" } else { "txt" },
             );
             let label = match action {
-                "Find usages" | "Callers" | "Callees" | "Copy as Frida snippet" => {
+                "Find usages" | "Callers" | "Callees" | "Call graph…" | "Copy as Frida snippet" => {
                     "pkg.Target.run()V"
                 }
                 "Copy symbol name" => "pkg.Target.café:I",
@@ -1823,7 +1836,7 @@ mod tests {
                 submenu.2,
                 !blank && metadata && usages_enabled && label.contains('(')
             );
-            if matches!(action, "Callers" | "Callees") {
+            if matches!(action, "Callers" | "Callees" | "Call graph…") {
                 let pos = submenu.1.center();
                 render(&mut doc, 0.31, vec![egui::Event::PointerMoved(pos)]);
                 render(&mut doc, 0.39, vec![]);
@@ -1856,6 +1869,9 @@ mod tests {
                     Some((2, action == "Callers"))
                 );
                 assert_eq!(doc.take_method_xrefs_request(), None);
+            } else if action == "Call graph…" {
+                assert_eq!(doc.take_call_graph_request(), Some(2));
+                assert_eq!(doc.take_call_graph_request(), None);
             } else if action == "Find usages" {
                 assert_eq!(result, None);
                 assert_eq!(doc.take_usages_request(), Some(2));

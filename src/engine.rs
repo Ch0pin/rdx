@@ -475,6 +475,56 @@ impl NativeEngine {
         Ok(target)
     }
 
+    pub fn call_graph_by_id(
+        &self,
+        method: &str,
+        depth: usize,
+        direction: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::call_graph::CallGraph> {
+        anyhow::ensure!(
+            method.contains('(') && method.contains(')'),
+            "Expected exact DEX method signature"
+        );
+        crate::call_graph::build_direction(&self.native, method, depth, direction, cancel)
+    }
+
+    pub fn call_graph_at(
+        &mut self,
+        class: &str,
+        offset: usize,
+        hash: &str,
+        depth: usize,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::call_graph::CallGraph> {
+        let target = self.resolve_method_xref_target(class, offset, hash, false)?;
+        crate::call_graph::build(&self.native, &target.id, depth, cancel)
+    }
+
+    pub fn navigate_graph_method(&mut self, symbol: &str) -> Result<NavigationResult> {
+        let owner = self
+            .owner(symbol)
+            .context("Method is external to this project")?;
+        let member = symbol
+            .strip_prefix(&format!("{owner}."))
+            .context("Invalid method")?;
+        let owner = inherited_method_owner(&owner, member, |name| self.native.class(name))?
+            .unwrap_or(owner);
+        let declaration = format!("{owner}.{member}");
+        let code = self.decompile_with_metadata(&owner)?;
+        let position = code
+            .definitions
+            .iter()
+            .find(|d| self.definition_symbol(&owner, &code, d).as_deref() == Some(&declaration))
+            .context("Method declaration unavailable")?
+            .start;
+        Ok(NavigationResult {
+            class: owner,
+            code,
+            position,
+        })
+    }
+
     pub fn method_xrefs_in_class(
         &mut self,
         target: &str,
@@ -497,6 +547,54 @@ impl NativeEngine {
                 occurrences: vec![],
                 limited: false,
             });
+        }
+        // Prefer Java only when every selected instruction has a unique source
+        // reference within its caller. Repeated/rewritten calls retain exact DEX.
+        if let Ok(code) = self.decompile_search_cancellable(class, cancel) {
+            let mut definitions: Vec<_> = code
+                .definitions
+                .iter()
+                .filter(|d| d.kind == "method")
+                .filter_map(|d| {
+                    self.definition_symbol(class, &code, d)
+                        .map(|id| (d.start, d.end, id))
+                })
+                .collect();
+            definitions.sort_by_key(|d| d.0);
+            let mut occurrences = Vec::new();
+            let mut used = std::collections::HashSet::new();
+            for site in &sites {
+                let Some(index) = definitions.iter().position(|d| d.2 == site.caller) else {
+                    break;
+                };
+                let start = definitions[index].1;
+                let end = definitions.get(index + 1).map_or(usize::MAX, |d| d.0);
+                let mut matches = code.links.iter().filter(|link| {
+                    link.start >= start && link.start < end && link.label == site.callee
+                });
+                let Some(link) = matches.next() else { break };
+                if matches.next().is_some() || !used.insert(link.start) {
+                    break;
+                }
+                occurrences.push(UsageOccurrence {
+                    start: link.start,
+                    end: link.end,
+                    enclosing: format!(
+                        "{} → {} [{}; DEX @{:04x}]",
+                        site.caller, site.callee, site.dispatch, site.pc
+                    ),
+                });
+            }
+            if occurrences.len() == sites.len() {
+                let limited = occurrences.len() > 1000;
+                occurrences.truncate(1000);
+                return Ok(ClassUsages {
+                    class: class.into(),
+                    code: Some(code),
+                    occurrences,
+                    limited,
+                });
+            }
         }
         // DEX call-site views provide exact instruction locations even when Java
         // emission inlines calls, rewrites constructors, or falls back.

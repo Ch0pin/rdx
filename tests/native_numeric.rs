@@ -25,7 +25,7 @@ fn raw_constants_require_correct_width_and_preserve_signed_bits() {
     }
 }
 #[test]
-fn floating_literals_roundtrip_finite_patterns_and_reject_nan_payloads() {
+fn floating_literals_roundtrip_finite_and_quiet_nan_patterns() {
     let mut state = 0x9e3779b97f4a7c15u64;
     for bits in [
         0,
@@ -45,7 +45,14 @@ fn floating_literals_roundtrip_finite_patterns_and_reject_nan_payloads() {
         let double = f64::from_bits(bits);
         let rendered = Literal::Bits64(bits).render(Kind::Double);
         if double.is_nan() {
-            assert!(rendered.is_err());
+            if bits & 0x0008_0000_0000_0000 == 0 {
+                assert!(rendered.is_err());
+            } else {
+                assert_eq!(
+                    rendered.unwrap(),
+                    format!("java.lang.Double.longBitsToDouble(0x{bits:016x}L)")
+                );
+            }
         } else if double.is_finite() {
             assert_eq!(
                 rendered
@@ -64,7 +71,14 @@ fn floating_literals_roundtrip_finite_patterns_and_reject_nan_payloads() {
         let float = f32::from_bits(bits);
         let rendered = Literal::Bits32(bits).render(Kind::Float);
         if float.is_nan() {
-            assert!(rendered.is_err());
+            if bits & 0x0040_0000 == 0 {
+                assert!(rendered.is_err());
+            } else {
+                assert_eq!(
+                    rendered.unwrap(),
+                    format!("java.lang.Float.intBitsToFloat(0x{bits:08x})")
+                );
+            }
         } else if float.is_finite() {
             assert_eq!(
                 rendered
@@ -564,7 +578,7 @@ fn wide_field_invoke_and_array_paths_keep_exact_types_and_links() {
     }
 }
 #[test]
-fn all_wide_constant_formats_and_typed_nan_fallback() {
+fn all_wide_constant_formats_and_typed_nan_payloads() {
     for words in [
         vec![0x0016, 0xffff, 0x0010],
         vec![0x0017, 0xffff, 0xffff, 0x0010],
@@ -583,8 +597,35 @@ fn all_wide_constant_formats_and_typed_nan_fallback() {
             .source
             .contains("return -0.0d;")
     );
-    assert!(render_numeric(&[0x0018, 1, 0, 0, 0x7ff8, 0x0010], &[], "D", 2).is_err());
-    assert!(render_numeric(&[0x0014, 1, 0x7fc0, 0x000f], &[], "F", 1).is_err());
+    for (words, ty, registers, expected) in [
+        (
+            vec![0x0018, 1, 0, 0, 0x7ff8, 0x0010],
+            "D",
+            2,
+            "java.lang.Double.longBitsToDouble(0x7ff8000000000001L)",
+        ),
+        (
+            vec![0x0014, 1, 0x7fc0, 0x000f],
+            "F",
+            1,
+            "java.lang.Float.intBitsToFloat(0x7fc00001)",
+        ),
+        (
+            vec![0x0014, 0xffff, 0xffff, 0x000f],
+            "F",
+            1,
+            "java.lang.Float.intBitsToFloat(0xffffffff)",
+        ),
+    ] {
+        assert!(
+            render_numeric(&words, &[], ty, registers)
+                .unwrap()
+                .source
+                .contains(expected)
+        );
+    }
+    assert!(render_numeric(&[0x0018, 1, 0, 0, 0x7ff0, 0x0010], &[], "D", 2).is_err());
+    assert!(render_numeric(&[0x0014, 1, 0x7f80, 0x000f], &[], "F", 1).is_err());
 }
 
 #[test]
@@ -650,4 +691,83 @@ fn actual_float_to_integer_casts_cover_nan_saturation_and_truncation() {
             assert_eq!(actual, expected, "op={op:x} value={value:?}");
         }
     }
+}
+
+#[test]
+#[ignore = "requires javac and java on PATH"]
+fn generated_quiet_nan_returns_preserve_raw_bits_on_jvm() {
+    use std::{fs, process::Command};
+    let directory = std::env::temp_dir().join(format!("rdx-nan-jvm-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let mut source = String::from("public class NanReturns {\n");
+    let mut checks = String::new();
+    for (index, bits) in [
+        0x7fc00000u32,
+        0x7fc00001,
+        0x7fffffff,
+        0xffc00000,
+        0xffc01234,
+        0xffffffff,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let code = render_numeric(
+            &[0x0014, bits as u16, (bits >> 16) as u16, 0x000f],
+            &[],
+            "F",
+            1,
+        )
+        .unwrap();
+        source.push_str(&code.source.replace("numeric(", &format!("f{index}(")));
+        checks.push_str(&format!("if (Float.floatToRawIntBits(f{index}()) != 0x{bits:08x}) throw new AssertionError(\"float {index}\");\n"));
+    }
+    for (index, bits) in [
+        0x7ff8000000000000u64,
+        0x7ff8000000000001,
+        0x7fffffffffffffff,
+        0xfff8000000000000,
+        0xfff8123456789abc,
+        0xffffffffffffffff,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let code = render_numeric(
+            &[
+                0x0018,
+                bits as u16,
+                (bits >> 16) as u16,
+                (bits >> 32) as u16,
+                (bits >> 48) as u16,
+                0x0010,
+            ],
+            &[],
+            "D",
+            2,
+        )
+        .unwrap();
+        source.push_str(&code.source.replace("numeric(", &format!("d{index}(")));
+        checks.push_str(&format!("if (Double.doubleToRawLongBits(d{index}()) != 0x{bits:016x}L) throw new AssertionError(\"double {index}\");\n"));
+    }
+    source.push_str(&format!(
+        "public static void main(String[] args) {{\n{checks}}}\n}}\n"
+    ));
+    fs::write(directory.join("NanReturns.java"), source).unwrap();
+    for (program, arguments) in [
+        ("javac", vec!["NanReturns.java"]),
+        ("java", vec!["-cp", ".", "NanReturns"]),
+    ] {
+        let output = Command::new(program)
+            .args(arguments)
+            .current_dir(&directory)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{program}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(directory).unwrap();
 }

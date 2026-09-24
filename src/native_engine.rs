@@ -42,6 +42,9 @@ pub struct NativeDexEngine {
     opened: bool,
 }
 impl NativeDexEngine {
+    pub(crate) fn graph_classes(&self) -> impl Iterator<Item = &DexClass> {
+        self.classes.values()
+    }
     pub fn render(&self, name: &str) -> Result<DecompiledCode> {
         let class = self
             .classes

@@ -32,6 +32,7 @@ memory while enabled. Opening/reloading a GUI project stops that service.
 | Classes | `get_all_classes`, `search_classes_by_keyword`, `find_direct_subclasses` |
 | Source and metadata | `get_class_source`, `get_class_disassembly`, `get_methods_of_class`, `get_fields_of_class` |
 | Resources | `get_all_resource_file_names`, `get_android_manifest`, `get_resource_file`, `get_strings` |
+| Call graphs | `get_call_graph` (exact `method_id`, `direction`: `callers` / `callees` / `both`, `depth`: 1–100, default 20) |
 | DEX strings | `get_dex_strings` (strings from the DEX containing `class_id`) |
 
 Search is currently a literal class-name substring search, not a method-body
@@ -56,3 +57,22 @@ and cross-connection open-request deduplication remain future work.
 
 Protocol reference: [MCP lifecycle](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle)
 and [tools](https://modelcontextprotocol.io/specification/2025-06-18/server/tools).
+
+### Method call graph
+
+`get_call_graph` requires `instance_id`, `project_id`, and an exact DEX
+`method_id` from `get_methods_of_class`, such as `sample.Target.doubleValue(I)I`.
+Use `direction: "callers"` to trace into a method, `"callees"` (default) to
+follow outgoing calls, or `"both"`. Edges always point from caller to callee.
+
+The response includes numbered nodes, method IDs, distance from the root,
+component classifications, available declarations, call-site counts, and
+component-path highlights. `truncated` reports the 5,000-node/20,000-edge cap;
+`depth_boundary_reached` reports that nodes reached the requested depth.
+The graph is returned as one response, without pagination. Caller queries scan
+the loaded DEX call sites and may take longer than outgoing queries.
+
+This is a static graph. It resolves inherited aliases through known superclass
+metadata, but does not infer runtime virtual targets, reflection or Intent
+routing. External method bodies cannot be expanded. The GUI graph continues
+to follow outgoing calls; direction selection is currently an MCP feature.

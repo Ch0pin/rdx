@@ -55,7 +55,7 @@ fn dex_calls_keep_overloads_dispatch_and_repeated_sites() {
 }
 
 #[test]
-fn call_results_open_exact_dex_sites_and_reject_stale_sources() {
+fn call_results_open_mapped_sites_and_reject_stale_sources() {
     let mut engine = NativeEngine::default();
     engine
         .open(std::path::Path::new("tests/fixtures/navigation.apk"))
@@ -213,5 +213,41 @@ fn schedule_e0_is_java_not_a_decompilation_fallback() {
             .decompile(&format!("dex://{name}"))
             .unwrap()
             .contains("Exact method call sites")
+    );
+}
+
+#[test]
+#[ignore = "Set RDX_TEST_APK to the Play Store APK"]
+fn bhnh_load_url_callers_open_java() {
+    let mut engine = NativeEngine::default();
+    engine
+        .open(std::path::Path::new(
+            &std::env::var_os("RDX_TEST_APK").unwrap(),
+        ))
+        .unwrap();
+    let result = engine
+        .method_xrefs_in_class(
+            "bhnh.loadUrl(Ljava/lang/String;)V",
+            "bhnh",
+            true,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(result.class, "bhnh");
+    let code = result.code.unwrap();
+    assert!(
+        code.source
+            .contains("public final class bhnh extends WebView")
+    );
+    assert!(!code.source.contains(".method "));
+    assert_eq!(result.occurrences.len(), 1);
+    let hit = &result.occurrences[0];
+    assert_eq!(
+        code.source
+            .chars()
+            .skip(hit.start)
+            .take(hit.end - hit.start)
+            .collect::<String>(),
+        "loadUrl"
     );
 }

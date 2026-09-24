@@ -311,6 +311,23 @@ fn dispatch(
         );
     }
     match name {
+        "get_call_graph" => {
+            let direction = args["direction"].as_str().unwrap_or("callees");
+            let depth = args["depth"].as_u64().unwrap_or(20) as usize;
+            let graph = engine.call_graph_by_id(required(args,"method_id")?, depth, direction, cancel)?;
+            let masks = graph.component_reachability();
+            let kinds = |mask: u8| ["Activity", "Service", "Receiver", "Provider"].into_iter().enumerate()
+                .filter_map(|(i,k)| ((mask & (1 << i)) != 0).then_some(k)).collect::<Vec<_>>();
+            let nodes: Vec<_> = graph.nodes.iter().enumerate().map(|(i,n)| json!({
+                "id":i,"method_id":n.method,"depth":n.depth,"component":n.component.map(|c| c.label()),
+                "available":n.available,"reachable_components":kinds(masks[i])})).collect();
+            let edges: Vec<_> = graph.edges.iter().map(|e|json!({"from":e.from,"to":e.to,"call_sites":e.sites,
+                "highlighted":masks[e.to]!=0,"reachable_components":kinds(masks[e.to])})).collect();
+            Ok(json!({"root":0,"direction":direction,"depth":depth,"nodes":nodes,"edges":edges,
+                "truncated":graph.truncated,"node_limit":5000,"edge_limit":20000,
+                "depth_boundary_reached":graph.nodes.iter().any(|n|n.depth==depth),
+                "analysis":"static DEX declared calls; inherited aliases resolved through known superclasses; no runtime dispatch, reflection, or Intent target inference"}))
+        },
         "get_all_classes" | "search_classes_by_keyword" => page(project.classes.iter().filter(|c|c.contains(query)).map(|c|json!({"class_id":c,"name":c})).collect(),args),
         "get_class_source"=>text_page(engine.decompile_search_cancellable(required(args,"class_id")?,cancel)?.source,args,"java-or-mixed-dex"),
         "get_class_disassembly"=> {let name=required(args,"class_id")?; let class=engine.dex_class(name).context("SYMBOL_NOT_FOUND")?; text_page(crate::native_engine::disassembly::render(name,class).source,args,"rdx-dex")},
@@ -413,6 +430,12 @@ fn tools_list() -> Value {
             false,
         ),
         (
+            "get_call_graph",
+            "Build a static method call graph with component-path highlights. Direction: callers, callees (default), or both. Depth defaults to 20; capped at 5000 nodes/20000 edges. Returns full graph, not paginated.",
+            vec!["method_id"],
+            true,
+        ),
+        (
             "get_all_classes",
             "List class names and IDs, optionally filtered by query.",
             vec![],
@@ -489,9 +512,13 @@ fn tools_list() -> Value {
         if scoped{required.extend(["instance_id","project_id"])}
         let mut properties=serde_json::Map::new();
         for key in &required{properties.insert((*key).into(),json!({"type":"string","minLength":1}));}
-        if scoped||name=="list_instances"{
+        if (scoped && name!="get_call_graph")||name=="list_instances"{
             properties.insert("offset".into(),json!({"type":"integer","minimum":0}));
             properties.insert("limit".into(),json!({"type":"integer","minimum":1,"maximum":if ["get_class_source","get_class_disassembly","get_android_manifest","get_resource_file"].contains(&name){128000}else{500}}));
+        }
+        if name=="get_call_graph" {
+            properties.insert("depth".into(),json!({"type":"integer","minimum":1,"maximum":100,"default":20}));
+            properties.insert("direction".into(),json!({"type":"string","enum":["callers","callees","both"],"default":"callees"}));
         }
         if ["get_all_classes","get_all_resource_file_names","get_strings","get_dex_strings"].contains(&name){properties.insert("query".into(),json!({"type":"string"}));}
         json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":name!="open_apk","destructiveHint":false,"openWorldHint":false}})
@@ -515,6 +542,9 @@ fn validate(name: &str, args: &Value) -> Result<()> {
         ensure!(!property.is_null(), "Unknown argument: {key}");
         if property["type"] == "string" {
             ensure!(value.is_string(), "{key} must be a string");
+            if let Some(choices) = property["enum"].as_array() {
+                ensure!(choices.contains(value), "Invalid {key}");
+            }
             if property["minLength"] == 1 {
                 ensure!(
                     !value.as_str().unwrap().is_empty(),
@@ -700,6 +730,39 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("Instance did not become ready")
+    }
+    #[test]
+    fn call_graph_tool_roundtrip() {
+        let dir = TestDir::new();
+        let (_server, record, mut args) = start(&dir, "navigation.apk");
+        args["method_id"] = json!("sample.Target.doubleValue(I)I");
+        args["direction"] = json!("callers");
+        validate("get_call_graph", &args).unwrap();
+        let result = remote(&record, "get_call_graph", &args).unwrap();
+        let data = &result["data"];
+        let nodes = data["nodes"].as_array().unwrap();
+        assert!(nodes.iter().any(|n| {
+            n["method_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("sample.Caller.compute(")
+        }));
+        assert!(
+            data["edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["to"] == 0)
+        );
+        assert_eq!(data["depth"], 20);
+        assert_eq!(data["truncated"], false);
+        args["direction"] = json!("both");
+        assert!(remote(&record, "get_call_graph", &args).is_ok());
+        args["direction"] = json!("wrong");
+        assert!(validate("get_call_graph", &args).is_err());
+        args["direction"] = json!("callees");
+        args["depth"] = json!(101);
+        assert!(validate("get_call_graph", &args).is_err());
     }
     #[test]
     fn instance_isolation_authentication_and_stop() {

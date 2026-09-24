@@ -76,15 +76,9 @@ fn discarded_wide_result_before_try_keeps_call_outside_handler() {
     assert!(code.source[protected..].contains("sample.Effects.touch()"));
     assert!(code.source.contains("catch (java.lang.Throwable "));
 
-    // Moving the protected boundary before the wide register is overwritten
-    // still requires unsupported wide handler state. Do not accept it silently.
+    // The handler does not observe the discarded wide value: no snapshot.
     class.methods[0].code.as_mut().unwrap().try_regions[0].start = 4;
-    let error =
-        native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap_err();
-    assert!(
-        error.to_string().contains("wide exception snapshots"),
-        "{error:#}"
-    );
+    native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
 }
 
 #[test]
@@ -849,13 +843,11 @@ fn wide_normal_continuation_remains_outside_terminating_catch() {
         code.source
     );
     assert_eq!(code.source.matches("sample.Effects.first()").count(), 1);
-    // Extending protection across the wide result still requires snapshots.
+    // A terminating rethrow handler does not observe the wide result.
     class.methods[0].code.as_mut().unwrap().try_regions[0].end = 7;
-    let error =
-        native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap_err();
+    let code = native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
     assert!(
-        error.to_string().contains("wide exception snapshots"),
-        "{error:#}"
+        code.source.find("sample.Effects.first()").unwrap() < code.source.find("catch (").unwrap()
     );
 }
 
@@ -1227,4 +1219,120 @@ fn shared_void_return_handler_keeps_normal_effects_outside_catch() {
             result.source
         );
     }
+}
+
+#[test]
+fn wide_try_values_without_mutable_handler_snapshots() {
+    for ty in ["J", "D"] {
+        // v0/v1 is established before try; the call cannot alter it. Both
+        // normal and catch return the same value, including the upper word.
+        let mut class = fixture(
+            vec![
+                0x0018, 0x1234, 0x5678, 0x9abc, 0x3ff0, 0x0071, 2, 0, 0x0010, 0x020d, 0x0010,
+            ],
+            vec![(Some("Ljava/lang/RuntimeException;"), 9)],
+            5,
+            8,
+            ty,
+        );
+        // const-wide is initially J; a double parameter establishes D without
+        // depending on literal inference in the handler probe.
+        if ty == "D" {
+            class.methods[0].parameters = vec!["D".into()];
+            let code = class.methods[0].code.as_mut().unwrap();
+            code.registers = 5;
+            code.ins = 2;
+            code.instructions.splice(0..5, [0x3004, 0, 0, 0, 0]);
+        }
+        let code = native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
+        assert!(
+            code.source.contains("catch (java.lang.RuntimeException"),
+            "{}",
+            code.source
+        );
+        assert_eq!(code.source.matches("sample.Effects.touch()").count(), 1);
+
+        // Writing either half makes the handler-visible value mutable. Keep
+        // rejecting it until wide exception snapshots themselves are supported.
+        for write in [0x0016, 0x0116] {
+            let original = class.methods[0].code.as_ref().unwrap().instructions.clone();
+            let dex = class.methods[0].code.as_mut().unwrap();
+            dex.registers = 5;
+            dex.instructions.splice(5..5, [write, 42]);
+            dex.try_regions[0].end += 2;
+            dex.try_regions[0].catches =
+                vec![(Some("Ljava/lang/RuntimeException;".into()), 11)].into();
+            let error = native_java::render_method("sample.Effects", &class, &class.methods[0])
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("wide exception snapshots"),
+                "{error:#}"
+            );
+            let dex = class.methods[0].code.as_mut().unwrap();
+            dex.instructions = original;
+            dex.try_regions[0].end -= 2;
+            dex.try_regions[0].catches =
+                vec![(Some("Ljava/lang/RuntimeException;".into()), 9)].into();
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires javac and java on PATH"]
+fn wide_try_success_and_exception_paths_run_on_jvm() {
+    use std::{fs, process::Command};
+    let directory = std::env::temp_dir().join(format!("rdx-wide-try-jvm-{}", std::process::id()));
+    fs::create_dir_all(directory.join("sample")).unwrap();
+    let mut source = String::from(
+        "package sample; public class Effects { static boolean fail; static int calls;\n",
+    );
+    for (ty, name, producer) in [
+        ("J", "longTest", "first"),
+        ("D", "doubleTest", "firstDouble"),
+    ] {
+        // Protected invoke/result, normal wide return; catch produces zero.
+        let mut class = fixture(
+            vec![0x0071, 0, 0, 0x000b, 0x0010, 0x020d, 0x0016, 0, 0x0010],
+            vec![(Some("Ljava/lang/RuntimeException;"), 5)],
+            0,
+            4,
+            ty,
+        );
+        let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+        symbols.protos[0].0 = ty.into();
+        symbols.strings[0] = producer.into();
+        class.methods[0].name = name.into();
+        let rendered =
+            native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
+        source.push_str(&rendered.source);
+    }
+    source.push_str(r#"
+static long first() { calls++; if (fail) throw new IllegalStateException(); return 0x123456789abcdef0L; }
+static double firstDouble() { calls++; if (fail) throw new IllegalStateException(); return -0.0d; }
+public static void main(String[] args) {
+    if (longTest() != 0x123456789abcdef0L || calls != 1) throw new AssertionError("long success");
+    if (Double.doubleToRawLongBits(doubleTest()) != 0x8000000000000000L || calls != 2) throw new AssertionError("double success");
+    fail = true;
+    if (longTest() != 0L || calls != 3) throw new AssertionError("long catch");
+    if (Double.doubleToRawLongBits(doubleTest()) != 0L || calls != 4) throw new AssertionError("double catch");
+}
+}
+"#);
+    fs::write(directory.join("sample/Effects.java"), source).unwrap();
+    for (program, args) in [
+        ("javac", vec!["sample/Effects.java"]),
+        ("java", vec!["-cp", ".", "sample.Effects"]),
+    ] {
+        let result = Command::new(program)
+            .args(args)
+            .current_dir(&directory)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{program}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    fs::remove_dir_all(directory).unwrap();
 }

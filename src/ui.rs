@@ -28,6 +28,11 @@ use std::{
 };
 
 enum Event {
+    CallGraph(
+        u64,
+        NativeEngine,
+        Result<rdx::call_graph::CallGraph, String>,
+    ),
     Archive(u64, Arc<Archive>),
     Opened(u64, Result<(NativeEngine, Project), String>),
     Source(
@@ -226,6 +231,7 @@ pub struct App {
     mcp_auto_start: bool,
     search: SearchWindow,
     usages: UsagesWindow,
+    call_graph: crate::call_graph_window::CallGraphWindow,
     usages_cancel: Option<Arc<AtomicBool>>,
     usages_id: u64,
     search_cache: Arc<Mutex<search::SearchCache>>,
@@ -315,6 +321,7 @@ impl App {
             mcp_auto_start: std::env::var_os("RDX_MCP_AUTO_START").is_some(),
             search,
             usages,
+            call_graph: crate::call_graph_window::CallGraphWindow::default(),
             usages_cancel: None,
             usages_id: 0,
             search_cache: Arc::new(Mutex::new(search::SearchCache::default())),
@@ -468,6 +475,10 @@ impl App {
             self.search.running = false;
             self.search.status = "Search stopped".into();
         }
+        if let Some(cancel) = &self.call_graph.cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.call_graph = crate::call_graph_window::CallGraphWindow::default();
         self.generation += 1;
         self.search_cache = Arc::new(Mutex::new(search::SearchCache::default()));
         self.engine = None;
@@ -587,6 +598,60 @@ impl App {
             content: Content::Text(Box::new(document)),
             note: None,
         })
+    }
+    fn build_call_graph(
+        &mut self,
+        class: String,
+        offset: usize,
+        hash: String,
+        ctx: &egui::Context,
+    ) {
+        self.call_graph.visible = true;
+        let Some(mut engine) = self.engine.take() else {
+            self.call_graph.status = "Wait for the current engine operation, then retry.".into();
+            return;
+        };
+        self.busy = true;
+        self.call_graph.origin = Some((class.clone(), offset, hash.clone()));
+        self.call_graph.graph = None;
+        self.call_graph.status = "Building call graph…".into();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.call_graph.cancel = Some(cancel.clone());
+        let (tx, generation, ctx, depth) = (
+            self.tx.clone(),
+            self.generation,
+            ctx.clone(),
+            self.call_graph.depth,
+        );
+        thread::spawn(move || {
+            let result = engine
+                .call_graph_at(&class, offset, &hash, depth, &cancel)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Event::CallGraph(generation, engine, result));
+            ctx.request_repaint();
+            ctx.request_repaint_of(crate::call_graph_window::CallGraphWindow::viewport_id());
+        });
+    }
+    fn navigate_graph_method(&mut self, method: String, ctx: &egui::Context) {
+        let Some(mut engine) = self.engine.take() else {
+            self.call_graph.status =
+                "Wait for the current engine operation, then click the method again.".into();
+            return;
+        };
+        self.busy = true;
+        let origin = self.current_location().unwrap_or(JumpLocation {
+            target: Target::Class(rdx::call_graph::owner(&method).unwrap_or_default().into()),
+            position: 0,
+            source_hash: None,
+        });
+        let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
+        thread::spawn(move || {
+            let result = engine
+                .navigate_graph_method(&method)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Event::Navigated(generation, origin, Some(engine), result));
+            ctx.request_repaint();
+        });
     }
     fn find_usages(
         &mut self,
@@ -1671,6 +1736,22 @@ impl App {
                         Err(error) => self.error(format!("Export failed: {error}")),
                     }
                 }
+                Event::CallGraph(generation, engine, result) if generation == self.generation => {
+                    self.engine = Some(engine);
+                    self.busy = false;
+                    self.call_graph.cancel = None;
+                    match result {
+                        Ok(graph) => {
+                            self.call_graph.status = format!(
+                                "{} methods · {} edges · click a method to open it",
+                                graph.nodes.len(),
+                                graph.edges.len()
+                            );
+                            self.call_graph.graph = Some(graph);
+                        }
+                        Err(error) => self.call_graph.status = error,
+                    }
+                }
                 Event::UsagesUpdate(generation, id, update)
                     if generation == self.generation && id == self.usages_id =>
                 {
@@ -2319,6 +2400,7 @@ impl eframe::App for App {
         let mut jump = None;
         let mut manifest_jump = None;
         let mut usage_request = None;
+        let mut graph_request = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.tabs.is_empty() {
                 ui.add_space(75.0);
@@ -2469,6 +2551,11 @@ impl eframe::App for App {
                                     UsageMode::Implementations,
                                 ));
                             }
+                            if let Some(offset) = document.take_call_graph_request()
+                                && let Some(hash) = &tab.source_hash
+                            {
+                                graph_request = Some((tab.name.clone(), offset, hash.clone()));
+                            }
                             if let Some((offset, callers)) = document.take_method_xrefs_request()
                                 && let Some(hash) = &tab.source_hash
                             {
@@ -2514,6 +2601,9 @@ impl eframe::App for App {
                 }
             }
         });
+        if let Some((class, offset, hash)) = graph_request {
+            self.build_call_graph(class, offset, hash, ctx);
+        }
         if let Some((class, offset, hash, mode)) = usage_request {
             self.find_usages(class, offset, hash, mode, ctx);
         }
@@ -2577,6 +2667,13 @@ impl eframe::App for App {
             let location = format!("{} · {}:{}", self.usages.mode.title(), hit.kind, hit.line);
             self.open_search_hit(hit);
             self.status = location;
+        }
+        let (method, rebuild) = self.call_graph.show(ctx);
+        if let Some(method) = method {
+            self.navigate_graph_method(method, ctx);
+        }
+        if rebuild && let Some((class, offset, hash)) = self.call_graph.origin.clone() {
+            self.build_call_graph(class, offset, hash, ctx);
         }
         self.persist_preferences(ctx);
         if let Some(target) = export {
@@ -2764,6 +2861,7 @@ mod settings_tests {
             mcp_auto_start: false,
             search: SearchWindow::default(),
             usages: UsagesWindow::default(),
+            call_graph: crate::call_graph_window::CallGraphWindow::default(),
             usages_cancel: None,
             usages_id: 0,
             search_cache: Arc::new(Mutex::new(search::SearchCache::default())),

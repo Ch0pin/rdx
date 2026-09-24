@@ -129,10 +129,32 @@ The native parser adapts algorithms from pinned JADX sources. Preserve [upstream
 
 Method references are available from the viewer's **X-Refs → Callers /
 Callees** submenu. Results preserve overload signatures, dispatch kinds, and DEX
-instruction offsets. Opening a result shows the exact DEX call site; declaration
+instruction offsets. Opening a result shows Java when the call has an unambiguous source reference;
+otherwise it shows the exact DEX call site. Declaration
 navigation opens the normal source view. Virtual/interface references use their
 declared DEX targets, not inferred runtime receiver types. Reflection and
 invoke-custom targets are not resolved.
+
+### Component-focused call graph
+
+Right-click a method declaration or call and choose **Method references →
+Call graph…**. The graph opens in an independent native window that can be
+resized or moved to another monitor. All collected methods and call edges are displayed. Circular nodes
+use shading and shadows for a 3D appearance. Full paths leading to Activities,
+Services, BroadcastReceivers, and ContentProviders are highlighted, including
+intermediate helper calls. Other calls stay visible with subdued edges.
+
+The graph starts at **depth 20**, adjustable from 1 to 100. Change depth and press
+**Rebuild**. Use **Zoom**, **Fit graph**, and drag-to-pan to explore larger graphs.
+Click an available node to open the exact method; hover for its full signature.
+Component classification follows superclass ancestry, including custom base
+classes, rather than relying on class-name suffixes.
+
+**Cancel** or closing the window stops collection. Graphs have a 5,000-method /
+20,000-edge safety limit with a visible partial-graph notice when reached.
+Virtual/interface calls use declared targets. Intent destinations, reflection,
+runtime dispatch, and invoke-custom calls are not inferred. Missing class ancestry
+can leave a component unclassified.
 
 ### MCP server
 

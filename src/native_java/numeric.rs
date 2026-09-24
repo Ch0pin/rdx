@@ -39,8 +39,15 @@ impl Literal {
             (Self::Bits64(bits), Kind::Long) => format!("{}L", bits as i64),
             (Self::Bits32(bits), Kind::Float) => {
                 let value = f32::from_bits(bits);
-                ensure!(!value.is_nan(), "NaN payload reconstruction unsupported");
-                if value.is_infinite() {
+                if value.is_nan() {
+                    // Java may quiet signaling NaNs while passing/returning them.
+                    // Preserve quiet payloads explicitly rather than canonicalizing.
+                    ensure!(
+                        bits & 0x0040_0000 != 0,
+                        "Signaling NaN payload reconstruction unsupported"
+                    );
+                    format!("java.lang.Float.intBitsToFloat(0x{bits:08x})")
+                } else if value.is_infinite() {
                     if value.is_sign_negative() {
                         "(-1.0f / 0.0f)".into()
                     } else {
@@ -57,8 +64,13 @@ impl Literal {
             }
             (Self::Bits64(bits), Kind::Double) => {
                 let value = f64::from_bits(bits);
-                ensure!(!value.is_nan(), "NaN payload reconstruction unsupported");
-                if value.is_infinite() {
+                if value.is_nan() {
+                    ensure!(
+                        bits & 0x0008_0000_0000_0000 != 0,
+                        "Signaling NaN payload reconstruction unsupported"
+                    );
+                    format!("java.lang.Double.longBitsToDouble(0x{bits:016x}L)")
+                } else if value.is_infinite() {
                     if value.is_sign_negative() {
                         "(-1.0d / 0.0d)".into()
                     } else {

@@ -40,7 +40,8 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     assert_eq!(replies[0]["error"]["code"], -32600);
     assert_eq!(replies[1]["result"]["protocolVersion"], "2025-06-18");
     let tools = replies[2]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 15);
+    assert_eq!(tools.len(), 16);
+    assert!(tools.iter().any(|t| t["name"] == "get_call_graph"));
     assert!(tools.iter().any(|t| t["name"] == "open_apk"));
     assert!(
         !tools

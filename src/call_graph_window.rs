@@ -79,7 +79,7 @@ fn sphere(painter: &egui::Painter, center: Pos2, radius: f32, tint: Color32, dar
             mix(base, Color32::WHITE, t * if dark { 0.22 } else { 0.62 }),
         );
     }
-    painter.circle_stroke(center, radius, Stroke::new(1.5, tint));
+    painter.circle_stroke(center, radius, Stroke::new(1.5_f32, tint));
 }
 impl CallGraphWindow {
     pub fn viewport_id() -> egui::ViewportId {
@@ -156,10 +156,10 @@ impl CallGraphWindow {
                     // Offset back-edges above the cards; preserve recursive edges.
                     if edge.to==edge.from || b.x<=a.x {
                         let top=from.top().min(to.top())-12.0;
-                        ui.painter().line(vec![a,Pos2::new(a.x+12.0,top),Pos2::new(b.x-12.0,top),b],Stroke::new(if highlighted{2.5}else{0.7},tint));
-                    } else {ui.painter().line_segment([a,b],Stroke::new(if highlighted{2.5}else{0.7},tint));}
+                        ui.painter().line(vec![a,Pos2::new(a.x+12.0,top),Pos2::new(b.x-12.0,top),b],Stroke::new(if highlighted{2.5_f32}else{0.7_f32},tint));
+                    } else {ui.painter().line_segment([a,b],Stroke::new(if highlighted{2.5_f32}else{0.7_f32},tint));}
                     let arrow=direction*10.0*self.zoom;
-                    ui.painter().arrow(b-arrow,arrow,Stroke::new(if highlighted{2.0}else{1.0},tint));
+                    ui.painter().arrow(b-arrow,arrow,Stroke::new(if highlighted{2.0_f32}else{1.0_f32},tint));
                 }
                 for (i,node) in graph.nodes.iter().enumerate() {
                     let Some(rect)=rects[i] else {continue};

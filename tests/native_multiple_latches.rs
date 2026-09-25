@@ -79,6 +79,15 @@ fn expression(mut text: &str, vars: &HashMap<String, i32>) -> i32 {
             }
         }
     }
+    if let Some(value) = text.strip_prefix('!') {
+        return i32::from(expression(value, vars) == 0);
+    }
+    if text == "true" {
+        return 1;
+    }
+    if text == "false" {
+        return 0;
+    }
     if let Ok(n) = text.parse() {
         return n;
     }
@@ -267,7 +276,16 @@ fn loop_can_return_through_shared_external_void_tail() {
         let code = class.methods[0].code.as_mut().unwrap();
         let end = code.instructions.len() - 1;
         code.instructions.splice(end.., [0x0071, 0, 0, 0x000e]);
-        assert!(native_java::render_method("sample.Hello", &class, &class.methods[0]).is_err());
+        let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+            .unwrap()
+            .source;
+        // Both complete terminal tails are now reconstructed. Each path keeps
+        // its effect instead of replacing that path with a bare return.
+        assert_eq!(
+            source.matches("sample.Effects.touch()").count(),
+            2,
+            "{source}"
+        );
     }
 }
 
@@ -328,4 +346,64 @@ fn backward_conditional_to_acyclic_shared_tail_preserves_results() {
             );
         }
     }
+}
+
+#[test]
+#[ignore = "requires javac and java on PATH"]
+fn computed_external_loop_tails_execute_their_effect_once() {
+    use std::{fs, process::Command};
+    let dir = std::env::temp_dir().join(format!("rdx-loop-effect-tails-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let mut source = String::from(
+        "public class LoopEffects { static class Effects { static int count; static void touch(){count++;} }\n",
+    );
+    for (i, words) in [
+        vec![
+            0x0012, 0x1035, 7, 0x00d8, 0x0100, 0x1032, 7, 0xfa28, 0x0071, 0, 0, 0x000e, 0x0071, 0,
+            0, 0x000e,
+        ],
+        vec![
+            0x0012, 0x1035, 8, 0x00d8, 0x0100, 0x1033, 3, 0x0628, 0xf928, 0x0071, 0, 0, 0x000e,
+            0x0071, 0, 0, 0x000e,
+        ],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut class = fixture();
+        class.symbols = Arc::new(DexSymbols {
+            strings: vec!["touch".into()],
+            types: vec!["Lsample/Effects;".into()],
+            protos: vec![("V".into(), vec![])],
+            methods: vec![(0, 0, 0)],
+            ..Default::default()
+        });
+        let m = &mut class.methods[0];
+        m.name = format!("path{i}").into();
+        m.return_type = "V".into();
+        let code = m.code.as_mut().unwrap();
+        code.registers = 2;
+        code.instructions = words;
+        source.push_str(
+            &native_java::render_method("sample.Hello", &class, &class.methods[0])
+                .unwrap()
+                .source
+                .replace("sample.Effects", "Effects"),
+        );
+    }
+    source.push_str("public static void main(String[] args){for(int n=-3;n<10;n++){Effects.count=0;path0(n);if(Effects.count!=1)throw new AssertionError(\"path0\");Effects.count=0;path1(n);if(Effects.count!=1)throw new AssertionError(\"path1\");}}}\n");
+    fs::write(dir.join("LoopEffects.java"), &source).unwrap();
+    for (program, arg) in [("javac", "LoopEffects.java"), ("java", "LoopEffects")] {
+        let output = Command::new(program)
+            .arg(arg)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{program}: {}\n{source}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
 }

@@ -771,3 +771,38 @@ fn generated_quiet_nan_returns_preserve_raw_bits_on_jvm() {
     }
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn floating_branches_merge_raw_bits_without_numeric_conversion() {
+    // if (p0 == 0) v0 = raw 1.0 bits; else v0 = p1; return v0.
+    let float = render_numeric(
+        &[0x0138, 4, 0x2001, 0x0428, 0x0014, 0, 0x3f80, 0x000f],
+        &["Z", "F"],
+        "F",
+        3,
+    )
+    .unwrap()
+    .source;
+    assert!(float.contains("1.0f"), "{float}");
+    assert!(!float.contains("1065353216"), "{float}");
+    let double = render_numeric(
+        &[0x0238, 4, 0x3004, 0x0628, 0x0018, 0, 0, 0, 0x3ff0, 0x0010],
+        &["Z", "D"],
+        "D",
+        5,
+    )
+    .unwrap()
+    .source;
+    assert!(double.contains("1.0d"), "{double}");
+    assert!(!double.contains("4607182418800017408"), "{double}");
+    // A typed integer parameter is not a raw-bit literal.
+    assert!(
+        render_numeric(
+            &[0x0138, 4, 0x2001, 0x0228, 0x3001, 0x000f],
+            &["Z", "F", "I"],
+            "F",
+            4,
+        )
+        .is_err()
+    );
+}

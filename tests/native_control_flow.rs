@@ -36,6 +36,7 @@ fn dex(words: &[u16], register_count: usize, inputs: &[i32]) -> i32 {
     for _ in 0..10000 {
         let word = words[pc];
         match word & 255 {
+            0x00 => pc += 1,
             0x01 => {
                 regs[((word >> 8) & 15) as usize] = regs[(word >> 12) as usize];
                 pc += 1;
@@ -578,7 +579,7 @@ fn return_inside_loop_preserves_guard_and_exit_paths() {
 }
 
 #[test]
-fn multiple_entry_infinite_and_undefined_exit_loops_fail_closed() {
+fn multiple_entry_and_undefined_exit_loops_fail_closed() {
     for (words, parameters, registers) in [
         // Entry bypasses the loop header and enters its body.
         (
@@ -586,8 +587,6 @@ fn multiple_entry_infinite_and_undefined_exit_loops_fail_closed() {
             vec!["I", "I"],
             2,
         ),
-        // Unconditional infinite loop has no reconstructable exit.
-        (vec![0, 0xff28], vec![], 0),
         // v0 only acquires a value if the body runs at least once.
         (
             vec![0x013d, 6, 0x1012, 0x01d8, 0xff01, 0xfb28, 0x000f],
@@ -601,6 +600,23 @@ fn multiple_entry_infinite_and_undefined_exit_loops_fail_closed() {
             "accepted {words:x?}"
         );
     }
+}
+
+#[test]
+fn unconditional_infinite_loop_preserves_nontermination_with_bounded_execution() {
+    let words = [0, 0xff28];
+    let source = render(&fixture(&words, &[], 0));
+    assert!(source.contains("while (true)"), "{source}");
+    let dex_error = std::panic::catch_unwind(|| dex(&words, 0, &[])).unwrap_err();
+    assert_eq!(
+        dex_error.downcast_ref::<&str>().copied(),
+        Some("test DEX did not terminate")
+    );
+    let java_error = std::panic::catch_unwind(|| java(&source, &[])).unwrap_err();
+    assert_eq!(
+        java_error.downcast_ref::<&str>().copied(),
+        Some("generated Java loop exceeded test budget")
+    );
 }
 
 // Assemble only the tiny switch fixtures; this does not use production codecs.
@@ -798,4 +814,35 @@ fn switch_backedge_and_object_selector_fail_closed_but_boolean_projects_to_int()
 
     let object = fixture(&words, &["Ljava/lang/Object;"], 2);
     assert!(native_java::render_method("sample.Hello", &object, &object.methods[0]).is_err());
+}
+
+#[test]
+fn large_switches_preserve_every_key_and_default_with_bounded_analysis() {
+    let keys: Vec<i32> = (-150..150).collect();
+    let groups: Vec<usize> = (0..300).map(|i| i % 3).collect();
+    for op in [0x2b, 0x2c] {
+        let words = switch_fixture(op, &keys, &groups);
+        let class = fixture(&words, &["I"], 2);
+        let source = render(&class);
+        for key in -151..=150 {
+            assert_eq!(java(&source, &[key]), dex(&words, 2, &[key]), "key {key}");
+        }
+    }
+    let oversized = switch_fixture(0x2b, &(0..1025).collect::<Vec<_>>(), &vec![0; 1025]);
+    let class = fixture(&oversized, &["I"], 2);
+    assert!(native_java::render_method("sample.Hello", &class, &class.methods[0]).is_err());
+}
+
+#[test]
+fn hundreds_of_sequential_branches_keep_their_shared_continuations() {
+    let mut words = vec![0x2012];
+    for _ in 0..300 {
+        words.extend([0x0138, 3, 0x3012]);
+    }
+    words.push(0x000f);
+    let class = fixture(&words, &["I"], 2);
+    let source = render(&class);
+    for input in [-7, 0, 1, 128] {
+        assert_eq!(java(&source, &[input]), dex(&words, 2, &[input]));
+    }
 }

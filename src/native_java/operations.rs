@@ -215,3 +215,77 @@ pub(super) fn filled(
         &refs,
     )
 }
+
+/// Returns element width, element count, and payload size in DEX code units.
+pub(super) fn array_payload(words: &[u16], pc: usize) -> Result<(usize, usize, usize)> {
+    ensure!(
+        words.get(pc) == Some(&0x0300),
+        "invalid array payload marker"
+    );
+    let element_width = usize::from(*words.get(pc + 1).context("truncated array payload")?);
+    ensure!(
+        matches!(element_width, 1 | 2 | 4 | 8),
+        "invalid array element width"
+    );
+    let count = usize::from(*words.get(pc + 2).context("truncated array count")?)
+        | (usize::from(*words.get(pc + 3).context("truncated array count")?) << 16);
+    ensure!(count <= 65_536, "array payload exceeds output budget");
+    let width = 4 + (count * element_width).div_ceil(2);
+    ensure!(
+        pc.checked_add(width).is_some_and(|end| end <= words.len()),
+        "truncated array payload data"
+    );
+    Ok((element_width, count, width))
+}
+
+pub(super) fn fill_array(words: &[u16], pc: usize, array: &Value, out: &mut Output) -> Result<()> {
+    let (width, count, _) = array_payload(words, pc)?;
+    let element = array
+        .ty
+        .strip_prefix('[')
+        .context("fill-array-data requires known array")?;
+    let required = match element {
+        "Z" | "B" => 1,
+        "C" | "S" => 2,
+        "I" | "F" => 4,
+        "J" | "D" => 8,
+        _ => anyhow::bail!("fill-array-data requires primitive array"),
+    };
+    ensure!(width == required, "array payload width/type mismatch");
+    let mut values = Vec::with_capacity(count);
+    for index in 0..count {
+        let mut bits = 0u64;
+        for byte in 0..width {
+            let offset = index * width + byte;
+            bits |=
+                u64::from((words[pc + 4 + offset / 2] >> ((offset % 2) * 8)) & 255) << (byte * 8);
+        }
+        use super::numeric::{Kind, Literal};
+        values.push(match element {
+            "Z" => {
+                ensure!(bits <= 1, "noncanonical boolean array payload");
+                (bits == 1).to_string()
+            }
+            "B" => (bits as i8).to_string(),
+            "S" => (bits as i16).to_string(),
+            "C" => (bits as u16).to_string(),
+            "I" => Literal::Bits32(bits as u32).render(Kind::Int)?,
+            "F" => Literal::Bits32(bits as u32).render(Kind::Float)?,
+            "J" => Literal::Bits64(bits).render(Kind::Long)?,
+            "D" => Literal::Bits64(bits).render(Kind::Double)?,
+            _ => unreachable!(),
+        });
+    }
+    // ART FillArrayData (runtime/entrypoints/entrypoint_utils.cc) checks null
+    // and the complete destination capacity before copying.
+    // Checking first avoids Java's sequential stores partially mutating a short array.
+    out.line(&format!("if ({}.length < {count}) {{", array.text), &[]);
+    out.indent += 1;
+    out.line("throw new java.lang.ArrayIndexOutOfBoundsException();", &[]);
+    out.indent -= 1;
+    out.line("}", &[]);
+    for (index, value) in values.into_iter().enumerate() {
+        out.line(&format!("{}[{index}] = {value};", array.text), &[]);
+    }
+    Ok(())
+}

@@ -71,6 +71,7 @@ fn execute_java(source: &str, stack: &[Option<bool>]) -> (i32, Calls) {
     enum Flow {
         Next,
         Break,
+        Continue,
         Return(i32),
     }
     fn expr(
@@ -198,7 +199,7 @@ fn execute_java(source: &str, stack: &[Option<bool>]) -> (i32, Calls) {
                     match block(&lines[pc + 1..finish], vars, stack, calls, fuel) {
                         Flow::Break => break,
                         Flow::Return(r) => return Flow::Return(r),
-                        Flow::Next => {}
+                        Flow::Next | Flow::Continue => {}
                     }
                 }
                 pc = finish + 1;
@@ -206,6 +207,9 @@ fn execute_java(source: &str, stack: &[Option<bool>]) -> (i32, Calls) {
             }
             if line == "break;" {
                 return Flow::Break;
+            }
+            if line == "continue;" {
+                return Flow::Continue;
             }
             if let Some(ret) = line.strip_prefix("return ") {
                 return Flow::Return(expr(ret.trim_end_matches(';'), vars, stack, calls));
@@ -331,5 +335,625 @@ fn generated_loop_preserves_first_match_return_and_exact_call_order() {
                 "stack {stack:?}"
             );
         }
+    }
+}
+
+#[test]
+fn common_loop_exit_break_preserves_accumulated_value() {
+    for limit in 0..8 {
+        for break_at in 0..8 {
+            let mut class = fixture();
+            let method = &mut class.methods[0];
+            method.name = "sumUntil".into();
+            method.access_flags = 9;
+            method.return_type = "I".into();
+            let code = method.code.as_mut().unwrap();
+            code.registers = 4;
+            code.ins = 0;
+            // v0=index, v1=sum, v2=limit, v3=breakAt. Both the
+            // header and body exit to the same return, but carry different sums.
+            code.instructions = vec![
+                0x0012, 0x0112, 0x0213, limit, 0x0313, break_at, 0x2032, 8, 0x01b0, 0x3032, 5,
+                0x00d8, 0x0100, 0xf928, 0x010f,
+            ];
+            let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+                .unwrap()
+                .source;
+            let expected: i32 = (0..limit)
+                .take_while(|i| *i <= break_at)
+                .map(i32::from)
+                .sum();
+            let (actual, _) = execute_java(&source, &[]);
+            assert_eq!(
+                actual, expected,
+                "limit={limit}, breakAt={break_at}\n{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn loop_exit_after_conditional_body_keeps_test_order() {
+    for limit in 0..8 {
+        for skip in 0..8 {
+            let mut class = fixture();
+            let method = &mut class.methods[0];
+            method.name = "sumExcept".into();
+            method.access_flags = 9;
+            method.return_type = "I".into();
+            let code = method.code.as_mut().unwrap();
+            code.registers = 4;
+            code.ins = 0;
+            // The first branch skips a sum update, not the loop body. Testing
+            // the limit before the update would lose the final term.
+            code.instructions = vec![
+                0x0012, 0x0112, 0x0213, limit, 0x0313, skip, 0x3032, 3, 0x01b0, 0x2032, 5, 0x00d8,
+                0x0100, 0xf928, 0x010f,
+            ];
+            let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+                .unwrap()
+                .source;
+            let expected: i32 = (0..=limit).filter(|i| *i != skip).map(i32::from).sum();
+            let (actual, _) = execute_java(&source, &[]);
+            assert_eq!(actual, expected, "limit={limit}, skip={skip}\n{source}");
+        }
+    }
+}
+
+#[test]
+fn nested_natural_loops_preserve_independent_counters() {
+    for rows in 0..6 {
+        for columns in 0..6 {
+            let mut class = fixture();
+            let method = &mut class.methods[0];
+            method.name = "rectangleSize".into();
+            method.access_flags = 9;
+            method.return_type = "I".into();
+            let code = method.code.as_mut().unwrap();
+            code.registers = 5;
+            code.ins = 0;
+            code.instructions = vec![
+                0x0012, 0x0112, 0x0313, rows, 0x0413, columns, 0x3132, 13, 0x0212, 0x4232, 7,
+                0x00d8, 0x0100, 0x02d8, 0x0102, 0xfa28, 0x01d8, 0x0101, 0xf428, 0x000f,
+            ];
+            let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+                .unwrap()
+                .source;
+            assert_eq!(source.matches("while (true)").count(), 2, "{source}");
+            let (actual, _) = execute_java(&source, &[]);
+            assert_eq!(actual, i32::from(rows * columns), "{source}");
+        }
+    }
+}
+
+#[test]
+fn conditional_latch_and_interior_break_share_correct_exit_values() {
+    for limit in 1..8 {
+        for break_at in 0..8 {
+            let mut class = fixture();
+            let method = &mut class.methods[0];
+            method.name = "sumDoWhile".into();
+            method.access_flags = 9;
+            method.return_type = "I".into();
+            let code = method.code.as_mut().unwrap();
+            code.registers = 4;
+            code.ins = 0;
+            code.instructions = vec![
+                0x0012, 0x0112, 0x0213, limit, 0x0313, break_at, 0x01b0, 0x3032, 6, 0x00d8, 0x0100,
+                0x2033, 0xfffb, 0x010f,
+            ];
+            let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+                .unwrap()
+                .source;
+            let expected: i32 = (0..limit)
+                .take_while(|i| *i <= break_at)
+                .map(i32::from)
+                .sum();
+            let (actual, _) = execute_java(&source, &[]);
+            assert_eq!(
+                actual, expected,
+                "limit={limit}, breakAt={break_at}\n{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nested_loop_interior_entry_is_still_rejected() {
+    let mut class = fixture();
+    let method = &mut class.methods[0];
+    method.name = "invalidNested".into();
+    method.access_flags = 9;
+    method.return_type = "I".into();
+    let code = method.code.as_mut().unwrap();
+    code.registers = 5;
+    code.ins = 0;
+    // A branch before the outer header jumps directly into the inner body,
+    // bypassing both its guard and its counter initialization.
+    code.instructions = vec![
+        0x0012, 0x0112, 0x0313, 2, 0x0413, 2, 0x0038, 7, 0x3132, 13, 0x0212, 0x4232, 7, 0x00d8,
+        0x0100, 0x02d8, 0x0102, 0xfa28, 0x01d8, 0x0101, 0xf428, 0x000f,
+    ];
+    assert!(native_java::render_method("sample.Hello", &class, &class.methods[0]).is_err());
+}
+
+#[test]
+fn switch_after_loop_is_not_rejected_as_loop_interior() {
+    let mut class = fixture();
+    let method = &mut class.methods[0];
+    method.name = "switchAfterLoop".into();
+    method.access_flags = 9;
+    method.return_type = "I".into();
+    let code = method.code.as_mut().unwrap();
+    code.registers = 2;
+    code.ins = 0;
+    code.instructions = vec![
+        0x0012, 0x2112, 0x1032, 5, 0x00d8, 0x0100, 0xfc28, 0x002b, 7, 0, 0x000f, 0x7012, 0x000f, 0,
+        0x0100, 1, 2, 0, 4, 0,
+    ];
+    let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    assert!(source.contains("while (true)"), "{source}");
+    assert!(source.contains("switch ("), "{source}");
+    assert!(source.contains("case 2:"), "{source}");
+    assert!(source.contains("return 7;"), "{source}");
+}
+
+#[test]
+fn final_unconditional_backedge_with_internal_return_is_terminal() {
+    for limit in 0..8_u16 {
+        let mut class = fixture();
+        let method = &mut class.methods[0];
+        method.name = "untilEqual".into();
+        method.access_flags = 9;
+        method.return_type = "I".into();
+        let code = method.code.as_mut().unwrap();
+        code.registers = 2;
+        code.ins = 0;
+        code.instructions = vec![
+            0x0012,
+            0x0112 | (limit << 12),
+            0x1033,
+            3,
+            0x000f,
+            0x00d8,
+            0x0100,
+            0xfb28,
+        ];
+        let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+            .unwrap()
+            .source;
+        let (actual, _) = execute_java(&source, &[]);
+        assert_eq!(actual, i32::from(limit), "{source}");
+    }
+}
+
+#[test]
+fn shared_nonvoid_return_after_latch_preserves_selected_register() {
+    for limit in 0..8_u16 {
+        for break_at in 0..8_u16 {
+            let mut class = fixture();
+            let method = &mut class.methods[0];
+            method.name = "firstLimit".into();
+            method.access_flags = 9;
+            method.return_type = "I".into();
+            let code = method.code.as_mut().unwrap();
+            code.registers = 3;
+            code.ins = 0;
+            code.instructions = vec![
+                0x0012,
+                0x0112 | (limit << 12),
+                0x0212 | (break_at << 12),
+                0x1032,
+                8,
+                0x2032,
+                5,
+                0x00d8,
+                0x0100,
+                0xfa28,
+                0x000f,
+                0x010f,
+            ];
+            let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+                .unwrap()
+                .source;
+            let (actual, _) = execute_java(&source, &[]);
+            assert_eq!(actual, i32::from(limit.min(break_at)), "{source}");
+        }
+    }
+}
+
+#[test]
+fn conditional_loop_returning_exit_tail_preserves_both_exits() {
+    for limit in 0..8_u16 {
+        for break_at in 1..8_u16 {
+            let mut class = fixture();
+            let method = &mut class.methods[0];
+            method.name = "tailReturn".into();
+            method.access_flags = 9;
+            method.return_type = "I".into();
+            let code = method.code.as_mut().unwrap();
+            code.registers = 3;
+            code.ins = 0;
+            code.instructions = vec![
+                0x0012,
+                0x0112 | (limit << 12),
+                0x0212 | (break_at << 12),
+                0x1032,
+                7,
+                0x00d8,
+                0x0100,
+                0x2033,
+                0xfffc,
+                0x000f,
+                0x010f,
+            ];
+            let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+                .unwrap()
+                .source;
+            let (actual, _) = execute_java(&source, &[]);
+            assert_eq!(actual, i32::from(limit.min(break_at)), "{source}");
+        }
+    }
+}
+
+#[test]
+fn loop_exit_can_skip_sibling_branch_in_address_order() {
+    for limit in 0..8_u16 {
+        for enabled in 0..=1_u16 {
+            let mut class = fixture();
+            let method = &mut class.methods[0];
+            method.name = "loopOrConstant".into();
+            method.access_flags = 9;
+            method.return_type = "I".into();
+            let code = method.code.as_mut().unwrap();
+            code.registers = 3;
+            code.ins = 0;
+            code.instructions = vec![
+                0x0012,
+                0x0112 | (limit << 12),
+                0x0212 | (enabled << 12),
+                0x0238,
+                7,
+                0x1032,
+                7,
+                0x00d8,
+                0x0100,
+                0xfc28,
+                0x7012,
+                0x0128,
+                0x000f,
+            ];
+            let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+                .unwrap()
+                .source;
+            let (actual, _) = execute_java(&source, &[]);
+            assert_eq!(
+                actual,
+                if enabled == 0 { 7 } else { i32::from(limit) },
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn loop_escape_computed_terminal_tail_preserves_branch_values() {
+    for limit in 0..8_u16 {
+        for break_at in 0..8_u16 {
+            let mut class = fixture();
+            let method = &mut class.methods[0];
+            method.name = "computedEscape".into();
+            method.access_flags = 9;
+            method.return_type = "I".into();
+            let code = method.code.as_mut().unwrap();
+            code.registers = 3;
+            code.ins = 0;
+            code.instructions = vec![
+                0x0012,
+                0x0112 | (limit << 12),
+                0x0212 | (break_at << 12),
+                0x1032,
+                7,
+                0x2032,
+                6,
+                0x00d8,
+                0x0100,
+                0xfa28,
+                0x010f,
+                0x00d8,
+                0x0500,
+                0x1032,
+                4,
+                0x00d8,
+                0x0100,
+                0x000f,
+            ];
+            let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+                .unwrap()
+                .source;
+            let expected = if break_at < limit {
+                let tail = break_at + 5;
+                tail + u16::from(tail != limit)
+            } else {
+                limit
+            };
+            assert_eq!(
+                execute_java(&source, &[]).0,
+                i32::from(expected),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn backward_shared_tails_inside_outer_loop_are_not_nested_loops() {
+    for limit in 0..8_u16 {
+        let mut class = fixture();
+        let method = &mut class.methods[0];
+        method.name = "sharedTail".into();
+        method.access_flags = 9;
+        method.return_type = "I".into();
+        let code = method.code.as_mut().unwrap();
+        code.registers = 4;
+        code.ins = 0;
+        code.instructions = vec![
+            0x0012,
+            0x0112 | (limit << 12),
+            0x0212,
+            0x1032,
+            15,
+            0x0038,
+            6,
+            0x2312,
+            0x0628,
+            0x3312,
+            0x0428,
+            0x0038,
+            0xfffe,
+            0xfa28,
+            0x32b0,
+            0x00d8,
+            0x0100,
+            0xf228,
+            0x020f,
+        ];
+        let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+            .unwrap()
+            .source;
+        assert_eq!(source.matches("while (true)").count(), 1, "{source}");
+        assert_eq!(
+            execute_java(&source, &[]).0,
+            if limit == 0 {
+                0
+            } else {
+                i32::from(2 * limit + 1)
+            },
+            "{source}"
+        );
+    }
+}
+
+fn contained_switch_loop(limit: u16) -> String {
+    let mut class = fixture();
+    let method = &mut class.methods[0];
+    method.name = "switchLoop".into();
+    method.access_flags = 9;
+    method.return_type = "I".into();
+    let code = method.code.as_mut().unwrap();
+    code.registers = 3;
+    code.ins = 0;
+    // Each iteration adds 3 for index zero, 1 otherwise. The switch join
+    // precedes the loop latch, so its breaks must leave only the switch.
+    code.instructions = vec![
+        0x0012,
+        0x0112 | (limit << 12),
+        0x0212,
+        0x1032,
+        13,
+        0x002b,
+        13,
+        0,
+        0x02d8,
+        0x0102,
+        0x0328,
+        0x02d8,
+        0x0302,
+        0x00d8,
+        0x0100,
+        0xf428,
+        0x020f,
+        0,
+        0x0100,
+        1,
+        0,
+        0,
+        6,
+        0,
+    ];
+    native_java::render_method("sample.Hello", &class, &class.methods[0])
+        .unwrap()
+        .source
+}
+
+#[test]
+fn switch_contained_in_loop_keeps_separate_break_scopes() {
+    let source = contained_switch_loop(4);
+    assert_eq!(source.matches("while (true)").count(), 1, "{source}");
+    assert_eq!(source.matches("switch (").count(), 1, "{source}");
+    assert!(source.contains("case 0:"), "{source}");
+}
+
+#[test]
+#[ignore = "requires javac and java on PATH"]
+fn contained_switch_loop_jvm_matches_independent_sum() {
+    use std::{fs, process::Command};
+    let dir = std::env::temp_dir().join(format!("rdx-switch-loop-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let mut java = String::from("public class SwitchLoop {\n");
+    for limit in 0..8 {
+        java.push_str(
+            &contained_switch_loop(limit).replace("switchLoop(", &format!("case{limit}(")),
+        );
+    }
+    java.push_str("public static void main(String[] args) {\n");
+    for limit in 0..8 {
+        let expected = if limit == 0 { 0 } else { limit + 2 };
+        java.push_str(&format!(
+            "if(case{limit}() != {expected}) throw new AssertionError(\"limit {limit}\");\n"
+        ));
+    }
+    java.push_str("}}\n");
+    fs::write(dir.join("SwitchLoop.java"), &java).unwrap();
+    for (program, argument) in [("javac", "SwitchLoop.java"), ("java", "SwitchLoop")] {
+        let output = Command::new(program)
+            .arg(argument)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{program}: {}\n{java}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn conditional_loop_exit_values_initialized_by_header_are_preserved() {
+    for limit in 0..8_u16 {
+        for stop in 1..8_u16 {
+            for constant in [false, true] {
+                let mut class = fixture();
+                let method = &mut class.methods[0];
+                method.name = "headerExit".into();
+                method.access_flags = 9;
+                method.return_type = "I".into();
+                let code = method.code.as_mut().unwrap();
+                code.registers = 4;
+                code.ins = 0;
+                code.instructions = vec![0x0012, 0x0112 | (limit << 12), 0x0212 | (stop << 12)];
+                if constant {
+                    code.instructions.extend([0x7312, 0]);
+                } else {
+                    code.instructions.extend([0x03d8, 0x0500]);
+                }
+                code.instructions
+                    .extend([0x1032, 7, 0x00d8, 0x0100, 0x2033, 0xfffa, 0x000f, 0x030f]);
+                let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+                    .unwrap()
+                    .source;
+                let expected = if limit < stop {
+                    if constant { 7 } else { limit + 5 }
+                } else {
+                    stop
+                };
+                assert_eq!(
+                    execute_java(&source, &[]).0,
+                    i32::from(expected),
+                    "limit={limit},stop={stop},constant={constant}\n{source}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn header_initialized_null_exit_stays_a_null_reference() {
+    let mut class = fixture();
+    let method = &mut class.methods[0];
+    method.name = "nullHeaderExit".into();
+    method.access_flags = 9;
+    method.return_type = "Ljava/lang/Object;".into();
+    method.parameters = vec!["Ljava/lang/Object;".into()];
+    let code = method.code.as_mut().unwrap();
+    code.registers = 5;
+    code.ins = 1;
+    // index=0, limit=2, stop=1; header defines a DEX zero used as null.
+    code.instructions = vec![
+        0x0012, 0x2112, 0x1212, 0x0312, 0, 0x1032, 7, 0x00d8, 0x0100, 0x2033, 0xfffa, 0x0411,
+        0x0311,
+    ];
+    let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    assert!(source.contains("return null;"), "{source}");
+}
+
+#[test]
+fn search_loop_merges_success_and_default_exit_tails() {
+    for limit in 0..8_u16 {
+        for stop in 1..8_u16 {
+            let mut class = fixture();
+            let method = &mut class.methods[0];
+            method.name = "searchExit".into();
+            method.access_flags = 9;
+            method.return_type = "I".into();
+            let code = method.code.as_mut().unwrap();
+            code.registers = 3;
+            code.ins = 0;
+            code.instructions = vec![
+                0x0012,
+                0x0112 | (limit << 12),
+                0x0212 | (stop << 12),
+                0x1032,
+                7,
+                0x00d8,
+                0x0100,
+                0x2033,
+                0xfffc,
+                0x0228,
+                0xf012,
+                0x000f,
+            ];
+            let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+                .unwrap()
+                .source;
+            assert_eq!(
+                execute_java(&source, &[]).0,
+                if limit < stop { -1 } else { i32::from(stop) },
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn interior_break_uses_values_established_by_dominating_prefix() {
+    for limit in 0..8_u16 {
+        let mut class = fixture();
+        let method = &mut class.methods[0];
+        method.name = "prefixExit".into();
+        method.access_flags = 9;
+        method.return_type = "I".into();
+        let code = method.code.as_mut().unwrap();
+        code.registers = 3;
+        code.ins = 0;
+        code.instructions = vec![
+            0x0012,
+            0x0112 | (limit << 12),
+            0x02d8,
+            0x0500,
+            0x0038,
+            3,
+            0,
+            0x1032,
+            5,
+            0x00d8,
+            0x0100,
+            0xf728,
+            0x020f,
+        ];
+        let source = native_java::render_method("sample.Hello", &class, &class.methods[0])
+            .unwrap()
+            .source;
+        assert_eq!(
+            execute_java(&source, &[]).0,
+            i32::from(limit + 5),
+            "{source}"
+        );
     }
 }

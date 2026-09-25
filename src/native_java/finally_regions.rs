@@ -15,10 +15,11 @@ pub(super) fn reconstruct(
         code.try_regions.len() <= 16,
         "cleanup region budget exceeded"
     );
-    ensure!(
-        method.return_type.as_ref() == "V",
-        "nested cleanup requires void return"
-    );
+    if code.try_regions.iter().all(|r| {
+        r.catches.len() == 1 && r.catches[0].0.is_none() && r.catches == code.try_regions[0].catches
+    }) {
+        return standalone(class, method, regs);
+    }
     let words = &code.instructions;
     let catchall = code
         .try_regions
@@ -100,8 +101,10 @@ pub(super) fn reconstruct(
     ensure!(copies.len() == 1, "cleanup requires one exact normal copy");
     let normal_cleanup = copies[0].pc;
     ensure!(
-        words.get(normal_cleanup + 3) == Some(&0x000e),
-        "normal cleanup must precede void return"
+        words
+            .get(normal_cleanup + 3)
+            .is_some_and(|word| matches!(*word as u8, 0x0e..=0x11)),
+        "normal cleanup must precede return"
     );
     let original = Graph::with_handlers(words, &[handler, outer_handler])?;
     ensure!(
@@ -312,6 +315,7 @@ pub(super) fn reconstruct(
             ty: ty.to_string(),
             literal: None,
             wide_literal: None,
+            raw_bits32: false,
         },
     )?;
     graph.caught_values.borrow_mut().insert(caught);
@@ -334,6 +338,230 @@ pub(super) fn reconstruct(
     let mut body = MethodBody {
         text: out.text,
         links: out.links,
+        inferred_throws: out.inferred_throws.into_iter().collect(),
+    };
+    cleanup::inline_receivers(&mut body, &out.receiver_locals);
+    Ok(body)
+}
+
+// A terminal finally whose handler is shared by disjoint protected ranges.
+// Every normal exit must execute the same cleanup; all throwing body effects
+// must dispatch to that handler, and cleanup itself must remain unprotected.
+fn standalone(
+    class: &DexClass,
+    method: &DexMethod,
+    regs: Vec<Option<Value>>,
+) -> Result<MethodBody> {
+    let code = method.code.as_ref().unwrap();
+    let words = &code.instructions;
+    let start = code
+        .try_regions
+        .iter()
+        .map(|r| r.start as usize)
+        .min()
+        .unwrap();
+    let handler = code.try_regions[0].catches[0].1 as usize;
+    let ir = DecodedMethod::decode(code)?;
+    let original = Graph::with_handlers(words, &[handler])?;
+    ensure!(
+        start < handler && handler + 5 == words.len(),
+        "standalone cleanup layout unsupported"
+    );
+    ensure!(
+        words[handler] as u8 == 0x0d
+            && words[handler + 4] as u8 == 0x27
+            && words[handler] >> 8 == words[handler + 4] >> 8,
+        "standalone cleanup must rethrow original exception"
+    );
+    let cleanup_pc = handler + 1;
+    let cleanup = ir
+        .instructions
+        .iter()
+        .find(|i| i.pc == cleanup_pc)
+        .context("cleanup boundary")?;
+    ensure!(
+        cleanup.width == 3 && matches!(cleanup.opcode,0x6e..=0x72|0x74..=0x78),
+        "standalone cleanup must be one invocation"
+    );
+    let (_, proto, _) = *class
+        .symbols
+        .methods
+        .get(words[cleanup_pc + 1] as usize)
+        .context("cleanup method")?;
+    ensure!(
+        class
+            .symbols
+            .protos
+            .get(proto as usize)
+            .context("cleanup prototype")?
+            .0
+            .as_ref()
+            == "V",
+        "cleanup result unsupported"
+    );
+    let copies: std::collections::HashSet<_> = ir
+        .instructions
+        .iter()
+        .filter(|i| {
+            i.pc >= start
+                && i.pc < handler
+                && i.width == 3
+                && words[i.pc..i.pc + 3] == words[cleanup_pc..cleanup_pc + 3]
+        })
+        .map(|i| i.pc)
+        .collect();
+    ensure!(!copies.is_empty(), "standalone cleanup lacks normal copies");
+    for pc in &copies {
+        ensure!(
+            words
+                .get(pc + 3)
+                .is_some_and(|w| matches!(*w as u8, 0x0e..=0x11)),
+            "standalone cleanup must precede return"
+        );
+    }
+    for read in &cleanup.reads {
+        let reg = usize::from(read.register);
+        ensure!(
+            reg != (words[handler] >> 8) as usize,
+            "cleanup observes exception"
+        );
+        ensure!(
+            !ir.instructions
+                .iter()
+                .filter(|i| i.pc >= start && i.pc < handler)
+                .flat_map(|i| &i.writes)
+                .any(|w| usize::from(w.register) <= reg
+                    && reg < usize::from(w.register) + w.kind.word_count()),
+            "cleanup input changes in protected body"
+        );
+    }
+    for region in &code.try_regions {
+        ensure!(
+            region.start < region.end
+                && region.start as usize >= start
+                && region.end as usize <= handler
+                && original.widths[region.start as usize] != 0
+                && original.widths[region.end as usize] != 0,
+            "standalone cleanup invalid range"
+        );
+    }
+    for i in ir.instructions.iter().filter(|i| i.may_throw) {
+        let covering = code
+            .try_regions
+            .iter()
+            .filter(|r| r.start as usize <= i.pc && i.pc < (r.end as usize))
+            .count();
+        let protected = i.pc >= start && i.pc < handler && !copies.contains(&i.pc);
+        ensure!(
+            covering == usize::from(protected),
+            "standalone cleanup exception dispatch mismatch"
+        );
+    }
+    let mut pending = vec![start];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(pc) = pending.pop() {
+        if copies.contains(&pc) || !visited.insert(pc) {
+            continue;
+        }
+        ensure!(
+            pc >= start && pc < handler && original.widths[pc] != 0,
+            "normal path escapes cleanup body"
+        );
+        match words[pc] as u8 {
+            0x0e..=0x11 => bail!("normal return bypasses cleanup"),
+            0x27 => {}
+            0x28..=0x2a => pending.push(original.targets[pc].context("cleanup jump")?),
+            _ => {
+                pending.push(pc + original.widths[pc]);
+                pending.extend(original.targets[pc]);
+                if let Some(switch) = &original.switches[pc] {
+                    pending.extend(switch.cases.iter().map(|(_, target)| *target));
+                }
+            }
+        }
+    }
+    for i in &ir.instructions {
+        let mut targets: Vec<_> = original.targets[i.pc].into_iter().collect();
+        if let Some(switch) = &original.switches[i.pc] {
+            targets.extend(switch.cases.iter().map(|(_, target)| *target));
+        }
+        for target in targets {
+            ensure!(
+                (i.pc < start && target <= start)
+                    || (i.pc >= start && i.pc < handler && target >= start && target < handler),
+                "branch crosses standalone cleanup region"
+            );
+        }
+    }
+    let mut lowered = DexMethod {
+        declaring_type: method.declaring_type.clone(),
+        name: method.name.clone(),
+        return_type: method.return_type.clone(),
+        parameters: method.parameters.clone(),
+        thrown_types: method.thrown_types.clone(),
+        access_flags: method.access_flags,
+        code: Some(DexCode {
+            registers: code.registers,
+            ins: code.ins,
+            outs: code.outs,
+            tries: 0,
+            try_regions: vec![],
+            instructions: words.clone(),
+            offset: code.offset,
+        }),
+    };
+    let lowered_code = lowered.code.as_mut().unwrap();
+    lowered_code.tries = 0;
+    lowered_code.try_regions.clear();
+    for pc in copies {
+        lowered_code.instructions[pc..pc + 3].fill(0);
+    }
+    let mut graph = Graph::with_handlers(&lowered_code.instructions, &[handler])?;
+    graph.live = super::super::liveness::analyze(lowered_code);
+    let mut out = Output::default();
+    let (inner_regs, terminal) = render(
+        class, &lowered, &graph, 0, start, regs, &mut out, 0, true, None, None,
+    )?;
+    ensure!(!terminal, "cleanup prefix terminates");
+    out.line("try {", &[]);
+    out.indent += 1;
+    let (_, terminal) = render(
+        class,
+        &lowered,
+        &graph,
+        start,
+        handler,
+        inner_regs.clone(),
+        &mut out,
+        1,
+        true,
+        None,
+        None,
+    )?;
+    ensure!(terminal, "standalone cleanup body must terminate");
+    out.indent -= 1;
+    out.line("} finally {", &[]);
+    out.indent += 1;
+    let (_, terminal) = render(
+        class,
+        &lowered,
+        &graph,
+        cleanup_pc,
+        cleanup_pc + 3,
+        inner_regs,
+        &mut out,
+        1,
+        true,
+        None,
+        None,
+    )?;
+    ensure!(!terminal, "cleanup unexpectedly terminates");
+    out.indent -= 1;
+    out.line("}", &[]);
+    let mut body = MethodBody {
+        text: out.text,
+        links: out.links,
+        inferred_throws: out.inferred_throws.into_iter().collect(),
     };
     cleanup::inline_receivers(&mut body, &out.receiver_locals);
     Ok(body)

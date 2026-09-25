@@ -20,14 +20,58 @@ enum Atom {
     Uninitialized { site: usize, ty: String },
 }
 fn atom(regs: &[Option<Atom>], r: usize) -> Result<Atom> {
-    regs.get(r)
+    let value = regs
+        .get(r)
         .and_then(Clone::clone)
-        .context("undefined allocation register")
+        .context("undefined allocation register")?;
+    ensure!(
+        atom_type(&value) != "<wide-tail>",
+        "read from allocation wide tail"
+    );
+    if matches!(atom_type(&value), "J" | "D") {
+        ensure!(
+            matches!(regs.get(r + 1), Some(Some(Atom::Input(tail)))
+            if tail.ty == "<wide-tail>" && tail.text == r.to_string()),
+            "invalid allocation wide pair"
+        );
+    }
+    Ok(value)
 }
 fn put(regs: &mut [Option<Atom>], r: usize, value: Atom) -> Result<()> {
-    *regs
-        .get_mut(r)
-        .context("allocation register out of bounds")? = Some(value);
+    let width = if matches!(atom_type(&value), "J" | "D") {
+        2
+    } else {
+        1
+    };
+    ensure!(
+        r.checked_add(width).is_some_and(|end| end <= regs.len()),
+        "allocation register out of bounds"
+    );
+    for slot in r..r + width {
+        if let Some(old) = &regs[slot] {
+            if atom_type(old) == "<wide-tail>" {
+                let Atom::Input(tail) = old else {
+                    anyhow::bail!("invalid allocation wide tail")
+                };
+                let head: usize = tail.text.parse()?;
+                ensure!(head + 1 == slot, "invalid allocation wide owner");
+                regs[head] = None;
+            } else if matches!(atom_type(old), "J" | "D") {
+                regs[slot + 1] = None;
+            }
+        }
+        regs[slot] = None;
+    }
+    regs[r] = Some(value);
+    if width == 2 {
+        regs[r + 1] = Some(Atom::Input(Value {
+            raw_bits32: false,
+            text: r.to_string(),
+            ty: "<wide-tail>".into(),
+            literal: None,
+            wide_literal: None,
+        }));
+    }
     Ok(())
 }
 fn atom_type(value: &Atom) -> &str {
@@ -69,7 +113,21 @@ fn expression(value: Atom, expected: &str, class: &DexClass) -> Result<Expr> {
                 value: Box::new(Expr::Local(value.text)),
             })
         }
-        Atom::Input(value) => Ok(Expr::Local(super::argument(&value, expected)?)),
+        Atom::Input(value) => {
+            let text = if expected == "I" && matches!(value.ty.as_str(), "B" | "S" | "C") {
+                format!("((int) {})", value.text)
+            } else {
+                super::argument(&value, expected)?
+            };
+            if text == value.text {
+                Ok(Expr::Local(text))
+            } else {
+                Ok(Expr::ConvertedLocal {
+                    name: value.text,
+                    text,
+                })
+            }
+        }
         Atom::Expr { expression, ty } => {
             if ty != expected && super::reference(&ty) && super::reference(expected) {
                 ensure!(
@@ -93,10 +151,13 @@ fn expression(value: Atom, expected: &str, class: &DexClass) -> Result<Expr> {
                     value: Box::new(expression),
                 });
             }
-            ensure!(
-                ty == expected || (expected == "I" && matches!(ty.as_str(), "B" | "S" | "C")),
-                "allocation argument type mismatch"
-            );
+            if expected == "I" && matches!(ty.as_str(), "B" | "S" | "C") {
+                return Ok(Expr::Cast {
+                    ty: symbol("int".into(), "int".into()),
+                    value: Box::new(expression),
+                });
+            }
+            ensure!(ty == expected, "allocation argument type mismatch");
             Ok(expression)
         }
         Atom::Uninitialized { .. } => anyhow::bail!("uninitialized allocation value escapes"),
@@ -223,6 +284,283 @@ fn guarded_copy(
     Ok(Some(join))
 }
 
+// Render argument preparation with the ordinary structured-region renderer.
+// Masking the allocation makes every use of its uninitialized identity fail;
+// only the proven matching constructor may introduce the initialized object.
+#[allow(clippy::too_many_arguments)]
+fn try_region_staging(
+    class: &DexClass,
+    method: &DexMethod,
+    graph: &Graph,
+    words: &[u16],
+    pc: usize,
+    stop: usize,
+    caller_regs: &[Option<Value>],
+    caller_out: &Output,
+) -> Result<Lowered> {
+    let dst = (words[pc] >> 8) as usize;
+    let ty = class
+        .symbols
+        .types
+        .get(words[pc + 1] as usize)
+        .context("allocation type")?;
+    let start = pc + graph.widths[pc];
+    let mut cursor = start;
+    let mut constructor_pc = None;
+    let mut count = 0;
+    let mut allocations = 0;
+    while cursor < stop && count < 256 {
+        count += 1;
+        graph.tick()?;
+        let op = words[cursor] as u8;
+        ensure!(
+            graph.widths[cursor] != 0 && !graph.payloads[cursor],
+            "allocation region crosses payload"
+        );
+        ensure!(
+            !matches!(op, 0x0e..=0x11),
+            "allocation region contains early return"
+        );
+        if op == 0x22 {
+            allocations += 1;
+            ensure!(allocations <= 16, "nested region staging budget");
+        }
+        if matches!(op, 0x70 | 0x76) {
+            let (_, _, _, name) = method_symbol(class, words[cursor + 1] as usize)?;
+            if name == "<init>" && graph.constructor_binding(class, method, cursor).is_some_and(|binding| matches!(&binding.origin,
+                crate::native_constructors::ConstructorOrigin::Allocation { pc: origin, type_descriptor }
+                if *origin == pc && type_descriptor.as_ref() == ty.as_ref())) {
+                constructor_pc = Some(cursor);
+                break;
+            }
+        }
+        cursor += graph.widths[cursor];
+    }
+    let constructor_pc =
+        constructor_pc.context("no bounded SSA constructor for allocation region")?;
+    let valid_edge = |origin: usize, target: usize| {
+        if start <= origin && origin < constructor_pc {
+            start <= target && target <= constructor_pc
+        } else {
+            !(start <= target && target <= constructor_pc)
+        }
+    };
+    for (origin, target) in graph.targets.iter().enumerate() {
+        if let Some(target) = target {
+            ensure!(
+                valid_edge(origin, *target),
+                "allocation region has escaping or external edge"
+            );
+        }
+        if let Some(switch) = &graph.switches[origin] {
+            ensure!(
+                switch
+                    .cases
+                    .iter()
+                    .all(|(_, target)| valid_edge(origin, *target)),
+                "allocation region has escaping switch edge"
+            );
+        }
+    }
+    for region in &method.code.as_ref().context("method code")?.try_regions {
+        let from = region.start as usize;
+        let end = region.end as usize;
+        ensure!(
+            end <= pc
+                || from > constructor_pc
+                || (from <= pc && constructor_pc + graph.widths[constructor_pc] <= end),
+            "allocation region crosses handler boundary"
+        );
+    }
+    let inputs = invoke_inputs(
+        words[constructor_pc] as u8,
+        (words[constructor_pc] >> 8) as usize,
+        words,
+        constructor_pc,
+    )?;
+    // Keep exact uninitialized aliases while staging ordinary argument code.
+    // Branches may precede alias transfers; after the first transfer, require
+    // a linear suffix so all paths share the same receiver identity.
+    let ir = crate::native_ir::DecodedMethod::decode(method.code.as_ref().unwrap())?;
+    let mut aliases = HashSet::from([dst]);
+    let mut alias_transfer = false;
+    let mut staged_words = words.to_vec();
+    for instruction in ir
+        .instructions
+        .iter()
+        .filter(|i| start <= i.pc && i.pc < constructor_pc)
+    {
+        ensure!(
+            !alias_transfer
+                || (instruction.branch_target.is_none()
+                    && !matches!(instruction.opcode, 0x2b | 0x2c)),
+            "allocation alias crosses control flow"
+        );
+        let from_alias = matches!(instruction.opcode, 0x07..=0x09)
+            && instruction
+                .reads
+                .first()
+                .is_some_and(|r| aliases.contains(&(r.register as usize)));
+        ensure!(
+            from_alias
+                || instruction
+                    .reads
+                    .iter()
+                    .all(|r| !aliases.contains(&(r.register as usize))),
+            "uninitialized allocation alias escapes"
+        );
+        for write in &instruction.writes {
+            aliases.remove(&(write.register as usize));
+            if write.kind == crate::native_ir::ValueKind::Wide64 {
+                aliases.remove(&(write.register as usize + 1));
+            }
+        }
+        if from_alias {
+            let target = instruction
+                .writes
+                .first()
+                .context("allocation alias destination")?
+                .register as usize;
+            aliases.insert(target);
+            alias_transfer = true;
+            staged_words[instruction.pc..instruction.pc + graph.widths[instruction.pc]].fill(0);
+        }
+    }
+    ensure!(
+        inputs.first().is_some_and(|r| aliases.contains(r)),
+        "allocation region lost constructor receiver"
+    );
+    let (owner, ret, args, name) = method_symbol(class, words[constructor_pc + 1] as usize)?;
+    ensure!(
+        ret == "V"
+            && name == "<init>"
+            && (owner == ty.as_ref()
+                || class
+                    .symbols
+                    .hierarchy
+                    .get()
+                    .is_some_and(|h| h.equivalent_constructor(ty, owner, args))),
+        "allocation region constructor mismatch"
+    );
+    let mut regs = caller_regs.to_vec();
+    // assign() also invalidates any overwritten wide-word pair.
+    super::assign(
+        &mut regs,
+        dst,
+        Value {
+            raw_bits32: false,
+            text: String::new(),
+            ty: "I".into(),
+            literal: None,
+            wide_literal: None,
+        },
+    )?;
+    regs[dst] = None;
+    let mut out = Output {
+        sequence: caller_out.sequence,
+        indent: caller_out.indent,
+        ..Output::default()
+    };
+    let staged_method = DexMethod {
+        declaring_type: method.declaring_type.clone(),
+        name: method.name.clone(),
+        return_type: method.return_type.clone(),
+        parameters: method.parameters.clone(),
+        thrown_types: method.thrown_types.clone(),
+        access_flags: method.access_flags,
+        code: method.code.as_ref().map(|code| crate::native_dex::DexCode {
+            registers: code.registers,
+            ins: code.ins,
+            outs: code.outs,
+            tries: code.tries,
+            try_regions: code.try_regions.clone(),
+            instructions: staged_words,
+            offset: code.offset,
+        }),
+    };
+    let (mut regs, returned) = super::render(
+        class,
+        &staged_method,
+        graph,
+        start,
+        constructor_pc,
+        regs,
+        &mut out,
+        1,
+        true,
+        None,
+        None,
+    )?;
+    ensure!(!returned, "allocation region returned before constructor");
+    let mut actual = Vec::new();
+    let mut input = 1;
+    for arg in args {
+        let r = *inputs.get(input).context("allocation region argument")?;
+        ensure!(
+            !aliases.contains(&r),
+            "uninitialized allocation alias passed as argument"
+        );
+        if matches!(arg.as_ref(), "J" | "D") {
+            ensure!(
+                inputs.get(input + 1) == Some(&(r + 1)),
+                "allocation region wide argument pair"
+            );
+        }
+        let value = super::register(&regs, r)?;
+        if value.ty != arg.as_ref() && super::reference(&value.ty) && super::reference(arg) {
+            ensure!(
+                value.ty == "Ljava/lang/Object;"
+                    || arg.as_ref() == "Ljava/lang/Object;"
+                    || class
+                        .symbols
+                        .hierarchy
+                        .get()
+                        .is_some_and(|h| h.assignable(&value.ty, arg)
+                            == crate::native_hierarchy::Relation::Proven),
+                "allocation region reference conversion lacks hierarchy proof"
+            );
+        }
+        actual.push(
+            if arg.as_ref() == "I" && matches!(value.ty.as_str(), "B" | "S" | "C") {
+                format!("((int) {})", value.text)
+            } else {
+                super::argument(&value, arg)?
+            },
+        );
+        input += if matches!(arg.as_ref(), "J" | "D") {
+            2
+        } else {
+            1
+        };
+    }
+    ensure!(input == inputs.len(), "extra allocation region arguments");
+    let display = super::java_type(ty)?;
+    let label = format!(
+        "{}.{}({}){}",
+        super::class_label(owner).context("constructor owner")?,
+        name,
+        args.join(""),
+        ret
+    );
+    let value = out.local(
+        ty,
+        &format!("new {display}({})", actual.join(", ")),
+        &[(4, display.chars().count(), label)],
+    )?;
+    for alias in aliases {
+        super::assign(&mut regs, alias, value.clone())?;
+    }
+    ensure!(
+        caller_out.text.len().saturating_add(out.text.len()) <= 4 * 1024 * 1024,
+        "allocation region output budget"
+    );
+    Ok(Lowered {
+        regs,
+        out,
+        next_pc: constructor_pc + graph.widths[constructor_pc],
+    })
+}
+
 /// Decode one allocation through its matching constructor. Unsupported regions
 /// decline without exposing any staged register or output mutation.
 #[allow(clippy::too_many_arguments)]
@@ -249,13 +587,6 @@ pub(super) fn try_lower(
             .to_string();
         ensure!(ty.starts_with('L'), "new-instance requires class");
         let display = super::java_type(&ty)?;
-        ensure!(
-            caller_regs
-                .iter()
-                .flatten()
-                .all(|value| !matches!(value.ty.as_str(), "J" | "D" | "<wide-tail>")),
-            "allocation decoder declines live wide registers"
-        );
         let mut prelude = Output {
             sequence: caller_out.sequence,
             indent: caller_out.indent,
@@ -279,10 +610,14 @@ pub(super) fn try_lower(
             .map(|value| value.map(Atom::Input))
             .collect();
         ensure!(dst < regs.len(), "allocation register out of bounds");
-        regs[dst] = Some(Atom::Uninitialized {
-            site: pc,
-            ty: ty.clone(),
-        });
+        put(
+            &mut regs,
+            dst,
+            Atom::Uninitialized {
+                site: pc,
+                ty: ty.clone(),
+            },
+        )?;
         let mut nested = false;
         let mut captures = Vec::new();
         let mut discarded = Vec::new();
@@ -317,31 +652,141 @@ pub(super) fn try_lower(
             let op = word as u8;
             let a = (word >> 8) as usize;
             match op {
-                0xb0 => {
-                    // Integer add/2addr is nonthrowing and wraps exactly as Java int.
-                    // Restrict operands to already materialized values; effectful
-                    // captures must keep their original evaluation position.
-                    let dst = a & 15;
-                    let (Atom::Input(left), Atom::Input(right)) =
-                        (atom(&regs, dst)?, atom(&regs, a >> 4)?)
-                    else {
-                        anyhow::bail!("allocation integer add requires materialized inputs");
+                0x21 | 0x7b..=0x8f => {
+                    let operand = atom(&regs, a >> 4)?;
+                    let (value, prefix, suffix, ty) = if op == 0x21 {
+                        let ty = atom_type(&operand).to_string();
+                        ensure!(
+                            ty.starts_with('['),
+                            "allocation array-length requires array type"
+                        );
+                        (
+                            expression(operand, &ty, class)?,
+                            String::new(),
+                            ".length",
+                            "I",
+                        )
+                    } else {
+                        let unary =
+                            super::numeric::Unary::decode(op).context("allocation unary opcode")?;
+                        let prefix = unary
+                            .expression("")
+                            .strip_suffix("()")
+                            .context("unary format")?
+                            .to_string();
+                        (
+                            expression(operand, unary.input.descriptor(), class)?,
+                            prefix,
+                            "",
+                            unary.result_descriptor,
+                        )
                     };
-                    ensure!(
-                        left.ty == "I" && right.ty == "I",
-                        "noninteger allocation add"
-                    );
-                    let text = format!("({} + {})", left.text, right.text);
-                    local_names.push(text.clone());
+                    let index = captures.len();
+                    captures.push(Capture {
+                        ty: super::java_type(ty)?,
+                        name: format!("v{}", base_sequence + index),
+                        expression: Expr::Unary {
+                            site: cursor,
+                            prefix,
+                            suffix,
+                            value: Box::new(value),
+                        },
+                    });
+                    events.push(Event::Compute { site: cursor });
                     put(
                         &mut regs,
-                        dst,
-                        Atom::Input(Value {
-                            text,
-                            ty: "I".into(),
-                            literal: None,
-                            wide_literal: None,
-                        }),
+                        a & 15,
+                        Atom::Expr {
+                            expression: Expr::Capture(index),
+                            ty: ty.into(),
+                        },
+                    )?;
+                }
+                0x90..=0xcf => {
+                    let binary =
+                        super::numeric::Binary::decode(op).context("allocation binary opcode")?;
+                    let (to, left, right) = if op >= 0xb0 {
+                        (a & 15, a & 15, a >> 4)
+                    } else {
+                        (
+                            a,
+                            (words[cursor + 1] & 255) as usize,
+                            (words[cursor + 1] >> 8) as usize,
+                        )
+                    };
+                    let left = expression(atom(&regs, left)?, binary.left.descriptor(), class)?;
+                    let right = expression(atom(&regs, right)?, binary.right.descriptor(), class)?;
+                    let index = captures.len();
+                    captures.push(Capture {
+                        ty: super::java_type(binary.result.descriptor())?,
+                        name: format!("v{}", base_sequence + index),
+                        expression: Expr::Binary {
+                            site: cursor,
+                            operator: binary.operator,
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        },
+                    });
+                    events.push(Event::Compute { site: cursor });
+                    put(
+                        &mut regs,
+                        to,
+                        Atom::Expr {
+                            expression: Expr::Capture(index),
+                            ty: binary.result.descriptor().into(),
+                        },
+                    )?;
+                }
+                0xd0..=0xe2 => {
+                    let (to, from, literal, offset) = if op <= 0xd7 {
+                        (a & 15, a >> 4, words[cursor + 1] as i16 as i32, op - 0xd0)
+                    } else {
+                        (
+                            a,
+                            (words[cursor + 1] & 255) as usize,
+                            (words[cursor + 1] >> 8) as i8 as i32,
+                            op - 0xd8,
+                        )
+                    };
+                    let operators = ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>"];
+                    let operator = operators[offset as usize];
+                    let source = atom(&regs, from)?;
+                    let boolean = atom_type(&source) == "Z"
+                        && matches!(offset, 5..=7)
+                        && matches!(literal, 0 | 1);
+                    let result_ty = if boolean { "Z" } else { "I" };
+                    let operand = expression(source, result_ty, class)?;
+                    let text = literal.to_string();
+                    local_names.push(text.clone());
+                    let literal = if boolean {
+                        Expr::Boolean(literal != 0)
+                    } else {
+                        Expr::Local(text)
+                    };
+                    let (left, right) = if offset == 1 {
+                        (literal, operand)
+                    } else {
+                        (operand, literal)
+                    };
+                    let index = captures.len();
+                    captures.push(Capture {
+                        ty: super::java_type(result_ty)?,
+                        name: format!("v{}", base_sequence + index),
+                        expression: Expr::Binary {
+                            site: cursor,
+                            operator,
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        },
+                    });
+                    events.push(Event::Compute { site: cursor });
+                    put(
+                        &mut regs,
+                        to,
+                        Atom::Expr {
+                            expression: Expr::Capture(index),
+                            ty: result_ty.into(),
+                        },
                     )?;
                 }
                 0x22 => {
@@ -360,12 +805,30 @@ pub(super) fn try_lower(
                     put(&mut regs, a, Atom::Uninitialized { site: cursor, ty })?;
                     nested = true;
                 }
+                0x04..=0x06 => {
+                    let (to, from) = match op {
+                        0x04 => (a & 15, a >> 4),
+                        0x05 => (a, words[cursor + 1] as usize),
+                        _ => (words[cursor + 1] as usize, words[cursor + 2] as usize),
+                    };
+                    let value = atom(&regs, from)?;
+                    ensure!(
+                        matches!(atom_type(&value), "J" | "D"),
+                        "move-wide requires wide value"
+                    );
+                    put(&mut regs, to, value)?;
+                }
                 0x01 | 0x07 => {
                     let value = atom(&regs, a >> 4)?;
                     ensure!(
-                        (op == 0x07)
-                            == (atom_type(&value).starts_with('L')
-                                || atom_type(&value).starts_with('[')),
+                        !matches!(atom_type(&value), "J" | "D"),
+                        "narrow move of wide allocation value"
+                    );
+                    ensure!(
+                        (op == 0x07 && matches!(&value, Atom::Input(v) if v.literal == Some(0)))
+                            || ((op == 0x07)
+                                == (atom_type(&value).starts_with('L')
+                                    || atom_type(&value).starts_with('['))),
                         "move opcode type mismatch"
                     );
                     put(&mut regs, a & 15, value)?;
@@ -373,9 +836,14 @@ pub(super) fn try_lower(
                 0x02 | 0x08 => {
                     let value = atom(&regs, words[cursor + 1] as usize)?;
                     ensure!(
-                        (op == 0x08)
-                            == (atom_type(&value).starts_with('L')
-                                || atom_type(&value).starts_with('[')),
+                        !matches!(atom_type(&value), "J" | "D"),
+                        "narrow move of wide allocation value"
+                    );
+                    ensure!(
+                        (op == 0x08 && matches!(&value, Atom::Input(v) if v.literal == Some(0)))
+                            || ((op == 0x08)
+                                == (atom_type(&value).starts_with('L')
+                                    || atom_type(&value).starts_with('['))),
                         "move opcode type mismatch"
                     );
                     put(&mut regs, a, value)?;
@@ -384,9 +852,14 @@ pub(super) fn try_lower(
                     let to = words[cursor + 1] as usize;
                     let value = atom(&regs, words[cursor + 2] as usize)?;
                     ensure!(
-                        (op == 0x09)
-                            == (atom_type(&value).starts_with('L')
-                                || atom_type(&value).starts_with('[')),
+                        !matches!(atom_type(&value), "J" | "D"),
+                        "narrow move of wide allocation value"
+                    );
+                    ensure!(
+                        (op == 0x09 && matches!(&value, Atom::Input(v) if v.literal == Some(0)))
+                            || ((op == 0x09)
+                                == (atom_type(&value).starts_with('L')
+                                    || atom_type(&value).starts_with('['))),
                         "move opcode type mismatch"
                     );
                     put(&mut regs, to, value)?;
@@ -398,6 +871,7 @@ pub(super) fn try_lower(
                         &mut regs,
                         to,
                         Atom::Input(Value {
+                            raw_bits32: false,
                             text: n.to_string(),
                             ty: "I".into(),
                             literal: Some(n as i32),
@@ -412,6 +886,7 @@ pub(super) fn try_lower(
                         &mut regs,
                         a,
                         Atom::Input(Value {
+                            raw_bits32: false,
                             text: n.to_string(),
                             ty: "I".into(),
                             literal: Some(n),
@@ -420,12 +895,17 @@ pub(super) fn try_lower(
                     )?;
                     local_names.push(n.to_string());
                 }
-                0x14 => {
-                    let n = (words[cursor + 1] as u32 | (words[cursor + 2] as u32) << 16) as i32;
+                0x14 | 0x15 => {
+                    let n = if op == 0x15 {
+                        ((words[cursor + 1] as u32) << 16) as i32
+                    } else {
+                        (words[cursor + 1] as u32 | (words[cursor + 2] as u32) << 16) as i32
+                    };
                     put(
                         &mut regs,
                         a,
                         Atom::Input(Value {
+                            raw_bits32: false,
                             text: n.to_string(),
                             ty: "I".into(),
                             literal: Some(n),
@@ -433,6 +913,32 @@ pub(super) fn try_lower(
                         }),
                     )?;
                     local_names.push(n.to_string());
+                }
+                0x16..=0x19 => {
+                    let bits = match op {
+                        0x16 => words[cursor + 1] as i16 as i64,
+                        0x17 => {
+                            (words[cursor + 1] as u32 | ((words[cursor + 2] as u32) << 16)) as i32
+                                as i64
+                        }
+                        0x18 => (0..4).fold(0u64, |n, i| {
+                            n | ((words[cursor + 1 + i] as u64) << (16 * i))
+                        }) as i64,
+                        _ => ((words[cursor + 1] as u64) << 48) as i64,
+                    };
+                    let text = format!("{bits}L");
+                    local_names.push(text.clone());
+                    put(
+                        &mut regs,
+                        a,
+                        Atom::Input(Value {
+                            raw_bits32: false,
+                            text,
+                            ty: "J".into(),
+                            literal: None,
+                            wide_literal: Some(bits as u64),
+                        }),
+                    )?;
                 }
                 0x1a | 0x1b => {
                     let string_index = if op == 0x1a {
@@ -546,7 +1052,8 @@ pub(super) fn try_lower(
                             value: Box::new(operand),
                         }
                     };
-                    let label = super::class_label(descriptor).context("check-cast label")?;
+                    let label =
+                        super::class_label(descriptor).unwrap_or_else(|| descriptor.to_string());
                     let index = captures.len();
                     captures.push(Capture {
                         ty: super::java_type(descriptor)?,
@@ -590,14 +1097,11 @@ pub(super) fn try_lower(
                         .get(field_ty_i as usize)
                         .context("field type")?
                         .to_string();
-                    ensure!(
-                        !matches!(field_ty.as_str(), "J" | "D"),
-                        "wide allocation field capture is unsupported"
-                    );
                     let family = if op >= 0x60 { op - 0x60 } else { op - 0x52 };
                     ensure!(
                         match family {
                             0 => matches!(field_ty.as_str(), "I" | "F"),
+                            1 => matches!(field_ty.as_str(), "J" | "D"),
                             2 => field_ty.starts_with('L') || field_ty.starts_with('['),
                             3 => field_ty == "Z",
                             4 => field_ty == "B",
@@ -648,6 +1152,205 @@ pub(super) fn try_lower(
                             ty: field_ty,
                         },
                     )?;
+                }
+                0x59..=0x5f | 0x67..=0x6d => {
+                    let &(owner_i, type_i, name_i) = class
+                        .symbols
+                        .fields
+                        .get(words[cursor + 1] as usize)
+                        .context("allocation store field")?;
+                    let owner = class
+                        .symbols
+                        .types
+                        .get(owner_i as usize)
+                        .context("allocation store owner")?;
+                    let ty = class
+                        .symbols
+                        .types
+                        .get(type_i as usize)
+                        .context("allocation store type")?;
+                    let raw_name = class
+                        .symbols
+                        .strings
+                        .get(name_i as usize)
+                        .context("allocation store name")?;
+                    let family = if op >= 0x67 { op - 0x67 } else { op - 0x59 };
+                    ensure!(
+                        match family {
+                            0 => matches!(ty.as_ref(), "I" | "F"),
+                            1 => matches!(ty.as_ref(), "J" | "D"),
+                            2 => super::reference(ty),
+                            3 => ty.as_ref() == "Z",
+                            4 => ty.as_ref() == "B",
+                            5 => ty.as_ref() == "C",
+                            6 => ty.as_ref() == "S",
+                            _ => false,
+                        },
+                        "allocation field store opcode type mismatch"
+                    );
+                    let (receiver, from) = if op >= 0x67 {
+                        let display = super::java_type(owner)?;
+                        local_names.push(display.clone());
+                        (Expr::Local(display), a)
+                    } else {
+                        (expression(atom(&regs, a >> 4)?, owner, class)?, a & 15)
+                    };
+                    let value = expression(atom(&regs, from)?, ty, class)?;
+                    let label = format!(
+                        "{}.{}:{}",
+                        super::class_label(owner).context("allocation store owner label")?,
+                        raw_name,
+                        ty
+                    );
+                    let index = captures.len();
+                    captures.push(Capture {
+                        ty: "void".into(),
+                        name: format!("v{}", base_sequence + index),
+                        expression: Expr::FieldStore {
+                            site: cursor,
+                            receiver: Box::new(receiver),
+                            field: symbol(super::names::member(raw_name)?, label.clone()),
+                            value: Box::new(value),
+                        },
+                    });
+                    discarded.push(index);
+                    events.push(Event::Write {
+                        site: cursor,
+                        field: label,
+                    });
+                }
+                0x23 => {
+                    let array = class
+                        .symbols
+                        .types
+                        .get(words[cursor + 1] as usize)
+                        .context("new array type")?;
+                    ensure!(array.starts_with('['), "new array requires array type");
+                    let length = expression(atom(&regs, a >> 4)?, "I", class)?;
+                    let display = super::java_type(array)?;
+                    let index = captures.len();
+                    captures.push(Capture {
+                        ty: display.clone(),
+                        name: format!("v{}", base_sequence + index),
+                        expression: Expr::NewArray {
+                            site: cursor,
+                            ty: symbol(
+                                display.clone(),
+                                super::class_label(array).unwrap_or_default(),
+                            ),
+                            length: Box::new(length),
+                        },
+                    });
+                    events.push(Event::Allocate {
+                        site: cursor,
+                        ty: display,
+                    });
+                    events.push(Event::Compute { site: cursor });
+                    put(
+                        &mut regs,
+                        a & 15,
+                        Atom::Expr {
+                            expression: Expr::Capture(index),
+                            ty: array.to_string(),
+                        },
+                    )?;
+                }
+                0x44..=0x4a => {
+                    let array = atom(&regs, (words[cursor + 1] & 255) as usize)?;
+                    let ty = atom_type(&array).to_string();
+                    let component = ty
+                        .strip_prefix('[')
+                        .context("allocation array read requires array type")?;
+                    ensure!(
+                        match op - 0x44 {
+                            0 => matches!(component, "I" | "F"),
+                            1 => matches!(component, "J" | "D"),
+                            2 => super::reference(component),
+                            3 => component == "Z",
+                            4 => component == "B",
+                            5 => component == "C",
+                            6 => component == "S",
+                            _ => false,
+                        },
+                        "allocation array opcode type mismatch"
+                    );
+                    let array = expression(array, &ty, class)?;
+                    let index_value =
+                        expression(atom(&regs, (words[cursor + 1] >> 8) as usize)?, "I", class)?;
+                    let index = captures.len();
+                    captures.push(Capture {
+                        ty: super::java_type(component)?,
+                        name: format!("v{}", base_sequence + index),
+                        expression: Expr::ArrayRead {
+                            site: cursor,
+                            array: Box::new(array),
+                            index: Box::new(index_value),
+                        },
+                    });
+                    events.push(Event::Read {
+                        site: cursor,
+                        field: "<array>".into(),
+                    });
+                    put(
+                        &mut regs,
+                        a,
+                        Atom::Expr {
+                            expression: Expr::Capture(index),
+                            ty: component.to_string(),
+                        },
+                    )?;
+                }
+                0x4b..=0x51 => {
+                    let array = atom(&regs, (words[cursor + 1] & 255) as usize)?;
+                    let ty = atom_type(&array).to_string();
+                    let component = ty
+                        .strip_prefix('[')
+                        .context("allocation array store requires array type")?;
+                    ensure!(
+                        match op - 0x4b {
+                            0 => matches!(component, "I" | "F"),
+                            1 => matches!(component, "J" | "D"),
+                            2 => super::reference(component),
+                            3 => component == "Z",
+                            4 => component == "B",
+                            5 => component == "C",
+                            6 => component == "S",
+                            _ => false,
+                        },
+                        "allocation array store opcode type mismatch"
+                    );
+                    let mut array = expression(array, &ty, class)?;
+                    // Widen only the array receiver for aput-object: Java's array
+                    // store check must throw ArrayStoreException, not a new value
+                    // check-cast's ClassCastException.
+                    let expected = if super::reference(component) {
+                        array = Expr::Cast {
+                            ty: symbol("java.lang.Object[]".into(), "java.lang.Object".into()),
+                            value: Box::new(array),
+                        };
+                        "Ljava/lang/Object;"
+                    } else {
+                        component
+                    };
+                    let value = expression(atom(&regs, a)?, expected, class)?;
+                    let offset =
+                        expression(atom(&regs, (words[cursor + 1] >> 8) as usize)?, "I", class)?;
+                    let index = captures.len();
+                    captures.push(Capture {
+                        ty: "void".into(),
+                        name: format!("v{}", base_sequence + index),
+                        expression: Expr::ArrayStore {
+                            site: cursor,
+                            array: Box::new(array),
+                            index: Box::new(offset),
+                            value: Box::new(value),
+                        },
+                    });
+                    discarded.push(index);
+                    events.push(Event::Write {
+                        site: cursor,
+                        field: "<array>".into(),
+                    });
                 }
                 0x24 | 0x25 => {
                     let array = class
@@ -723,13 +1426,15 @@ pub(super) fn try_lower(
                     };
                     let mut actual = Vec::new();
                     for arg_ty in args {
-                        ensure!(
-                            !matches!(arg_ty.as_ref(), "J" | "D"),
-                            "wide allocation invocation argument is unsupported"
-                        );
                         let r = *inputs
                             .get(input_cursor)
                             .context("missing invoke argument")?;
+                        if matches!(arg_ty.as_ref(), "J" | "D") {
+                            ensure!(
+                                inputs.get(input_cursor + 1) == Some(&(r + 1)),
+                                "nonadjacent allocation wide argument"
+                            );
+                        }
                         actual.push(expression(atom(&regs, r)?, arg_ty, class)?);
                         input_cursor += if matches!(arg_ty.as_ref(), "J" | "D") {
                             2
@@ -756,9 +1461,8 @@ pub(super) fn try_lower(
                             anyhow::bail!("constructor does not consume allocation")
                         };
                         let retargeted = owner != allocation_ty
-                            && args.is_empty()
                             && class.symbols.hierarchy.get().is_some_and(|hierarchy| {
-                                hierarchy.equivalent_noarg_constructor(&allocation_ty, owner)
+                                hierarchy.equivalent_constructor(&allocation_ty, owner, args)
                             });
                         ensure!(
                             kind == 0x70 && (owner == allocation_ty || retargeted) && ret == "V",
@@ -814,6 +1518,15 @@ pub(super) fn try_lower(
                             continue;
                         }
                         ensure!(allocation_ty == ty, "outer allocation type mismatch");
+                        ensure!(
+                            regs.iter().all(|slot| !matches!(slot,
+                            Some(Atom::Uninitialized { site, .. }) if *site != pc)),
+                            "nested allocation remains uninitialized"
+                        );
+                        // Every decoded read/resolution/call remains observable,
+                        // including captures overwritten before the constructor or
+                        // used only after it. Staging retains these as statements.
+                        discarded.extend(0..captures.len());
                         let allocation = Allocation {
                             site: pc,
                             constructor_site: cursor,
@@ -825,10 +1538,6 @@ pub(super) fn try_lower(
                             local_names.iter().map(String::as_str).collect();
                         let mut rendered = match allocation.render_checked(&events, &local_refs) {
                             Ok(rendered) => rendered,
-                            // Keep the existing strict nested-expression path for
-                            // ordinary allocations. Broader staging is enabled only
-                            // for the verified pure guarded-copy region above.
-                            Err(error) if nested && selected_join.is_none() => return Err(error),
                             Err(_) => allocation.render_staged_with_discarded(
                                 &events,
                                 &local_refs,
@@ -876,12 +1585,14 @@ pub(super) fn try_lower(
                                     expression: Expr::Capture(index),
                                     ty,
                                 }) => Some(Value {
+                                    raw_bits32: false,
                                     text: format!("v{}", base_sequence + index),
                                     ty: ty.clone(),
                                     literal: None,
                                     wide_literal: None,
                                 }),
                                 Some(Atom::Expr { .. }) => final_regs[i].clone(),
+                                None => None,
                                 _ => final_regs[i].clone(),
                             };
                         }
@@ -891,21 +1602,16 @@ pub(super) fn try_lower(
                             next_pc: cursor + graph.widths[cursor],
                         });
                     }
-                    ensure!(
-                        ret != "V",
-                        "void effect cannot be delayed into constructor arguments"
-                    );
-                    ensure!(
-                        !matches!(ret, "J" | "D"),
-                        "wide allocation call capture is unsupported"
-                    );
                     let next = cursor + graph.widths[cursor];
-                    let result_opcode = if ret.starts_with('L') || ret.starts_with('[') {
+                    let result_opcode = if matches!(ret, "J" | "D") {
+                        0x0b
+                    } else if ret.starts_with('L') || ret.starts_with('[') {
                         0x0c
                     } else {
                         0x0a
                     };
-                    let has_result = next < words.len()
+                    let has_result = ret != "V"
+                        && next < words.len()
                         && next < stop
                         && !incoming_targets.contains(&next)
                         && words[next] as u8 == result_opcode
@@ -920,7 +1626,7 @@ pub(super) fn try_lower(
                         && raw_name == "append"
                         && ret == owner
                         && args.len() == 1
-                        && matches!(args[0].as_ref(), "Ljava/lang/String;" | "C")
+                        && matches!(args[0].as_ref(), "Ljava/lang/String;" | "C" | "I" | "Z")
                     {
                         match atom(&regs, inputs[0])? {
                             Atom::Expr {
@@ -941,7 +1647,11 @@ pub(super) fn try_lower(
                     };
                     let index = captures.len();
                     captures.push(Capture {
-                        ty: super::java_type(ret)?,
+                        ty: if ret == "V" {
+                            "void".into()
+                        } else {
+                            super::java_type(ret)?
+                        },
                         name: format!("v{}", base_sequence + index),
                         expression: call,
                     });
@@ -970,10 +1680,22 @@ pub(super) fn try_lower(
                         discarded.push(index);
                     }
                 }
-                _ => anyhow::bail!("unsupported instruction in allocation window"),
+                _ => anyhow::bail!("unsupported instruction in allocation window: {op:02x}"),
             }
             cursor += graph.widths[cursor];
         }
     };
-    Ok(attempt().ok())
+    let result = attempt().or_else(|_| {
+        try_region_staging(
+            class,
+            method,
+            graph,
+            words,
+            pc,
+            stop,
+            caller_regs,
+            caller_out,
+        )
+    });
+    Ok(result.ok())
 }

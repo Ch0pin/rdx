@@ -1,3 +1,4 @@
+use rdx::native_ir;
 mod native_dex {
     pub use rdx::native_dex::*;
 }
@@ -454,7 +455,8 @@ fn static_checked_exceptions_require_exact_loaded_declarations() {
         "Ljava/io/IOException;"
     ));
     assert!(!h.static_call_declares("Lapp/Parser;", "parse", &args, "V", "Ljava/io/IOException;"));
-    assert!(!h.static_call_declares(
+    // A declared IOException permits a narrower EOFException handler.
+    assert!(h.static_call_declares(
         "Lapp/Parser;",
         "parse",
         &args,
@@ -478,5 +480,293 @@ fn static_checked_exceptions_require_exact_loaded_declarations() {
         &args,
         "Lapp/Parser;",
         "Ljava/io/IOException;"
+    ));
+}
+
+#[test]
+fn platform_exception_facts_require_exact_signature_and_dispatch() {
+    let h = TypeHierarchy::from_classes(std::iter::empty()).unwrap();
+    assert!(h.call_declares(
+        "Ljava/io/InputStream;",
+        "read",
+        &[],
+        "I",
+        "Ljava/io/IOException;",
+        false
+    ));
+    assert!(!h.call_declares(
+        "Ljava/io/InputStream;",
+        "read",
+        &[],
+        "I",
+        "Ljava/io/IOException;",
+        true
+    ));
+    assert!(!h.call_declares(
+        "Ljava/io/InputStream;",
+        "read",
+        &[],
+        "V",
+        "Ljava/io/IOException;",
+        false
+    ));
+    assert!(!h.call_declares(
+        "Ljava/io/InputStream;",
+        "hashCode",
+        &[],
+        "I",
+        "Ljava/io/IOException;",
+        false
+    ));
+    assert_eq!(
+        h.assignable(
+            "Ljava/security/cert/CertificateParsingException;",
+            "Ljava/lang/Throwable;"
+        ),
+        Relation::Proven
+    );
+    let override_class = class("Ljava/io/InputStream;", Some("Ljava/lang/Object;"), &[]);
+    let h = TypeHierarchy::from_classes([&override_class]).unwrap();
+    assert!(!h.call_declares(
+        "Ljava/io/InputStream;",
+        "read",
+        &[],
+        "I",
+        "Ljava/io/IOException;",
+        false
+    ));
+}
+
+#[test]
+fn instance_checked_exception_declaration_is_available_without_static_assumption() {
+    let mut parser = class("Lapp/Parser;", Some("Ljava/lang/Object;"), &[]);
+    parser.methods.push(native_dex::DexMethod {
+        declaring_type: "Lapp/Parser;".into(),
+        name: "parse".into(),
+        return_type: "V".into(),
+        parameters: vec![],
+        thrown_types: vec!["Ljava/io/IOException;".into()],
+        access_flags: 1,
+        code: None,
+    });
+    let h = TypeHierarchy::from_classes([&parser]).unwrap();
+    assert!(h.call_declares(
+        "Lapp/Parser;",
+        "parse",
+        &[],
+        "V",
+        "Ljava/io/IOException;",
+        false
+    ));
+    assert!(!h.call_declares(
+        "Lapp/Parser;",
+        "parse",
+        &[],
+        "V",
+        "Ljava/io/IOException;",
+        true
+    ));
+}
+
+#[test]
+fn optimized_parameter_constructor_requires_observed_exact_accessible_parent() {
+    use native_dex::{DexCode, DexMethod};
+    let mut parent = class("Lsample/Parent;", Some("Ljava/lang/Object;"), &[]);
+    parent.methods.push(DexMethod {
+        declaring_type: parent.descriptor.clone(),
+        name: "<init>".into(),
+        return_type: "V".into(),
+        parameters: vec!["I".into()],
+        thrown_types: vec!["Ljava/io/IOException;".into()],
+        access_flags: 1,
+        code: Some(DexCode {
+            registers: 2,
+            ins: 2,
+            outs: 1,
+            tries: 0,
+            try_regions: vec![],
+            instructions: vec![0x000e],
+            offset: 0,
+        }),
+    });
+    let leaf = class("Lsample/Leaf;", Some("Lsample/Parent;"), &[]);
+    let mut caller = class("Lsample/Caller;", Some("Ljava/lang/Object;"), &[]);
+    caller.symbols = Arc::new(DexSymbols {
+        types: vec!["Lsample/Leaf;".into(), "Lsample/Parent;".into()],
+        strings: vec!["<init>".into()],
+        protos: vec![("V".into(), vec!["I".into()])],
+        methods: vec![(1, 0, 0)],
+        ..Default::default()
+    });
+    caller.methods.push(DexMethod {
+        declaring_type: caller.descriptor.clone(),
+        name: "make".into(),
+        return_type: "V".into(),
+        parameters: vec![],
+        thrown_types: vec![],
+        access_flags: 9,
+        code: Some(DexCode {
+            registers: 2,
+            ins: 0,
+            outs: 2,
+            tries: 0,
+            try_regions: vec![],
+            instructions: vec![0x0022, 0, 0x0112, 0x2070, 0, 0x0010, 0x000e],
+            offset: 0,
+        }),
+    });
+    let h = TypeHierarchy::from_classes([&leaf, &parent, &caller]).unwrap();
+    assert!(h.equivalent_constructor("Lsample/Leaf;", "Lsample/Parent;", &["I".into()]));
+    assert!(!h.has_accessible_noarg_super("Lsample/Leaf;"));
+    assert_eq!(
+        h.recovered_constructors("Lsample/Leaf;")[0].parent.as_ref(),
+        "Lsample/Parent;"
+    );
+    assert!(!h.equivalent_constructor("Lsample/Leaf;", "Ljava/lang/Object;", &["I".into()]));
+    assert!(!h.equivalent_constructor("Lsample/Leaf;", "Lsample/Parent;", &["J".into()]));
+    assert_eq!(
+        h.recovered_constructors("Lsample/Leaf;")[0].thrown_types[0].as_ref(),
+        "Ljava/io/IOException;"
+    );
+    let live = Arc::new(
+        rdx::native_hierarchy::TypeHierarchy::from_classes([&leaf, &parent, &caller]).unwrap(),
+    );
+    leaf.symbols.hierarchy.set(live.clone()).unwrap();
+    caller.symbols.hierarchy.set(live).unwrap();
+    let source = rdx::native_java::render("sample.Leaf", &leaf).unwrap();
+    assert!(
+        source
+            .source
+            .contains("public Leaf(int p0) throws java.io.IOException"),
+        "{}",
+        source.source
+    );
+    assert!(source.source.contains("super(p0);"), "{}", source.source);
+    assert!(
+        source
+            .links
+            .iter()
+            .any(|link| link.label == "sample.Parent.<init>(I)V")
+    );
+    let caller_source =
+        rdx::native_java::render_method("sample.Caller", &caller, &caller.methods[0]).unwrap();
+    assert!(
+        caller_source.source.contains("new sample.Leaf(0)"),
+        "{}",
+        caller_source.source
+    );
+    // No observed allocation means no invented overload.
+    let h = TypeHierarchy::from_classes([&leaf, &parent]).unwrap();
+    assert!(h.recovered_constructors("Lsample/Leaf;").is_empty());
+    // An overwrite destroys the new-instance receiver identity.
+    caller.methods[0].code.as_mut().unwrap().instructions[2] = 0x0012;
+    let h = TypeHierarchy::from_classes([&leaf, &parent, &caller]).unwrap();
+    assert!(h.recovered_constructors("Lsample/Leaf;").is_empty());
+    caller.methods[0].code.as_mut().unwrap().instructions[2] = 0x0112;
+    parent.methods[0].access_flags = 2;
+    let h = TypeHierarchy::from_classes([&leaf, &parent, &caller]).unwrap();
+    assert!(h.recovered_constructors("Lsample/Leaf;").is_empty());
+}
+
+#[test]
+fn empty_constructor_chain_retarget_requires_every_forwarder() {
+    fn forwarder(owner: &str, parent: &str) -> DexClass {
+        let mut c = class(owner, Some(parent), &[]);
+        c.symbols = Arc::new(DexSymbols {
+            types: vec![parent.into()],
+            strings: vec!["<init>".into()],
+            protos: vec![("V".into(), vec![])],
+            methods: vec![(0, 0, 0)],
+            ..Default::default()
+        });
+        c.methods.push(native_dex::DexMethod {
+            declaring_type: owner.into(),
+            name: "<init>".into(),
+            return_type: "V".into(),
+            parameters: vec![],
+            thrown_types: vec![],
+            access_flags: 1,
+            code: Some(native_dex::DexCode {
+                registers: 1,
+                ins: 1,
+                outs: 1,
+                tries: 0,
+                try_regions: vec![],
+                instructions: vec![0x1070, 0, 0, 0x000e],
+                offset: 0,
+            }),
+        });
+        c
+    }
+    let leaf = forwarder("Lsample/Leaf;", "Lsample/Parent;");
+    let mut parent = forwarder("Lsample/Parent;", "Ljava/lang/Object;");
+    let h = TypeHierarchy::from_classes([&leaf, &parent]).unwrap();
+    assert!(h.equivalent_noarg_constructor("Lsample/Leaf;", "Ljava/lang/Object;"));
+    parent.methods[0]
+        .code
+        .as_mut()
+        .unwrap()
+        .instructions
+        .insert(0, 0x0000);
+    let h = TypeHierarchy::from_classes([&leaf, &parent]).unwrap();
+    assert!(!h.equivalent_noarg_constructor("Lsample/Leaf;", "Ljava/lang/Object;"));
+}
+
+#[test]
+fn implicit_default_constructor_chain_includes_abstract_parent_but_not_hidden_effects() {
+    let leaf = class("Lsample/Leaf;", Some("Lsample/Parent;"), &[]);
+    let mut parent = class("Lsample/Parent;", Some("Ljava/lang/Object;"), &[]);
+    parent.access_flags = 0x401;
+    let h = TypeHierarchy::from_classes([&leaf, &parent]).unwrap();
+    assert!(h.equivalent_noarg_constructor("Lsample/Leaf;", "Ljava/lang/Object;"));
+    parent.methods.push(native_dex::DexMethod {
+        declaring_type: parent.descriptor.clone(),
+        name: "<init>".into(),
+        return_type: "V".into(),
+        parameters: vec!["I".into()],
+        thrown_types: vec![],
+        access_flags: 1,
+        code: None,
+    });
+    let h = TypeHierarchy::from_classes([&leaf, &parent]).unwrap();
+    assert!(!h.equivalent_noarg_constructor("Lsample/Leaf;", "Ljava/lang/Object;"));
+    parent.methods.clear();
+    parent.superclass = Some("Lsample/Leaf;".into());
+    let h = TypeHierarchy::from_classes([&leaf, &parent]).unwrap();
+    assert!(!h.equivalent_noarg_constructor("Lsample/Leaf;", "Ljava/lang/Object;"));
+}
+
+#[test]
+fn pinned_sdk_interfaces_prove_reference_widening() {
+    let hierarchy = TypeHierarchy::from_classes(std::iter::empty()).unwrap();
+    for (source, target) in [
+        ("Ljava/lang/String;", "Ljava/lang/CharSequence;"),
+        ("Ljava/util/Set;", "Ljava/util/Collection;"),
+        ("Ljava/util/HashSet;", "Ljava/lang/Iterable;"),
+        ("Landroid/app/Activity;", "Landroid/content/Context;"),
+    ] {
+        assert_eq!(hierarchy.assignable(source, target), Relation::Proven);
+        assert_ne!(hierarchy.assignable(target, source), Relation::Proven);
+    }
+}
+
+#[test]
+fn checked_catch_can_narrow_a_declared_exception() {
+    let hierarchy = TypeHierarchy::from_classes(std::iter::empty()).unwrap();
+    assert!(hierarchy.call_declares(
+        "Ljava/io/InputStream;",
+        "read",
+        &[],
+        "I",
+        "Ljava/io/EOFException;",
+        false
+    ));
+    assert!(!hierarchy.call_declares(
+        "Ljava/io/InputStream;",
+        "read",
+        &[],
+        "I",
+        "Ljava/sql/SQLException;",
+        false
     ));
 }

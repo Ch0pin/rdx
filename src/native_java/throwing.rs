@@ -165,6 +165,40 @@ pub(super) fn known_call_throws(
             && args[0].as_ref() == "Ljava/lang/String;"
 }
 
+// Throws metadata is optional in DEX. Infer only a type that the renderer has
+// established at an actual explicit throw and only where Java declaration
+// constraints are known: private or static methods of root classes.
+pub(super) fn may_infer_declaration(class: &DexClass, method: &DexMethod, value: &Value) -> bool {
+    method.name.as_ref() != "<clinit>"
+        && method.thrown_types.is_empty()
+        && method.access_flags & (2 | 8) != 0
+        && class.superclass.as_deref() == Some("Ljava/lang/Object;")
+        && validate_type(class, &value.ty).is_ok()
+        && !unchecked_type(class, &value.ty)
+}
+
+pub(super) fn locally_caught(
+    class: &DexClass,
+    method: &DexMethod,
+    pc: usize,
+    value: &Value,
+) -> bool {
+    validate_type(class, &value.ty).is_ok()
+        && method.code.as_ref().is_some_and(|code| {
+            code.try_regions.iter().any(|region| {
+                region.start as usize <= pc
+                    && pc < region.end as usize
+                    && region.catches.iter().any(|(ty, _)| {
+                        ty.as_ref().is_none_or(|ty| {
+                            ty.as_ref() == "Ljava/lang/Throwable;"
+                                || ty.as_ref() == value.ty
+                                || subtype(class, &value.ty, ty)
+                        })
+                    })
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

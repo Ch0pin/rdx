@@ -701,6 +701,7 @@ mod tests {
     use super::*;
     fn clean(text: &str, names: &[&str]) -> MethodBody {
         let mut body = MethodBody {
+            inferred_throws: vec![],
             text: text.into(),
             links: vec![],
         };
@@ -709,13 +710,14 @@ mod tests {
     }
     #[test]
     fn negated_conditions_and_this_field_assignments_inline_once() {
-        let mut body = MethodBody { text: "    boolean v0 = source.ready();\n    if (!v0) {\n        hit();\n    }\n    sample.A v1 = source.next();\n    this.field = v1;\n".into(), links: vec![] };
+        let mut body = MethodBody { inferred_throws: vec![], text: "    boolean v0 = source.ready();\n    if (!v0) {\n        hit();\n    }\n    sample.A v1 = source.next();\n    this.field = v1;\n".into(), links: vec![] };
         readable(&mut body);
         assert!(body.text.contains("if (!source.ready())"), "{}", body.text);
         assert!(body.text.contains("this.field = source.next();"));
         assert_eq!(body.text.matches("source.next()").count(), 1);
         let original = "    sample.A v1 = source.next();\n    other.field = v1;\n";
         let mut body = MethodBody {
+            inferred_throws: vec![],
             text: original.into(),
             links: vec![],
         };
@@ -725,12 +727,13 @@ mod tests {
 
     #[test]
     fn guard_receiver_inlining_does_not_cross_short_circuit_effects() {
-        let mut body = MethodBody { text: "    java.lang.Object v0 = source.next();\n    if (!(((sample.T) v0).ready())) {\n        hit();\n    }\n".into(), links: vec![] };
+        let mut body = MethodBody { inferred_throws: vec![], text: "    java.lang.Object v0 = source.next();\n    if (!(((sample.T) v0).ready())) {\n        hit();\n    }\n".into(), links: vec![] };
         readable(&mut body);
         assert!(!body.text.contains("v0"), "{}", body.text);
         assert_eq!(body.text.matches("source.next()").count(), 1);
         let original = "    java.lang.Object v0 = source.next();\n    if (gate() && ((sample.T) v0).ready()) {\n        hit();\n    }\n";
         let mut body = MethodBody {
+            inferred_throws: vec![],
             text: original.into(),
             links: vec![],
         };
@@ -743,6 +746,7 @@ mod tests {
         let source = "    java.lang.Class v0 = sample.Type.class;\n    sample.Type v1 = ((sample.Type) v9.get(v0));\n    check(v1, v0);\n";
         let begin = source.find("sample.Type.class").unwrap();
         let mut body = MethodBody {
+            inferred_throws: vec![],
             text: source.into(),
             links: vec![CodeLink {
                 start: begin,
@@ -777,6 +781,7 @@ mod tests {
             "    Class v0 = sample.Type.class;\n    v9.get(v0);\n    v0 = other;\n",
         ] {
             let mut body = MethodBody {
+                inferred_throws: vec![],
                 text: source.into(),
                 links: vec![],
             };
@@ -785,6 +790,7 @@ mod tests {
         }
         let source = "    sample.Type v0 = ((sample.Type) value).next();\n";
         let mut body = MethodBody {
+            inferred_throws: vec![],
             text: source.into(),
             links: vec![],
         };
@@ -817,6 +823,7 @@ mod tests {
         let text = "        sample.A v0 = source.first(\"λ v0\");\n        v0.consume(\"v0\");\n";
         let start = text[..text.find("first").unwrap()].chars().count();
         let mut body = MethodBody {
+            inferred_throws: vec![],
             text: text.into(),
             links: vec![CodeLink {
                 start,
@@ -863,6 +870,7 @@ mod condition_tests {
             let text =
                 format!("        boolean v0 = source.check();\n        {use_line}\n        }}\n");
             let mut body = MethodBody {
+                inferred_throws: vec![],
                 text: text.clone(),
                 links: vec![],
             };
@@ -897,6 +905,7 @@ mod argument_tests {
     fn class_argument_cast_and_receiver_chain_keep_runtime_check_and_links() {
         let text = "        java.lang.Class v0 = sample.A.class;\n        java.lang.Object v1 = sample.Factory.create(v0);\n        ((sample.A) v1).run();\n";
         let mut body = MethodBody {
+            inferred_throws: vec![],
             text: text.into(),
             links: vec![
                 link(text, "sample.A", "sample.A"),
@@ -953,6 +962,7 @@ mod argument_tests {
                 links.push(link(&text, "sample.Factory", "sample.Factory"));
             }
             let mut body = MethodBody {
+                inferred_throws: vec![],
                 text: text.clone(),
                 links,
             };

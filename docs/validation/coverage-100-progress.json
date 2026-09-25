@@ -1,0 +1,1152 @@
+{
+  "date": "2026-09-25",
+  "metric": "Concrete DEX methods reconstructed as Java",
+  "target_percent": 100,
+  "target_reached": false,
+  "corpus": {
+    "file": "com.android.vending.apk",
+    "sha256": "c9910583fc93af2b750bde69d3db89a625359e19281adb5b3aa607b640d64ee5",
+    "classes": 63315,
+    "concrete_methods": 268289,
+    "declaration_only_methods": 12736
+  },
+  "baseline": {
+    "reconstructed_methods": 254989,
+    "fallback_methods": 13300,
+    "coverage_percent": 95.04265922195842
+  },
+  "checkpoint": {
+    "reconstructed_methods": 259509,
+    "fallback_methods": 8780,
+    "coverage_percent": 96.7274096217139,
+    "additional_reconstructed_methods": 4520
+  },
+  "fallback_reasons": {
+    "Exception type requires unavailable Throwable hierarchy": 2,
+    "Signaling NaN payload reconstruction unsupported": 1,
+    "Static initializer early returns not reconstructed": 10,
+    "Static initializer requires a single terminal return": 11,
+    "Throw requires an established unchecked type or matching declared exception": 653,
+    "Varargs requires a final array parameter": 17,
+    "allocation constructor mismatch": 369,
+    "array access requires known array type": 2,
+    "array-length requires known array type": 4,
+    "branch crosses region boundary at 0006: target 0110, stop 010f": 1,
+    "branch crosses region boundary at 0007: target 004d, stop 0009": 1,
+    "branch crosses region boundary at 0007: target 011b, stop 011a": 1,
+    "branch crosses region boundary at 000c: target 001a, stop 0019": 1,
+    "branch crosses region boundary at 000d: target 0037, stop 002b": 1,
+    "branch crosses region boundary at 000e: target 0025, stop 001f": 1,
+    "branch crosses region boundary at 000e: target 013a, stop 0139": 1,
+    "branch crosses region boundary at 000e: target 01b5, stop 01b4": 1,
+    "branch crosses region boundary at 0012: target 0037, stop 0027": 1,
+    "branch crosses region boundary at 0013: target 002b, stop 001e": 3,
+    "branch crosses region boundary at 0013: target 0065, stop 0019": 1,
+    "branch crosses region boundary at 0015: target 035c, stop 035b": 1,
+    "branch crosses region boundary at 0016: target 002a, stop 001a": 1,
+    "branch crosses region boundary at 0017: target 058c, stop 058b": 1,
+    "branch crosses region boundary at 0018: target 051f, stop 051e": 1,
+    "branch crosses region boundary at 0019: target 02b6, stop 02b5": 1,
+    "branch crosses region boundary at 001a: target 004a, stop 001c": 1,
+    "branch crosses region boundary at 001d: target 0087, stop 0022": 1,
+    "branch crosses region boundary at 001e: target 004d, stop 0027": 1,
+    "branch crosses region boundary at 0021: target 016c, stop 016a": 1,
+    "branch crosses region boundary at 0023: target 003b, stop 0028": 1,
+    "branch crosses region boundary at 0024: target 005a, stop 0027": 1,
+    "branch crosses region boundary at 0025: target 0198, stop 0028": 1,
+    "branch crosses region boundary at 0026: target 03d3, stop 038f": 1,
+    "branch crosses region boundary at 002c: target 0048, stop 0046": 1,
+    "branch crosses region boundary at 0031: target 004d, stop 0036": 1,
+    "branch crosses region boundary at 003a: target 0078, stop 003e": 1,
+    "branch crosses region boundary at 003f: target 05da, stop 05d9": 1,
+    "branch crosses region boundary at 0042: target 006b, stop 0046": 1,
+    "branch crosses region boundary at 0048: target 005f, stop 004c": 1,
+    "branch crosses region boundary at 0048: target 0098, stop 004a": 1,
+    "branch crosses region boundary at 004d: target 0064, stop 0051": 1,
+    "branch crosses region boundary at 004f: target 0052, stop 0051": 1,
+    "branch crosses region boundary at 0053: target 0076, stop 0057": 1,
+    "branch crosses region boundary at 0054: target 006f, stop 0056": 1,
+    "branch crosses region boundary at 005a: target 007d, stop 005e": 1,
+    "branch crosses region boundary at 005e: target 008c, stop 0067": 2,
+    "branch crosses region boundary at 0062: target 008f, stop 0064": 1,
+    "branch crosses region boundary at 0063: target 006e, stop 006c": 1,
+    "branch crosses region boundary at 006c: target 00f3, stop 00ba": 1,
+    "branch crosses region boundary at 006d: target 0089, stop 006f": 1,
+    "branch crosses region boundary at 006d: target 02ea, stop 02a2": 1,
+    "branch crosses region boundary at 006e: target 00c1, stop 0071": 1,
+    "branch crosses region boundary at 0071: target 01ed, stop 0073": 1,
+    "branch crosses region boundary at 007a: target 00f0, stop 00e8": 1,
+    "branch crosses region boundary at 007d: target 01bf, stop 0188": 1,
+    "branch crosses region boundary at 0087: target 00ec, stop 00ca": 1,
+    "branch crosses region boundary at 0088: target 010d, stop 008e": 1,
+    "branch crosses region boundary at 0089: target 00b9, stop 008e": 1,
+    "branch crosses region boundary at 0094: target 01b9, stop 013e": 1,
+    "branch crosses region boundary at 00a0: target 00c0, stop 00ba": 1,
+    "branch crosses region boundary at 00b7: target 00f3, stop 00bc": 1,
+    "branch crosses region boundary at 00b8: target 033d, stop 0143": 1,
+    "branch crosses region boundary at 00bb: target 00be, stop 00bd": 1,
+    "branch crosses region boundary at 00bc: target 00bf, stop 00be": 1,
+    "branch crosses region boundary at 00c3: target 014d, stop 00c8": 1,
+    "branch crosses region boundary at 00e0: target 0190, stop 00e4": 1,
+    "branch crosses region boundary at 00e5: target 0123, stop 011e": 1,
+    "branch crosses region boundary at 00f0: target 012e, stop 0129": 1,
+    "branch crosses region boundary at 0104: target 0241, stop 0109": 1,
+    "branch crosses region boundary at 0106: target 0140, stop 010c": 1,
+    "branch crosses region boundary at 010b: target 0124, stop 011c": 1,
+    "branch crosses region boundary at 0113: target 0136, stop 0130": 1,
+    "branch crosses region boundary at 011b: target 09ea, stop 05c8": 1,
+    "branch crosses region boundary at 0125: target 0563, stop 0127": 1,
+    "branch crosses region boundary at 012e: target 04a8, stop 0187": 1,
+    "branch crosses region boundary at 0151: target 026e, stop 0153": 1,
+    "branch crosses region boundary at 0174: target 0364, stop 017b": 1,
+    "branch crosses region boundary at 0194: target 03cc, stop 0196": 1,
+    "branch crosses region boundary at 0253: target 029d, stop 0260": 1,
+    "branch crosses region boundary at 0289: target 028c, stop 028b": 1,
+    "branch crosses region boundary at 02a9: target 02f2, stop 02ad": 1,
+    "branch crosses region boundary at 04a7: target 0509, stop 0507": 1,
+    "branch crosses region boundary at 04d1: target 0085, stop 04d3": 1,
+    "branch crosses region boundary at 04f9: target 04ff, stop 04fe": 1,
+    "cast of nonreference": 1,
+    "catch ordering shadows a later handler": 2,
+    "cleanup region budget exceeded": 41,
+    "constructor branch overwrites receiver": 5,
+    "constructor cleanup regions not reconstructed": 76,
+    "control flow analysis exceeds work budget": 1,
+    "control flow crosses region boundary": 324,
+    "control flow exceeds branch budget": 1,
+    "control flow nesting exceeds budget": 31,
+    "cyclic protected return tail": 25,
+    "detached handler does not terminate": 106,
+    "effectful instruction between allocation and constructor": 634,
+    "effectful normal continuation before exception join": 147,
+    "exception nesting exceeds budget": 14,
+    "external edge enters monitor body": 6,
+    "field writes before this delegation not reconstructed": 6,
+    "filled-array requires known assignable reference": 3,
+    "goto crosses region boundary": 93,
+    "incompatible register types at control flow join": 96,
+    "instance-of on nonreference": 1,
+    "invalid method call": 5,
+    "invalid super receiver": 77,
+    "invalid wide register pair": 1,
+    "loop changes register type": 378,
+    "loop crosses region boundary": 35,
+    "loop exit value has no established entry type": 35,
+    "loop has an interior entry": 427,
+    "loop has no structured exit": 128,
+    "loop inside try not reconstructed": 126,
+    "loop interrupts instruction state": 16,
+    "loop overlaps protected region": 322,
+    "mixed monitor and ordinary exception regions not reconstructed": 172,
+    "monitor body crosses release layout": 159,
+    "monitor body has no immediate protected region": 24,
+    "monitor cleanup move does not preserve exception": 32,
+    "monitor handler is not exact release/rethrow": 10,
+    "monitor requires a normal release": 2,
+    "move type mismatch at 0016: register v2 has type I": 1,
+    "move type mismatch at 001f: register v4 has type I": 1,
+    "move type mismatch at 0028: register v10 has type I": 1,
+    "move type mismatch at 0030: register v2 has type I": 1,
+    "move type mismatch at 004f: register v1 has type I": 1,
+    "move type mismatch at 005a: register v0 has type I": 1,
+    "move type mismatch at 005d: register v0 has type I": 1,
+    "move type mismatch at 0092: register v2 has type I": 1,
+    "move type mismatch at 0099: register v9 has type I": 1,
+    "move type mismatch at 009d: register v3 has type I": 1,
+    "move type mismatch at 00be: register v1 has type I": 1,
+    "move type mismatch at 00e8: register v2 has type I": 1,
+    "move type mismatch at 0133: register v11 has type I": 1,
+    "move type mismatch at 0139: register v2 has type Lkrd;": 1,
+    "move type mismatch at 015e: register v4 has type I": 1,
+    "move type mismatch at 01e4: register v4 has type I": 1,
+    "move type mismatch at 0345: register v10 has type I": 1,
+    "multiple monitor releases require immediate returns": 145,
+    "nested monitor regions not reconstructed": 88,
+    "nested or multiple try regions not reconstructed": 25,
+    "nonforward or invalid switch target": 5,
+    "overlapping loops not reconstructed": 20,
+    "partially overlapping exception handlers": 4,
+    "protected continuation crosses another exception region": 178,
+    "protected flow escapes backward": 124,
+    "protected region has distinct effectful exits": 298,
+    "protected return tail crosses effectful continuation": 69,
+    "read from upper half of wide register": 148,
+    "reconstructed method exceeds output budget": 5,
+    "reference comparison with nonreference": 2,
+    "shared switch tail crosses protected region": 47,
+    "switch before constructor initialization": 1,
+    "switch crosses loop boundary": 2,
+    "switch exceeds case budget": 1,
+    "switch inside try not reconstructed": 5,
+    "throw before initialization: implicit super() would change construction/finalization effects": 17,
+    "throwing handler instruction inside protected region": 4,
+    "throwing monitor body instruction escapes protected range": 106,
+    "try continuation crosses enclosing region": 40,
+    "try crosses enclosing region": 178,
+    "try interrupts instruction state": 6,
+    "undefined register": 887,
+    "unfinished allocation": 11,
+    "unmatched or unproven monitor instruction": 280,
+    "unstructured backward jump": 49,
+    "unsupported constructor invocation": 31,
+    "unsupported literal conversion": 6,
+    "unsupported loop interior edge": 841,
+    "unsupported register type conversion B to Z": 1,
+    "unsupported register type conversion F to I": 1,
+    "unsupported register type conversion I to B": 3,
+    "unsupported register type conversion I to C": 11,
+    "unsupported register type conversion I to F": 115,
+    "unsupported register type conversion I to Landroid/animation/AnimatorSet$Builder;": 1,
+    "unsupported register type conversion I to Landroid/app/usage/NetworkStats;": 1,
+    "unsupported register type conversion I to Landroid/content/pm/PackageInfo;": 1,
+    "unsupported register type conversion I to Landroid/content/res/XmlResourceParser;": 1,
+    "unsupported register type conversion I to Landroid/graphics/drawable/Drawable;": 1,
+    "unsupported register type conversion I to Landroid/net/Uri;": 1,
+    "unsupported register type conversion I to Landroid/view/View;": 6,
+    "unsupported register type conversion I to Latqi;": 1,
+    "unsupported register type conversion I to Lbglv;": 1,
+    "unsupported register type conversion I to Lbljc;": 1,
+    "unsupported register type conversion I to Lbrez;": 1,
+    "unsupported register type conversion I to Lbrkp;": 1,
+    "unsupported register type conversion I to Lbsnq;": 1,
+    "unsupported register type conversion I to Lcdmp;": 1,
+    "unsupported register type conversion I to Lcfvy;": 1,
+    "unsupported register type conversion I to Lcgiz;": 1,
+    "unsupported register type conversion I to Lcgmi;": 1,
+    "unsupported register type conversion I to Lgde;": 4,
+    "unsupported register type conversion I to Lhhv;": 1,
+    "unsupported register type conversion I to Liaa;": 1,
+    "unsupported register type conversion I to Lilb;": 2,
+    "unsupported register type conversion I to Lilz;": 2,
+    "unsupported register type conversion I to Limv;": 1,
+    "unsupported register type conversion I to Lj$/time/chrono/ChronoLocalDate;": 1,
+    "unsupported register type conversion I to Lj$/time/zone/ZoneRules;": 1,
+    "unsupported register type conversion I to Lj$/util/concurrent/j;": 1,
+    "unsupported register type conversion I to Lj$/util/concurrent/p;": 1,
+    "unsupported register type conversion I to Ljava/io/InputStream;": 1,
+    "unsupported register type conversion I to Ljava/lang/CharSequence;": 1,
+    "unsupported register type conversion I to Ljava/lang/Class;": 1,
+    "unsupported register type conversion I to Ljava/lang/Iterable;": 1,
+    "unsupported register type conversion I to Ljava/lang/Long;": 1,
+    "unsupported register type conversion I to Ljava/lang/Object;": 13,
+    "unsupported register type conversion I to Ljava/lang/String;": 5,
+    "unsupported register type conversion I to Ljava/lang/StringBuilder;": 3,
+    "unsupported register type conversion I to Ljava/lang/reflect/Constructor;": 1,
+    "unsupported register type conversion I to Ljava/lang/reflect/Method;": 2,
+    "unsupported register type conversion I to Ljava/net/InetAddress;": 2,
+    "unsupported register type conversion I to Ljava/util/List;": 1,
+    "unsupported register type conversion I to Ljava/util/Map$Entry;": 1,
+    "unsupported register type conversion I to Ljava/util/Map;": 1,
+    "unsupported register type conversion I to Ljava/util/concurrent/ExecutorService;": 1,
+    "unsupported register type conversion I to Llim;": 1,
+    "unsupported register type conversion I to Lmnm;": 1,
+    "unsupported register type conversion I to Lmuf;": 1,
+    "unsupported register type conversion I to Lmwd;": 1,
+    "unsupported register type conversion I to Lndq;": 1,
+    "unsupported register type conversion I to Lomh;": 1,
+    "unsupported register type conversion I to Lomk;": 2,
+    "unsupported register type conversion I to Lpbi;": 1,
+    "unsupported register type conversion I to Luqc;": 1,
+    "unsupported register type conversion I to Lvhz;": 1,
+    "unsupported register type conversion I to S": 1,
+    "unsupported register type conversion I to Z": 154,
+    "unsupported register type conversion I to [B": 3,
+    "unsupported register type conversion I to [C": 1,
+    "unsupported register type conversion J to D": 19,
+    "wide exception snapshots not reconstructed": 11,
+    "wide tail merged without head": 9,
+    "wide tail owner mismatch": 19
+  },
+  "limitations": [
+    "Reconstruction acceptance is not corpus-wide semantic equivalence or proof that emitted classes compile together.",
+    "Checked exception contracts inferred for eligible methods are not propagated to all callers.",
+    "Enum normalization preserves tested names, ordinals, identity and values behavior, but not identical reflective field layout.",
+    "Some DEX allocation and pre-constructor behaviors cannot be represented by an equivalent idiomatic Java allocation."
+  ],
+  "validation": {
+    "status": "passed",
+    "explicit_jvm_tests_passed": 18,
+    "clippy": "cargo clippy --locked --all-targets -- -D warnings passed",
+    "format": "cargo fmt --all -- --check passed",
+    "diff_check": "git diff --check passed",
+    "local_app": "target/RDX.app",
+    "corpus_method_check": "bhnh contains Java methods and no DEX fallback markers",
+    "default_suite_passed": 751,
+    "default_suite_ignored": 74,
+    "default_suite_command": "cargo test --locked --no-fail-fast",
+    "note": "Optional environment-specific corpus tests remain ignored; 18 JVM tests were explicitly run separately."
+  },
+  "binary_sha256": "aba8e296e1006867d67d0a45f39b40a462923fb4932a5bc0a0ef9d7324a5f927",
+  "fallback_reason_samples": {
+    "Exception type requires unavailable Throwable hierarchy": [
+      "a.V(Lorg/apache/http/client/methods/HttpUriRequest;)Lorg/apache/http/impl/client/RequestWrapper;",
+      "bowy.a(Lorg/apache/http/HttpRequest;)Lorg/apache/http/impl/client/RequestWrapper;"
+    ],
+    "Signaling NaN payload reconstruction unsupported": [
+      "hms.<clinit>()V"
+    ],
+    "Static initializer early returns not reconstructed": [
+      "blcm.<clinit>()V",
+      "brjb.<clinit>()V",
+      "bsri.<clinit>()V"
+    ],
+    "Static initializer requires a single terminal return": [
+      "agvn.<clinit>()V",
+      "android.media.LoudnessCodecController$OnLoudnessCodecUpdateListener.<clinit>()V",
+      "android.view.SurfaceControl$OnJankDataListener.<clinit>()V"
+    ],
+    "Throw requires an established unchecked type or matching declared exception": [
+      "aacf.lA(Ljava/lang/Object;)Ljava/lang/Object;",
+      "acly.lA(Ljava/lang/Object;)Ljava/lang/Object;",
+      "adar.a(Ljava/lang/Object;)Lbrlq;"
+    ],
+    "Varargs requires a final array parameter": [
+      "agox.D(Ljava/lang/String;[Ljava/lang/Class;Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+      "bekn.a()Ljava/lang/Long;",
+      "cetz.<init>(Lceul;[Ljava/lang/Object;ILcetw;)V"
+    ],
+    "allocation constructor mismatch": [
+      "aaxf.iQ(Lcgts;Lcgmi;)Ljava/lang/Object;",
+      "aaza.b(Ljava/util/List;Lcgts;Lcgmi;)Ljava/lang/Object;",
+      "abvd.aR(Laelq;Lahnq;Ltjn;Ltwy;Lalze;Lcewj;Lcewj;Lanau;Lchd;Lhsf;I)V"
+    ],
+    "array access requires known array type": [
+      "com.google.android.material.focus.FocusRingDrawable.f()Z",
+      "lyv.r([Llys;[IZ)Z"
+    ],
+    "array-length requires known array type": [
+      "apom.<init>(Lanau;[C)V",
+      "bnps.n(Ljava/lang/Throwable;Z)Lcaso;",
+      "cgbi.invoke(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0006: target 0110, stop 010f": [
+      "adzh.lF(Lbomv;)V"
+    ],
+    "branch crosses region boundary at 0007: target 004d, stop 0009": [
+      "cevm.b()Lceth;"
+    ],
+    "branch crosses region boundary at 0007: target 011b, stop 011a": [
+      "mbr.a()V"
+    ],
+    "branch crosses region boundary at 000c: target 001a, stop 0019": [
+      "awih.a()Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 000d: target 0037, stop 002b": [
+      "afh.c(Lafh;)V"
+    ],
+    "branch crosses region boundary at 000e: target 0025, stop 001f": [
+      "bpme.v(Lbpme;ZI)V"
+    ],
+    "branch crosses region boundary at 000e: target 013a, stop 0139": [
+      "aeze.test(Ljava/lang/Object;)Z"
+    ],
+    "branch crosses region boundary at 000e: target 01b5, stop 01b4": [
+      "aokv.apply(Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0012: target 0037, stop 0027": [
+      "aff.<init>(Lahj;)V"
+    ],
+    "branch crosses region boundary at 0013: target 002b, stop 001e": [
+      "j$.util.stream.f0.h(Lj$/util/Spliterator;Lj$/util/stream/u3;)Z",
+      "j$.util.stream.i0.h(Lj$/util/Spliterator;Lj$/util/stream/u3;)Z",
+      "j$.util.stream.m3.h(Lj$/util/Spliterator;Lj$/util/stream/u3;)Z"
+    ],
+    "branch crosses region boundary at 0013: target 0065, stop 0019": [
+      "bnuk.Z(I[DII)V"
+    ],
+    "branch crosses region boundary at 0015: target 035c, stop 035b": [
+      "scl.run()V"
+    ],
+    "branch crosses region boundary at 0016: target 002a, stop 001a": [
+      "ifj.w(Ljava/lang/Object;)Z"
+    ],
+    "branch crosses region boundary at 0017: target 058c, stop 058b": [
+      "afst.run()V"
+    ],
+    "branch crosses region boundary at 0018: target 051f, stop 051e": [
+      "vok.a()Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0019: target 02b6, stop 02b5": [
+      "lkc.ig(Landroid/view/View;Llqk;)Llqk;"
+    ],
+    "branch crosses region boundary at 001a: target 004a, stop 001c": [
+      "chug.m(Ljava/lang/String;Lcarp;Lbrnj;Lbrnk;Ljava/lang/Integer;)Lchug;"
+    ],
+    "branch crosses region boundary at 001d: target 0087, stop 0022": [
+      "ore.aW(Ljava/nio/ByteBuffer;ILjava/security/cert/CertificateFactory;Ljava/util/Map;Lolv;II)V"
+    ],
+    "branch crosses region boundary at 001e: target 004d, stop 0027": [
+      "com.google.android.material.bottomsheet.BottomSheetBehavior.ai(Z)V"
+    ],
+    "branch crosses region boundary at 0021: target 016c, stop 016a": [
+      "bheg.i(Lcefs;)Z"
+    ],
+    "branch crosses region boundary at 0023: target 003b, stop 0028": [
+      "wob.g(Lwos;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0024: target 005a, stop 0027": [
+      "hhc.j(Lhcm;)V"
+    ],
+    "branch crosses region boundary at 0025: target 0198, stop 0028": [
+      "juu.at(Limv;Ljut;JLjrp;IZFZ)V"
+    ],
+    "branch crosses region boundary at 0026: target 03d3, stop 038f": [
+      "akvd.onClick(Landroid/view/View;)V"
+    ],
+    "branch crosses region boundary at 002c: target 0048, stop 0046": [
+      "siy.h()Z"
+    ],
+    "branch crosses region boundary at 0031: target 004d, stop 0036": [
+      "j$.util.concurrent.ConcurrentHashMap.get(Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 003a: target 0078, stop 003e": [
+      "cgko.du(Ljava/lang/CharSequence;Ljava/lang/CharSequence;IIZZ)I"
+    ],
+    "branch crosses region boundary at 003f: target 05da, stop 05d9": [
+      "rgk.accept(Ljava/lang/Object;)V"
+    ],
+    "branch crosses region boundary at 0042: target 006b, stop 0046": [
+      "ifj.f(Lifj;ILifv;Lieu;)Lifj;"
+    ],
+    "branch crosses region boundary at 0048: target 005f, stop 004c": [
+      "ifj.g(ILjava/lang/Object;ILieu;)Lifj;"
+    ],
+    "branch crosses region boundary at 0048: target 0098, stop 004a": [
+      "hnp.a(F)F"
+    ],
+    "branch crosses region boundary at 004d: target 0064, stop 0051": [
+      "ifj.k(ILjava/lang/Object;I)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 004f: target 0052, stop 0051": [
+      "puy.l(Lcgod;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0053: target 0076, stop 0057": [
+      "ifj.h(ILjava/lang/Object;Ljava/lang/Object;ILieu;)Lifj;"
+    ],
+    "branch crosses region boundary at 0054: target 006f, stop 0056": [
+      "drw.c(JLjava/lang/CharSequence;)J"
+    ],
+    "branch crosses region boundary at 005a: target 007d, stop 005e": [
+      "ifj.j(ILjava/lang/Object;I)Lifj;"
+    ],
+    "branch crosses region boundary at 005e: target 008c, stop 0067": [
+      "bgzf.a(Lbgzf;Ljava/lang/String;Lcgmi;)Ljava/lang/Object;",
+      "bgzf.b(Lbgzf;Ljava/lang/String;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0062: target 008f, stop 0064": [
+      "mhq.E(Ljava/lang/String;)Ljava/lang/String;"
+    ],
+    "branch crosses region boundary at 0063: target 006e, stop 006c": [
+      "bbcl.dO(Lbcul;Labyh;Lbdmz;Lbdjv;Lbdjb;Ljava/lang/Boolean;ZZLhsf;I)Lbdni;"
+    ],
+    "branch crosses region boundary at 006c: target 00f3, stop 00ba": [
+      "asqk.g(Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 006d: target 0089, stop 006f": [
+      "auv.h(Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 006d: target 02ea, stop 02a2": [
+      "asdu.b(Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 006e: target 00c1, stop 0071": [
+      "bplr.t(Landroid/view/LayoutInflater;Landroid/view/ViewGroup;Landroid/os/Bundle;)Landroid/view/View;"
+    ],
+    "branch crosses region boundary at 0071: target 01ed, stop 0073": [
+      "com.google.android.finsky.workmanager.backgroundimpl.PlayInternalCoroutineWorker.m(Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 007a: target 00f0, stop 00e8": [
+      "afjv.s(Lafjv;Lafdo;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 007d: target 01bf, stop 0188": [
+      "bhtu.aQ(Lbklh;JJLcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0087: target 00ec, stop 00ca": [
+      "com.google.android.finsky.workmanager.backgroundimpl.PlayInternalCoroutineWorker.s(Lbhcy;Lbotz;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0088: target 010d, stop 008e": [
+      "catv.k(Laqzq;)Ljava/io/File;"
+    ],
+    "branch crosses region boundary at 0089: target 00b9, stop 008e": [
+      "ifj.d(ILjava/lang/Object;Ljava/lang/Object;I)Lifi;"
+    ],
+    "branch crosses region boundary at 0094: target 01b9, stop 013e": [
+      "com.google.android.finsky.workmanager.backgroundimpl.PlayInternalCoroutineWorker.n(Lbhcy;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 00a0: target 00c0, stop 00ba": [
+      "yzc.iQ(Lcgts;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 00b7: target 00f3, stop 00bc": [
+      "ifj.e(ILjava/lang/Object;Ljava/lang/Object;ILieu;)Lifj;"
+    ],
+    "branch crosses region boundary at 00b8: target 033d, stop 0143": [
+      "atdh.j(Latcu;Lcgts;Ladx;Lbebu;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 00bb: target 00be, stop 00bd": [
+      "j$.time.LocalDate.a0(JLj$/time/temporal/TemporalField;)Lj$/time/LocalDate;"
+    ],
+    "branch crosses region boundary at 00bc: target 00bf, stop 00be": [
+      "eh.onTransact(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z"
+    ],
+    "branch crosses region boundary at 00c3: target 014d, stop 00c8": [
+      "aow.h(Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 00e0: target 0190, stop 00e4": [
+      "acoa.iQ(Lcgts;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 00e5: target 0123, stop 011e": [
+      "wkb.b(ZZLbycj;Lcgyn;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 00f0: target 012e, stop 0129": [
+      "wcf.b(ZZLbycj;Lbycj;Lcgyn;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0104: target 0241, stop 0109": [
+      "qci.c(Lqbs;Lcgts;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0106: target 0140, stop 010c": [
+      "tnf.a()Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 010b: target 0124, stop 011c": [
+      "bazs.iQ(Lcgts;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0113: target 0136, stop 0130": [
+      "akhx.iQ(Lcgts;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 011b: target 09ea, stop 05c8": [
+      "bene.k(Lbene;Ljava/lang/String;Lbzqu;Ljava/lang/String;Lbajf;Lbavj;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0125: target 0563, stop 0127": [
+      "asex.m(Lasex;Ljava/lang/String;ZLjava/lang/Long;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 012e: target 04a8, stop 0187": [
+      "avqx.c(Lbdzc;Lcgts;Lbgon;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0151: target 026e, stop 0153": [
+      "pxh.a(Ljava/lang/String;IZIZILcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0174: target 0364, stop 017b": [
+      "adma.c(Ladlu;Lcgts;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0194: target 03cc, stop 0196": [
+      "awau.k(Lawau;Lawaf;Lcgts;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 0253: target 029d, stop 0260": [
+      "androidx.coordinatorlayout.widget.CoordinatorLayout.i(I)V"
+    ],
+    "branch crosses region boundary at 0289: target 028c, stop 028b": [
+      "uoy.run()V"
+    ],
+    "branch crosses region boundary at 02a9: target 02f2, stop 02ad": [
+      "admg.b(Ladmb;Lcgts;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 04a7: target 0509, stop 0507": [
+      "chmf.i(Lcom/google/android/libraries/engage/service/appsearch/documents/ClusterDocument;)Lbkmd;"
+    ],
+    "branch crosses region boundary at 04d1: target 0085, stop 04d3": [
+      "aozs.l(Lcaed;Laooz;Laoue;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "branch crosses region boundary at 04f9: target 04ff, stop 04fe": [
+      "oxb.dispatchTransaction(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z"
+    ],
+    "cast of nonreference": [
+      "afsp.doInBackground([Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "catch ordering shadows a later handler": [
+      "bnps.M(Ljava/io/File;Ljava/io/IOException;Ljava/lang/String;)Ljava/io/IOException;",
+      "cbgj.a(Lcaty;Ljava/lang/String;IZLandroid/content/Context;)Lcatz;"
+    ],
+    "cleanup region budget exceeded": [
+      "ajnr.call()Ljava/lang/Object;",
+      "aqti.b(Lbrgm;Ljava/lang/String;Landroid/net/Uri;)Z",
+      "atlw.g()Latnj;"
+    ],
+    "constructor branch overwrites receiver": [
+      "androidx.media3.exoplayer.ExoPlaybackException.<init>(ILjava/lang/Throwable;ILjava/lang/String;ILmds;ILmrz;Z)V",
+      "awef.<init>(Lauok;Lbech;Lpnk;Lbebk;Lbebk;Laisj;Labes;Lcewj;Lanau;Lcewj;Lcewj;Latav;Laqbo;Lbetj;Lbriv;Lavzb;Lcewj;)V",
+      "bbtt.<init>(Lpnk;Ladpa;Laabg;Lbebk;Labik;Lcewj;Lcewj;Lanau;Lafdd;Lagws;Lamfe;Laisj;Labie;Lbhal;Lbebk;Laxzi;Lbech;Labes;Ljava/lang/String;Lbbtl;I)V"
+    ],
+    "constructor cleanup regions not reconstructed": [
+      "acoa.<init>(Lanau;Lbech;Laqrb;Lafpp;Lojs;Latav;Lamuz;Latav;Lxtn;Lcewj;Lcewj;Ladiq;Laeqz;Laeqz;Ladpa;Latpy;Laisj;Lauqh;Lbdph;Lacun;Lagak;Lbxhx;)V",
+      "aihr.<init>(Lcgod;)V",
+      "akee.<init>(Lcewj;)V"
+    ],
+    "control flow analysis exceeds work budget": [
+      "pww.<clinit>()V"
+    ],
+    "control flow crosses region boundary": [
+      "aaa.h()Ljava/lang/Object;",
+      "aase.e(Lbynn;Lcgts;Laasf;Lcgmi;)Ljava/lang/Object;",
+      "aaug.c(Ljava/lang/Object;Lcgts;Laauk;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "control flow exceeds branch budget": [
+      "cavl.b(Lcatz;I)Lcatv;"
+    ],
+    "control flow nesting exceeds budget": [
+      "abc.b(Ljava/util/List;Ljava/util/List;Lzga;Ljava/util/Set;)V",
+      "agcd.b(Ljava/lang/Object;)V",
+      "ahnu.b(Lbebu;Limw;Lhsf;I)V"
+    ],
+    "cyclic protected return tail": [
+      "aaco.r(Lxfe;Lcgmi;)Ljava/lang/Object;",
+      "abx.f(Landroid/content/Context;Landroid/content/res/TypedArray;Lbnxm;)Labx;",
+      "atiq.b(Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "detached handler does not terminate": [
+      "abvd.aZ(Lbogm;Landroid/os/Bundle;)V",
+      "acdd.a(Ljava/lang/String;I)I",
+      "aesh.L(Lbojx;Landroid/os/Bundle;)V"
+    ],
+    "effectful instruction between allocation and constructor": [
+      "aaam.iQ(Lcgts;Lcgmi;)Ljava/lang/Object;",
+      "aac.f([Laac;)[Landroid/app/RemoteInput;",
+      "aaco.H(I)Ljava/io/File;"
+    ],
+    "effectful normal continuation before exception join": [
+      "aaco.b()Z",
+      "abbi.b(Ljava/lang/Object;)Ljava/lang/Object;",
+      "abvc.eF(Lchaz;Lbyno;Lpnk;Lbfop;Lbriv;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "exception nesting exceeds budget": [
+      "a.O(Ljava/util/concurrent/Future;)Ljava/lang/Object;",
+      "atal.j(Lcgod;)V",
+      "bgvq.c()Z"
+    ],
+    "external edge enters monitor body": [
+      "bgeo.run()V",
+      "bhol.run()V",
+      "ceuu.a(Lceuk;)Z"
+    ],
+    "field writes before this delegation not reconstructed": [
+      "cftg.<init>(Lcfpw;Lcfiq;)V",
+      "cfzw.<init>(Lcfzt;Lcgbo;)V",
+      "chlo.<init>(Lcfox;)V"
+    ],
+    "filled-array requires known assignable reference": [
+      "bosy.e(Landroid/view/ViewGroup;I)Lnt;",
+      "bpia.c(Ljava/util/List;Ljava/lang/String;)Ljava/lang/String;",
+      "bpmk.pc(Ljava/lang/String;)Ljava/lang/String;"
+    ],
+    "goto crosses region boundary": [
+      "abvc.bS(Ljava/util/Map;)Lbuhy;",
+      "aeqz.aK(I)Z",
+      "afrk.aF(Ljava/lang/String;Larlc;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "incompatible register types at control flow join": [
+      "adpa.f(Lagyy;)Lcdoh;",
+      "aewz.getDatabaseNodes(Landroid/content/Context;)[Ljava/lang/String;",
+      "afae.accept(Ljava/lang/Object;)V"
+    ],
+    "instance-of on nonreference": [
+      "com.google.android.finsky.frameworkviews.HorizontalSeparatorContainer.draw(Landroid/graphics/Canvas;)V"
+    ],
+    "invalid method call": [
+      "ahwe.c(Lcgts;Laeqz;Lcgmi;)Ljava/lang/Object;",
+      "avu.r(Ljava/lang/Object;Z)V",
+      "bazm.g(Lbazn;)Ljava/lang/Object;"
+    ],
+    "invalid super receiver": [
+      "acbj.setImageBitmap(Landroid/graphics/Bitmap;)V",
+      "afvv.a(Lafvv;)V",
+      "amrq.bA(Lamrq;Landroid/os/Bundle;)V"
+    ],
+    "invalid wide register pair": [
+      "abbh.a(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "loop changes register type": [
+      "aaxd.e(Ljava/util/List;Lbgrp;Lcgts;Lcgmi;)Ljava/lang/Object;",
+      "aayx.a()Ljava/lang/Object;",
+      "abbv.lA(Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "loop crosses region boundary": [
+      "afjv.t(Lafjv;Laevp;Lcgmi;)Ljava/lang/Object;",
+      "agx.a(Ljava/lang/Object;)I",
+      "android.support.v7.widget.LinearLayoutManager.bL(Lnj;II)V"
+    ],
+    "loop exit value has no established entry type": [
+      "aoom.a()I",
+      "aplv.c(Lcgjs;)Ljava/lang/Object;",
+      "azpn.a(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "loop has an interior entry": [
+      "aagy.c(Laagy;Lcgjn;Lcgts;Ladvf;Lcgmi;)Ljava/lang/Object;",
+      "aavt.b(Ljava/lang/Object;)Ljava/lang/Object;",
+      "acma.e(Lacmb;)Ljava/lang/Object;"
+    ],
+    "loop has no structured exit": [
+      "aca.d(Ljava/lang/String;)[Llml;",
+      "aeca.v(Loxm;)Lqfp;",
+      "aegn.b(Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "loop inside try not reconstructed": [
+      "aar.u(Landroid/content/res/TypedArray;Lorg/xmlpull/v1/XmlPullParser;Landroid/content/res/Resources$Theme;Ljava/lang/String;I)Lchlj;",
+      "aaza.c(Lcgts;Ljava/util/List;Ljava/util/List;Lcgmi;)Ljava/lang/Object;",
+      "acwm.c(Ljava/util/List;Ljava/util/Collection;ZLcgmi;)Ljava/lang/Object;"
+    ],
+    "loop interrupts instruction state": [
+      "akmc.<init>(Ljava/util/List;Ljava/util/Set;Ljava/util/Set;ZLaksu;Lcgod;Lcgod;Lcgod;Lcgod;Lcgod;)V",
+      "aloq.<init>(Ljava/lang/String;)V",
+      "bqvu.e(Ljava/lang/String;)Lbqup;"
+    ],
+    "loop overlaps protected region": [
+      "a.l(Ljava/util/concurrent/ExecutorService;)V",
+      "aam.k(Ljava/nio/ByteBuffer;)Ljava/util/List;",
+      "abce.a()Ljava/lang/Object;"
+    ],
+    "mixed monitor and ordinary exception regions not reconstructed": [
+      "aadw.b(Ljava/lang/Object;)Ljava/lang/Object;",
+      "adta.a(Ljava/lang/Object;)Lbrlq;",
+      "aeis.n(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Landroid/os/Bundle;Lbogt;ZLandroid/os/IBinder;IIJLjava/lang/String;)V"
+    ],
+    "monitor body crosses release layout": [
+      "aeff.a(Lcewj;)V",
+      "aehh.f(Ljava/lang/String;Ljava/lang/String;Landroid/os/IBinder;Z)Laehe;",
+      "afnx.e(Lafol;)V"
+    ],
+    "monitor body has no immediate protected region": [
+      "ajoz.a(Lcgod;Lcgmi;)Ljava/lang/Object;",
+      "amaj.c()V",
+      "aulm.a(Ljava/lang/Object;)Lbrlq;"
+    ],
+    "monitor cleanup move does not preserve exception": [
+      "aexh.g(Ljava/lang/String;Lcdnl;Lj$/time/Instant;)V",
+      "agzr.a(Ljava/lang/Object;)Lbrlq;",
+      "ardi.c(Ljava/lang/Object;Lardc;Lcgoj;)V"
+    ],
+    "monitor handler is not exact release/rethrow": [
+      "afrj.uncaughtException(Ljava/lang/Thread;Ljava/lang/Throwable;)V",
+      "bjdy.c(Landroid/os/Bundle;)V",
+      "bkak.a()I"
+    ],
+    "monitor requires a normal release": [
+      "aios.c(Lainj;)Lainj;",
+      "bpsn.reset()V"
+    ],
+    "move type mismatch at 0016: register v2 has type I": [
+      "kim.a(Ljss;Z)Lkil;"
+    ],
+    "move type mismatch at 001f: register v4 has type I": [
+      "jyz.P(Lkil;Landroid/graphics/Rect;Lixc;)Litg;"
+    ],
+    "move type mismatch at 0028: register v10 has type I": [
+      "iiy.t(JLahf;Ljava/util/Map;Lijm;)Liji;"
+    ],
+    "move type mismatch at 0030: register v2 has type I": [
+      "com.google.android.finsky.uicomponentsmvc.blurbs.view.MiniBlurbView.<init>(Landroid/content/Context;Landroid/util/AttributeSet;)V"
+    ],
+    "move type mismatch at 004f: register v1 has type I": [
+      "bhog.ah(Landroid/content/pm/PackageInfo;)Lbqlw;"
+    ],
+    "move type mismatch at 005a: register v0 has type I": [
+      "zhg.i(Lzhb;)Lbwhh;"
+    ],
+    "move type mismatch at 005d: register v0 has type I": [
+      "awea.c(Lawdx;)Lbwhh;"
+    ],
+    "move type mismatch at 0092: register v2 has type I": [
+      "gvm.C(Lhcm;FFF)V"
+    ],
+    "move type mismatch at 0099: register v9 has type I": [
+      "lye.<init>(Ljava/util/List;J)V"
+    ],
+    "move type mismatch at 009d: register v3 has type I": [
+      "bkiv.j(Landroid/os/Bundle;Lcgod;)Lbkms;"
+    ],
+    "move type mismatch at 00be: register v1 has type I": [
+      "ijs.m(JLiiy;Lijm;)Ljava/util/Map;"
+    ],
+    "move type mismatch at 00e8: register v2 has type I": [
+      "bncs.h(Lbndn;Lbnam;Ljava/lang/String;)Ljava/lang/Object;"
+    ],
+    "move type mismatch at 0133: register v11 has type I": [
+      "agfk.d(Ljava/util/List;Lafwx;JLhsf;II)V"
+    ],
+    "move type mismatch at 0139: register v2 has type Lkrd;": [
+      "klr.lA(Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "move type mismatch at 015e: register v4 has type I": [
+      "ahyu.b(Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "move type mismatch at 01e4: register v4 has type I": [
+      "afrk.aC(Larlc;)Laruk;"
+    ],
+    "move type mismatch at 0345: register v10 has type I": [
+      "asgh.b(Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "multiple monitor releases require immediate returns": [
+      "ablj.e(Lcdyj;Ljava/util/function/Consumer;)Lable;",
+      "adxu.i(JJ)J",
+      "aefc.onCreate()Z"
+    ],
+    "nested monitor regions not reconstructed": [
+      "adzx.b(Ljava/lang/String;JLlad;Lcgns;)J",
+      "aezd.c()V",
+      "afsa.d(Lafsa;)V"
+    ],
+    "nested or multiple try regions not reconstructed": [
+      "aexc.o(Landroid/database/Cursor;)Laewx;",
+      "angj.d()V",
+      "anmn.d()V"
+    ],
+    "nonforward or invalid switch target": [
+      "apsq.e(Lcewj;Lcewj;Lcewj;Lcewj;)V",
+      "bagk.lA(Ljava/lang/Object;)Ljava/lang/Object;",
+      "bcod.b(Lccar;)Lbwr;"
+    ],
+    "overlapping loops not reconstructed": [
+      "aafr.e(Ljmn;Ljava/util/List;J)Ljmj;",
+      "acwp.b(Ljava/lang/Object;)Ljava/lang/Object;",
+      "androidx.gridlayout.widget.GridLayout.l()V"
+    ],
+    "partially overlapping exception handlers": [
+      "aeoe.h(Landroid/view/View;Landroid/content/Context;)V",
+      "afys.a(Ljava/util/concurrent/Callable;Ljava/lang/Object;Lbqev;)Lafys;",
+      "boja.ab(Z)V"
+    ],
+    "protected continuation crosses another exception region": [
+      "aaua.e(Lcgmi;)Ljava/lang/Object;",
+      "abdy.b(Ljava/lang/Object;)Ljava/lang/Object;",
+      "abng.b(Lcgmi;)Ljava/lang/Object;"
+    ],
+    "protected flow escapes backward": [
+      "a.x(Ljava/security/cert/X509Certificate;I)Ljava/util/List;",
+      "aadf.onReceive(Landroid/content/Context;Landroid/content/Intent;)V",
+      "aasj.lA(Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "protected region has distinct effectful exits": [
+      "aaqm.e(Laaqg;Lcgts;Laaqn;Lcgmi;)Ljava/lang/Object;",
+      "abgp.a(Lcgmi;)Ljava/lang/Object;",
+      "acen.m(Ljava/io/File;)Ljava/nio/ByteBuffer;"
+    ],
+    "protected return tail crosses effectful continuation": [
+      "abvc.dW(Landroid/content/Context;Lbnkn;Lcgmi;)Ljava/lang/Object;",
+      "afh.equals(Ljava/lang/Object;)Z",
+      "afiz.f(Ljava/lang/Object;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "read from upper half of wide register": [
+      "abvq.<init>(Lkqf;IJIILcgod;Labvp;ZJI)V",
+      "acxv.<init>()V",
+      "adzf.<init>(Ljava/lang/String;ZIZLima;Ljjy;Liuy;FFLcgoi;JLadzc;I)V"
+    ],
+    "reconstructed method exceeds output budget": [
+      "ayas.l(Lbdzc;Lagyu;Lagxn;Lafbt;ZZLajxc;Lcgts;Laybe;Lcgmi;)Ljava/lang/Object;",
+      "bhgn.g(Lbhgo;Lcgts;Lcgmi;)Ljava/lang/Object;",
+      "kpp.c(Lkpn;JJLktx;Lktq;Lktr;Lksv;Ljava/lang/String;JLkym;Lkze;Lkxq;JLkyx;Lixa;Lkmk;Lizo;)Lkpn;"
+    ],
+    "reference comparison with nonreference": [
+      "j$.util.stream.v.onCompletion(Ljava/util/concurrent/CountedCompleter;)V",
+      "mah.a(Lmac;Llzw;)V"
+    ],
+    "shared switch tail crosses protected region": [
+      "abjc.run()V",
+      "acxz.b(Ljava/lang/Object;)Ljava/lang/Object;",
+      "adru.run()V"
+    ],
+    "switch before constructor initialization": [
+      "com.google.vr.vrcore.base.api.VrCoreNotAvailableException.<init>(I)V"
+    ],
+    "switch crosses loop boundary": [
+      "aexg.run()V",
+      "rgv.accept(Ljava/lang/Object;)V"
+    ],
+    "switch exceeds case budget": [
+      "ceby.a(I)I"
+    ],
+    "switch inside try not reconstructed": [
+      "afak.a(Ljava/lang/Object;)Lbrlq;",
+      "bhbq.t(Lbzqu;Ljava/lang/String;)Ljava/lang/String;",
+      "piy.o(Lotw;Lbhzt;)Lovh;"
+    ],
+    "throw before initialization: implicit super() would change construction/finalization effects": [
+      "aikv.<init>()V",
+      "bbfp.<init>()V",
+      "bbfz.<init>()V"
+    ],
+    "throwing handler instruction inside protected region": [
+      "agyh.a()Landroid/database/sqlite/SQLiteDatabase;",
+      "agyh.b()Landroid/database/sqlite/SQLiteDatabase;",
+      "bjch.a([B[B)V"
+    ],
+    "throwing monitor body instruction escapes protected range": [
+      "adym.run()V",
+      "aexc.b()Ljava/util/Collection;",
+      "afyx.p(Ljava/lang/String;Lcebj;)V"
+    ],
+    "try continuation crosses enclosing region": [
+      "aarf.c(Lbzpk;Lcgmi;)Ljava/lang/Object;",
+      "acsu.a(Landroid/accounts/Account;Ljava/util/Map;Lj$/time/LocalDate;Lcgmi;)Ljava/lang/Object;",
+      "adzx.i()V"
+    ],
+    "try crosses enclosing region": [
+      "aaco.l(Ljava/util/List;ILcgmi;)Ljava/lang/Object;",
+      "abni.b(Lcgmi;)Ljava/lang/Object;",
+      "abpa.b(Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "try interrupts instruction state": [
+      "aaes.c(Laact;)Ljava/lang/Object;",
+      "ajbx.iQ(Lcgts;Lcgmi;)Ljava/lang/Object;",
+      "blnl.b(Lbtey;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "undefined register": [
+      "a.t([B)Ljava/lang/String;",
+      "a.v(Ljava/lang/String;II[BI)Z",
+      "aahn.a(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "unfinished allocation": [
+      "afsv.d(Ljava/lang/String;Ljava/util/List;Landroid/os/Bundle;Lboif;)V",
+      "afsv.f(Ljava/lang/String;Ljava/util/List;Lboif;)V",
+      "arzu.a(Ljava/util/ArrayList;ILaruo;ZJLarqa;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "unmatched or unproven monitor instruction": [
+      "adzu.lF(Lbomv;)V",
+      "aekl.q(Ljava/lang/String;Ljava/lang/String;Landroid/os/Bundle;Lbojx;ZII[BLjava/lang/String;)V",
+      "aexi.n()Z"
+    ],
+    "unstructured backward jump": [
+      "anbe.f(Ljava/io/DataInputStream;Ljava/lang/String;Lanbd;)V",
+      "aplb.lA(Ljava/lang/Object;)Ljava/lang/Object;",
+      "bhpp.createFromParcel(Landroid/os/Parcel;)Ljava/lang/Object;"
+    ],
+    "unsupported constructor invocation": [
+      "j$.desugar.sun.nio.fs.i.<init>(Lj$/desugar/sun/nio/fs/m;Ljava/lang/String;)V",
+      "j$.nio.channels.a.<init>(Ljava/nio/channels/AsynchronousFileChannel;)V",
+      "j$.nio.file.attribute.w0.<init>(Ljava/nio/file/attribute/UserPrincipalLookupService;)V"
+    ],
+    "unsupported literal conversion": [
+      "avbe.lA(Ljava/lang/Object;)Ljava/lang/Object;",
+      "azza.c(Lbdzc;)Ljava/lang/Object;",
+      "bcsf.b(Lbctf;Lbdfh;Lcgod;)Lbcvc;"
+    ],
+    "unsupported loop interior edge": [
+      "aaco.h(Ljava/util/List;ILjava/util/Map;Ljava/util/List;Lcgmi;)Ljava/lang/Object;",
+      "aadd.c(Laada;)Ljava/lang/Object;",
+      "aafp.a(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "unsupported register type conversion B to Z": [
+      "wuq.d(IZ)V"
+    ],
+    "unsupported register type conversion F to I": [
+      "kkg.j(Ljss;)V"
+    ],
+    "unsupported register type conversion I to B": [
+      "aca.h(ILjava/nio/ByteBuffer;)I",
+      "bvs.d(J)V",
+      "mpq.a(Ljava/nio/ByteBuffer;JIIZ)V"
+    ],
+    "unsupported register type conversion I to C": [
+      "beuf.oE(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
+      "bowi.A(Lbqaz;Lcom/google/android/wallet/ui/common/FormEditText;Landroid/content/Context;)Lbqaz;",
+      "boyu.k(CLorg/json/JSONObject;)Z"
+    ],
+    "unsupported register type conversion I to F": [
+      "abvc.cF(ZZLjava/util/List;Lhsf;I)V",
+      "abvc.cj(Labyh;Ljava/util/List;Limw;Lhsf;I)V",
+      "abvd.g(Ljava/util/List;JLabwp;)Labwk;"
+    ],
+    "unsupported register type conversion I to Landroid/animation/AnimatorSet$Builder;": [
+      "com.google.android.finsky.frameworkviews.FlexBoxBulletSeparatorFlowLayout.c()V"
+    ],
+    "unsupported register type conversion I to Landroid/app/usage/NetworkStats;": [
+      "upn.f(ILj$/time/Instant;Lj$/time/Instant;)Landroid/app/usage/NetworkStats;"
+    ],
+    "unsupported register type conversion I to Landroid/content/pm/PackageInfo;": [
+      "aitm.apply(Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "unsupported register type conversion I to Landroid/content/res/XmlResourceParser;": [
+      "hx.inflate(ILandroid/view/Menu;)V"
+    ],
+    "unsupported register type conversion I to Landroid/graphics/drawable/Drawable;": [
+      "boqw.e(Landroid/content/Context;Lboqu;)Landroid/graphics/drawable/Drawable;"
+    ],
+    "unsupported register type conversion I to Landroid/net/Uri;": [
+      "bhsm.<init>(Lbhsl;)V"
+    ],
+    "unsupported register type conversion I to Landroid/view/View;": [
+      "android.support.v7.widget.AppCompatSpinner.py(Landroid/widget/SpinnerAdapter;Landroid/graphics/drawable/Drawable;)I",
+      "androidx.core.widget.NestedScrollView.M(III)Z",
+      "booh.c()V"
+    ],
+    "unsupported register type conversion I to Latqi;": [
+      "atrg.handleMessage(Landroid/os/Message;)V"
+    ],
+    "unsupported register type conversion I to Lbglv;": [
+      "bgoz.az([BLjava/util/List;Lbfxc;Ljava/util/Set;)V"
+    ],
+    "unsupported register type conversion I to Lbljc;": [
+      "bljv.c()V"
+    ],
+    "unsupported register type conversion I to Lbrez;": [
+      "upn.a(Lj$/time/Instant;Lj$/time/Instant;)Lbrez;"
+    ],
+    "unsupported register type conversion I to Lbrkp;": [
+      "brkq.b()V"
+    ],
+    "unsupported register type conversion I to Lbsnq;": [
+      "bsra.a()Lbsnq;"
+    ],
+    "unsupported register type conversion I to Lcdmp;": [
+      "acel.c(Ljava/lang/String;)Lj$/time/Instant;"
+    ],
+    "unsupported register type conversion I to Lcfvy;": [
+      "cfrd.g(I)Lcfvy;"
+    ],
+    "unsupported register type conversion I to Lcgiz;": [
+      "cgjd.f()Ljava/lang/Object;"
+    ],
+    "unsupported register type conversion I to Lcgmi;": [
+      "amwg.e(Lahyg;ZLcgts;Lcgmi;)Ljava/lang/Object;"
+    ],
+    "unsupported register type conversion I to Lgde;": [
+      "gdg.lA(Ljava/lang/Object;)Ljava/lang/Object;",
+      "gdl.lA(Ljava/lang/Object;)Ljava/lang/Object;",
+      "gdu.c(Lgdy;)I"
+    ],
+    "unsupported register type conversion I to Lhhv;": [
+      "gvm.h(Ljava/util/ArrayList;ZLgvm;)Ljava/util/ArrayList;"
+    ],
+    "unsupported register type conversion I to Liaa;": [
+      "juu.ak(Liut;Lizx;)V"
+    ],
+    "unsupported register type conversion I to Lilb;": [
+      "ijs.f(Lilb;Likz;)Lilb;",
+      "ijs.i(Lilb;JLijm;)Lilb;"
+    ],
+    "unsupported register type conversion I to Lilz;": [
+      "aztn.d(Lbgrp;Labyh;Ljava/util/List;Limw;Lhsf;I)V",
+      "bhiy.a(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+    ],
+    "unsupported register type conversion I to Limv;": [
+      "jrc.T(Ljqz;)V"
+    ],
+    "unsupported register type conversion I to Lj$/time/chrono/ChronoLocalDate;": [
+      "aztj.as(Lbwtk;Ljava/util/List;)Lawtg;"
+    ],
+    "unsupported register type conversion I to Lj$/time/zone/ZoneRules;": [
+      "j$.time.s.U(Ljava/lang/String;Z)Lj$/time/s;"
+    ],
+    "unsupported register type conversion I to Lj$/util/concurrent/j;": [
+      "j$.util.concurrent.ConcurrentHashMap.p(Lj$/util/concurrent/p;)Lj$/util/concurrent/j;"
+    ],
+    "unsupported register type conversion I to Lj$/util/concurrent/p;": [
+      "j$.util.concurrent.ConcurrentHashMap.n([Lj$/util/concurrent/j;I)V"
+    ],
+    "unsupported register type conversion I to Ljava/io/InputStream;": [
+      "bjmb.a(Lbsbu;Ljava/lang/String;)Lbotz;"
+    ],
+    "unsupported register type conversion I to Ljava/lang/CharSequence;": [
+      "bpfj.a(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;"
+    ],
+    "unsupported register type conversion I to Ljava/lang/Class;": [
+      "cflv.<clinit>()V"
+    ],
+    "unsupported register type conversion I to Ljava/lang/Iterable;": [
+      "nlm.onCorruption(Landroid/database/sqlite/SQLiteDatabase;)V"
+    ],
+    "unsupported register type conversion I to Ljava/lang/Long;": [
+      "aeis.r(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Landroid/os/Bundle;I)Lzo;"
+    ],
+    "unsupported register type conversion I to Ljava/lang/Object;": [
+      "aatl.b(Ljava/lang/Object;)Ljava/lang/Object;",
+      "adwj.a(Ljava/lang/Object;Lcgmi;)Ljava/lang/Object;",
+      "ajck.c(Ljava/lang/Iterable;Lbetz;)V"
+    ],
+    "unsupported register type conversion I to Ljava/lang/String;": [
+      "aujl.run()V",
+      "bhua.<init>(Landroid/content/Context;)V",
+      "bsgb.i(Ljava/net/URL;)Ljava/net/HttpURLConnection;"
+    ],
+    "unsupported register type conversion I to Ljava/lang/StringBuilder;": [
+      "bsrk.f(C)Ljava/lang/String;",
+      "ola.u(Lchjc;)Ljava/lang/String;",
+      "us.m(Ljava/lang/String;)Ljava/lang/String;"
+    ],
+    "unsupported register type conversion I to Ljava/lang/reflect/Constructor;": [
+      "cgap.<clinit>()V"
+    ],
+    "unsupported register type conversion I to Ljava/lang/reflect/Method;": [
+      "bjki.<clinit>()V",
+      "cfuq.<clinit>()V"
+    ],
+    "unsupported register type conversion I to Ljava/net/InetAddress;": [
+      "cesu.f(Ljava/lang/String;I)Ljava/net/InetAddress;",
+      "cgca.b(Ljava/lang/String;I)Ljava/net/InetAddress;"
+    ],
+    "unsupported register type conversion I to Ljava/util/List;": [
+      "pch.m(Ljava/lang/String;)Ljava/util/List;"
+    ],
+    "unsupported register type conversion I to Ljava/util/Map$Entry;": [
+      "llu.a(Landroid/content/Context;Ljava/lang/String;Ljava/io/File;)Landroid/net/Uri;"
+    ],
+    "unsupported register type conversion I to Ljava/util/Map;": [
+      "aqrb.f(Lcewj;Ljava/lang/String;Lbvwx;Landroid/accounts/Account;Lcewj;Ljava/util/Set;)Laeqz;"
+    ],
+    "unsupported register type conversion I to Ljava/util/concurrent/ExecutorService;": [
+      "bkex.b(Lbkez;Lblrk;Lbkeu;)Lbkew;"
+    ],
+    "unsupported register type conversion I to Llim;": [
+      "lip.a(Llgy;Z)V"
+    ],
+    "unsupported register type conversion I to Lmnm;": [
+      "mnn.j(ILmrz;)Lmnm;"
+    ],
+    "unsupported register type conversion I to Lmuf;": [
+      "mun.o(Lmtd;[[ILmuh;)Lojt;"
+    ],
+    "unsupported register type conversion I to Lmwd;": [
+      "mwa.d()V"
+    ],
+    "unsupported register type conversion I to Lndq;": [
+      "ndr.e(Lndp;)Lndq;"
+    ],
+    "unsupported register type conversion I to Lomh;": [
+      "ore.J(Lomr;Ljava/lang/Class;Z)Ljava/lang/Object;"
+    ],
+    "unsupported register type conversion I to Lomk;": [
+      "oml.d(Ljava/lang/Object;)[B",
+      "oml.g(Ljava/lang/Object;Z)[B"
+    ],
+    "unsupported register type conversion I to Lpbi;": [
+      "bcov.W(Landroid/content/Context;Lbzsp;)Lpbi;"
+    ],
+    "unsupported register type conversion I to Luqc;": [
+      "bbdd.m(Laff;I)Lbrlj;"
+    ],
+    "unsupported register type conversion I to Lvhz;": [
+      "via.a(Ljava/nio/ByteBuffer;)V"
+    ],
+    "unsupported register type conversion I to S": [
+      "cgbt.b(Lchiz;J)J"
+    ],
+    "unsupported register type conversion I to Z": [
+      "aaph.h(Lbcul;Latav;Labuj;Limw;Limw;Lhsf;I)V",
+      "abgt.lA(Ljava/lang/Object;)Ljava/lang/Object;",
+      "absi.cW(Latav;Ladze;Laarn;Limw;Lhsf;I)V"
+    ],
+    "unsupported register type conversion I to [B": [
+      "auls.Q(Lbetz;III)V",
+      "bfxc.a()V",
+      "bnja.y(Landroid/support/v7/widget/RecyclerView;)V"
+    ],
+    "unsupported register type conversion I to [C": [
+      "um.w(Landroid/content/Context;Ljava/util/List;IZILandroid/os/Handler;Llke;)Landroid/graphics/Typeface;"
+    ],
+    "unsupported register type conversion J to D": [
+      "abuv.a()Ljava/lang/Object;",
+      "ajlw.onPreDraw()Z",
+      "ath.e(FFF)J"
+    ],
+    "wide exception snapshots not reconstructed": [
+      "anap.a(Ljava/lang/String;J)J",
+      "bjll.d(Landroid/content/Context;Lbjkg;Lbsch;Ljava/lang/String;Lbsch;)Lbsbl;",
+      "bjxt.a(Ljava/net/HttpURLConnection;)J"
+    ],
+    "wide tail merged without head": [
+      "aflq.b(Ljava/util/List;JLuaz;Lcgmi;)Ljava/lang/Object;",
+      "ati.d(JFFF)F",
+      "behy.bi(Lizh;FFFJLizo;F)V"
+    ],
+    "wide tail owner mismatch": [
+      "absi.U(Ljava/lang/String;Ljava/lang/String;Limw;JJLktx;JLkyx;Lkyw;JIZILcgod;Lkqf;Lhsf;III)V",
+      "aobf.d()V",
+      "aocm.d()V"
+    ]
+  }
+}

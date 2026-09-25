@@ -2,6 +2,7 @@
 mod annotations;
 mod condition_cleanup;
 mod display_names;
+mod enums;
 mod liveness;
 mod method;
 mod names;
@@ -220,6 +221,9 @@ pub(super) fn inherited_override_exception(
 
 pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result<DecompiledCode> {
     if method.name.as_ref() == "<clinit>" {
+        if let Ok(plan) = enums::Plan::analyze(class) {
+            return plan.initializer(name, class);
+        }
         return render_initializer(name, class, method);
     }
     let constructor = method.name.as_ref() == "<init>";
@@ -343,6 +347,11 @@ pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result
         .iter()
         .map(AsRef::as_ref)
         .chain(inherited_override_exception(class, method))
+        .chain(
+            body.as_ref()
+                .into_iter()
+                .flat_map(|body| body.inferred_throws.iter().map(String::as_str)),
+        )
         .collect();
     if !declared_throws.is_empty() {
         out.push(" throws ");
@@ -834,6 +843,46 @@ fn class_prefix(name: &str, class: &DexClass) -> Result<Output> {
     for field in &class.fields {
         out.append(render_field(name, class, field)?);
     }
+    if let Some(hierarchy) = class.symbols.hierarchy.get() {
+        for constructor in hierarchy.recovered_constructors(&class.descriptor) {
+            let display = java_type(&class.descriptor)?;
+            let short = display.rsplit('.').next().unwrap_or(&display);
+            let signature = format!("{name}.<init>({})V", constructor.parameters.join(""));
+            out.push("\n    // Reconstructed forwarding constructor removed by DEX optimization.\n    public ");
+            out.definition(short, "<init>", &signature, "method");
+            out.push("(");
+            for (index, ty) in constructor.parameters.iter().enumerate() {
+                if index != 0 {
+                    out.push(", ");
+                }
+                out.push(&format!("{} p{index}", java_type(ty)?));
+            }
+            out.push(")");
+            if !constructor.thrown_types.is_empty() {
+                out.push(" throws ");
+                for (index, ty) in constructor.thrown_types.iter().enumerate() {
+                    if index != 0 {
+                        out.push(", ");
+                    }
+                    out.push(&java_type(ty)?);
+                }
+            }
+            out.push(" {\n        ");
+            let parent = java_type(&constructor.parent)?;
+            out.reference(
+                "super",
+                &format!("{parent}.<init>({})V", constructor.parameters.join("")),
+            );
+            out.push("(");
+            for index in 0..constructor.parameters.len() {
+                if index != 0 {
+                    out.push(", ");
+                }
+                out.push(&format!("p{index}"));
+            }
+            out.push(");\n    }\n");
+        }
+    }
     Ok(out)
 }
 
@@ -860,6 +909,9 @@ fn finish_class(name: &str, class: &DexClass, mut out: Output) -> DecompiledCode
 }
 
 pub fn render(name: &str, class: &DexClass) -> Result<DecompiledCode> {
+    if let Ok(plan) = enums::Plan::analyze(class) {
+        return plan.render(name, class);
+    }
     let mut out = class_prefix(name, class)?;
     for method in &class.methods {
         append_presented_method(&mut out, class, method, render_method(name, class, method)?)?;
@@ -901,6 +953,11 @@ fn render_mixed_controlled(
     cancelled: &impl Fn() -> bool,
 ) -> Result<DecompiledCode> {
     ensure!(!cancelled(), "decompilation cancelled");
+    if let Ok(plan) = enums::Plan::analyze(class)
+        && let Ok(code) = plan.render(name, class)
+    {
+        return Ok(code);
+    }
     let mut attempted = Vec::new();
     if let Ok(mut out) = class_prefix(name, class) {
         for method in &class.methods {

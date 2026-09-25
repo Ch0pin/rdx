@@ -335,3 +335,135 @@ remain available in catch paths. Writes to either register half are checked;
 handler-visible mutable wide values still fall back. JVM regression fixtures
 exercise successful wide results and throwing calls, checking exact long values,
 double signed zero, catch results, and call counts.
+
+### Primitive builder appends inside allocation regions
+
+Ignored `StringBuilder.append(int)` and `append(boolean)` results now retain the
+builder receiver identity across aliases during nested allocation reconstruction.
+Calls remain in their original order and keep exact overload navigation links.
+Arbitrary builder types and unsupported overloads still decline reconstruction.
+
+Play Store corpus validation (268,289 concrete methods): 241,897 reconstructed,
+26,392 fallbacks, a gain of 27 methods over the wide-try baseline (90.163%).
+Thirteen allocation regressions passed, including a JVM execution check of
+rendered Java for text order, returned aliases, and constructor call count.
+
+### Coverage expansion: allocation, loops and exception regions
+
+The reconstruction pipeline now handles more constructor argument preparation:
+wide values, arithmetic and conversions, array and field operations, discarded
+calls, and bounded structured branches before initialization. Every staged
+operation retains its order. Uninitialized receivers cannot escape into these
+operations. The existing readable-allocation timing policy still applies.
+
+Constructor recovery also recognizes verified chains of empty constructors and
+observed erased parameter constructors. It emits a forwarding constructor only
+when the exact accessible parent declaration and argument signature are known.
+Abstract classes may occur inside a forwarding chain but cannot become a
+constructed leaf. Constructor prologues can select arguments through branches
+while keeping uninitialized `this` inaccessible.
+
+Loop support includes nested natural loops, shared return tails, terminal
+infinite loops and distant exits over sibling branches. Synchronized regions can
+span multiple protected ranges with the same cleanup handler and can contain
+multiple releases immediately followed by returns. Missing protection, altered
+catch dispatch and effects after a released monitor remain unsupported.
+
+Pinned Android API 35 type and method-exception metadata supports proven
+reference widening and checked catches. Loaded APK definitions take precedence.
+A narrower checked catch retains its exact type; other declared exceptions are
+not absorbed. Non-void terminal cleanup preserves the value evaluated before
+`finally`. Metadata generation and provenance are documented in
+[data/README.md](../data/README.md); no SDK or JVM is required to run RDX.
+
+Coverage is the fraction of concrete DEX methods reconstructed as Java on the
+measured corpus. It is not a claim of semantic correctness for every method or
+of the same coverage on every APK. Regression validation includes execution of
+emitted Java for effect order, exception propagation, constructor counts,
+monitor ownership and release, and array-store failure behavior.
+
+Primitive `fill-array-data` payloads reconstruct with exact element widths and
+values. The emitted code checks null/capacity before any store, preserving the
+unchanged destination when a fill fails. Reference arrays, malformed payloads,
+noncanonical booleans and signaling NaNs remain rejected.
+
+Measured on 2026-09-24: **254,989 / 268,289 concrete methods reconstructed
+(95.043%)**, up from 241,897 (90.163%). This removes **13,092 fallbacks**;
+13,300 remain. The final release binary was rescanned after diagnostic cleanup
+and produced identical coverage. Exact corpus SHA-256, denominator and remaining
+fallback reasons are recorded in [the validation report](validation/coverage-95.json).
+
+Validation for this checkpoint: 709 default-suite tests passed; 60 optional
+tests were skipped by that run, with nine JVM execution tests run separately
+and passing. Strict Clippy, formatting and diff checks passed. The local
+`target/RDX.app` contains the rescanned release binary.
+
+### Recovered checked exception declarations
+
+When DEX omits checked-exception metadata, an explicit throw can now supply an
+exact Java `throws` declaration. The renderer must establish the value's
+Throwable type. Inference is restricted to private or static methods whose direct superclass
+is `java.lang.Object`; unknown inherited signature conflicts, overriding methods
+and static-hiding contracts retain their guards. A checked throw already handled by
+its original protected region does not require a broader method declaration.
+Existing explicit throws metadata is not broadened by this recovery.
+Only types needed by retained emitted code are collected; exploratory renderer
+passes cannot add declarations.
+
+This preserves the tested method body's exception identity and control flow.
+It does **not** establish whole-program recompilation equivalence: callers of a
+method with a recovered checked declaration may also need a corresponding catch
+or `throws` declaration. Inferred contracts are not yet propagated through the
+caller graph. RDX reconstruction coverage therefore remains separate from a
+claim that all emitted classes compile together without additional recovery.
+
+### Constructor and enum source normalization
+
+Linear constructors that always throw before initialization can use a Java 25
+constructor prologue: `if (true) { throw ...; } super();`. The explicit delegation
+is required by Java source rules but is never executed. A JDK 25 compile/run and
+bytecode check confirms that the emitted constructor contains `athrow` and no
+superclass invocation, including constructors with unassigned final fields.
+The renderer requires either `Object` as the direct superclass or an exact,
+loaded, accessible no-argument parent constructor without declared throws.
+Unknown or inaccessible parent constructors remain unsupported. Java 25 is a
+requirement for compiling this emitted syntax, not for running the Rust app.
+
+Erased enum constructors can reconstruct as Java enum constants when the
+initializer proves each constant's original name, ordinal, identity and array
+order. Original obfuscated constant fields remain aliases of the named constants.
+The private backing array is represented by Java's generated enum storage only
+when its uses are limited to the recognized initializer and standard `values()`
+method. Exposed arrays, custom uses, nonstandard initializers and instance state
+remain unsupported. JVM tests check names, ordinals, aliases, `valueOf`, identity
+and defensive copies returned by `values()`.
+
+Enum normalization is not exact reflection equivalence: named constants and
+original obfuscated aliases can produce additional reflective fields, and the
+compiler chooses the backing array's private name. This is a source-reconstruction
+normalization; it must not be interpreted as proof that the emitted class has an
+identical reflective layout or can replace the original binary unchanged.
+
+
+### Progress toward complete reconstruction (2026-09-25)
+
+The same pinned Play Store APK now reconstructs **259,509 of 268,289 concrete
+methods (96.727410%)**, compared with **254,989 (95.042659%)** at the previous
+checkpoint. This adds **4,520** reconstructed methods and leaves **8,780** explicit
+DEX fallbacks. The 100% target is not reached. Counts, exact APK/binary hashes,
+remaining reasons and representative method identities are recorded in
+[`validation/coverage-100-progress.json`](validation/coverage-100-progress.json).
+
+This batch adds structured loop exits and switches, shared switch tails,
+exception dispatch with erased metadata, synchronized typed handlers, standalone
+cleanup recovery, raw constant typing, constrained constructor recovery and
+fieldless enum reconstruction. It preserves rejection guards where the original
+exception scope, register state, allocation behavior or Java declaration cannot
+be established. Reconstruction acceptance is not a semantic-accuracy percentage.
+
+The largest next tasks are loop/register dataflow, overlapping exception and
+monitor regions, remaining allocation identities, and checked-throw contracts
+on overriding methods. Some DEX patterns require an explicit source normalization
+policy: allocating an object without ever invoking a constructor, for example,
+has no directly equivalent Java `new` expression. Increasing acceptance by
+silently dropping such an allocation would change observable behavior.

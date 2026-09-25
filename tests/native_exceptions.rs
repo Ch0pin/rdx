@@ -769,7 +769,7 @@ fn deferred_capture_moved_to_observed_handler_register_is_rejected() {
 }
 
 #[test]
-fn review_checked_catch_requires_a_potentially_throwing_protected_body() {
+fn erased_checked_catch_uses_guarded_dispatch_without_inventing_calls() {
     let class = fixture(
         vec![0x0012, 0x000f, 0x1012, 0x000f],
         vec![(Some("Ljava/io/IOException;"), 2)],
@@ -777,12 +777,14 @@ fn review_checked_catch_requires_a_potentially_throwing_protected_body() {
         2,
         "I",
     );
-    let rendered = native_java::render_method("sample.Effects", &class, &class.methods[0]);
+    let rendered = native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
     assert!(
-        rendered.is_err(),
-        "checked catch cannot compile: {}",
-        rendered.unwrap().source
+        rendered.source.contains("instanceof java.io.IOException"),
+        "{}",
+        rendered.source
     );
+    assert!(rendered.source.contains("catch (java.lang.Throwable"));
+    assert!(rendered.source.contains("throw caught"));
 }
 
 #[test]
@@ -868,7 +870,17 @@ fn unchanged_caught_throwable_can_be_rethrown_after_cleanup() {
     Arc::get_mut(&mut class.symbols).unwrap().protos[0].0 = "Ljava/lang/Throwable;".into();
     class.methods[0].code.as_mut().unwrap().instructions =
         vec![0x0071, 2, 0, 0x000e, 0x000d, 0x0071, 0, 0, 0x000c, 0x0027];
-    assert!(native_java::render_method("sample.Effects", &class, &class.methods[0]).is_err());
+    let code = native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
+    assert!(
+        code.source.contains("throws java.lang.Throwable"),
+        "{}",
+        code.source
+    );
+    assert!(
+        !code.source.contains("throw e"),
+        "replacement is not precise rethrow: {}",
+        code.source
+    );
 }
 
 #[test]
@@ -980,7 +992,9 @@ fn return_only_try_exits_are_allowed_but_effectful_exits_are_not_widened() {
     let error =
         native_java::render_method("sample.Effects", &effects, &effects.methods[0]).unwrap_err();
     assert!(
-        error.to_string().contains("distinct effectful exits"),
+        error
+            .to_string()
+            .contains("protected return tail crosses effectful continuation"),
         "{error:#}"
     );
 }
@@ -1335,4 +1349,430 @@ public static void main(String[] args) {
         );
     }
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn android_api_checked_catch_uses_exact_declared_call() {
+    let mut class = fixture(
+        vec![0x106e, 0, 2, 0x000a, 0x000f, 0x010d, 0x0012, 0x000f],
+        vec![(Some("Ljava/io/IOException;"), 5)],
+        0,
+        4,
+        "I",
+    );
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols.types[0] = "Ljava/io/InputStream;".into();
+    symbols.strings[0] = "read".into();
+    class.methods[0].parameters = vec!["Ljava/io/InputStream;".into()];
+    class.methods[0].code.as_mut().unwrap().ins = 1;
+    let hierarchy = rdx::native_hierarchy::TypeHierarchy::from_classes([&class]).unwrap();
+    class.symbols.hierarchy.set(Arc::new(hierarchy)).unwrap();
+    let code = native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
+    assert!(
+        code.source.contains("catch (java.io.IOException "),
+        "{}",
+        code.source
+    );
+    assert_eq!(code.source.matches(".read()").count(), 1);
+    // A method on the same class that does not declare IOException is not proof.
+    Arc::get_mut(&mut class.symbols).unwrap().strings[0] = "hashCode".into();
+    let guarded = native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
+    assert!(guarded.source.contains("instanceof java.io.IOException"));
+    assert!(!guarded.source.contains("catch (java.io.IOException"));
+}
+
+fn nonvoid_cleanup_fixture() -> DexClass {
+    let mut class = fixture(
+        vec![
+            0x0071, 0, 0, 0x000a, 0x0071, 1, 0, 0x000a, 0x0071, 2, 0, 0x000f, 0x010d, 0x0071, 2, 0,
+            0x0127, 0x010d, 0x0012, 0x000f,
+        ],
+        vec![],
+        0,
+        1,
+        "I",
+    );
+    let outer: Arc<[(Option<Arc<str>>, u32)]> =
+        vec![(Some(Arc::from("Ljava/lang/RuntimeException;")), 17)].into();
+    class.methods[0].code.as_mut().unwrap().try_regions = vec![
+        DexTryRegion {
+            start: 0,
+            end: 4,
+            catches: outer.clone(),
+        },
+        DexTryRegion {
+            start: 4,
+            end: 8,
+            catches: vec![(None, 12)].into(),
+        },
+        DexTryRegion {
+            start: 8,
+            end: 12,
+            catches: outer.clone(),
+        },
+        DexTryRegion {
+            start: 13,
+            end: 17,
+            catches: outer,
+        },
+    ];
+    class.methods[0].code.as_mut().unwrap().tries = 4;
+    class
+}
+
+#[test]
+fn nested_cleanup_preserves_nonvoid_return() {
+    let class = nonvoid_cleanup_fixture();
+    let code = native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("finally {"), "{}", code.source);
+    assert_eq!(code.source.matches(".touch()").count(), 1);
+    assert!(code.source.find("return ").unwrap() < code.source.find("finally {").unwrap());
+}
+
+#[test]
+#[ignore = "requires javac and java on PATH"]
+fn nonvoid_finally_return_and_throw_paths_run_on_jvm() {
+    use std::{fs, process::Command};
+    let class = nonvoid_cleanup_fixture();
+    let method = native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
+    let directory =
+        std::env::temp_dir().join(format!("rdx-nonvoid-finally-{}", std::process::id()));
+    fs::create_dir_all(directory.join("sample")).unwrap();
+    let source = format!(
+        r#"package sample; public class Effects {{
+static int fail, trace;
+static int first() {{ trace = trace * 10 + 1; if (fail == 1) throw new IllegalStateException(); return 13; }}
+static int second() {{ trace = trace * 10 + 2; if (fail == 2) throw new IllegalStateException(); return 27; }}
+static void touch() {{ trace = trace * 10 + 3; if (fail == 3) throw new IllegalStateException(); }}
+{}
+public static void main(String[] args) {{
+    for (fail = 0; fail < 4; fail++) {{
+        trace = 0;
+        int result = test();
+        if (result != (fail == 0 ? 27 : 0)) throw new AssertionError("return " + fail);
+        if (trace != (fail == 1 ? 1 : 123)) throw new AssertionError("effects " + fail + ": " + trace);
+    }}
+}}
+}}"#,
+        method.source
+    );
+    fs::write(directory.join("sample/Effects.java"), source).unwrap();
+    for (program, args) in [
+        ("javac", vec!["sample/Effects.java"]),
+        ("java", vec!["-cp", ".", "sample.Effects"]),
+    ] {
+        let output = Command::new(program)
+            .args(args)
+            .current_dir(&directory)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{program}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[ignore = "requires javac and java on PATH"]
+fn narrowed_checked_catch_preserves_other_exceptions_on_jvm() {
+    use std::{fs, process::Command};
+    let mut class = fixture(
+        vec![0x106e, 0, 2, 0x000a, 0x000f, 0x010d, 0x0012, 0x000f],
+        vec![(Some("Ljava/io/EOFException;"), 5)],
+        0,
+        4,
+        "I",
+    );
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols.types[0] = "Ljava/io/InputStream;".into();
+    symbols.strings[0] = "read".into();
+    class.methods[0].parameters = vec!["Ljava/io/InputStream;".into()];
+    class.methods[0].thrown_types = vec!["Ljava/io/IOException;".into()];
+    class.methods[0].code.as_mut().unwrap().ins = 1;
+    let hierarchy = rdx::native_hierarchy::TypeHierarchy::from_classes([&class]).unwrap();
+    class.symbols.hierarchy.set(Arc::new(hierarchy)).unwrap();
+    let method = native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
+    let directory = std::env::temp_dir().join(format!("rdx-narrowed-catch-{}", std::process::id()));
+    fs::create_dir_all(directory.join("sample")).unwrap();
+    let source = format!(
+        r#"package sample; public class Effects {{
+{}
+static int mode;
+public static void main(String[] args) throws Exception {{
+    java.io.InputStream stream = new java.io.InputStream() {{
+        public int read() throws java.io.IOException {{
+            if (mode == 1) throw new java.io.EOFException();
+            if (mode == 2) throw new java.io.IOException("other");
+            return 7;
+        }}
+    }};
+    if (test(stream) != 7) throw new AssertionError();
+    mode = 1;
+    if (test(stream) != 0) throw new AssertionError();
+    mode = 2;
+    try {{ test(stream); throw new AssertionError(); }}
+    catch (java.io.IOException expected) {{ if (!"other".equals(expected.getMessage())) throw new AssertionError(); }}
+}}
+}}"#,
+        method.source
+    );
+    fs::write(directory.join("sample/Effects.java"), source).unwrap();
+    for (program, args) in [
+        ("javac", vec!["sample/Effects.java"]),
+        ("java", vec!["-cp", ".", "sample.Effects"]),
+    ] {
+        let result = Command::new(program)
+            .args(args)
+            .current_dir(&directory)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{program}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn erased_throws_dispatch_preserves_order_identity_and_unmatched_exceptions() {
+    use std::{fs, process::Command};
+    let mut class = fixture(
+        vec![
+            0x0071, 0, 0, 0x000a, 0x000f, 0x010d, 0x0013, 10, 0x000f, 0x010d, 0x0013, 20, 0x000f,
+        ],
+        vec![
+            (Some("Ljava/io/EOFException;"), 5),
+            (Some("Ljava/io/IOException;"), 9),
+        ],
+        0,
+        4,
+        "I",
+    );
+    let h = rdx::native_hierarchy::TypeHierarchy::from_classes([&class]).unwrap();
+    class.symbols.hierarchy.set(Arc::new(h)).unwrap();
+    let dispatch = native_java::render_method("sample.Effects", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    class.methods[0].name = "rethrow".into();
+    let dex = class.methods[0].code.as_mut().unwrap();
+    dex.instructions = vec![0x0071, 0, 0, 0x000a, 0x000f, 0x010d, 0x0127];
+    dex.try_regions[0].catches = vec![(Some(Arc::from("Ljava/io/IOException;")), 5)].into();
+    let rethrow = native_java::render_method("sample.Effects", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    let source = format!(
+        r#"package sample; public class Effects {{
+static Throwable failure; static int calls;
+@SuppressWarnings("unchecked") static <E extends Throwable> void raise(Throwable e) throws E {{ throw (E)e; }}
+static int first() {{ calls++; if (failure!=null) Effects.<RuntimeException>raise(failure); return 7; }}
+{dispatch}
+{rethrow}
+public static void main(String[] args) {{
+ if (test()!=7 || calls!=1) throw new AssertionError();
+ failure=new java.io.EOFException(); if(test()!=10 || calls!=2) throw new AssertionError("first matching handler");
+ failure=new java.io.IOException(); if(test()!=20 || calls!=3) throw new AssertionError("super handler");
+ for(Throwable e : new Throwable[] {{new IllegalStateException(),new AssertionError()}}) {{
+  failure=e; try {{test();throw new AssertionError("swallowed");}} catch(Throwable actual) {{if(actual!=e)throw new AssertionError("identity");}}
+ }}
+ failure=new java.io.IOException();
+ try {{rethrow();throw new AssertionError("swallowed");}}catch(Throwable actual){{if(actual!=failure)throw new AssertionError("rethrow identity");}}
+}}
+}}"#
+    );
+    let directory = std::env::temp_dir().join(format!("rdx-erased-throws-{}", std::process::id()));
+    fs::create_dir_all(directory.join("sample")).unwrap();
+    fs::write(directory.join("sample/Effects.java"), source).unwrap();
+    for (program, args) in [
+        ("javac", vec!["sample/Effects.java"]),
+        ("java", vec!["-cp", ".", "sample.Effects"]),
+    ] {
+        let result = Command::new(program)
+            .args(args)
+            .current_dir(&directory)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{program}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+fn terminal_result_reuses_handler_input_fixture(goto_tail: bool) -> DexClass {
+    let mut class = fixture(
+        if goto_tail {
+            vec![
+                0x1071, 0, 0, 0x000a, 0x0128, 0x000f, 0x1071, 1, 0, 0x000a, 0x000f,
+            ]
+        } else {
+            vec![0x1071, 0, 0, 0x000a, 0x000f, 0x1071, 1, 0, 0x000a, 0x000f]
+        },
+        vec![(
+            Some("Ljava/lang/AbstractMethodError;"),
+            if goto_tail { 6 } else { 5 },
+        )],
+        0,
+        4,
+        "I",
+    );
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols.protos[0] = ("I".into(), vec!["Ljava/lang/String;".into()]);
+    class.methods[0].parameters = vec!["Ljava/lang/String;".into()];
+    let code = class.methods[0].code.as_mut().unwrap();
+    code.registers = 1;
+    code.ins = 1;
+    code.outs = 1;
+    let h = rdx::native_hierarchy::TypeHierarchy::from_classes([&class]).unwrap();
+    class.symbols.hierarchy.set(Arc::new(h)).unwrap();
+    class
+}
+
+#[test]
+fn terminal_result_can_reuse_exception_handler_argument_with_another_type() {
+    for goto_tail in [false, true] {
+        let class = terminal_result_reuses_handler_input_fixture(goto_tail);
+        let rendered =
+            native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
+        assert!(
+            rendered
+                .source
+                .contains("catch (java.lang.AbstractMethodError"),
+            "{}",
+            rendered.source
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn terminal_result_snapshot_preserves_normal_and_exception_values_on_jvm() {
+    use std::{fs, process::Command};
+    for goto_tail in [false, true] {
+        let class = terminal_result_reuses_handler_input_fixture(goto_tail);
+        let method =
+            native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
+        let source = format!(
+            r#"package sample; public class Effects {{
+static boolean fail; static String observed;
+static int first(String s) {{ if(fail) throw new AbstractMethodError(); return s.length(); }}
+static int second(String s) {{ observed=s;return 91; }}
+{}
+public static void main(String[] args) {{
+ String s=new String("original");if(test(s)!=8 || observed!=null)throw new AssertionError();
+ fail=true;if(test(s)!=91 || observed!=s)throw new AssertionError("handler lost original register");
+}}
+}}"#,
+            method.source
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "rdx-terminal-snapshot-{}-{goto_tail}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join("sample")).unwrap();
+        fs::write(dir.join("sample/Effects.java"), source).unwrap();
+        for (program, args) in [
+            ("javac", vec!["sample/Effects.java"]),
+            ("java", vec!["-cp", ".", "sample.Effects"]),
+        ] {
+            let result = Command::new(program)
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{program}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+fn nested_guarded_probe_fixture() -> String {
+    let mut class = fixture(
+        vec![
+            0x0071, 0, 0, 0x000a, 0x000f, 0x010d, 0x0071, 2, 0, 0x0012, 0x000f, 0x020d, 0x0127,
+        ],
+        vec![(Some("Ljava/lang/RuntimeException;"), 5)],
+        0,
+        4,
+        "I",
+    );
+    class.methods[0]
+        .code
+        .as_mut()
+        .unwrap()
+        .try_regions
+        .push(DexTryRegion {
+            start: 6,
+            end: 9,
+            catches: vec![(Some(Arc::from("Ljava/io/IOException;")), 11)].into(),
+        });
+    class.methods[0].code.as_mut().unwrap().tries = 2;
+    let h = rdx::native_hierarchy::TypeHierarchy::from_classes([&class]).unwrap();
+    class.symbols.hierarchy.set(Arc::new(h)).unwrap();
+    native_java::render_method("sample.Effects", &class, &class.methods[0])
+        .unwrap()
+        .source
+}
+
+#[test]
+fn nested_guarded_probe_does_not_rewrite_outer_plain_catch_identity() {
+    let source = nested_guarded_probe_fixture();
+    assert!(
+        !source.contains("throw caught0;"),
+        "probe-local dispatch variable escaped: {source}"
+    );
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn nested_guarded_probe_preserves_outer_exception_identity_on_jvm() {
+    use std::{fs, process::Command};
+    let method = nested_guarded_probe_fixture();
+    let source = format!(
+        r#"package sample; public class Effects {{
+static RuntimeException outer = new IllegalStateException("outer");
+static Throwable inner;
+@SuppressWarnings("unchecked") static <E extends Throwable> void raise(Throwable e) throws E {{ throw (E)e; }}
+static int first() {{ throw outer; }}
+static void touch() {{ if(inner!=null) Effects.<RuntimeException>raise(inner); }}
+{method}
+public static void main(String[] args) {{
+ if(test()!=0)throw new AssertionError();
+ inner=new java.io.IOException("inner");
+ try {{test();throw new AssertionError("swallowed");}}catch(Throwable actual){{if(actual!=outer)throw new AssertionError("outer identity");}}
+ inner=new AssertionError("unmatched");
+ try {{test();throw new AssertionError("swallowed");}}catch(Throwable actual){{if(actual!=inner)throw new AssertionError("unmatched identity");}}
+}}
+}}"#
+    );
+    let dir = std::env::temp_dir().join(format!("rdx-nested-probe-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    fs::write(dir.join("sample/Effects.java"), source).unwrap();
+    for (program, args) in [
+        ("javac", vec!["sample/Effects.java"]),
+        ("java", vec!["-cp", ".", "sample.Effects"]),
+    ] {
+        let result = Command::new(program)
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{program}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
 }

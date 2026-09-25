@@ -117,6 +117,28 @@ fn implicit_constructor_proof_rejects_inaccessible_or_missing_super_constructor(
     let child = empty_class("Lsample/Child;", Some("Lsample/Base;"), 1);
     let parent = empty_class("Lsample/Base;", Some("Ljava/lang/Object;"), 1);
     let class = caller(&child, &parent);
+    // Both loaded classes have no fields, initializers, or constructors. Java's
+    // implicit Child() -> Base() -> Object() chain is exactly the observed call.
+    let source = native_java::render_method("sample.Caller", &class, &class.methods[0]).unwrap();
+    assert!(
+        source.source.contains("new sample.Child()"),
+        "{}",
+        source.source
+    );
+    assert!(
+        native_java::render("sample.Base", &parent)
+            .unwrap()
+            .source
+            .contains("class Base")
+    );
+    assert!(
+        native_java::render("sample.Child", &child)
+            .unwrap()
+            .source
+            .contains("extends Base")
+    );
+    let missing = empty_class("Lsample/Base;", Some("Lmissing/Ancestor;"), 1);
+    let class = caller(&child, &missing);
     assert!(native_java::render_method("sample.Caller", &class, &class.methods[0]).is_err());
 }
 
@@ -232,4 +254,43 @@ fn implicit_constructor_can_call_external_object_only_as_direct_parent() {
             .unwrap()
             .equivalent_noarg_constructor("Lsample/Abstract;", "Ljava/lang/Object;")
     );
+}
+
+#[test]
+fn observed_parameter_constructor_can_cross_proven_transparent_forwarder() {
+    let mut base = parent("Lsample/Base;", 1);
+    base.methods[0].parameters = vec!["I".into()];
+    base.methods[0].code.as_mut().unwrap().registers = 2;
+    base.methods[0].code.as_mut().unwrap().ins = 2;
+    let mut middle = parent("Lsample/Middle;", 1);
+    middle.superclass = Some(base.descriptor.clone());
+    middle.methods[0].parameters = vec!["I".into()];
+    middle.symbols = Arc::new(DexSymbols {
+        types: vec![base.descriptor.clone()],
+        strings: vec!["<init>".into()],
+        protos: vec![("V".into(), vec!["I".into()])],
+        methods: vec![(0, 0, 0)],
+        ..Default::default()
+    });
+    let code = middle.methods[0].code.as_mut().unwrap();
+    code.registers = 2;
+    code.ins = 2;
+    code.outs = 2;
+    code.instructions = vec![0x2070, 0, 0x0010, 0x000e];
+    let leaf = empty_class("Lsample/Leaf;", Some("Lsample/Middle;"), 1);
+    let mut caller = caller(&leaf, &base);
+    Arc::get_mut(&mut caller.symbols).unwrap().protos[0].1 = vec!["I".into()];
+    let code = caller.methods[0].code.as_mut().unwrap();
+    code.registers = 2;
+    code.outs = 2;
+    code.instructions = vec![0x0022, 0, 0x7112, 0x2070, 0, 0x0010, 0x0011];
+    let hierarchy = TypeHierarchy::from_classes([&leaf, &middle, &base, &caller]).unwrap();
+    assert!(hierarchy.equivalent_constructor(&leaf.descriptor, &base.descriptor, &["I".into()]));
+    let ctor = &hierarchy.recovered_constructors(&leaf.descriptor)[0];
+    assert_eq!(ctor.parent, middle.descriptor);
+    assert_eq!(ctor.invoked_owner, base.descriptor);
+    // A constant replacing the forwarded argument changes behavior and must fail.
+    middle.methods[0].code.as_mut().unwrap().instructions = vec![0x0112, 0x2070, 0, 0x0010, 0x000e];
+    let hierarchy = TypeHierarchy::from_classes([&leaf, &middle, &base, &caller]).unwrap();
+    assert!(!hierarchy.equivalent_constructor(&leaf.descriptor, &base.descriptor, &["I".into()]));
 }

@@ -106,13 +106,9 @@ fn shared_read_is_evaluated_once_and_static_write_remains_rejected() {
 #[test]
 fn throw_before_parent_initialization_does_not_invent_super_effects() {
     let class = fixture(vec![0x0012, 0x0027], &[]);
-    let err = native_java::render_method("sample.Hello", &class, &class.methods[0])
-        .err()
-        .unwrap();
-    assert!(
-        err.to_string().contains("throw before initialization"),
-        "{err:#}"
-    );
+    let code = native_java::render_method("sample.Hello", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("if (true)"), "{}", code.source);
+    assert!(code.source.find("throw null;").unwrap() < code.source.find("super();").unwrap());
 }
 
 #[test]

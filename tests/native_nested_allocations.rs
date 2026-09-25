@@ -100,7 +100,7 @@ fn child_arguments_capture_call_after_child_allocation() {
     assert!(code.source.contains("return v1;"), "{}", code.source);
 }
 #[test]
-fn rejects_call_that_would_move_across_child_allocation() {
+fn stages_call_before_child_constructor_without_reordering_effects() {
     let class = fixture(
         vec![
             0x0022, 0, 0x0071, 2, 0, 0x020a, 0x0122, 1, 0x2070, 1, 0x0021, 0x2070, 0, 0x0010,
@@ -109,7 +109,9 @@ fn rejects_call_that_would_move_across_child_allocation() {
         vec!["Lsample/B;"],
         vec!["I"],
     );
-    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("new sample.A"), "{}", code.source);
+    assert_eq!(code.source.matches("new sample.A").count(), 1);
 }
 #[test]
 fn rejects_crossed_constructor_lifetimes() {
@@ -139,7 +141,7 @@ fn earlier_capture_can_be_reused_inside_child_when_root_argument_preserves_order
     );
 }
 #[test]
-fn rejects_sibling_allocations_that_would_reorder_allocation_and_construction() {
+fn stages_sibling_constructors_in_original_order() {
     // A allocated, B allocated twice, only then the two B constructors execute.
     let class = fixture(
         vec![
@@ -148,7 +150,9 @@ fn rejects_sibling_allocations_that_would_reorder_allocation_and_construction() 
         vec!["Lsample/B;", "Lsample/B;"],
         vec![],
     );
-    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("new sample.A"), "{}", code.source);
+    assert_eq!(code.source.matches("new sample.A").count(), 1);
 }
 
 fn builder_fixture(owner: &str) -> DexClass {
@@ -213,7 +217,16 @@ fn ignored_builder_appends_preserve_mutations_and_live_aliases() {
 #[test]
 fn arbitrary_append_return_is_not_assumed_to_be_receiver() {
     let class = builder_fixture("Lsample/Builder;");
-    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("new sample.A"), "{}", code.source);
+    assert_eq!(
+        code.source.matches("v0.append(v1)").count(),
+        2,
+        "{}",
+        code.source
+    );
+    assert!(code.source.contains("v0.toString()"), "{}", code.source);
+    assert!(code.source.contains("return v0;"), "{}", code.source);
 }
 
 #[test]
@@ -276,10 +289,166 @@ fn ignored_char_append_preserves_overload_order_and_receiver_alias() {
 }
 
 #[test]
-fn unknown_ignored_builder_overload_still_declines() {
+fn unknown_ignored_builder_overload_is_staged_without_alias_assumption() {
     let mut class = builder_fixture("Ljava/lang/StringBuilder;");
     Arc::get_mut(&mut class.symbols).unwrap().protos[3].1[0] = "Ljava/lang/Object;".into();
     let hierarchy = rdx::native_hierarchy::TypeHierarchy::from_classes([&class]).unwrap();
     class.symbols.hierarchy.set(Arc::new(hierarchy)).unwrap();
-    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("new sample.A"), "{}", code.source);
+    assert_eq!(code.source.matches("new sample.A").count(), 1);
+}
+
+#[test]
+fn ignored_primitive_builder_appends_keep_effects_and_aliases() {
+    for (ty, literal, expected) in [("I", 46, "46"), ("Z", 1, "true")] {
+        let mut class = builder_fixture("Ljava/lang/StringBuilder;");
+        let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+        symbols
+            .protos
+            .push(("Ljava/lang/StringBuilder;".into(), vec![ty.into()]));
+        symbols.methods.push((1, 5, 2));
+        class.methods[0]
+            .code
+            .as_mut()
+            .unwrap()
+            .instructions
+            .splice(13..16, [0x0213, literal, 0x206e, 5, 0x0023]);
+        let code = native_java::render_method("sample.Test", &class, &class.methods[0])
+            .unwrap_or_else(|e| panic!("{ty}: {e}"));
+        assert_eq!(
+            code.source.matches(".append(").count(),
+            2,
+            "{}",
+            code.source
+        );
+        assert!(
+            code.source.contains(&format!(".append({expected})")),
+            "{}",
+            code.source
+        );
+        assert!(
+            code.source.find(".mp4").unwrap()
+                < code.source.find(&format!(".append({expected})")).unwrap()
+        );
+        assert!(code.source.contains("return v3;"), "{}", code.source);
+        assert!(
+            code.links.iter().any(|l| l.label
+                == format!("java.lang.StringBuilder.append({ty})Ljava/lang/StringBuilder;"))
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn primitive_builder_java_preserves_text_order_and_returned_alias() {
+    use std::{fs, process::Command};
+    let dir = std::env::temp_dir().join(format!("rdx-builder-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    for (ty, value, expected) in [("I", 46, ".mp446"), ("Z", 1, ".mp4true")] {
+        let mut class = builder_fixture("Ljava/lang/StringBuilder;");
+        let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+        symbols
+            .protos
+            .push(("Ljava/lang/StringBuilder;".into(), vec![ty.into()]));
+        symbols.methods.push((1, 5, 2));
+        class.methods[0]
+            .code
+            .as_mut()
+            .unwrap()
+            .instructions
+            .splice(13..16, [0x0213, value, 0x206e, 5, 0x0023]);
+        let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+        fs::write(dir.join("sample/Test.java"), format!("package sample; public class Test {{ {} public static void main(String[] args) {{ StringBuilder b = make(); if (!b.toString().equals(\"{expected}\") || !A.text.equals(\"{expected}\") || A.calls != 1) throw new AssertionError(b.toString()); System.out.print(\"ok\"); }} }} class A {{ static String text; static int calls; A(String value) {{ text=value; calls++; }} }}", code.source)).unwrap();
+        let result = Command::new("javac")
+            .arg(dir.join("sample/Test.java"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stderr),
+            code.source
+        );
+        let result = Command::new("java")
+            .arg("-cp")
+            .arg(&dir)
+            .arg("sample.Test")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout, b"ok");
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn staged_nested_wide_and_void_effects_execute_once_in_order() {
+    use std::{fs, process::Command};
+    // A allocation; B allocation; f()->long; B.init(long); effect(); A.init(B).
+    let mut class = fixture(
+        vec![
+            0x0022, 0, 0x0122, 1, 0x0071, 2, 0, 0x020b, 0x3070, 1, 0x0321, 0x0071, 3, 0, 0x2070, 0,
+            0x0010, 0x0111,
+        ],
+        vec!["Lsample/B;"],
+        vec!["J"],
+    );
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols.protos[2].0 = "J".into();
+    symbols.protos.push(("V".into(), vec![]));
+    symbols.strings.push("effect".into());
+    symbols.methods.push((2, 3, 2));
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    let dir = std::env::temp_dir().join(format!("rdx-staged-effects-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    let source = format!(
+        r#"package sample;
+public class Test {{
+{}
+static String log = ""; static boolean fail;
+public static void main(String[] args) {{
+ B b = make();
+ if (!log.equals("fBeA") || b.value != 0x123456789abcdefL || A.saved != b) throw new AssertionError(log);
+ log=""; fail=true;
+ try {{ make(); throw new AssertionError("expected failure"); }} catch (IllegalStateException expected) {{}}
+ if (!log.equals("fBe")) throw new AssertionError(log);
+ System.out.print("ok");
+}}
+}}
+class Source {{ static long f() {{ Test.log += "f"; return 0x123456789abcdefL; }} static void effect() {{ Test.log += "e"; if (Test.fail) throw new IllegalStateException(); }} }}
+class B {{ final long value; B(long v) {{ Test.log += "B"; value=v; }} }}
+class A {{ static B saved; A(B b) {{ Test.log += "A"; saved=b; }} }}
+"#,
+        code.source
+    );
+    fs::write(dir.join("sample/Test.java"), source).unwrap();
+    let result = Command::new("javac")
+        .arg(dir.join("sample/Test.java"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stderr),
+        code.source
+    );
+    let result = Command::new("java")
+        .arg("-cp")
+        .arg(&dir)
+        .arg("sample.Test")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(result.stdout, b"ok");
+    fs::remove_dir_all(dir).unwrap();
 }

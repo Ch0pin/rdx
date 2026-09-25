@@ -4,8 +4,11 @@
 //! platform graph below only records relationships guaranteed by the Java type
 //! hierarchy and needed to anchor exception ancestry.
 
+#[path = "native_constructor_recovery.rs"]
+mod constructor_recovery;
 use crate::native_dex::DexClass;
 use anyhow::{Result, ensure};
+pub use constructor_recovery::RecoveredConstructor;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +33,8 @@ struct TypeEntry {
     interfaces: Arc<[Arc<str>]>,
 }
 
+type DeclaredThrows = HashMap<String, (bool, Arc<[Arc<str>]>)>;
+
 /// Read-only project-wide class hierarchy. It is cheap to share behind an
 /// `Arc<TypeHierarchy>` from each DEX symbol table.
 #[derive(Debug, Clone)]
@@ -38,9 +43,13 @@ pub struct TypeHierarchy {
     ambiguous: Arc<HashSet<Arc<str>>>,
     cache: Arc<Mutex<RelationCache>>,
     trivial_constructors: Arc<HashMap<Arc<str>, Arc<str>>>,
+    recovered_constructors: Arc<HashMap<Arc<str>, Vec<RecoveredConstructor>>>,
+    accessible_noarg_superclasses: Arc<HashSet<Arc<str>>>,
     object_varargs: Arc<HashSet<String>>,
     object_calls: Arc<HashSet<String>>,
-    static_throws: Arc<HashMap<String, Arc<[Arc<str>]>>>,
+    static_throws: Arc<DeclaredThrows>,
+    loaded_owners: Arc<HashSet<Arc<str>>>,
+    noninstantiable_owners: Arc<HashSet<Arc<str>>>,
 }
 
 #[derive(Debug, Default)]
@@ -100,6 +109,20 @@ impl TypeHierarchy {
         ret: &str,
         caught: &str,
     ) -> bool {
+        self.call_declares(owner, name, args, ret, caught, true)
+    }
+
+    /// Exact declared exceptions from loaded methods or pinned Android API facts.
+    /// Dispatch mode and descriptor must match; project definitions override SDK facts.
+    pub fn call_declares(
+        &self,
+        owner: &str,
+        name: &str,
+        args: &[Arc<str>],
+        ret: &str,
+        caught: &str,
+        static_call: bool,
+    ) -> bool {
         if self.ambiguous.contains(owner) {
             return false;
         }
@@ -107,11 +130,26 @@ impl TypeHierarchy {
             "{owner}->{name}({}){ret}",
             args.iter().map(AsRef::as_ref).collect::<String>()
         );
-        self.static_throws.get(&key).is_some_and(|types| {
-            types.iter().any(|ty| {
-                self.assignable(ty, "Ljava/lang/Throwable;") == Relation::Proven
-                    && self.assignable(ty, caught) == Relation::Proven
-            })
+        let types: Vec<&str> = if let Some((is_static, types)) = self.static_throws.get(&key) {
+            if *is_static != static_call {
+                return false;
+            }
+            types.iter().map(AsRef::as_ref).collect()
+        } else if !self.loaded_owners.contains(owner) {
+            let Some((is_static, types)) = platform_exceptions().methods.get(&key) else {
+                return false;
+            };
+            if *is_static != static_call {
+                return false;
+            }
+            types.iter().map(String::as_str).collect()
+        } else {
+            return false;
+        };
+        types.iter().any(|ty| {
+            self.assignable(ty, "Ljava/lang/Throwable;") == Relation::Proven
+                && (self.assignable(ty, caught) == Relation::Proven
+                    || self.assignable(caught, ty) == Relation::Proven)
         })
     }
 
@@ -129,12 +167,57 @@ impl TypeHierarchy {
     /// only for an exact forwarding body, or a proven implicit default
     /// constructor calling the accessible direct parent's no-arg constructor.
     pub fn equivalent_noarg_constructor(&self, allocated: &str, invoked: &str) -> bool {
+        if self.noninstantiable_owners.contains(allocated) {
+            return false;
+        }
+        if self.strict_superclass(allocated, invoked) != Relation::Proven {
+            return false;
+        }
+        let mut current = allocated;
+        let mut visited = HashSet::new();
+        for _ in 0..256 {
+            if self.ambiguous.contains(current) || !visited.insert(current) {
+                return false;
+            }
+            let Some(parent) = self.trivial_constructors.get(current) else {
+                return false;
+            };
+            if parent.as_ref() == invoked {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    }
+
+    pub fn has_accessible_noarg_super(&self, owner: &str) -> bool {
+        self.accessible_noarg_superclasses.contains(owner)
+    }
+
+    pub fn recovered_constructors(&self, owner: &str) -> &[RecoveredConstructor] {
+        self.recovered_constructors
+            .get(owner)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn equivalent_constructor(
+        &self,
+        allocated: &str,
+        invoked: &str,
+        args: &[Arc<str>],
+    ) -> bool {
+        if args.is_empty() {
+            return self.equivalent_noarg_constructor(allocated, invoked);
+        }
         !self.ambiguous.contains(allocated)
+            && !self.ambiguous.contains(invoked)
             && self
-                .trivial_constructors
-                .get(allocated)
-                .is_some_and(|owner| owner.as_ref() == invoked)
-            && self.strict_superclass(allocated, invoked) == Relation::Proven
+                .recovered_constructors(allocated)
+                .iter()
+                .any(|constructor| {
+                    constructor.invoked_owner.as_ref() == invoked && constructor.parameters == args
+                })
     }
 
     /// Strict superclass ancestry only: implemented interfaces must never
@@ -185,16 +268,13 @@ impl TypeHierarchy {
                 || !class
                     .methods
                     .iter()
-                    .any(|method| method.access_flags & 8 != 0 && !method.thrown_types.is_empty())
+                    .any(|method| !method.thrown_types.is_empty())
             {
                 continue;
             }
             let mut seen = HashSet::new();
             let mut duplicates = HashSet::new();
             for method in &class.methods {
-                if method.access_flags & 8 == 0 {
-                    continue;
-                }
                 let key = format!(
                     "{}->{}({}){}",
                     class.descriptor,
@@ -210,7 +290,13 @@ impl TypeHierarchy {
                     duplicates.insert(key.clone());
                 }
                 if !method.thrown_types.is_empty() && method.declaring_type == class.descriptor {
-                    static_throws.insert(key, Arc::from(method.thrown_types.clone()));
+                    static_throws.insert(
+                        key,
+                        (
+                            method.access_flags & 8 != 0,
+                            Arc::from(method.thrown_types.clone()),
+                        ),
+                    );
                     ensure!(
                         static_throws.len() <= MAX_EDGES,
                         "declared exception index exceeds limit"
@@ -224,6 +310,24 @@ impl TypeHierarchy {
         let object_varargs = verified_object_calls(&classes, true);
         let object_calls = verified_object_calls(&classes, false);
         let implicit_constructors = verified_implicit_constructors(&classes);
+        let mut recovered_constructors = constructor_recovery::recover(&classes);
+        let accessible_noarg_superclasses =
+            constructor_recovery::accessible_noarg_superclasses(&classes);
+        // Explicit parameter constructors suppress Java's implicit default.
+        // Preserve an already-proven accessible default when adding overloads.
+        for (owner, constructors) in &mut recovered_constructors {
+            if let Some(parent) = implicit_constructors.get(owner) {
+                constructors.insert(
+                    0,
+                    RecoveredConstructor {
+                        parent: parent.clone(),
+                        invoked_owner: parent.clone(),
+                        parameters: vec![],
+                        thrown_types: vec![],
+                    },
+                );
+            }
+        }
         let mut entries = platform_entries();
         let mut ambiguous = HashSet::new();
         let mut trivial_constructors = HashMap::new();
@@ -235,6 +339,12 @@ impl TypeHierarchy {
             .map(|entry| usize::from(entry.superclass.is_some()) + entry.interfaces.len())
             .sum::<usize>();
 
+        let loaded_owners = classes.iter().map(|c| c.descriptor.clone()).collect();
+        let noninstantiable_owners = classes
+            .iter()
+            .filter(|class| class.access_flags & (0x200 | 0x400 | 0x4000) != 0)
+            .map(|class| class.descriptor.clone())
+            .collect();
         for class in classes {
             count = count.saturating_add(1);
             ensure!(
@@ -275,7 +385,11 @@ impl TypeHierarchy {
         trivial_constructors.retain(|descriptor, _| !constructor_conflicts.contains(descriptor));
         Ok(Self {
             static_throws: Arc::new(static_throws),
+            loaded_owners: Arc::new(loaded_owners),
+            noninstantiable_owners: Arc::new(noninstantiable_owners),
             trivial_constructors: Arc::new(trivial_constructors),
+            recovered_constructors: Arc::new(recovered_constructors),
+            accessible_noarg_superclasses: Arc::new(accessible_noarg_superclasses),
             object_varargs: Arc::new(object_varargs),
             object_calls: Arc::new(object_calls),
             entries: Arc::new(entries),
@@ -460,8 +574,31 @@ impl TypeHierarchy {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct PlatformExceptions {
+    exception_parents: HashMap<String, Option<String>>,
+    types: HashMap<String, (Option<String>, Vec<String>)>,
+    methods: HashMap<String, (bool, Vec<String>)>,
+}
+fn platform_exceptions() -> &'static PlatformExceptions {
+    static FACTS: std::sync::OnceLock<PlatformExceptions> = std::sync::OnceLock::new();
+    FACTS.get_or_init(|| {
+        serde_json::from_str(include_str!("../data/android-35-exceptions.json"))
+            .expect("embedded Android exception metadata is valid")
+    })
+}
+
 fn platform_entries() -> HashMap<Arc<str>, TypeEntry> {
     let mut entries = HashMap::new();
+    for (name, parent) in &platform_exceptions().exception_parents {
+        entries.insert(
+            Arc::from(name.as_str()),
+            TypeEntry {
+                superclass: parent.as_deref().map(Arc::from),
+                interfaces: Arc::from([]),
+            },
+        );
+    }
     entries.insert(
         Arc::from(OBJECT),
         TypeEntry {
@@ -658,6 +795,17 @@ fn platform_entries() -> HashMap<Arc<str>, TypeEntry> {
         .get_mut("Ljava/sql/SQLException;")
         .unwrap()
         .interfaces = Arc::from([Arc::from("Ljava/lang/Iterable;")]);
+    // Pinned SDK declarations provide complete parent/interface edges. Project
+    // definitions replace these entries during hierarchy construction.
+    for (name, (parent, interfaces)) in &platform_exceptions().types {
+        entries.insert(
+            Arc::from(name.as_str()),
+            TypeEntry {
+                superclass: parent.as_deref().map(Arc::from),
+                interfaces: interfaces.iter().map(|s| Arc::from(s.as_str())).collect(),
+            },
+        );
+    }
     entries
 }
 
@@ -750,11 +898,16 @@ fn verified_implicit_constructors(classes: &[&DexClass]) -> HashMap<Arc<str>, Ar
             .to_string()
     };
     let mut result = HashMap::new();
+    let mut dependencies: HashMap<Arc<str>, Vec<Arc<str>>> = HashMap::new();
     for &class in classes {
         if duplicates.contains(class.descriptor.as_ref())
-            || class.access_flags & (0x200 | 0x400 | 0x4000) != 0
+            || class.access_flags & (0x200 | 0x4000) != 0
             || !matches!(class.access_flags & 7, 0 | 1)
             || class.descriptor.contains('$')
+            || class
+                .fields
+                .iter()
+                .any(|field| !field.is_static && field.access_flags & 0x10 != 0)
             || class
                 .methods
                 .iter()
@@ -787,6 +940,16 @@ fn verified_implicit_constructors(classes: &[&DexClass]) -> HashMap<Arc<str>, Ar
             continue;
         }
         let Some(constructor) = noarg.get(parent_type.as_ref()).copied().flatten() else {
+            if !parent
+                .methods
+                .iter()
+                .any(|method| method.name.as_ref() == "<init>")
+            {
+                dependencies
+                    .entry(parent_type.clone())
+                    .or_default()
+                    .push(class.descriptor.clone());
+            }
             continue;
         };
         if constructor.declaring_type != *parent_type
@@ -803,6 +966,14 @@ fn verified_implicit_constructors(classes: &[&DexClass]) -> HashMap<Arc<str>, Ar
             continue;
         }
         result.insert(Arc::clone(&class.descriptor), Arc::clone(parent_type));
+    }
+    let mut queue: VecDeque<Arc<str>> = result.keys().cloned().collect();
+    while let Some(parent) = queue.pop_front() {
+        for child in dependencies.remove(&parent).unwrap_or_default() {
+            if result.insert(child.clone(), parent.clone()).is_none() {
+                queue.push_back(child);
+            }
+        }
     }
     result
 }

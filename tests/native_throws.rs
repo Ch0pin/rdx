@@ -45,7 +45,7 @@ fn unchecked_exception_and_null_are_terminal_throws() {
     assert!(code.source.contains("throw null;"));
 }
 #[test]
-fn checked_throw_requires_exact_declared_exception_and_preserves_type_link() {
+fn checked_throw_uses_exact_declared_or_body_inferred_type_and_preserves_link() {
     let ty = "Ljava/io/IOException;";
     let code = render(&fixture(&[0x0027], &[ty], "V", 1, &[ty])).unwrap();
     assert!(code.source.contains("throws java.io.IOException"));
@@ -62,7 +62,23 @@ fn checked_throw_requires_exact_declared_exception_and_preserves_type_link() {
         .take(link.end - link.start)
         .collect();
     assert_eq!(text, "java.io.IOException");
-    assert!(render(&fixture(&[0x0027], &[ty], "V", 1, &[])).is_err());
+    let inferred = render(&fixture(&[0x0027], &[ty], "V", 1, &[])).unwrap();
+    assert!(inferred.source.contains("throws java.io.IOException"));
+    assert!(inferred.source.contains("throw p0;"));
+    let link = inferred
+        .links
+        .iter()
+        .find(|link| link.label == "java.io.IOException")
+        .unwrap();
+    assert_eq!(
+        inferred
+            .source
+            .chars()
+            .skip(link.start)
+            .take(link.end - link.start)
+            .collect::<String>(),
+        "java.io.IOException"
+    );
     assert!(
         render(&fixture(
             &[0x0027],

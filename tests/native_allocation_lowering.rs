@@ -623,7 +623,7 @@ fn constructor_argument_guarded_integer_copy_and_add() {
     c.methods[0].code.as_mut().unwrap().ins = 1;
     let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
     assert!(code.source.contains("p0 != 0 ? p0 : 1"), "{}", code.source);
-    assert!(code.source.contains("+ -1"), "{}", code.source);
+    assert!(code.source.contains("+ (-1)"), "{}", code.source);
     assert_eq!(code.source.matches("new sample.A").count(), 1);
     assert!(code.links.iter().any(|l| l.label == "sample.A.<init>(I)V"));
 
@@ -674,4 +674,517 @@ fn filled_array_arguments_preserve_order_in_both_dex_encodings() {
                 .all(|link| link.label != "[I" && link.label != "int")
         );
     }
+}
+
+#[test]
+fn allocation_stages_void_calls_before_constructor() {
+    let mut class = class(
+        vec![0x0022, 0, 0x0071, 0, 0, 0x1070, 1, 0, 0x0011],
+        vec!["effect", "<init>"],
+        vec![(1, 0, 0), (0, 0, 1)],
+    );
+    Arc::get_mut(&mut class.symbols).unwrap().protos[0].0 = "V".into();
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(
+        code.source.contains("sample.Source.effect();"),
+        "{}",
+        code.source
+    );
+    assert!(!code.source.contains("void v"), "{}", code.source);
+    assert!(code.source.find("effect()").unwrap() < code.source.find("new sample.A").unwrap());
+    let link = code
+        .links
+        .iter()
+        .find(|l| l.label == "sample.Source.effect()V")
+        .unwrap();
+    assert_eq!(
+        code.source
+            .chars()
+            .skip(link.start)
+            .take(link.end - link.start)
+            .collect::<String>(),
+        "effect"
+    );
+}
+
+#[test]
+fn allocation_accepts_wide_call_field_and_literal_arguments() {
+    for (ty, prefix, source) in [
+        ("J", vec![0x0071, 0, 0, 0x010b], "sample.Source.effect()"),
+        ("D", vec![0x0071, 0, 0, 0x010b], "sample.Source.effect()"),
+        ("J", vec![0x0161, 0], "sample.Source.number"),
+        ("J", vec![0x0116, 42], "42L"),
+        ("D", vec![0x0119, 0x3ff0], "1.0d"),
+    ] {
+        let mut words = vec![0x0022, 0];
+        words.extend(prefix);
+        words.extend([0x3070, 1, 0x0210, 0x0011]);
+        let mut class = class(
+            words,
+            vec!["number", "<init>", "effect"],
+            vec![(1, 0, 2), (0, 1, 1)],
+        );
+        let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+        symbols.protos[0].0 = ty.into();
+        symbols.protos[1].1[0] = ty.into();
+        symbols.types[2] = ty.into();
+        let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+        assert!(code.source.contains(source), "{}", code.source);
+        assert!(!code.source.contains("wide-tail"));
+    }
+}
+
+#[test]
+fn allocation_rejects_invalidated_wide_pairs_and_nonadjacent_arguments() {
+    for tail in [vec![0x0212, 0x3070, 1, 0x0210], vec![0x3070, 1, 0x0110]] {
+        let mut words = vec![0x0022, 0, 0x0071, 0, 0, 0x010b];
+        words.extend(tail);
+        words.push(0x0011);
+        let mut class = class(words, vec!["number", "<init>"], vec![(1, 0, 0), (0, 1, 1)]);
+        let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+        symbols.protos[0].0 = "J".into();
+        symbols.protos[1].1[0] = "J".into();
+        assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+    }
+}
+
+#[test]
+fn unused_field_read_is_retained_before_constructor() {
+    let mut class = class(
+        vec![0x0022, 0, 0x0160, 0, 0x1112, 0x1070, 0, 0, 0x0011],
+        vec!["number", "<init>"],
+        vec![(0, 1, 1)],
+    );
+    Arc::get_mut(&mut class.symbols).unwrap().protos[1]
+        .1
+        .clear();
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(
+        code.source.find("sample.Source.number").unwrap()
+            < code.source.find("new sample.A").unwrap(),
+        "{}",
+        code.source
+    );
+    assert_eq!(code.source.matches("sample.Source.number").count(), 1);
+}
+
+#[test]
+fn live_wide_input_survives_allocation_staging() {
+    let mut class = class(
+        vec![0x0022, 0, 0x0071, 0, 0, 0x1070, 1, 0, 0x0110],
+        vec!["effect", "<init>"],
+        vec![(1, 0, 0), (0, 0, 1)],
+    );
+    Arc::get_mut(&mut class.symbols).unwrap().protos[0].0 = "V".into();
+    class.methods[0].parameters = vec!["J".into()];
+    class.methods[0].return_type = "J".into();
+    class.methods[0].code.as_mut().unwrap().ins = 2;
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("return p0;"), "{}", code.source);
+    assert!(!code.source.contains("wide-tail"));
+}
+
+#[test]
+fn allocation_keeps_typed_float_constant_conversion_bound_to_input() {
+    let mut class = class(
+        vec![0x0115, 0x3f80, 0x0022, 0, 0x2070, 0, 0x0010, 0x0011],
+        vec!["<init>"],
+        vec![(0, 1, 0)],
+    );
+    Arc::get_mut(&mut class.symbols).unwrap().protos[1].1[0] = "F".into();
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("1.0f"), "{}", code.source);
+}
+
+#[test]
+fn captured_arithmetic_preserves_operand_order_and_long_type() {
+    let mut class = class(
+        vec![
+            0x0022, 0, 0x0160, 0, 0x01d9, 0x0701, 0x2070, 0, 0x0010, 0x0011,
+        ],
+        vec!["number", "<init>"],
+        vec![(0, 1, 1)],
+    );
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("(7) - ("), "{}", code.source);
+    assert_eq!(code.source.matches("sample.Source.number").count(), 1);
+    class.methods[0].code.as_mut().unwrap().instructions = vec![
+        0x0022, 0, 0x0116, 1, 0x0316, 2, 0x31bb, 0x3070, 0, 0x0210, 0x0011,
+    ];
+    class.methods[0].code.as_mut().unwrap().registers = 5;
+    Arc::get_mut(&mut class.symbols).unwrap().protos[1].1[0] = "J".into();
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("(1L) + (2L)"), "{}", code.source);
+    assert!(code.source.contains("long v"));
+}
+
+#[test]
+fn nested_array_creation_keeps_dimension_and_array_type() {
+    for (descriptor, rendered) in [("[I", "new int[2]"), ("[[I", "new int[2][]")] {
+        let mut class = class(
+            vec![0x0022, 0, 0x2112, 0x1223, 2, 0x2070, 0, 0x0020, 0x0011],
+            vec!["<init>"],
+            vec![(0, 1, 0)],
+        );
+        let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+        symbols.types[2] = descriptor.into();
+        symbols.protos[1].1[0] = descriptor.into();
+        let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+        assert!(code.source.contains(rendered), "{}", code.source);
+    }
+}
+
+#[test]
+fn array_read_between_allocation_and_constructor_keeps_index_and_wide_pair() {
+    for (descriptor, op, registers, packed, invoke) in [
+        ("[I", 0x0244, 4, 0x0103, 0x2070),
+        ("[J", 0x0245, 5, 0x0104, 0x3070),
+    ] {
+        let mut class = class(
+            vec![
+                0x0022,
+                0,
+                0x0112,
+                op,
+                packed,
+                invoke,
+                0,
+                if descriptor == "[J" { 0x0320 } else { 0x0020 },
+                0x0011,
+            ],
+            vec!["<init>"],
+            vec![(0, 1, 0)],
+        );
+        Arc::get_mut(&mut class.symbols).unwrap().protos[1].1[0] = descriptor[1..].into();
+        class.methods[0].parameters = vec![descriptor.into()];
+        let code = class.methods[0].code.as_mut().unwrap();
+        code.registers = registers;
+        code.ins = 1;
+        let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+        assert!(code.source.contains("(p0)[0]"), "{}", code.source);
+        assert_eq!(code.source.matches("[0]").count(), 1);
+    }
+}
+
+fn branching_allocation() -> DexClass {
+    let mut class = class(
+        vec![
+            0x0022, 0, 0x0238, 7, 0x0071, 0, 0, 0x010a, 0x0228, 0x2112, 0x2070, 1, 0x0010, 0x0011,
+        ],
+        vec!["value", "<init>"],
+        vec![(1, 0, 0), (0, 1, 1)],
+    );
+    class.methods[0].parameters = vec!["Z".into()];
+    class.methods[0].code.as_mut().unwrap().ins = 1;
+    class
+}
+
+#[test]
+fn allocation_region_stages_conditional_argument_effects() {
+    let class = branching_allocation();
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("if ("), "{}", code.source);
+    assert_eq!(code.source.matches("sample.Source.value()").count(), 1);
+    assert!(
+        code.source.find("sample.Source.value()").unwrap()
+            < code.source.find("new sample.A").unwrap()
+    );
+}
+
+#[test]
+fn allocation_region_rejects_escaping_branch_and_uninitialized_alias() {
+    let mut class = branching_allocation();
+    class.methods[0].code.as_mut().unwrap().instructions[3] = 11;
+    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+    let mut class = branching_allocation();
+    class.methods[0].code.as_mut().unwrap().instructions =
+        vec![0x0022, 0, 0x0107, 0x0238, 3, 0x0000, 0x1070, 1, 1, 0x0111];
+    Arc::get_mut(&mut class.symbols).unwrap().protos[1]
+        .1
+        .clear();
+    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+}
+
+#[test]
+fn allocation_unary_conversion_and_array_length_are_staged() {
+    let mut class = class(
+        vec![0x0022, 0, 0x0116, 42, 0x1184, 0x2070, 0, 0x0010, 0x0011],
+        vec!["<init>"],
+        vec![(0, 1, 0)],
+    );
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("(int) (42L)"), "{}", code.source);
+    class.methods[0].parameters = vec!["[I".into()];
+    class.methods[0].code.as_mut().unwrap().ins = 1;
+    class.methods[0].code.as_mut().unwrap().instructions =
+        vec![0x0022, 0, 0x2121, 0x2070, 0, 0x0010, 0x0011];
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("(p0).length"), "{}", code.source);
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn conditional_allocation_java_keeps_branch_effects_and_exceptions() {
+    use std::{fs, process::Command};
+    let class = branching_allocation();
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    let dir =
+        std::env::temp_dir().join(format!("rdx-conditional-allocation-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    fs::write(dir.join("sample/Test.java"), format!(r#"package sample;
+public class Test {{ {}
+public static void main(String[] args) {{
+ if (make(false).value != 2 || Source.calls != 0 || A.calls != 1) throw new AssertionError();
+ if (make(true).value != 42 || Source.calls != 1 || A.calls != 2) throw new AssertionError();
+ Source.fail=true;
+ try {{ make(true); throw new AssertionError(); }} catch (IllegalStateException expected) {{}}
+ if (Source.calls != 2 || A.calls != 2) throw new AssertionError();
+ System.out.print("ok");
+}} }}
+class Source {{ static int calls; static boolean fail; static int value() {{ calls++; if (fail) throw new IllegalStateException(); return 42; }} }}
+class A {{ static int calls; final int value; A(int n) {{ value=n; calls++; }} }}
+"#, code.source)).unwrap();
+    let output = Command::new("javac")
+        .arg(dir.join("sample/Test.java"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        code.source
+    );
+    let output = Command::new("java")
+        .arg("-cp")
+        .arg(&dir)
+        .arg("sample.Test")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ok");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn null_object_move_and_primitive_array_cast_are_valid_allocation_inputs() {
+    let mut class = class(
+        vec![0x0022, 0, 0x0112, 0x1207, 0x2070, 0, 0x0020, 0x0011],
+        vec!["<init>"],
+        vec![(0, 1, 0)],
+    );
+    Arc::get_mut(&mut class.symbols).unwrap().protos[1].1[0] = "Ljava/lang/Object;".into();
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("null"), "{}", code.source);
+    class.methods[0].parameters = vec!["Ljava/lang/Object;".into()];
+    let code = class.methods[0].code.as_mut().unwrap();
+    code.ins = 1;
+    code.instructions = vec![0x0022, 0, 0x021f, 2, 0x2070, 0, 0x0020, 0x0011];
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols.types[2] = "[B".into();
+    symbols.protos[1].1[0] = "[B".into();
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("byte[]"), "{}", code.source);
+}
+
+#[test]
+fn narrowed_capture_keeps_declared_int_constructor_overload() {
+    let class = class(
+        vec![0x0022, 0, 0x7112, 0x118e, 0x2070, 0, 0x0010, 0x0011],
+        vec!["<init>"],
+        vec![(0, 1, 0)],
+    );
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("((int)"), "{}", code.source);
+    assert!(
+        code.links
+            .iter()
+            .any(|link| link.label == "sample.A.<init>(I)V")
+    );
+}
+
+fn array_store_allocation() -> DexClass {
+    let mut class = class(
+        vec![0x0022, 0, 0x0112, 0x034d, 0x0102, 0x1070, 0, 0, 0x0011],
+        vec!["<init>"],
+        vec![(0, 1, 0)],
+    );
+    Arc::get_mut(&mut class.symbols).unwrap().protos[1]
+        .1
+        .clear();
+    class.methods[0].parameters = vec!["[Ljava/lang/String;".into(), "Ljava/lang/Object;".into()];
+    let code = class.methods[0].code.as_mut().unwrap();
+    code.registers = 4;
+    code.ins = 2;
+    class
+}
+
+#[test]
+fn allocation_array_store_widens_receiver_without_casting_value() {
+    let class = array_store_allocation();
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(
+        code.source.contains("java.lang.Object[]"),
+        "{}",
+        code.source
+    );
+    assert!(!code.source.contains("][0]"), "{}", code.source);
+    assert!(code.source.contains("[0] = p1;"), "{}", code.source);
+    assert!(
+        !code.source.contains("((java.lang.String) p1)"),
+        "{}",
+        code.source
+    );
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn array_store_staging_preserves_jvm_exception_types_and_constructor_order() {
+    use std::{fs, process::Command};
+    let class = array_store_allocation();
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    let dir =
+        std::env::temp_dir().join(format!("rdx-allocation-array-store-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    fs::write(dir.join("sample/Test.java"), format!(r#"package sample;
+public class Test {{ {}
+public static void main(String[] args) {{
+ String[] array = new String[1]; make(array, "ok");
+ if (!array[0].equals("ok") || A.calls != 1) throw new AssertionError();
+ try {{ make(array, new Object()); throw new AssertionError(); }} catch (ArrayStoreException expected) {{}}
+ try {{ make(null, "ok"); throw new AssertionError(); }} catch (NullPointerException expected) {{}}
+ try {{ make(new String[0], "ok"); throw new AssertionError(); }} catch (ArrayIndexOutOfBoundsException expected) {{}}
+ if (A.calls != 1) throw new AssertionError(); System.out.print("ok");
+}} }}
+class A {{ static int calls; A() {{ calls++; }} }}
+"#, code.source)).unwrap();
+    let output = Command::new("javac")
+        .arg(dir.join("sample/Test.java"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        code.source
+    );
+    let output = Command::new("java")
+        .arg("-cp")
+        .arg(&dir)
+        .arg("sample.Test")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ok");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn allocation_field_store_precedes_read_and_constructor_and_keeps_link() {
+    let class = class(
+        vec![
+            0x0022, 0, 0x7112, 0x0167, 0, 0x0160, 0, 0x2070, 0, 0x0010, 0x0011,
+        ],
+        vec!["number", "<init>"],
+        vec![(0, 1, 1)],
+    );
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(
+        code.source.contains("sample.Source.number = 7;"),
+        "{}",
+        code.source
+    );
+    assert_eq!(code.source.matches("sample.Source.number").count(), 2);
+    assert!(
+        code.source.find("sample.Source.number = 7;").unwrap()
+            < code.source.find("new sample.A").unwrap()
+    );
+    let links: Vec<_> = code
+        .links
+        .iter()
+        .filter(|l| l.label == "sample.Source.number:I")
+        .collect();
+    assert_eq!(links.len(), 2);
+    for link in links {
+        assert_eq!(
+            code.source
+                .chars()
+                .skip(link.start)
+                .take(link.end - link.start)
+                .collect::<String>(),
+            "number"
+        );
+    }
+}
+
+#[test]
+fn allocation_store_cannot_expose_uninitialized_receiver() {
+    let mut class = class(
+        vec![0x0022, 0, 0x7112, 0x0159, 0, 0x2070, 0, 0x0010, 0x0011],
+        vec!["number", "<init>"],
+        vec![(0, 1, 1)],
+    );
+    Arc::get_mut(&mut class.symbols).unwrap().fields[0].0 = 0;
+    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+}
+
+#[test]
+fn branch_argument_staging_tracks_receiver_alias_and_overwritten_original() {
+    let mut c = class(
+        vec![
+            0x0022, 0, 0x0338, 4, 0x1112, 0x0228, 0x2112, 0x0207, 0x3012, 0x2070, 0, 0x0012, 0x0211,
+        ],
+        vec!["number", "<init>"],
+        vec![(0, 1, 1)],
+    );
+    c.methods[0].parameters = vec!["Z".into()];
+    let code = c.methods[0].code.as_mut().unwrap();
+    code.registers = 4;
+    code.ins = 1;
+    let output = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    assert!(output.source.contains("if ("), "{}", output.source);
+    assert_eq!(
+        output.source.matches("new sample.A(").count(),
+        1,
+        "{}",
+        output.source
+    );
+    assert!(!output.source.contains("<new"), "{}", output.source);
+}
+#[test]
+fn branch_argument_staging_rejects_uninitialized_alias_escape() {
+    let mut c = class(
+        vec![
+            0x0022, 0, 0x0338, 4, 0x1112, 0x0228, 0x2112, 0x0207, 0x2070, 0, 0x0022, 0x0211,
+        ],
+        vec!["number", "<init>"],
+        vec![(0, 1, 1)],
+    );
+    c.methods[0].parameters = vec!["Z".into()];
+    let code = c.methods[0].code.as_mut().unwrap();
+    code.registers = 4;
+    code.ins = 1;
+    assert!(native_java::render_method("sample.Test", &c, &c.methods[0]).is_err());
+}
+
+#[test]
+fn allocation_boolean_xor_keeps_boolean_constructor_argument() {
+    let mut c = class(
+        vec![0x0022, 0, 0x01df, 0x0102, 0x2070, 0, 0x0010, 0x0011],
+        vec!["number", "<init>"],
+        vec![(0, 1, 1)],
+    );
+    Arc::get_mut(&mut c.symbols).unwrap().protos[1].1 = vec!["Z".into()];
+    c.methods[0].parameters = vec!["Z".into()];
+    c.methods[0].code.as_mut().unwrap().ins = 1;
+    let out = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    assert!(out.source.contains("^ (true)"), "{}", out.source);
+    assert!(out.source.contains("new sample.A"), "{}", out.source);
 }

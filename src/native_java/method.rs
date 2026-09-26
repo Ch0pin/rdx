@@ -204,6 +204,7 @@ fn boolean_bitwise_expression(
     words: &[u16],
     pc: usize,
     regs: &[Option<Value>],
+    decoded: Option<&(usize, [usize; 2], Option<i64>)>,
 ) -> Result<Option<(usize, String)>> {
     let kind = match op {
         0x90..=0x9a => op - 0x90,
@@ -221,7 +222,17 @@ fn boolean_bitwise_expression(
         wide_literal: None,
         raw_bits32: false,
     };
-    let (dst, left, right) = if op <= 0x9a {
+    let (dst, left, right) = if let Some((dst, sources, immediate)) = decoded {
+        (
+            *dst,
+            register(regs, sources[0])?,
+            if let Some(n) = immediate {
+                literal(*n as i32)
+            } else {
+                register(regs, sources[1])?
+            },
+        )
+    } else if op <= 0x9a {
         (
             a,
             register(regs, (words[pc + 1] & 255) as usize)?,
@@ -294,6 +305,423 @@ fn receiver(value: &Value, ty: &str) -> Result<String> {
 fn wide(ty: &str) -> bool {
     matches!(ty, "J" | "D")
 }
+// Eligible straight-line methods consume the shared decoder's operands. These
+// checks are invariants, not a reason to retry raw operand decoding.
+fn decoded_register(
+    operand: &crate::native_ir::RegisterOperand,
+    kind: crate::native_ir::ValueKind,
+    registers: usize,
+) -> Result<usize> {
+    let register = usize::from(operand.register);
+    ensure!(
+        operand.kind == kind && register + kind.word_count() <= registers,
+        "invalid shared register operand"
+    );
+    Ok(register)
+}
+
+fn decoded_arithmetic(
+    instruction: &crate::native_ir::Instruction,
+    registers: usize,
+) -> Result<(usize, [usize; 2], Option<i64>)> {
+    use crate::native_ir::ValueKind::{Bits32, Wide64};
+    let kind = |numeric: numeric::Kind| if numeric.width() == 2 { Wide64 } else { Bits32 };
+    let op = instruction.opcode;
+    let (reads, write, width, literal, may_throw) = match op {
+        0x2d..=0x31 => {
+            let spec = numeric::Compare::decode(op).context("shared comparison opcode")?;
+            ([kind(spec.input); 2], Bits32, 2, false, false)
+        }
+        0x7b..=0x8f => {
+            let spec = numeric::Unary::decode(op).context("shared unary opcode")?;
+            (
+                [kind(spec.input), Bits32],
+                kind(spec.result),
+                1,
+                false,
+                false,
+            )
+        }
+        0x90..=0xcf => {
+            let spec = numeric::Binary::decode(op).context("shared binary opcode")?;
+            let basic = if op >= 0xb0 { op - 0x20 } else { op };
+            (
+                [kind(spec.left), kind(spec.right)],
+                kind(spec.result),
+                if op >= 0xb0 { 1 } else { 2 },
+                false,
+                matches!(basic, 0x93 | 0x94 | 0x9e | 0x9f),
+            )
+        }
+        0xd0..=0xe2 => (
+            [Bits32; 2],
+            Bits32,
+            2,
+            true,
+            matches!(op, 0xd3 | 0xd4 | 0xdb | 0xdc),
+        ),
+        _ => bail!("invalid shared arithmetic opcode"),
+    };
+    ensure!(
+        instruction.width == width
+            && instruction.may_throw == may_throw
+            && instruction.reference.is_none()
+            && instruction.prototype.is_none()
+            && instruction.branch_target.is_none()
+            && instruction.payload_target.is_none(),
+        "invalid shared arithmetic metadata"
+    );
+    let read_count = if matches!(op, 0x7b..=0x8f | 0xd0..=0xe2) {
+        1
+    } else {
+        2
+    };
+    ensure!(
+        instruction.reads.len() == read_count && instruction.writes.len() == 1,
+        "invalid shared arithmetic operand count"
+    );
+    ensure!(
+        instruction.literal.is_some() == literal,
+        "invalid shared arithmetic literal"
+    );
+    if let Some(value) = instruction.literal {
+        ensure!(
+            if op <= 0xd7 {
+                i16::try_from(value).is_ok()
+            } else {
+                i8::try_from(value).is_ok()
+            },
+            "shared arithmetic literal exceeds encoding"
+        );
+    }
+    let dst = decoded_register(&instruction.writes[0], write, registers)?;
+    let mut sources = [0; 2];
+    for (index, operand) in instruction.reads.iter().enumerate() {
+        sources[index] = decoded_register(operand, reads[index], registers)?;
+    }
+    ensure!(
+        !(0xb0..=0xcf).contains(&op) || sources[0] == dst,
+        "shared 2addr destination differs from left operand"
+    );
+    Ok((dst, sources, instruction.literal))
+}
+
+fn decoded_field(
+    instruction: &crate::native_ir::Instruction,
+    registers: usize,
+) -> Result<(usize, Option<usize>, usize)> {
+    use crate::native_ir::{PoolKind, ValueKind};
+    let op = instruction.opcode;
+    ensure!((0x52..=0x6d).contains(&op), "invalid shared field opcode");
+    let is_static = op >= 0x60;
+    let put = if is_static { op >= 0x67 } else { op >= 0x59 };
+    let family = if op >= 0x67 {
+        op - 0x67
+    } else if is_static {
+        op - 0x60
+    } else if put {
+        op - 0x59
+    } else {
+        op - 0x52
+    };
+    let kind = match family {
+        1 => ValueKind::Wide64,
+        2 => ValueKind::Reference,
+        _ => ValueKind::Bits32,
+    };
+    ensure!(
+        instruction.width == 2
+            && instruction.may_throw
+            && instruction.literal.is_none()
+            && instruction.prototype.is_none()
+            && instruction.branch_target.is_none()
+            && instruction.payload_target.is_none(),
+        "invalid shared field metadata"
+    );
+    let reference = instruction
+        .reference
+        .context("missing shared field reference")?;
+    ensure!(
+        reference.kind == PoolKind::Field && u16::try_from(reference.index).is_ok(),
+        "invalid shared field reference"
+    );
+    let receiver_count = usize::from(!is_static);
+    ensure!(
+        instruction.reads.len() == receiver_count + usize::from(put)
+            && instruction.writes.len() == usize::from(!put),
+        "invalid shared field operand count"
+    );
+    let receiver = if is_static {
+        None
+    } else {
+        Some(decoded_register(
+            &instruction.reads[0],
+            ValueKind::Reference,
+            registers,
+        )?)
+    };
+    let value = if put {
+        &instruction.reads[receiver_count]
+    } else {
+        &instruction.writes[0]
+    };
+    Ok((
+        decoded_register(value, kind, registers)?,
+        receiver,
+        reference.index as usize,
+    ))
+}
+
+fn decoded_array_type(
+    instruction: &crate::native_ir::Instruction,
+    registers: usize,
+) -> Result<operations::Operands> {
+    use crate::native_ir::{
+        PoolKind,
+        ValueKind::{Bits32, Reference, Wide64},
+    };
+    let op = instruction.opcode;
+    let (read_kinds, read_count, write_kind, has_type) = match op {
+        0x1f => ([Reference, Bits32, Bits32], 1, Some(Reference), true),
+        0x20 => ([Reference, Bits32, Bits32], 1, Some(Bits32), true),
+        0x21 => ([Reference, Bits32, Bits32], 1, Some(Bits32), false),
+        0x23 => ([Bits32; 3], 1, Some(Reference), true),
+        0x44..=0x51 => {
+            let kind = match op {
+                0x45 | 0x4c => Wide64,
+                0x46 | 0x4d => Reference,
+                _ => Bits32,
+            };
+            (
+                [Reference, Bits32, kind],
+                if op >= 0x4b { 3 } else { 2 },
+                if op >= 0x4b { None } else { Some(kind) },
+                false,
+            )
+        }
+        _ => bail!("invalid shared array/type opcode"),
+    };
+    ensure!(
+        instruction.width == if op == 0x21 { 1 } else { 2 }
+            && instruction.may_throw
+            && instruction.literal.is_none()
+            && instruction.prototype.is_none()
+            && instruction.branch_target.is_none()
+            && instruction.payload_target.is_none(),
+        "invalid shared array/type metadata"
+    );
+    ensure!(
+        instruction.reads.len() == read_count
+            && instruction.writes.len() == usize::from(write_kind.is_some()),
+        "invalid shared array/type operand count"
+    );
+    let type_index = if has_type {
+        let reference = instruction
+            .reference
+            .context("missing shared array/type reference")?;
+        ensure!(
+            reference.kind == PoolKind::Type && u16::try_from(reference.index).is_ok(),
+            "invalid shared array/type reference"
+        );
+        Some(reference.index as usize)
+    } else {
+        ensure!(
+            instruction.reference.is_none(),
+            "unexpected shared array/type reference"
+        );
+        None
+    };
+    let mut reads = [0; 3];
+    for (index, operand) in instruction.reads.iter().enumerate() {
+        reads[index] = decoded_register(operand, read_kinds[index], registers)?;
+    }
+    let dst = if let Some(kind) = write_kind {
+        decoded_register(&instruction.writes[0], kind, registers)?
+    } else {
+        0
+    };
+    ensure!(
+        op != 0x1f || dst == reads[0],
+        "shared check-cast destination differs from source"
+    );
+    Ok(operations::Operands {
+        dst,
+        reads,
+        read_count,
+        type_index,
+    })
+}
+
+fn decoded_throw_source(
+    instruction: &crate::native_ir::Instruction,
+    registers: usize,
+) -> Result<usize> {
+    use crate::native_ir::ValueKind;
+    let ([read], []) = (instruction.reads.as_slice(), instruction.writes.as_slice()) else {
+        bail!("invalid shared throw operand count");
+    };
+    ensure!(
+        instruction.opcode == 0x27
+            && instruction.width == 1
+            && instruction.may_throw
+            && instruction.literal.is_none()
+            && instruction.reference.is_none()
+            && instruction.prototype.is_none()
+            && instruction.branch_target.is_none()
+            && instruction.payload_target.is_none(),
+        "invalid shared throw metadata"
+    );
+    decoded_register(read, ValueKind::Reference, registers)
+}
+
+fn decoded_move(
+    instruction: &crate::native_ir::Instruction,
+    registers: usize,
+) -> Result<(usize, usize)> {
+    use crate::native_ir::ValueKind;
+    let kind = match instruction.opcode {
+        0x01..=0x03 => ValueKind::Bits32,
+        0x04..=0x06 => ValueKind::Wide64,
+        0x07..=0x09 => ValueKind::Reference,
+        _ => bail!("invalid shared move opcode"),
+    };
+    let ([read], [write]) = (instruction.reads.as_slice(), instruction.writes.as_slice()) else {
+        bail!("invalid shared move operand count");
+    };
+    ensure!(instruction.literal.is_none(), "literal on shared move");
+    Ok((
+        decoded_register(write, kind, registers)?,
+        decoded_register(read, kind, registers)?,
+    ))
+}
+
+fn decoded_result_destination(
+    instruction: &crate::native_ir::Instruction,
+    registers: usize,
+) -> Result<usize> {
+    use crate::native_ir::ValueKind;
+    let kind = match instruction.opcode {
+        0x0a => ValueKind::Unknown32,
+        0x0b => ValueKind::Wide64,
+        0x0c => ValueKind::Reference,
+        _ => bail!("invalid shared move-result opcode"),
+    };
+    let ([], [write]) = (instruction.reads.as_slice(), instruction.writes.as_slice()) else {
+        bail!("invalid shared move-result operand count");
+    };
+    ensure!(
+        instruction.width == 1
+            && !instruction.may_throw
+            && instruction.literal.is_none()
+            && instruction.reference.is_none()
+            && instruction.prototype.is_none()
+            && instruction.branch_target.is_none()
+            && instruction.payload_target.is_none(),
+        "invalid shared move-result metadata"
+    );
+    decoded_register(write, kind, registers)
+}
+
+fn decoded_return_source(
+    instruction: &crate::native_ir::Instruction,
+    registers: usize,
+) -> Result<Option<usize>> {
+    use crate::native_ir::ValueKind;
+    let kind = match instruction.opcode {
+        0x0e => None,
+        0x0f => Some(ValueKind::Bits32),
+        0x10 => Some(ValueKind::Wide64),
+        0x11 => Some(ValueKind::Reference),
+        _ => bail!("invalid shared return opcode"),
+    };
+    ensure!(
+        instruction.width == 1
+            && !instruction.may_throw
+            && instruction.literal.is_none()
+            && instruction.reference.is_none()
+            && instruction.prototype.is_none()
+            && instruction.branch_target.is_none()
+            && instruction.payload_target.is_none(),
+        "invalid shared return metadata"
+    );
+    match kind {
+        None => {
+            ensure!(
+                instruction.reads.is_empty() && instruction.writes.is_empty(),
+                "invalid shared void return operand count"
+            );
+            Ok(None)
+        }
+        Some(kind) => {
+            let ([read], []) = (instruction.reads.as_slice(), instruction.writes.as_slice()) else {
+                bail!("invalid shared return operand count");
+            };
+            Ok(Some(decoded_register(read, kind, registers)?))
+        }
+    }
+}
+
+fn decoded_constant(
+    instruction: &crate::native_ir::Instruction,
+    registers: usize,
+) -> Result<(usize, i64)> {
+    use crate::native_ir::ValueKind;
+    let kind = match instruction.opcode {
+        0x12..=0x15 => ValueKind::Bits32,
+        0x16..=0x19 => ValueKind::Wide64,
+        _ => bail!("invalid shared constant opcode"),
+    };
+    let ([], [write]) = (instruction.reads.as_slice(), instruction.writes.as_slice()) else {
+        bail!("invalid shared constant operand count");
+    };
+    let literal = instruction
+        .literal
+        .context("missing shared constant literal")?;
+    ensure!(
+        kind == ValueKind::Wide64 || i32::try_from(literal).is_ok(),
+        "shared constant exceeds 32 bits"
+    );
+    Ok((decoded_register(write, kind, registers)?, literal))
+}
+
+fn decoded_reference_constant(
+    instruction: &crate::native_ir::Instruction,
+    registers: usize,
+) -> Result<(usize, usize)> {
+    use crate::native_ir::{PoolKind, ValueKind};
+    let pool_kind = match instruction.opcode {
+        0x1a | 0x1b => PoolKind::String,
+        0x1c => PoolKind::Type,
+        _ => bail!("invalid shared reference constant opcode"),
+    };
+    let ([], [write]) = (instruction.reads.as_slice(), instruction.writes.as_slice()) else {
+        bail!("invalid shared reference constant operand count");
+    };
+    ensure!(
+        instruction.literal.is_none(),
+        "literal on shared reference constant"
+    );
+    ensure!(
+        instruction.may_throw,
+        "shared reference constant lost class/string resolution effect"
+    );
+    let reference = instruction
+        .reference
+        .context("missing shared reference constant pool reference")?;
+    ensure!(
+        reference.kind == pool_kind,
+        "invalid shared reference constant pool kind"
+    );
+    ensure!(
+        instruction.opcode == 0x1b || u16::try_from(reference.index).is_ok(),
+        "shared reference constant index exceeds 16 bits"
+    );
+    Ok((
+        decoded_register(write, ValueKind::Reference, registers)?,
+        usize::try_from(reference.index).context("shared reference constant index overflow")?,
+    ))
+}
+
 fn register(registers: &[Option<Value>], r: usize) -> Result<Value> {
     let value = registers
         .get(r)
@@ -436,8 +864,10 @@ fn string_literal(value: &str) -> Result<String> {
     super::strings::literal(value)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Loop {
+    // Canonical enclosing header; legacy regions leave this unset.
+    parent: Option<usize>,
     start: usize,
     latch: usize,
     guard: Option<usize>,
@@ -465,8 +895,949 @@ struct LoopContext<'a> {
 struct Switch {
     cases: Vec<(i32, usize)>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SharedBranch {
+    owner: Option<usize>,
+    branch: usize,
+    taken: usize,
+    fallthrough: usize,
+    join: usize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedLoopEdgeKind {
+    Break,
+    Continue,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SharedLoopEdge {
+    owner: usize,
+    branch: usize,
+    taken: usize,
+    fallthrough: usize,
+    kind: SharedLoopEdgeKind,
+}
+const MAX_SHARED_LOOPS: usize = 32;
+const MAX_SHARED_LOOP_DEPTH: usize = 4;
+fn shared_loop_owner(regions: &[Loop], pc: usize) -> Option<Loop> {
+    let mut index = regions
+        .partition_point(|region| region.start <= pc)
+        .checked_sub(1)?;
+    for _ in 0..MAX_SHARED_LOOP_DEPTH {
+        let region = regions[index];
+        if pc < region.exit {
+            return Some(region);
+        }
+        let parent = region.parent?;
+        index = regions
+            .binary_search_by_key(&parent, |region| region.start)
+            .ok()?;
+    }
+    None
+}
+fn assign_shared_loop_parents(regions: &mut [Loop]) -> Result<()> {
+    let mut ancestors: Vec<usize> = Vec::new();
+    for index in 0..regions.len() {
+        while ancestors
+            .last()
+            .is_some_and(|&parent| regions[parent].exit <= regions[index].start)
+        {
+            ancestors.pop();
+        }
+        regions[index].parent = if let Some(&parent) = ancestors.last() {
+            ensure!(
+                regions[index].start
+                    >= regions[parent]
+                        .guard
+                        .context("missing shared parent guard")?
+                        + 2
+                    && regions[index].exit <= regions[parent].latch,
+                "intersecting shared loop regions"
+            );
+            Some(regions[parent].start)
+        } else {
+            None
+        };
+        ensure!(
+            index == 0 || regions[index - 1].start < regions[index].start,
+            "duplicate shared loop header"
+        );
+        ancestors.push(index);
+        ensure!(
+            ancestors.len() <= MAX_SHARED_LOOP_DEPTH,
+            "shared loop nesting budget"
+        );
+    }
+    Ok(())
+}
+fn shared_loop_depth(regions: &[Loop], mut region: Loop) -> Result<usize> {
+    let mut depth = 1;
+    while let Some(parent) = region.parent {
+        let index = regions
+            .binary_search_by_key(&parent, |region| region.start)
+            .map_err(|_| anyhow::anyhow!("missing shared loop parent"))?;
+        ensure!(
+            regions[index].start < region.start,
+            "cyclic shared loop parent"
+        );
+        region = regions[index];
+        depth += 1;
+        ensure!(depth <= MAX_SHARED_LOOP_DEPTH, "shared loop nesting budget");
+    }
+    Ok(depth)
+}
+fn shared_loop_target_owned(regions: &[Loop], owner: Loop, target: usize) -> bool {
+    shared_loop_owner(regions, target).is_some_and(|region| {
+        region.start == owner.start
+            || (target == region.start && region.parent == Some(owner.start))
+    })
+}
+#[cfg(test)]
+fn decoded_loop_edges(
+    ir: &crate::native_ir::DecodedMethod,
+    region: Loop,
+) -> Result<Vec<SharedLoopEdge>> {
+    decoded_all_loop_edges(ir, &[region])
+}
+fn decoded_all_loop_edges(
+    ir: &crate::native_ir::DecodedMethod,
+    regions: &[Loop],
+) -> Result<Vec<SharedLoopEdge>> {
+    ensure!(
+        ir.instructions
+            .iter()
+            .filter(|i| matches!(i.opcode,0x28..=0x2a|0x32..=0x3d))
+            .count()
+            <= 1024,
+        "shared loop control budget"
+    );
+    let mut edges = Vec::new();
+    for instruction in &ir.instructions {
+        let Some(region) = shared_loop_owner(regions, instruction.pc) else {
+            continue;
+        };
+        if Some(instruction.pc) == region.guard || instruction.pc == region.latch {
+            continue;
+        }
+        let Some(target) = instruction.branch_target else {
+            continue;
+        };
+        let kind = if target == region.start {
+            SharedLoopEdgeKind::Continue
+        } else if target == region.exit {
+            SharedLoopEdgeKind::Break
+        } else {
+            continue;
+        };
+        ensure!(
+            matches!(instruction.opcode, 0x32..=0x3d)
+                && instruction.width == 2
+                && instruction.pc + instruction.width <= region.latch,
+            "invalid shared loop special edge"
+        );
+        ensure!(
+            edges
+                .last()
+                .is_none_or(|edge: &SharedLoopEdge| edge.branch < instruction.pc),
+            "unordered shared loop edges"
+        );
+        edges.push(SharedLoopEdge {
+            owner: region.start,
+            branch: instruction.pc,
+            taken: target,
+            fallthrough: instruction.pc + instruction.width,
+            kind,
+        });
+        ensure!(edges.len() <= 1024, "shared loop edge budget");
+    }
+    Ok(edges)
+}
+fn shared_loop_edge_at(edges: &[SharedLoopEdge], pc: usize) -> Option<SharedLoopEdge> {
+    edges
+        .binary_search_by_key(&pc, |edge| edge.branch)
+        .ok()
+        .map(|index| edges[index])
+}
+fn decoded_branch_plans(
+    ir: &crate::native_ir::DecodedMethod,
+    cfg: &crate::native_cfg::ControlFlowGraph,
+    len: usize,
+) -> Result<Vec<SharedBranch>> {
+    decoded_branch_plans_in(ir, cfg, len, 0..len, &[], &[])
+}
+fn decoded_branch_plans_in(
+    ir: &crate::native_ir::DecodedMethod,
+    cfg: &crate::native_cfg::ControlFlowGraph,
+    len: usize,
+    region: std::ops::Range<usize>,
+    excluded: &[SharedLoopEdge],
+    atomic_loops: &[Loop],
+) -> Result<Vec<SharedBranch>> {
+    let postdom = cfg.forward_postdominators()?;
+    let mut work = 16_000_000usize;
+    decoded_branch_plans_with_postdom(
+        ir,
+        cfg,
+        len,
+        region,
+        excluded,
+        atomic_loops,
+        &postdom,
+        &mut work,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn decoded_branch_plans_with_postdom(
+    ir: &crate::native_ir::DecodedMethod,
+    cfg: &crate::native_cfg::ControlFlowGraph,
+    len: usize,
+    region: std::ops::Range<usize>,
+    excluded: &[SharedLoopEdge],
+    atomic_loops: &[Loop],
+    postdom: &[usize],
+    work: &mut usize,
+) -> Result<Vec<SharedBranch>> {
+    let first = ir.instructions.partition_point(|i| i.pc < region.start);
+    let end = ir.instructions.partition_point(|i| i.pc < region.end);
+    let instructions = &ir.instructions[first..end];
+    let single_condition = instructions
+        .iter()
+        .filter(|instruction| {
+            matches!(instruction.opcode, 0x32..=0x3d)
+                && region.contains(&instruction.pc)
+                && shared_loop_owner(atomic_loops, instruction.pc).is_none()
+                && excluded
+                    .binary_search_by_key(&instruction.pc, |edge| edge.branch)
+                    .is_err()
+        })
+        .count()
+        == 1;
+    let mut plans = Vec::new();
+    let mut seen = vec![false; cfg.blocks.len()];
+    let mut escape = |start: usize, stop: usize| -> Result<Option<usize>> {
+        seen.fill(false);
+        if start == stop {
+            return Ok(None);
+        }
+        ensure!(start < stop, "shared branch region starts beyond join");
+        seen[start] = true;
+        let mut escaped = None;
+        for index in start..stop {
+            ensure!(*work > 0, "shared branch region work budget");
+            *work -= 1;
+            if !seen[index] {
+                continue;
+            }
+            for edge in &cfg.blocks[index].successors {
+                if edge.target > stop {
+                    escaped = Some(escaped.map_or(edge.target, |old: usize| old.min(edge.target)));
+                } else if edge.target < stop {
+                    seen[edge.target] = true;
+                }
+            }
+        }
+        Ok(escaped)
+    };
+    for branch in instructions.iter().filter(|instruction| {
+        matches!(instruction.opcode, 0x32..=0x3d)
+            && region.contains(&instruction.pc)
+            && shared_loop_owner(atomic_loops, instruction.pc).is_none()
+            && excluded
+                .binary_search_by_key(&instruction.pc, |edge| edge.branch)
+                .is_err()
+    }) {
+        let block_index = *cfg
+            .block_at
+            .get(&branch.pc)
+            .context("missing shared branch block")?;
+        let block = &cfg.blocks[block_index];
+        ensure!(
+            block.instructions.last() == Some(&branch.pc) && block.successors.len() == 2,
+            "invalid shared branch successors"
+        );
+        let taken_index = block.successors[0].target;
+        let fallthrough_index = block.successors[1].target;
+        let taken = cfg.blocks[taken_index].start;
+        let fallthrough = cfg.blocks[fallthrough_index].start;
+        ensure!(
+            taken >= fallthrough && fallthrough == branch.pc + branch.width,
+            "invalid shared branch arm identity"
+        );
+        // A strict common postdominator is a safe ceiling. Terminal exits need
+        // not traverse the join: preserve the earliest terminal-aware closed
+        // region, as the existing renderer does for guard returns/throws.
+        let ceiling = postdom[block_index];
+        // The already-integrated single-condition route used its canonical
+        // common postdominator; retain that source layout for terminal arms.
+        let mut join_index = if single_condition {
+            ceiling
+        } else {
+            taken_index
+        };
+        loop {
+            ensure!(
+                join_index <= ceiling,
+                "shared branch region exceeds postdominator"
+            );
+            let a = escape(taken_index, join_index)?;
+            let b = escape(fallthrough_index, join_index)?;
+            if let Some(next) = a.into_iter().chain(b).min() {
+                join_index = next;
+            } else {
+                break;
+            }
+        }
+        let join = cfg.blocks.get(join_index).map_or(len, |block| block.start);
+        plans.push(SharedBranch {
+            owner: None,
+            branch: branch.pc,
+            taken,
+            fallthrough,
+            join,
+        });
+        ensure!(plans.len() <= 1024, "shared conditional budget");
+    }
+    ensure!(!plans.is_empty(), "missing shared forward condition");
+    Ok(plans)
+}
+
+#[cfg(test)]
+fn decoded_natural_loop(
+    ir: &crate::native_ir::DecodedMethod,
+    cfg: &crate::native_cfg::ControlFlowGraph,
+) -> Result<Loop> {
+    let loops = decoded_natural_loops(ir, cfg)?;
+    ensure!(loops.len() == 1, "expected one shared natural loop");
+    Ok(loops[0])
+}
+// JADX LoopRegionMaker's condition-at-end case identifies the latch condition
+// and builds the mandatory body from the loop start. This specialization keeps
+// a single straight-line body and uses the complete decoded CFG for ownership.
+fn decoded_posttest_loop(
+    ir: &crate::native_ir::DecodedMethod,
+    cfg: &crate::native_cfg::ControlFlowGraph,
+    work: &mut usize,
+) -> Result<Loop> {
+    let mut controls = ir
+        .instructions
+        .iter()
+        .filter(|i| matches!(i.opcode, 0x28..=0x2a | 0x32..=0x3d));
+    let latch = controls.next().context("missing shared posttest latch")?;
+    ensure!(
+        controls.next().is_none() && matches!(latch.opcode, 0x32..=0x3d) && latch.width == 2,
+        "shared posttest control shape"
+    );
+    let start = latch
+        .branch_target
+        .context("missing shared posttest header")?;
+    let exit = latch.pc + latch.width;
+    ensure!(start < latch.pc, "shared posttest latch is not backward");
+    let header = *cfg
+        .block_at
+        .get(&start)
+        .context("shared posttest header boundary")?;
+    let from = *cfg
+        .block_at
+        .get(&latch.pc)
+        .context("shared posttest latch block")?;
+    let out = *cfg
+        .block_at
+        .get(&exit)
+        .context("shared posttest exit boundary")?;
+    ensure!(
+        cfg.blocks[header].start == start
+            && cfg.blocks[out].start == exit
+            && cfg.blocks[from].instructions.last() == Some(&latch.pc)
+            && cfg.blocks[from].successors.len() == 2
+            && cfg.blocks[from].successors[0].target == header
+            && cfg.blocks[from].successors[1].target == out,
+        "shared posttest successor identity"
+    );
+    let dominators = crate::native_dominators::DominatorTree::compute(cfg)?;
+    ensure!(
+        dominators.dominates(header, from),
+        "shared posttest header does not dominate latch"
+    );
+    let mut members = vec![false; cfg.blocks.len()];
+    members[header] = true;
+    members[from] = true;
+    let mut pending = vec![from];
+    while let Some(block) = pending.pop() {
+        if block == header {
+            continue;
+        }
+        for &predecessor in &dominators.predecessors[block] {
+            ensure!(*work > 0, "shared posttest membership work budget");
+            *work -= 1;
+            ensure!(
+                predecessor < cfg.blocks.len(),
+                "synthetic shared posttest predecessor"
+            );
+            if !members[predecessor] {
+                members[predecessor] = true;
+                pending.push(predecessor);
+            }
+        }
+    }
+    for (index, block) in cfg.blocks.iter().enumerate() {
+        ensure!(*work > 0, "shared posttest membership work budget");
+        *work -= 1;
+        ensure!(
+            members[index] == (header..=from).contains(&index),
+            "shared posttest cross-region membership"
+        );
+        if members[index] {
+            ensure!(
+                dominators.dominates(header, index),
+                "shared posttest non-dominated body"
+            );
+            for edge in &block.successors {
+                ensure!(
+                    members[edge.target] || (index == from && edge.target == out),
+                    "shared posttest additional exit"
+                );
+            }
+        } else {
+            ensure!(
+                block
+                    .successors
+                    .iter()
+                    .all(|edge| !members[edge.target] || edge.target == header),
+                "shared posttest non-header entry"
+            );
+        }
+    }
+    ensure!(
+        ir.instructions
+            .iter()
+            .all(|i| !(start..latch.pc).contains(&i.pc) || !matches!(i.opcode, 0x0e..=0x11 | 0x27)),
+        "terminal shared posttest body"
+    );
+    Ok(Loop {
+        parent: None,
+        start,
+        latch: latch.pc,
+        guard: None,
+        exit,
+        tail: None,
+    })
+}
+fn decoded_natural_loops(
+    ir: &crate::native_ir::DecodedMethod,
+    cfg: &crate::native_cfg::ControlFlowGraph,
+) -> Result<Vec<Loop>> {
+    if !ir
+        .instructions
+        .iter()
+        .any(|i| matches!(i.opcode, 0x28..=0x2a))
+    {
+        return Ok(vec![decoded_posttest_loop(ir, cfg, &mut 16_000_000)?]);
+    }
+    // JADX BlockProcessor.markLoops/registerLoops identifies and records
+    // dominating-successor backedges. processNestedLoops derives containing
+    // parents; this bounded specialization admits properly nested pretest
+    // regions and leaves intersecting or cross-owner shapes on the legacy route.
+    let dominators = crate::native_dominators::DominatorTree::compute(cfg)?;
+    let mut regions = Vec::new();
+    for (from, block) in cfg.blocks.iter().enumerate() {
+        let pc = *block
+            .instructions
+            .last()
+            .context("empty shared CFG block")?;
+        let instruction = &ir.instructions[ir
+            .instructions
+            .binary_search_by_key(&pc, |i| i.pc)
+            .map_err(|_| anyhow::anyhow!("missing shared block terminator"))?];
+        if !matches!(instruction.opcode, 0x28..=0x2a) {
+            continue;
+        }
+        for edge in block.successors.iter().filter(|edge| edge.target <= from) {
+            ensure!(
+                dominators.dominates(edge.target, from),
+                "shared loop latch is not uniquely dominated"
+            );
+            let start = cfg.blocks[edge.target].start;
+            ensure!(
+                decoded_goto(instruction)? == start,
+                "shared loop latch differs from header"
+            );
+            let guard_pc = *cfg.blocks[edge.target]
+                .instructions
+                .last()
+                .context("missing shared pretest guard")?;
+            let guard = &ir.instructions[ir
+                .instructions
+                .binary_search_by_key(&guard_pc, |i| i.pc)
+                .map_err(|_| anyhow::anyhow!("missing shared pretest guard instruction"))?];
+            let exit = pc + instruction.width;
+            ensure!(
+                matches!(guard.opcode, 0x32..=0x3d)
+                    && guard.pc >= start
+                    && guard.pc < pc
+                    && guard.branch_target == Some(exit),
+                "invalid shared pretest loop guard"
+            );
+            regions.push(Loop {
+                parent: None,
+                start,
+                latch: pc,
+                guard: Some(guard.pc),
+                exit,
+                tail: None,
+            });
+            ensure!(
+                regions.len() <= MAX_SHARED_LOOPS,
+                "shared loop region budget"
+            );
+        }
+    }
+    ensure!(!regions.is_empty(), "missing shared natural-loop latch");
+    regions.sort_unstable_by_key(|region| region.start);
+    assign_shared_loop_parents(&mut regions)?;
+    let special = decoded_all_loop_edges(ir, &regions)?;
+    for instruction in &ir.instructions {
+        if let Some(region) = shared_loop_owner(&regions, instruction.pc) {
+            let body = region.guard.unwrap() + 2..region.latch;
+            if Some(instruction.pc) == region.guard || instruction.pc == region.latch {
+                continue;
+            }
+            if matches!(instruction.opcode,0x28..=0x2a|0x32..=0x3d) {
+                let target = instruction
+                    .branch_target
+                    .context("missing shared region branch target")?;
+                ensure!(
+                    body.contains(&instruction.pc)
+                        && ((target > instruction.pc
+                            && target <= region.latch
+                            && shared_loop_target_owned(&regions, region, target))
+                            || (matches!(instruction.opcode, 0x32..=0x3d)
+                                && (target == region.start || target == region.exit))),
+                    "shared loop branch crosses region owner"
+                );
+            }
+            ensure!(
+                !body.contains(&instruction.pc)
+                    || !matches!(instruction.opcode, 0x0e..=0x11 | 0x27),
+                "terminal shared loop body"
+            );
+        } else if matches!(instruction.opcode,0x28..=0x2a|0x32..=0x3d) {
+            let target = instruction
+                .branch_target
+                .context("missing shared outer branch target")?;
+            ensure!(
+                target > instruction.pc
+                    && shared_loop_owner(&regions, target)
+                        .is_none_or(|region| target == region.start && region.parent.is_none()),
+                "shared outer branch enters loop interior"
+            );
+        }
+    }
+    for (from, block) in cfg.blocks.iter().enumerate() {
+        for edge in block.successors.iter().filter(|edge| edge.target <= from) {
+            let pc = *block.instructions.last().unwrap();
+            let region =
+                shared_loop_owner(&regions, pc).context("backedge outside shared loop owner")?;
+            ensure!(
+                cfg.blocks[edge.target].start == region.start
+                    && dominators.dominates(edge.target, from)
+                    && (pc == region.latch
+                        || shared_loop_edge_at(&special, pc)
+                            .is_some_and(|edge| edge.owner == region.start
+                                && edge.kind == SharedLoopEdgeKind::Continue)),
+                "invalid shared loop conditional backedge"
+            );
+        }
+    }
+    let mut work = 16_000_000usize;
+    for region in &regions {
+        let header = cfg.block_at[&region.start];
+        let latch = cfg.block_at[&region.latch];
+        let exit = *cfg
+            .block_at
+            .get(&region.exit)
+            .context("shared loop exit boundary")?;
+        ensure!(
+            cfg.blocks[exit].start == region.exit
+                && cfg.blocks[header].successors.len() == 2
+                && cfg.blocks[header].successors[0].target == exit
+                && cfg.blocks[header].successors[1].target > header
+                && cfg.blocks[header].successors[1].target <= latch,
+            "invalid shared pretest loop successors"
+        );
+        let mut members = vec![false; cfg.blocks.len()];
+        members[header] = true;
+        members[latch] = true;
+        let mut pending = vec![latch];
+        while let Some(block) = pending.pop() {
+            for &predecessor in &dominators.predecessors[block] {
+                ensure!(work > 0, "shared loop membership work budget");
+                work -= 1;
+                ensure!(
+                    predecessor < cfg.blocks.len(),
+                    "synthetic predecessor inside shared loop"
+                );
+                if !members[predecessor] {
+                    members[predecessor] = true;
+                    pending.push(predecessor);
+                }
+            }
+        }
+        for (index, block) in cfg.blocks.iter().enumerate() {
+            ensure!(work > 0, "shared loop membership work budget");
+            work -= 1;
+            ensure!(
+                members[index] == (header..=latch).contains(&index),
+                "shared loop has cross-region membership"
+            );
+            if members[index] {
+                ensure!(
+                    dominators.dominates(header, index),
+                    "shared loop header does not dominate body"
+                );
+                for edge in &block.successors {
+                    let special = block
+                        .instructions
+                        .last()
+                        .and_then(|pc| shared_loop_edge_at(&special, *pc));
+                    ensure!(
+                        members[edge.target]
+                            || ((index == header
+                                || special.is_some_and(|edge| edge.owner == region.start
+                                    && edge.kind == SharedLoopEdgeKind::Break))
+                                && edge.target == exit),
+                        "shared loop has an additional exit"
+                    );
+                }
+            } else {
+                ensure!(
+                    block
+                        .successors
+                        .iter()
+                        .all(|edge| !members[edge.target] || edge.target == header),
+                    "shared loop has a non-header entry"
+                );
+            }
+        }
+    }
+    Ok(regions)
+}
+fn decoded_loop_branch_plans(
+    ir: &crate::native_ir::DecodedMethod,
+    cfg: &crate::native_cfg::ControlFlowGraph,
+    regions: &[Loop],
+    len: usize,
+) -> Result<Vec<SharedBranch>> {
+    if regions.len() == 1 && regions[0].guard.is_none() {
+        ensure!(
+            decoded_posttest_loop(ir, cfg, &mut 16_000_000)? == regions[0],
+            "shared posttest region differs"
+        );
+        return Ok(Vec::new());
+    }
+    let special = decoded_all_loop_edges(ir, regions)?;
+    let depths = regions
+        .iter()
+        .map(|&region| shared_loop_depth(regions, region))
+        .collect::<Result<Vec<_>>>()?;
+    let mut work = 16_000_000usize;
+    let mut plans = Vec::new();
+    // At most four body projections. Closure work is cumulative across depths;
+    // each forward-postdom pass retains its existing 20m work bound.
+    for depth in 1..=depths.iter().copied().max().unwrap_or(0) {
+        let active: Vec<Loop> = regions
+            .iter()
+            .zip(&depths)
+            .filter(|(_, d)| **d == depth)
+            .map(|(&region, _)| region)
+            .collect();
+        if !ir.instructions.iter().any(|i| {
+            matches!(i.opcode, 0x32..=0x3d)
+                && shared_loop_owner(&active, i.pc).is_some_and(|region| Some(i.pc) != region.guard)
+                && shared_loop_owner(regions, i.pc)
+                    .is_some_and(|owner| active.iter().any(|region| region.start == owner.start))
+                && shared_loop_edge_at(&special, i.pc).is_none()
+        }) {
+            continue;
+        }
+        let children: Vec<Loop> = regions
+            .iter()
+            .zip(&depths)
+            .filter(|(_, d)| **d == depth + 1)
+            .map(|(&region, _)| region)
+            .collect();
+        let mut projection = cfg.clone();
+        for (region, d) in regions.iter().zip(&depths) {
+            if *d <= depth {
+                projection.blocks[cfg.block_at[&region.latch]]
+                    .successors
+                    .clear();
+            }
+        }
+        for edge in &special {
+            let owner = regions[regions
+                .binary_search_by_key(&edge.owner, |region| region.start)
+                .unwrap()];
+            if shared_loop_depth(regions, owner)? > depth {
+                continue;
+            }
+            let block = cfg.block_at[&edge.branch];
+            ensure!(
+                projection.blocks[block].successors.len() == 2
+                    && cfg.blocks[projection.blocks[block].successors[0].target].start
+                        == edge.taken
+                    && cfg.blocks[projection.blocks[block].successors[1].target].start
+                        == edge.fallthrough,
+                "shared loop edge differs from canonical successors"
+            );
+            projection.blocks[block].successors.remove(0);
+        }
+        for child in &children {
+            collapse_shared_loop(&mut projection, cfg, *child)?;
+        }
+        let postdom = projection.forward_postdominators()?;
+        for region in active {
+            let body = region.guard.context("missing shared loop guard")? + 2..region.latch;
+            let first = ir.instructions.partition_point(|i| i.pc < body.start);
+            let end = ir.instructions.partition_point(|i| i.pc < body.end);
+            if !ir.instructions[first..end].iter().any(|i| {
+                matches!(i.opcode, 0x32..=0x3d)
+                    && shared_loop_owner(regions, i.pc)
+                        .is_some_and(|owner| owner.start == region.start)
+                    && shared_loop_edge_at(&special, i.pc).is_none()
+            }) {
+                continue;
+            }
+            let mut inner = decoded_branch_plans_with_postdom(
+                ir,
+                &projection,
+                len,
+                body.clone(),
+                &special,
+                &children,
+                &postdom,
+                &mut work,
+            )?;
+            for plan in &mut inner {
+                ensure!(
+                    body.contains(&plan.branch)
+                        && (body.start..=region.latch).contains(&plan.fallthrough)
+                        && plan.taken >= body.start
+                        && plan.taken <= region.latch
+                        && plan.join >= plan.taken
+                        && plan.join <= region.latch
+                        && [plan.taken, plan.fallthrough, plan.join]
+                            .into_iter()
+                            .all(|pc| shared_loop_owner(&children, pc)
+                                .is_none_or(|child| pc == child.start)),
+                    "shared loop branch join crosses child ownership"
+                );
+                plan.owner = Some(region.start);
+            }
+            plans.extend(inner);
+        }
+    }
+    let roots: Vec<Loop> = regions
+        .iter()
+        .copied()
+        .filter(|region| region.parent.is_none())
+        .collect();
+    if ir
+        .instructions
+        .iter()
+        .any(|i| matches!(i.opcode, 0x32..=0x3d) && shared_loop_owner(&roots, i.pc).is_none())
+    {
+        let mut projection = cfg.clone();
+        for root in &roots {
+            collapse_shared_loop(&mut projection, cfg, *root)?;
+        }
+        let outer = decoded_branch_plans_in(ir, &projection, len, 0..len, &[], &roots)?;
+        for plan in &outer {
+            ensure!(
+                [plan.taken, plan.fallthrough, plan.join]
+                    .into_iter()
+                    .all(|pc| shared_loop_owner(&roots, pc).is_none_or(|root| pc == root.start)),
+                "shared outer plan crosses loop interior"
+            );
+        }
+        plans.extend(outer);
+    }
+    plans.sort_unstable_by_key(|plan| plan.branch);
+    ensure!(
+        plans.windows(2).all(|pair| pair[0].branch < pair[1].branch),
+        "duplicate shared loop branch ownership"
+    );
+    Ok(plans)
+}
+fn collapse_shared_loop(
+    projection: &mut crate::native_cfg::ControlFlowGraph,
+    cfg: &crate::native_cfg::ControlFlowGraph,
+    region: Loop,
+) -> Result<()> {
+    let header = cfg.block_at[&region.start];
+    let exit = cfg.block_at[&region.exit];
+    ensure!(
+        projection.blocks[header].successors.len() == 2
+            && projection.blocks[header].successors[0].target == exit,
+        "invalid atomic loop successor"
+    );
+    projection.blocks[header].successors.truncate(1);
+    for block in &mut projection.blocks[header + 1..exit] {
+        block.successors.clear();
+    }
+    Ok(())
+}
+
+struct SharedLiveness {
+    bits: Vec<u64>,
+    stride: usize,
+    registers: usize,
+}
+fn decoded_cfg_liveness(
+    ir: &crate::native_ir::DecodedMethod,
+    cfg: &crate::native_cfg::ControlFlowGraph,
+    registers: usize,
+) -> Result<Option<SharedLiveness>> {
+    const MAX_STORAGE: usize = 32 * 1024 * 1024;
+    const MAX_WORK: usize = 16_000_000;
+    let stride = registers.div_ceil(64);
+    let Some(storage) = cfg
+        .blocks
+        .len()
+        .checked_mul(stride)
+        .and_then(|count| count.checked_mul(8))
+    else {
+        return Ok(None);
+    };
+    if storage > MAX_STORAGE {
+        return Ok(None);
+    }
+    let mut bits = vec![0u64; storage / 8];
+    let mut transfer = vec![0u64; stride];
+    let cyclic = cfg
+        .blocks
+        .iter()
+        .enumerate()
+        .any(|(index, block)| block.successors.iter().any(|edge| edge.target <= index));
+    let mut work = 0usize;
+    loop {
+        let mut changed = false;
+        for (block_index, block) in cfg.blocks.iter().enumerate().rev() {
+            transfer.fill(0);
+            for edge in &block.successors {
+                work = work.saturating_add(stride);
+                if work > MAX_WORK {
+                    return Ok(None);
+                }
+                for word in 0..stride {
+                    transfer[word] |= bits[edge.target * stride + word];
+                }
+            }
+            for &pc in block.instructions.iter().rev() {
+                let instruction = &ir.instructions[ir
+                    .instructions
+                    .binary_search_by_key(&pc, |instruction| instruction.pc)
+                    .map_err(|_| anyhow::anyhow!("missing shared liveness instruction"))?];
+                for (operands, write) in [(&instruction.writes, true), (&instruction.reads, false)]
+                {
+                    for operand in operands {
+                        let start = usize::from(operand.register);
+                        let end = start + operand.kind.word_count();
+                        ensure!(
+                            end <= registers,
+                            "shared liveness operand outside register file"
+                        );
+                        work = work.saturating_add(end - start);
+                        if work > MAX_WORK {
+                            return Ok(None);
+                        }
+                        for register in start..end {
+                            let mask = 1 << (register % 64);
+                            if write {
+                                transfer[register / 64] &= !mask;
+                            } else {
+                                transfer[register / 64] |= mask;
+                            }
+                        }
+                    }
+                }
+            }
+            work = work.saturating_add(stride);
+            if work > MAX_WORK {
+                return Ok(None);
+            }
+            let current = &mut bits[block_index * stride..(block_index + 1) * stride];
+            if current != transfer {
+                current.copy_from_slice(&transfer);
+                changed = true;
+            }
+        }
+        if !cyclic || !changed {
+            break;
+        }
+    }
+    Ok(Some(SharedLiveness {
+        bits,
+        stride,
+        registers,
+    }))
+}
+fn decoded_condition_sources(
+    instruction: &crate::native_ir::Instruction,
+    registers: usize,
+) -> Result<(usize, Option<usize>)> {
+    use crate::native_ir::ValueKind;
+    let zero = matches!(instruction.opcode, 0x38..=0x3d);
+    ensure!(
+        matches!(instruction.opcode, 0x32..=0x3d)
+            && instruction.width == 2
+            && !instruction.may_throw
+            && instruction.writes.is_empty()
+            && instruction.reads.len() == if zero { 1 } else { 2 }
+            && instruction.literal.is_none()
+            && instruction.reference.is_none()
+            && instruction.prototype.is_none()
+            && instruction.payload_target.is_none()
+            && instruction.branch_target.is_some(),
+        "invalid shared condition operands/metadata"
+    );
+    let left = decoded_register(&instruction.reads[0], ValueKind::Unknown32, registers)?;
+    let right = if zero {
+        None
+    } else {
+        Some(decoded_register(
+            &instruction.reads[1],
+            ValueKind::Unknown32,
+            registers,
+        )?)
+    };
+    Ok((left, right))
+}
+fn decoded_goto(instruction: &crate::native_ir::Instruction) -> Result<usize> {
+    ensure!(
+        matches!(instruction.opcode, 0x28..=0x2a)
+            && instruction.width == usize::from(instruction.opcode - 0x27)
+            && instruction.reads.is_empty()
+            && instruction.writes.is_empty()
+            && !instruction.may_throw
+            && instruction.literal.is_none()
+            && instruction.reference.is_none()
+            && instruction.prototype.is_none()
+            && instruction.payload_target.is_none(),
+        "invalid shared goto metadata"
+    );
+    instruction
+        .branch_target
+        .context("missing shared goto target")
+}
+
 struct Graph {
+    front_end: Option<crate::native_method::MethodFrontEnd>,
+    shared_cfg: Option<crate::native_cfg::ControlFlowGraph>,
+    shared_loops: Vec<Loop>,
+    shared_loop_edges: Vec<SharedLoopEdge>,
+    shared_branches: Vec<SharedBranch>,
+    shared_live: Option<SharedLiveness>,
     synchronized: Vec<synchronized::Region>,
+    protected: Vec<std::ops::Range<usize>>,
     caught_values: std::cell::RefCell<std::collections::HashSet<String>>,
     catch_rethrows: std::cell::RefCell<std::collections::HashMap<String, String>>,
     constructor_bindings: std::cell::OnceCell<
@@ -503,21 +1874,356 @@ impl Graph {
     fn new(words: &[u16]) -> Result<Self> {
         Self::with_handlers(words, &[])
     }
-    fn with_handlers(words: &[u16], handlers: &[usize]) -> Result<Self> {
-        let mut graph = Self {
+    fn empty(len: usize) -> Self {
+        Self {
+            front_end: None,
+            shared_cfg: None,
+            shared_loops: Vec::new(),
+            shared_loop_edges: Vec::new(),
+            shared_branches: Vec::new(),
+            shared_live: None,
             synchronized: Vec::new(),
+            protected: Vec::new(),
             caught_values: Default::default(),
             catch_rethrows: Default::default(),
             constructor_bindings: std::cell::OnceCell::new(),
             live: None,
             loops: Vec::new(),
-            switches: vec![None; words.len()],
-            payloads: vec![false; words.len()],
-            widths: vec![0; words.len()],
-            targets: vec![None; words.len()],
+            switches: vec![None; len],
+            payloads: vec![false; len],
+            widths: vec![0; len],
+            targets: vec![None; len],
             acyclic_backwards: std::collections::HashSet::new(),
             work: std::cell::Cell::new(0),
+        }
+    }
+    fn straight_line(class: &DexClass, method: &DexMethod) -> Result<Option<Self>> {
+        let code = method.code.as_ref().context("method has no code")?;
+        if !code.try_regions.is_empty() || code.tries != 0 {
+            return Ok(None);
+        }
+        // Eligibility scans instruction boundaries, never operand words. Shapes
+        // with region/allocation-specific lowering remain on the existing path.
+        // Once eligible, decoding/binding errors must not retry that path.
+        let mut pc = 0;
+        let mut condition_count = 0;
+        let mut goto_count = 0;
+        let mut backward_gotos = 0;
+        let mut latch_candidates = Vec::new();
+        let mut control = Vec::new();
+        while pc < code.instructions.len() {
+            let word = code.instructions[pc];
+            let op = word as u8;
+            if matches!(op, 0x1d..=0x1e | 0x22 | 0x24..=0x26 | 0x2b..=0x2c)
+                || matches!(word, 0x0100 | 0x0200 | 0x0300)
+            {
+                return Ok(None);
+            }
+            let (width, _) = crate::native_cfg::instruction_width(&code.instructions, pc)?;
+            if matches!(op, 0x32..=0x3d) {
+                if method.name.as_ref() == "<init>" {
+                    return Ok(None);
+                }
+                if code.instructions[pc + 1] as i16 == 0 {
+                    return Ok(None);
+                }
+                let target = pc as i64 + i64::from(code.instructions[pc + 1] as i16);
+                control.push((pc, target));
+                condition_count += 1;
+            }
+            if matches!(op, 0x28..=0x2a) {
+                if condition_count == 0 {
+                    return Ok(None);
+                }
+                let delta = match op {
+                    0x28 => (word >> 8) as i8 as i64,
+                    0x29 => code.instructions[pc + 1] as i16 as i64,
+                    _ => {
+                        (u32::from(code.instructions[pc + 1])
+                            | (u32::from(code.instructions[pc + 2]) << 16))
+                            as i32 as i64
+                    }
+                };
+                if delta == 0 {
+                    return Ok(None);
+                }
+                if delta < 0 {
+                    backward_gotos += 1;
+                    latch_candidates.push((pc, pc as i64 + delta, width));
+                }
+                goto_count += 1;
+                control.push((pc, pc as i64 + delta));
+            }
+            ensure!(
+                condition_count + goto_count <= 1024,
+                "shared forward branch budget"
+            );
+            pc += width;
+        }
+        let posttest = backward_gotos == 0
+            && goto_count == 0
+            && condition_count == 1
+            && control[0].1 < control[0].0 as i64;
+        if posttest {
+            let (latch, header) = control[0];
+            // Scan real boundaries, never a branch operand interpreted as an opcode.
+            // Malformed selected targets fail before excluded terminal-body routing.
+            let mut body_pc = 0;
+            let mut boundary = false;
+            let mut terminal = false;
+            while body_pc < latch {
+                boundary |= body_pc as i64 == header;
+                terminal |= body_pc as i64 >= header
+                    && matches!(code.instructions[body_pc] as u8, 0x0e..=0x11 | 0x27);
+                body_pc += crate::native_cfg::instruction_width(&code.instructions, body_pc)?.0;
+            }
+            ensure!(
+                boundary,
+                "shared posttest target is not an instruction boundary"
+            );
+            if terminal {
+                return Ok(None);
+            }
+        } else if backward_gotos == 0 && control.iter().any(|&(pc, target)| target <= pc as i64) {
+            return Ok(None);
+        }
+        if backward_gotos != 0 {
+            if condition_count == 0 || latch_candidates.len() > MAX_SHARED_LOOPS {
+                return Ok(None);
+            }
+            latch_candidates.sort_unstable_by_key(|candidate| candidate.1);
+            let mut raw_regions: Vec<(i64, usize, usize, usize)> = Vec::new();
+            let mut ancestors: Vec<usize> = Vec::new();
+            let mut raw_parents = Vec::new();
+            for &(latch, header, width) in &latch_candidates {
+                let Some(&(guard, target)) = control.iter().find(|&&(pc, _)| {
+                    pc as i64 >= header
+                        && pc < latch
+                        && matches!(code.instructions[pc] as u8, 0x32..=0x3d)
+                }) else {
+                    return Ok(None);
+                };
+                let exit = latch + width;
+                if header > guard as i64 || guard >= latch || target != exit as i64 {
+                    return Ok(None);
+                }
+                while ancestors
+                    .last()
+                    .is_some_and(|&parent| raw_regions[parent].3 as i64 <= header)
+                {
+                    ancestors.pop();
+                }
+                if let Some(&parent) = ancestors.last() {
+                    let previous: (i64, usize, usize, usize) = raw_regions[parent];
+                    if header < (previous.1 + 2) as i64 || exit > previous.2 {
+                        return Ok(None);
+                    }
+                }
+                if ancestors.len() >= MAX_SHARED_LOOP_DEPTH {
+                    return Ok(None);
+                }
+                raw_parents.push(ancestors.last().map(|&index| raw_regions[index].0));
+                ancestors.push(raw_regions.len());
+                let mut body_pc = guard + 2;
+                while body_pc < latch {
+                    if matches!(code.instructions[body_pc] as u8, 0x0e..=0x11 | 0x27) {
+                        return Ok(None);
+                    }
+                    body_pc += crate::native_cfg::instruction_width(&code.instructions, body_pc)?.0;
+                }
+                raw_regions.push((header, guard, latch, exit));
+            }
+            if control.iter().any(|&(pc, target)| {
+                if let Some(&(header, guard, latch, exit)) = raw_regions
+                    .iter()
+                    .rev()
+                    .find(|&&(header, _, _, exit)| pc as i64 >= header && pc < exit)
+                {
+                    if pc == guard || pc == latch {
+                        return false;
+                    }
+                    return !(pc > guard
+                        && pc < latch
+                        && ((target > pc as i64
+                            && target <= latch as i64
+                            && raw_regions
+                                .iter()
+                                .rposition(|&(start, _, _, end)| {
+                                    target >= start && target < end as i64
+                                })
+                                .is_some_and(|index| {
+                                    raw_regions[index].0 == header
+                                        || (target == raw_regions[index].0
+                                            && raw_parents[index] == Some(header))
+                                }))
+                            || (matches!(code.instructions[pc] as u8, 0x32..=0x3d)
+                                && (target == header || target == exit as i64))));
+                }
+                target <= pc as i64
+                    || raw_regions
+                        .iter()
+                        .any(|&(header, _, _, exit)| target > header && target < exit as i64)
+            }) {
+                return Ok(None);
+            }
+        }
+        let front_end = crate::native_method::MethodFrontEnd::build(class, method)
+            .map_err(|error| anyhow::anyhow!("shared front end: {error:#}"))?;
+        let mut graph = Self::empty(code.instructions.len());
+        if condition_count != 0 {
+            let cfg = if backward_gotos == 0 && !posttest {
+                crate::native_cfg::ControlFlowGraph::from_decoded(
+                    &front_end.ir,
+                    code.instructions.len(),
+                )?
+            } else {
+                crate::native_cfg::ControlFlowGraph::from_decoded_loop(
+                    &front_end.ir,
+                    code.instructions.len(),
+                )?
+            };
+            if backward_gotos == 0 && !posttest {
+                graph.shared_branches =
+                    decoded_branch_plans(&front_end.ir, &cfg, code.instructions.len())?;
+            } else {
+                let regions = decoded_natural_loops(&front_end.ir, &cfg)?;
+                graph.shared_branches = decoded_loop_branch_plans(
+                    &front_end.ir,
+                    &cfg,
+                    &regions,
+                    code.instructions.len(),
+                )?;
+                graph.shared_loop_edges = decoded_all_loop_edges(&front_end.ir, &regions)?;
+                graph.loops = regions.clone();
+                graph.shared_loops = regions;
+            }
+            for instruction in &front_end.ir.instructions {
+                if matches!(instruction.opcode, 0x32..=0x3d) {
+                    decoded_condition_sources(instruction, usize::from(code.registers))?;
+                }
+                if matches!(instruction.opcode, 0x28..=0x2a) {
+                    decoded_goto(instruction)?;
+                }
+                graph.targets[instruction.pc] = instruction.branch_target;
+            }
+            graph.shared_live =
+                decoded_cfg_liveness(&front_end.ir, &cfg, usize::from(code.registers))?;
+            graph.shared_cfg = Some(cfg);
+        }
+        for instruction in &front_end.ir.instructions {
+            ensure!(
+                condition_count != 0
+                    || !matches!(instruction.opcode, 0x0e..=0x11 | 0x27)
+                    || instruction.pc + instruction.width == code.instructions.len(),
+                "unreachable instruction region not reconstructed"
+            );
+            graph.widths[instruction.pc] = instruction.width;
+        }
+        graph.front_end = Some(front_end);
+        Ok(Some(graph))
+    }
+    fn carry_loop_values(
+        &self,
+        slots: &[Option<Value>],
+        values: &[Option<Value>],
+        out: &mut Output,
+    ) -> Result<()> {
+        carry_loop_values_impl(slots, values, out, !self.shared_loops.is_empty())
+    }
+    fn target(&self, pc: usize) -> Result<Option<usize>> {
+        if let Some(instruction) = self.instruction(pc)? {
+            Ok(instruction.branch_target)
+        } else {
+            Ok(self.targets[pc])
+        }
+    }
+    fn written_in(
+        &self,
+        code: &crate::native_dex::DexCode,
+        start: usize,
+        end: usize,
+    ) -> Option<Vec<bool>> {
+        let Some(front) = &self.front_end else {
+            return super::liveness::written_in(code, start, end);
         };
+        let mut written = vec![false; usize::from(code.registers)];
+        for instruction in front
+            .ir
+            .instructions
+            .iter()
+            .skip_while(|instruction| instruction.pc < start)
+            .take_while(|instruction| instruction.pc < end)
+        {
+            for operand in &instruction.writes {
+                let start = usize::from(operand.register);
+                written
+                    .get_mut(start..start + operand.kind.word_count())?
+                    .fill(true);
+            }
+        }
+        Some(written)
+    }
+    fn test(
+        &self,
+        words: &[u16],
+        pc: usize,
+        inverse: bool,
+        regs: &[Option<Value>],
+    ) -> Result<String> {
+        if let Some(instruction) = self.instruction(pc)? {
+            let (left, right) = decoded_condition_sources(instruction, regs.len())?;
+            condition_sources(instruction.opcode ^ u8::from(inverse), left, right, regs)
+        } else {
+            condition(
+                (words[pc] as u8) ^ u8::from(inverse),
+                (words[pc] >> 8) as usize,
+                regs,
+            )
+        }
+    }
+    fn shared_loop_edge(&self, pc: usize) -> Option<SharedLoopEdge> {
+        shared_loop_edge_at(&self.shared_loop_edges, pc)
+    }
+    #[cfg(test)]
+    fn edge_kind(&self, kind: SharedLoopEdgeKind) -> Option<SharedLoopEdge> {
+        self.shared_loop_edges
+            .iter()
+            .find(|edge| edge.kind == kind)
+            .copied()
+    }
+    #[cfg(test)]
+    fn edge_kind_mut(&mut self, kind: SharedLoopEdgeKind) -> Option<&mut SharedLoopEdge> {
+        self.shared_loop_edges
+            .iter_mut()
+            .find(|edge| edge.kind == kind)
+    }
+    fn shared_branch(&self, pc: usize) -> Result<Option<SharedBranch>> {
+        if self.shared_cfg.is_none() {
+            return Ok(None);
+        }
+        let index = self
+            .shared_branches
+            .binary_search_by_key(&pc, |plan| plan.branch)
+            .map_err(|_| anyhow::anyhow!("missing canonical shared branch plan"))?;
+        Ok(Some(self.shared_branches[index]))
+    }
+    fn instruction(&self, pc: usize) -> Result<Option<&crate::native_ir::Instruction>> {
+        self.front_end
+            .as_ref()
+            .map(|front| {
+                front
+                    .ir
+                    .instructions
+                    .binary_search_by_key(&pc, |insn| insn.pc)
+                    .map(|index| &front.ir.instructions[index])
+                    .map_err(|_| {
+                        anyhow::anyhow!("render offset is not a shared instruction boundary: {pc}")
+                    })
+            })
+            .transpose()
+    }
+    fn with_handlers(words: &[u16], handlers: &[usize]) -> Result<Self> {
+        let mut graph = Self::empty(words.len());
         let mut pc = 0;
         let mut branches = 0;
         let mut payload_starts = Vec::new();
@@ -841,6 +2547,27 @@ impl Graph {
                     || (start > l.start && exit <= l.latch)),
                 "overlapping loops not reconstructed"
             );
+            graph.loops.push(Loop {
+                parent: None,
+                start,
+                latch,
+                guard,
+                exit,
+                tail,
+            });
+        }
+        // Discover all loop regions before validating exits. A shared exit may
+        // reach a later independent loop; address order does not establish CFG
+        // membership. Every region still undergoes the same entry/edge checks.
+        for region in graph.loops.clone() {
+            let Loop {
+                parent: _,
+                start,
+                latch,
+                guard,
+                exit,
+                tail,
+            } = region;
             for (from, target) in graph.targets.iter().enumerate() {
                 graph.tick()?;
                 let Some(to) = *target else { continue };
@@ -871,8 +2598,8 @@ impl Graph {
                     // A shared bare return after the loop is a method exit,
                     // not a second loop continuation. It can be emitted in place.
                     if to == exit
-                        || (to > latch
-                            && graph.terminal_tail(to, latch + graph.widths[latch], words)?)
+                        || (!(start..body_end).contains(&to)
+                            && graph.non_reentering_tail(to, start..body_end, words)?)
                     {
                         continue;
                     }
@@ -890,14 +2617,8 @@ impl Graph {
                     ensure!(to <= start || to >= body_end, "loop has an interior entry");
                 }
             }
-            graph.loops.push(Loop {
-                start,
-                latch,
-                guard,
-                exit,
-                tail,
-            });
         }
+
         ensure!(
             graph.switches.iter().enumerate().all(|(pc, switch)| {
                 switch.as_ref().is_none_or(|switch| {
@@ -923,6 +2644,25 @@ impl Graph {
         Ok(graph)
     }
     fn live_at(&self, pc: usize, register: usize) -> bool {
+        if let Some(cfg) = &self.shared_cfg {
+            if pc == self.widths.len() {
+                return false;
+            }
+            let Some(live) = &self.shared_live else {
+                return true;
+            };
+            if register >= live.registers {
+                return true;
+            }
+            let Some(&block_index) = cfg.block_at.get(&pc) else {
+                return true;
+            };
+            if cfg.blocks[block_index].start != pc {
+                return true;
+            }
+            return live.bits[block_index * live.stride + register / 64] & (1 << (register % 64))
+                != 0;
+        }
         self.live
             .as_ref()
             .is_none_or(|live| live.contains(pc, register))
@@ -969,15 +2709,27 @@ impl Graph {
         }
         Ok(false)
     }
-    // A shared terminal tail may contain calls and value construction before its
-    // return. Duplicating it into a loop escape is safe only if all paths stay
-    // outside the loop and terminate; a backward edge alone is not proof.
-    fn terminal_tail(&self, start: usize, floor: usize, words: &[u16]) -> Result<bool> {
+    // A shared escape region may physically precede the loop and may contain
+    // later independent loops. Follow every normal CFG edge to prove no reentry.
+    // Paths may terminate or remain in a separately validated loop; this does
+    // not prove runtime termination. Protected instructions cannot be cloned
+    // here: their exception ownership needs a separate region proof.
+    fn non_reentering_tail(
+        &self,
+        start: usize,
+        excluded: std::ops::Range<usize>,
+        words: &[u16],
+    ) -> Result<bool> {
         let mut colors = vec![0u8; words.len()];
         let mut pending = vec![(start, false)];
         while let Some((pc, finish)) = pending.pop() {
             self.tick()?;
-            if pc < floor || pc >= words.len() || self.widths[pc] == 0 || self.payloads[pc] {
+            if excluded.contains(&pc)
+                || self.protected.iter().any(|region| region.contains(&pc))
+                || pc >= words.len()
+                || self.widths[pc] == 0
+                || self.payloads[pc]
+            {
                 return Ok(false);
             }
             if finish {
@@ -985,6 +2737,16 @@ impl Graph {
                 continue;
             }
             if colors[pc] == 1 {
+                // A recognized independent loop can run on the escape path.
+                // Traverse its actual edges (not just its ordinary exit), so a
+                // secondary exit back into the excluded loop is still rejected.
+                if self.loops.iter().any(|region| {
+                    region.start == pc
+                        && (region.body_end(&self.widths) <= excluded.start
+                            || region.start >= excluded.end)
+                }) {
+                    continue;
+                }
                 return Ok(false);
             }
             if colors[pc] == 2 {
@@ -1009,16 +2771,19 @@ impl Graph {
         Ok(true)
     }
     fn terminal_loop_escape(&self, pc: usize, stop: usize, words: &[u16]) -> bool {
-        pc > stop
-            && self.loops.iter().any(|region| {
-                region.start <= stop
-                    && stop <= region.latch
-                    && (pc == region.exit
-                        || (pc > region.latch
-                            && self
-                                .terminal_tail(pc, region.latch + self.widths[region.latch], words)
-                                .unwrap_or(false)))
-            })
+        self.loops.iter().any(|region| {
+            region.start <= stop
+                && stop <= region.latch
+                && (pc == region.exit
+                    || (!(region.start..region.body_end(&self.widths)).contains(&pc)
+                        && self
+                            .non_reentering_tail(
+                                pc,
+                                region.start..region.body_end(&self.widths),
+                                words,
+                            )
+                            .unwrap_or(false)))
+        })
     }
 
     fn reachable(&self, start: usize, stop: usize, words: &[u16]) -> Result<Vec<bool>> {
@@ -1181,8 +2946,22 @@ fn merge_type(left: Option<&Value>, right: Option<&Value>) -> Result<String> {
 }
 fn condition(op: u8, a: usize, regs: &[Option<Value>]) -> Result<String> {
     let zero = op >= 0x38;
+    condition_sources(
+        op,
+        if zero { a } else { a & 15 },
+        if zero { None } else { Some(a >> 4) },
+        regs,
+    )
+}
+fn condition_sources(
+    op: u8,
+    left: usize,
+    right: Option<usize>,
+    regs: &[Option<Value>],
+) -> Result<String> {
+    let zero = op >= 0x38;
     let kind = if zero { op - 0x38 } else { op - 0x32 };
-    let lhs = register(regs, if zero { a } else { a & 15 })?;
+    let lhs = register(regs, left)?;
     let rhs = if zero {
         Value {
             text: "0".into(),
@@ -1192,7 +2971,7 @@ fn condition(op: u8, a: usize, regs: &[Option<Value>]) -> Result<String> {
             raw_bits32: false,
         }
     } else {
-        register(regs, a >> 4)?
+        register(regs, right.context("missing comparison right operand")?)?
     };
     let symbol = ["==", "!=", "<", ">=", ">", "<="][kind as usize];
     let (left, right) = if reference(&lhs.ty) || reference(&rhs.ty) {
@@ -1326,11 +3105,18 @@ pub(super) fn reconstruct(
         .iter()
         .flat_map(|region| region.catches.iter().map(|(_, pc)| *pc as usize))
         .collect();
-    let mut graph = if handlers.is_empty() {
+    let mut graph = if let Some(graph) = Graph::straight_line(class, method)? {
+        graph
+    } else if handlers.is_empty() {
         Graph::new(&code.instructions)?
     } else {
         Graph::with_handlers(&code.instructions, &handlers)?
     };
+    graph.protected = code
+        .try_regions
+        .iter()
+        .map(|region| region.start as usize..region.end as usize)
+        .collect();
     if monitor_candidate {
         graph.synchronized = synchronized::analyze(code, &graph)?;
     }
@@ -1363,11 +3149,12 @@ pub(super) fn reconstruct(
                         .any(|r| r.inner_tries.contains(&index))),
         "mixed monitor and ordinary exception regions not reconstructed"
     );
-    if !code.try_regions.is_empty()
-        || graph.switches.iter().any(Option::is_some)
-        || graph.targets.iter().enumerate().any(|(pc, target)| {
-            target.is_some() && matches!(code.instructions[pc] as u8, 0x32..=0x3d)
-        })
+    if graph.shared_cfg.is_none()
+        && (!code.try_regions.is_empty()
+            || graph.switches.iter().any(Option::is_some)
+            || graph.targets.iter().enumerate().any(|(pc, target)| {
+                target.is_some() && matches!(code.instructions[pc] as u8, 0x32..=0x3d)
+            }))
     {
         graph.live = super::liveness::analyze(code);
     }
@@ -1410,6 +3197,14 @@ fn carry_loop_values(
     values: &[Option<Value>],
     out: &mut Output,
 ) -> Result<()> {
+    carry_loop_values_impl(slots, values, out, false)
+}
+fn carry_loop_values_impl(
+    slots: &[Option<Value>],
+    values: &[Option<Value>],
+    out: &mut Output,
+    retained_literals: bool,
+) -> Result<()> {
     validate_wide_frame(slots)?;
     validate_wide_frame(values)?;
     let mut copies = Vec::new();
@@ -1419,6 +3214,17 @@ fn carry_loop_values(
             continue;
         }
         let value = value.as_ref().context("loop loses initialized register")?;
+        if retained_literals && slot.text == "this" {
+            ensure!(value == slot, "loop changes retained receiver");
+            continue;
+        }
+        if retained_literals && (slot.literal.is_some() || slot.wide_literal.is_some()) {
+            ensure!(
+                value.literal == slot.literal && value.wide_literal == slot.wide_literal,
+                "loop changes retained literal"
+            );
+            continue;
+        }
         if value == slot {
             continue;
         }
@@ -1464,21 +3270,26 @@ fn loop_invariant_registers(
     while let Some(pc) = pending.pop_front() {
         graph.tick().ok()?;
         let mut frame = frames.get(&pc)?.clone();
-        let op = words[pc] as u8;
-        let width = graph.widths[pc];
+        let instruction = graph.instruction(pc).ok()?;
+        let op = instruction.map_or(words[pc] as u8, |instruction| instruction.opcode);
+        let width = instruction.map_or(graph.widths[pc], |instruction| instruction.width);
         let moved = if matches!(op, 0x01..=0x09) {
             let a = (words[pc] >> 8) as usize;
-            let (dst, src) = match (op - 1) % 3 {
-                0 => (a & 15, a >> 4),
-                1 => (a, *words.get(pc + 1)? as usize),
-                _ => (*words.get(pc + 1)? as usize, *words.get(pc + 2)? as usize),
+            let (dst, src) = if let Some(instruction) = instruction {
+                decoded_move(instruction, count).ok()?
+            } else {
+                match (op - 1) % 3 {
+                    0 => (a & 15, a >> 4),
+                    1 => (a, *words.get(pc + 1)? as usize),
+                    _ => (*words.get(pc + 1)? as usize, *words.get(pc + 2)? as usize),
+                }
             };
             let n = if matches!(op, 0x04..=0x06) { 2 } else { 1 };
             Some((dst, frame.get(src..src + n)?.to_vec()))
         } else {
             None
         };
-        let writes = super::liveness::written_in(code, pc, pc + width)?;
+        let writes = graph.written_in(code, pc, pc + width)?;
         for (r, write) in writes.into_iter().enumerate() {
             if write {
                 frame[r] = None;
@@ -1493,14 +3304,28 @@ fn loop_invariant_registers(
             continue;
         }
         let mut successors = Vec::new();
-        if let Some(switch) = &graph.switches[pc] {
-            successors.extend(switch.cases.iter().map(|(_, target)| *target));
-        }
-        if let Some(target) = graph.targets[pc] {
-            successors.push(target);
-        }
-        if !matches!(op, 0x28..=0x2a) {
-            successors.push(pc + width);
+        if let Some(cfg) = &graph.shared_cfg {
+            let block = &cfg.blocks[*cfg.block_at.get(&pc)?];
+            if block.instructions.last() == Some(&pc) {
+                successors.extend(
+                    block
+                        .successors
+                        .iter()
+                        .map(|edge| cfg.blocks[edge.target].start),
+                );
+            } else {
+                successors.push(pc + width);
+            }
+        } else {
+            if let Some(switch) = &graph.switches[pc] {
+                successors.extend(switch.cases.iter().map(|(_, target)| *target));
+            }
+            if let Some(target) = graph.targets[pc] {
+                successors.push(target);
+            }
+            if !matches!(op, 0x28..=0x2a) {
+                successors.push(pc + width);
+            }
         }
         for next in successors {
             if next == region.start || !(region.start..end).contains(&next) {
@@ -1566,8 +3391,7 @@ fn render_loop(
                         && region.exit <= monitor.exit)),
         "loop overlaps protected region"
     );
-    let written =
-        super::liveness::written_in(method.code.as_ref().unwrap(), region.start, region.exit);
+    let written = graph.written_in(method.code.as_ref().unwrap(), region.start, region.exit);
     let mut header_written = written.clone();
     if regs.iter().any(|value| {
         value
@@ -1588,20 +3412,44 @@ fn render_loop(
         }
     }
     let slots = loop_slots(&regs, graph, region.start, out, header_written.as_deref())?;
-    let has_break = graph.targets.iter().enumerate().any(|(pc, target)| {
-        (region.start..region.latch).contains(&pc)
-            && Some(pc) != region.guard
-            && *target == Some(region.exit)
-    });
-    let exit_slots = if region.tail.is_some() || has_break {
+    let has_break = if !graph.shared_loops.is_empty() {
+        graph
+            .shared_loop_edges
+            .iter()
+            .any(|edge| edge.owner == region.start && edge.kind == SharedLoopEdgeKind::Break)
+    } else {
+        graph.targets.iter().enumerate().any(|(pc, target)| {
+            (region.start..region.latch).contains(&pc)
+                && Some(pc) != region.guard
+                && *target == Some(region.exit)
+        })
+    };
+    // Header liveness excludes registers defined before the guard, even when
+    // their final value is live after the loop. Preserve that distinct exit
+    // frame for ordinary guarded loops too (including zero body iterations).
+    let posttest = !graph.shared_loops.is_empty() && region.guard.is_none();
+    let header_exit = (region.guard.is_some() || posttest)
+        && (0..regs.len()).any(|r| graph.live_at(region.exit, r) && slots[r].is_none());
+    let exit_slots = if region.tail.is_some() || has_break || header_exit || posttest {
         // Separate exit values from values required only by the next iteration.
         // In iterator loops the same DEX register may hold a String on the exit
         // path after holding an Iterator on the backedge.
         let mut exit_entry = regs.clone();
-        let mut exit_written = written.clone();
-        if (0..regs.len()).any(|r| graph.live_at(region.exit, r) && regs[r].is_none()) {
+        let mut exit_written = if !graph.shared_loops.is_empty() {
+            // The decoded invariant walk proves retained literals at both
+            // the latch and every canonical exit, including conditional break.
+            header_written.clone()
+        } else {
+            written.clone()
+        };
+        if (0..regs.len()).any(|r| {
+            graph.live_at(region.exit, r)
+                && (regs[r].is_none() || (header_exit && slots[r].is_none()))
+        }) {
             let prefix_end = if let Some(guard) = region.guard {
                 guard
+            } else if posttest {
+                region.latch
             } else {
                 let mut cursor = region.start;
                 while cursor < region.latch
@@ -1641,7 +3489,7 @@ fn render_loop(
             )?;
             ensure!(!returned, "loop header returns");
             if let Some(guard) = region.guard
-                && let Some(guard_target) = graph.targets[guard]
+                && let Some(guard_target) = graph.target(guard)?
                 && guard_target != region.exit
             {
                 let (values, returned) = render(
@@ -1660,7 +3508,7 @@ fn render_loop(
                 ensure!(!returned, "loop guard tail returns before merge");
                 header = values;
             }
-            let body_writes = super::liveness::written_in(
+            let body_writes = graph.written_in(
                 method.code.as_ref().unwrap(),
                 region
                     .guard
@@ -1668,7 +3516,9 @@ fn render_loop(
                 region.exit,
             );
             for (r, value) in header.iter().enumerate() {
-                if exit_entry[r].is_some() || !graph.live_at(region.exit, r) {
+                if !graph.live_at(region.exit, r)
+                    || (exit_entry[r].is_some() && !(header_exit && slots[r].is_none()))
+                {
                     continue;
                 }
                 let Some(value) = value else { continue };
@@ -1677,9 +3527,14 @@ fn render_loop(
                 }
                 let mut seed = value.clone();
                 if seed.literal == Some(0)
-                    && words
-                        .get(region.exit)
-                        .is_some_and(|word| *word as u8 == 0x1f && (*word >> 8) as usize == r)
+                    && if let Some(instruction) = graph.instruction(region.exit)? {
+                        instruction.opcode == 0x1f
+                            && decoded_array_type(instruction, regs.len())?.dst == r
+                    } else {
+                        words
+                            .get(region.exit)
+                            .is_some_and(|word| *word as u8 == 0x1f && (*word >> 8) as usize == r)
+                    }
                 {
                     // A check-cast at the common exit proves this register is a
                     // reference on every incoming edge, including DEX null.
@@ -1751,14 +3606,10 @@ fn render_loop(
             None,
         )?;
         ensure!(!returned, "loop header returns");
-        let cond = condition(
-            words[guard] as u8,
-            (words[guard] >> 8) as usize,
-            &header_regs,
-        )?;
+        let cond = graph.test(words, guard, false, &header_regs)?;
         body.line(&format!("if ({cond}) {{"), &[]);
         body.indent += 1;
-        let guard_target = graph.targets[guard].context("missing loop guard target")?;
+        let guard_target = graph.target(guard)?.context("missing loop guard target")?;
         let (guard_values, guard_returned) = if guard_target != region.exit {
             render(
                 class,
@@ -1777,7 +3628,7 @@ fn render_loop(
             (header_regs.clone(), false)
         };
         if !guard_returned {
-            carry_loop_values(
+            graph.carry_loop_values(
                 exit_slots.as_ref().unwrap_or(&slots),
                 &guard_values,
                 &mut body,
@@ -1830,7 +3681,7 @@ fn render_loop(
         )?;
         body.line(&format!("if ({cond}) {{"), &[]);
         body.indent += 1;
-        carry_loop_values(&slots, &values, &mut body)?;
+        graph.carry_loop_values(&slots, &values, &mut body)?;
         body.line("continue;", &[]);
         body.indent -= 1;
         body.line("}", &[]);
@@ -1848,39 +3699,42 @@ fn render_loop(
             None,
         )?;
         if !returned {
-            carry_loop_values(
+            graph.carry_loop_values(
                 exit_slots.as_ref().expect("tail exit slots"),
                 &tail_values,
                 &mut body,
             )?;
             body.line("break;", &[]);
         }
-    } else if region.guard.is_none() && !matches!(words[region.latch] as u8, 0x28..=0x2a) {
-        let cond = condition(
-            (words[region.latch] as u8) ^ 1,
-            (words[region.latch] >> 8) as usize,
-            &values,
-        )?;
+    } else if region.guard.is_none()
+        && !matches!(
+            graph
+                .instruction(region.latch)?
+                .map_or(words[region.latch] as u8, |i| i.opcode),
+            0x28..=0x2a
+        )
+    {
+        let cond = graph.test(words, region.latch, true, &values)?;
         // Evaluate the condition before rewriting the loop slots.
         let test = body.local("Z", &cond, &[])?;
         if exit_slots.is_none() {
-            carry_loop_values(&slots, &values, &mut body)?;
+            graph.carry_loop_values(&slots, &values, &mut body)?;
         }
         body.line(&format!("if ({}) {{", test.text), &[]);
         body.indent += 1;
         if let Some(exit_slots) = &exit_slots {
             // Snapshot exit values before rewriting possibly aliased header
             // slots on the continuation path.
-            carry_loop_values(exit_slots, &values, &mut body)?;
+            graph.carry_loop_values(exit_slots, &values, &mut body)?;
         }
         body.line("break;", &[]);
         body.indent -= 1;
         body.line("}", &[]);
         if exit_slots.is_some() {
-            carry_loop_values(&slots, &values, &mut body)?;
+            graph.carry_loop_values(&slots, &values, &mut body)?;
         }
     } else {
-        carry_loop_values(&slots, &values, &mut body)?;
+        graph.carry_loop_values(&slots, &values, &mut body)?;
     }
     out.sequence = body.sequence;
     out.line("while (true) {", &[]);
@@ -2860,6 +4714,37 @@ fn render(
         .as_ref()
         .context("method has no code")?
         .instructions;
+    if depth == 0
+        && let Some(cfg) = &graph.shared_cfg
+    {
+        let front = graph
+            .front_end
+            .as_ref()
+            .context("shared CFG without front end")?;
+        if !graph.shared_loops.is_empty() {
+            cfg.validate_decoded_loop(&front.ir, words.len())?;
+            ensure!(
+                graph.shared_loops == decoded_natural_loops(&front.ir, cfg)?
+                    && graph.loops == graph.shared_loops
+                    && graph.shared_loop_edges
+                        == decoded_all_loop_edges(&front.ir, &graph.shared_loops)?
+                    && graph.shared_branches
+                        == decoded_loop_branch_plans(
+                            &front.ir,
+                            cfg,
+                            &graph.shared_loops,
+                            words.len()
+                        )?,
+                "shared natural-loop metadata differs from canonical CFG"
+            );
+        } else {
+            cfg.validate_decoded(&front.ir, words.len())?;
+            ensure!(
+                graph.shared_branches == decoded_branch_plans(&front.ir, cfg, words.len())?,
+                "shared diamond plan differs from canonical CFG"
+            );
+        }
+    }
     let constructor = method.name.as_ref() == "<init>";
     let mut returned = false;
     let mut pending: Option<Value> = None;
@@ -2940,13 +4825,14 @@ fn render(
             continue;
         }
         let w = words[pc];
-        let op = w as u8;
+        let instruction = graph.instruction(pc)?;
+        let op = instruction.map_or(w as u8, |insn| insn.opcode);
         let a = (w >> 8) as usize;
         ensure!(
             allocation.is_none() || matches!(op, 0x00..=0x09 | 0x12..=0x19 | 0x1c | 0x70 | 0x76),
             "effectful instruction between allocation and constructor"
         );
-        let width = graph.widths[pc];
+        let width = instruction.map_or(graph.widths[pc], |insn| insn.width);
         if op == 0x1e
             && graph
                 .synchronized
@@ -2965,7 +4851,11 @@ fn render(
                 initialized || constructor,
                 "branch before constructor initialization"
             );
-            let target = graph.targets[pc].context("missing goto target")?;
+            let target = if let Some(instruction) = instruction {
+                decoded_goto(instruction)?
+            } else {
+                graph.targets[pc].context("missing goto target")?
+            };
             if let Some(context) = suppressed_loop
                 && target == context.start
             {
@@ -2981,29 +4871,28 @@ fn render(
                 && target == context.exit
             {
                 ensure!(allocation.is_none(), "break interrupts instruction state");
-                carry_loop_values(context.exit_slots, &regs, out)?;
+                graph.carry_loop_values(context.exit_slots, &regs, out)?;
                 out.line("break;", &[]);
                 return Ok((regs, true));
             }
             if let Some(context) = suppressed_loop
-                && target >= stop
                 && graph
                     .loops
                     .iter()
                     .find(|region| region.start == context.start)
                     .is_some_and(|region| {
-                        target > region.latch
+                        !(region.start..region.body_end(&graph.widths)).contains(&target)
                             && graph
-                                .terminal_tail(
+                                .non_reentering_tail(
                                     target,
-                                    region.latch + graph.widths[region.latch],
+                                    region.start..region.body_end(&graph.widths),
                                     words,
                                 )
                                 .unwrap_or(false)
                     })
             {
                 ensure!(allocation.is_none(), "invalid loop return");
-                return render(
+                let result = render(
                     class,
                     method,
                     graph,
@@ -3015,8 +4904,14 @@ fn render(
                     initialized,
                     None,
                     exception_slots,
-                );
+                )?;
+                ensure!(result.1, "loop escape does not terminate its region");
+                return Ok(result);
             }
+            ensure!(
+                suppressed_loop.is_none_or(|context| target >= context.start),
+                "unproven backward loop escape"
+            );
             ensure!(
                 target > pc || graph.acyclic_backwards.contains(&pc),
                 "unstructured backward jump"
@@ -3047,7 +4942,14 @@ fn render(
                 initialized || constructor,
                 "branch before constructor initialization"
             );
-            let target = graph.targets[pc].context("missing branch target")?;
+            let target = if let Some(edge) = graph.shared_loop_edge(pc) {
+                edge.taken
+            } else if let Some(diamond) = graph.shared_branch(pc)? {
+                ensure!(diamond.branch == pc, "condition outside shared diamond");
+                diamond.taken
+            } else {
+                graph.targets[pc].context("missing branch target")?
+            };
             if let Some(context) = suppressed_loop
                 && target == context.start
             {
@@ -3055,44 +4957,47 @@ fn render(
                     allocation.is_none(),
                     "continue interrupts instruction state"
                 );
-                let test = condition(op, a, &regs)?;
+                let test = graph.test(words, pc, false, &regs)?;
                 out.line(&format!("if ({test}) {{"), &[]);
                 out.indent += 1;
-                carry_loop_values(context.slots, &regs, out)?;
+                graph.carry_loop_values(context.slots, &regs, out)?;
                 out.line("continue;", &[]);
                 out.indent -= 1;
                 out.line("}", &[]);
                 pending = None;
-                pc += width;
+                pc = graph
+                    .shared_loop_edge(pc)
+                    .map_or(pc + width, |edge| edge.fallthrough);
                 continue;
             }
             if let Some(context) = suppressed_loop
                 && target == context.exit
             {
                 ensure!(allocation.is_none(), "break interrupts instruction state");
-                let test = condition(op, a, &regs)?;
+                let test = graph.test(words, pc, false, &regs)?;
                 out.line(&format!("if ({test}) {{"), &[]);
                 out.indent += 1;
-                carry_loop_values(context.exit_slots, &regs, out)?;
+                graph.carry_loop_values(context.exit_slots, &regs, out)?;
                 out.line("break;", &[]);
                 out.indent -= 1;
                 out.line("}", &[]);
                 pending = None;
-                pc += width;
+                pc = graph
+                    .shared_loop_edge(pc)
+                    .map_or(pc + width, |edge| edge.fallthrough);
                 continue;
             }
             if let Some(context) = suppressed_loop
-                && target >= stop
                 && graph
                     .loops
                     .iter()
                     .find(|region| region.start == context.start)
                     .is_some_and(|region| {
-                        target > region.latch
+                        !(region.start..region.body_end(&graph.widths)).contains(&target)
                             && graph
-                                .terminal_tail(
+                                .non_reentering_tail(
                                     target,
-                                    region.latch + graph.widths[region.latch],
+                                    region.start..region.body_end(&graph.widths),
                                     words,
                                 )
                                 .unwrap_or(false)
@@ -3102,7 +5007,7 @@ fn render(
                 let test = condition(op, a, &regs)?;
                 out.line(&format!("if ({test}) {{"), &[]);
                 out.indent += 1;
-                render(
+                let (_, terminal) = render(
                     class,
                     method,
                     graph,
@@ -3115,12 +5020,17 @@ fn render(
                     None,
                     exception_slots,
                 )?;
+                ensure!(terminal, "loop escape does not terminate its region");
                 out.indent -= 1;
                 out.line("}", &[]);
                 pending = None;
                 pc += width;
                 continue;
             }
+            ensure!(
+                suppressed_loop.is_none_or(|context| target >= context.start),
+                "unproven backward loop escape"
+            );
             ensure!(
                 (target > pc || graph.acyclic_backwards.contains(&pc)) && target <= stop,
                 "branch crosses region boundary at {pc:04x}: target {target:04x}, stop {stop:04x}"
@@ -3133,9 +5043,26 @@ fn render(
                     }
                 }
             }
-            let condition = condition(op, a, &branch_regs)?;
-            let inverse = self::condition(op ^ 1, a, &branch_regs)?;
-            let join = graph.join(pc + width, target, stop, words)?;
+            let (condition, inverse, fallthrough, join) = if let Some(diamond) =
+                graph.shared_branch(pc)?
+            {
+                let instruction = instruction.context("shared diamond lacks decoded condition")?;
+                let (left, right) = decoded_condition_sources(instruction, regs.len())?;
+                ensure!(diamond.join <= stop, "shared diamond join crosses region");
+                (
+                    condition_sources(op, left, right, &branch_regs)?,
+                    condition_sources(op ^ 1, left, right, &branch_regs)?,
+                    diamond.fallthrough,
+                    diamond.join,
+                )
+            } else {
+                (
+                    condition(op, a, &branch_regs)?,
+                    self::condition(op ^ 1, a, &branch_regs)?,
+                    pc + width,
+                    graph.join(pc + width, target, stop, words)?,
+                )
+            };
             if !initialized {
                 // Keep initialization outside both arms. Masking rejects any
                 // reads/escapes/delegation through this, and this write proof
@@ -3181,7 +5108,7 @@ fn render(
                 class,
                 method,
                 graph,
-                pc + width,
+                fallthrough,
                 join,
                 branch_regs,
                 &mut no,
@@ -3356,10 +5283,14 @@ fn render(
         match op {
             0x00 => ensure!(w == 0, "payload in straight-line body"),
             0x01..=0x09 => {
-                let (dst, src) = match (op - 1) % 3 {
-                    0 => (a & 15, a >> 4),
-                    1 => (a, words[pc + 1] as usize),
-                    _ => (words[pc + 1] as usize, words[pc + 2] as usize),
+                let (dst, src) = if let Some(instruction) = instruction {
+                    decoded_move(instruction, regs.len())?
+                } else {
+                    match (op - 1) % 3 {
+                        0 => (a & 15, a >> 4),
+                        1 => (a, words[pc + 1] as usize),
+                        _ => (words[pc + 1] as usize, words[pc + 2] as usize),
+                    }
                 };
                 let value = register(&regs, src)?;
                 let kind = (op - 1) / 3;
@@ -3382,6 +5313,31 @@ fn render(
                 assign(&mut regs, dst, value)?;
             }
             0x0a..=0x0c => {
+                let dst = if let Some(instruction) = instruction {
+                    decoded_result_destination(instruction, regs.len())?
+                } else {
+                    a
+                };
+                if let Some(front) = &graph.front_end {
+                    let index = front.ir.instructions.partition_point(|insn| insn.pc < pc);
+                    let producer = index
+                        .checked_sub(1)
+                        .and_then(|index| front.ir.instructions.get(index))
+                        .context("missing shared move-result producer")?;
+                    let call_index = front
+                        .bound
+                        .calls
+                        .binary_search_by_key(&producer.pc, |call| call.pc)
+                        .map_err(|_| anyhow::anyhow!("missing shared move-result binding"))?;
+                    let result = front.bound.calls[call_index]
+                        .result
+                        .as_ref()
+                        .context("missing shared bound result")?;
+                    ensure!(
+                        result.move_pc == pc && usize::from(result.register.register) == dst,
+                        "shared move-result destination differs from bound result"
+                    );
+                }
                 let value = pending.take().context("move-result without invoke")?;
                 ensure!(
                     match op {
@@ -3391,7 +5347,7 @@ fn render(
                     },
                     "result opcode type mismatch"
                 );
-                assign(&mut regs, a, value)?;
+                assign(&mut regs, dst, value)?;
             }
             0x0d => bail!("move-exception outside handled entry"),
             0x27 => {
@@ -3411,7 +5367,12 @@ fn render(
                     initialized || throwing_prologue,
                     "throw before initialization: implicit super() would change construction/finalization effects"
                 );
-                let value = register(&regs, a)?;
+                let src = if let Some(instruction) = instruction {
+                    decoded_throw_source(instruction, regs.len())?
+                } else {
+                    a
+                };
+                let value = register(&regs, src)?;
                 // Java precise rethrow preserves the exception from this catch.
                 // Only unchanged catch identities qualify, not arbitrary Throwable values.
                 let expression = if graph.caught_values.borrow().contains(&value.text) {
@@ -3451,6 +5412,12 @@ fn render(
                 returned = true;
             }
             0x0e => {
+                if let Some(instruction) = instruction {
+                    ensure!(
+                        decoded_return_source(instruction, regs.len())?.is_none(),
+                        "invalid shared void return"
+                    );
+                }
                 ensure!(
                     method.return_type.as_ref() == "V" && initialized,
                     "invalid void return"
@@ -3459,6 +5426,12 @@ fn render(
                 returned = true;
             }
             0x0f..=0x11 => {
+                let src = if let Some(instruction) = instruction {
+                    decoded_return_source(instruction, regs.len())?
+                        .context("missing shared return source")?
+                } else {
+                    a
+                };
                 ensure!(
                     initialized && method.return_type.as_ref() != "V",
                     "invalid return"
@@ -3468,7 +5441,7 @@ fn render(
                         && (op == 0x10) == wide(&method.return_type),
                     "return opcode type mismatch"
                 );
-                let value = register(&regs, a)?;
+                let value = register(&regs, src)?;
                 let expr = argument(&value, &method.return_type)?;
                 if exception_slots.is_some()
                     && reference(&method.return_type)
@@ -3497,14 +5470,22 @@ fn render(
                 returned = true;
             }
             0x12..=0x15 => {
-                let (dst, n) = match op {
-                    0x12 => (a & 15, ((w as i16) >> 12) as i32),
-                    0x13 => (a, words[pc + 1] as i16 as i32),
-                    0x14 => (
-                        a,
-                        (words[pc + 1] as u32 | ((words[pc + 2] as u32) << 16)) as i32,
-                    ),
-                    _ => (a, (words[pc + 1] as i32) << 16),
+                let (dst, n) = if let Some(instruction) = instruction {
+                    let (dst, literal) = decoded_constant(instruction, regs.len())?;
+                    (
+                        dst,
+                        i32::try_from(literal).context("shared constant exceeds 32 bits")?,
+                    )
+                } else {
+                    match op {
+                        0x12 => (a & 15, ((w as i16) >> 12) as i32),
+                        0x13 => (a, words[pc + 1] as i16 as i32),
+                        0x14 => (
+                            a,
+                            (words[pc + 1] as u32 | ((words[pc + 2] as u32) << 16)) as i32,
+                        ),
+                        _ => (a, (words[pc + 1] as i32) << 16),
+                    }
                 };
                 assign(
                     &mut regs,
@@ -3519,19 +5500,28 @@ fn render(
                 )?;
             }
             0x16..=0x19 => {
-                let bits = match op {
-                    0x16 => words[pc + 1] as i16 as i64 as u64,
-                    0x17 => {
-                        (words[pc + 1] as u32 | ((words[pc + 2] as u32) << 16)) as i32 as i64 as u64
-                    }
-                    0x18 => (0..4).fold(0u64, |bits, i| {
-                        bits | ((words[pc + 1 + i] as u64) << (16 * i))
-                    }),
-                    _ => (words[pc + 1] as u64) << 48,
+                let (dst, bits) = if let Some(instruction) = instruction {
+                    let (dst, literal) = decoded_constant(instruction, regs.len())?;
+                    (dst, literal as u64)
+                } else {
+                    (
+                        a,
+                        match op {
+                            0x16 => words[pc + 1] as i16 as i64 as u64,
+                            0x17 => {
+                                (words[pc + 1] as u32 | ((words[pc + 2] as u32) << 16)) as i32
+                                    as i64 as u64
+                            }
+                            0x18 => (0..4).fold(0u64, |bits, i| {
+                                bits | ((words[pc + 1 + i] as u64) << (16 * i))
+                            }),
+                            _ => (words[pc + 1] as u64) << 48,
+                        },
+                    )
                 };
                 assign(
                     &mut regs,
-                    a,
+                    dst,
                     Value {
                         text: format!("{}L", bits as i64),
                         ty: "J".into(),
@@ -3543,27 +5533,32 @@ fn render(
             }
             0x2d..=0x31 => {
                 let spec = numeric::Compare::decode(op).context("comparison opcode")?;
-                let packed = words[pc + 1];
-                let lhs = argument(
-                    &register(&regs, (packed & 255) as usize)?,
-                    spec.input.descriptor(),
-                )?;
-                let rhs = argument(
-                    &register(&regs, (packed >> 8) as usize)?,
-                    spec.input.descriptor(),
-                )?;
+                let (dst, left, right) = if let Some(instruction) = instruction {
+                    let (dst, sources, _) = decoded_arithmetic(instruction, regs.len())?;
+                    (dst, sources[0], sources[1])
+                } else {
+                    let packed = words[pc + 1];
+                    (a, (packed & 255) as usize, (packed >> 8) as usize)
+                };
+                let lhs = argument(&register(&regs, left)?, spec.input.descriptor())?;
+                let rhs = argument(&register(&regs, right)?, spec.input.descriptor())?;
                 let value = out.local("I", &spec.expression(&lhs, &rhs), &[])?;
-                assign(&mut regs, a, value)?;
+                assign(&mut regs, dst, value)?;
             }
             0x1a | 0x1b => {
-                let mut index = words[pc + 1] as usize;
-                if op == 0x1b {
-                    index |= (words[pc + 2] as usize) << 16;
-                }
+                let (dst, index) = if let Some(instruction) = instruction {
+                    decoded_reference_constant(instruction, regs.len())?
+                } else {
+                    let mut index = words[pc + 1] as usize;
+                    if op == 0x1b {
+                        index |= (words[pc + 2] as usize) << 16;
+                    }
+                    (a, index)
+                };
                 let s = class.symbols.strings.get(index).context("string index")?;
                 assign(
                     &mut regs,
-                    a,
+                    dst,
                     Value {
                         text: string_literal(s)?,
                         ty: "Ljava/lang/String;".into(),
@@ -3607,32 +5602,47 @@ fn render(
                     },
                 )?;
             }
+            0x8d..=0x8f if instruction.is_some() => {
+                let (dst, sources, _) = decoded_arithmetic(instruction.unwrap(), regs.len())?;
+                let input = register(&regs, sources[0])?;
+                ensure!(
+                    initialized || input.text != "this",
+                    "uninitialized this used by array/type operation"
+                );
+                let ty = ["B", "C", "S"][(op - 0x8d) as usize];
+                let value = out.local(
+                    ty,
+                    &format!("({}) ({})", java_type(ty)?, integral(&input)?),
+                    &[],
+                )?;
+                assign(&mut regs, dst, value)?;
+            }
             0x1c | 0x1f..=0x21 | 0x23 | 0x44..=0x51 | 0x8d..=0x8f => {
+                let operands = if let Some(instruction) = instruction {
+                    if op == 0x1c {
+                        let (dst, index) = decoded_reference_constant(instruction, regs.len())?;
+                        operations::Operands {
+                            dst,
+                            reads: [0; 3],
+                            read_count: 0,
+                            type_index: Some(index),
+                        }
+                    } else {
+                        decoded_array_type(instruction, regs.len())?
+                    }
+                } else {
+                    operations::Operands::legacy(op, a, if width > 1 { words[pc + 1] } else { 0 })
+                };
                 if !initialized {
-                    let operand = if width > 1 { words[pc + 1] } else { 0 };
-                    let inputs = match op {
-                        0x1c => vec![],
-                        0x1f => vec![a],
-                        0x20 | 0x21 | 0x23 | 0x8d..=0x8f => vec![a >> 4],
-                        0x44..=0x4a => vec![(operand & 255) as usize, (operand >> 8) as usize],
-                        0x4b..=0x51 => vec![a, (operand & 255) as usize, (operand >> 8) as usize],
-                        _ => unreachable!(),
-                    };
-                    for input in inputs {
+                    let inputs = operands.guarded_inputs(op);
+                    for &input in &inputs[..operands.read_count] {
                         ensure!(
                             register(&regs, input)?.text != "this",
                             "uninitialized this used by array/type operation"
                         );
                     }
                 }
-                operations::emit(
-                    class,
-                    op,
-                    a,
-                    if width > 1 { words[pc + 1] } else { 0 },
-                    &mut regs,
-                    out,
-                )?;
+                operations::emit(class, op, operands, &mut regs, out)?;
             }
             0x24 | 0x25 => {
                 if !initialized {
@@ -3758,11 +5768,16 @@ fn render(
                 allocation = Some((a, ty.to_string()));
             }
             0x52..=0x6d => {
-                let &(owner, ty, name) = class
-                    .symbols
-                    .fields
-                    .get(words[pc + 1] as usize)
-                    .context("field index")?;
+                let (reg, receiver_reg, index) = if let Some(instruction) = instruction {
+                    decoded_field(instruction, regs.len())?
+                } else {
+                    (
+                        if op >= 0x60 { a } else { a & 15 },
+                        if op >= 0x60 { None } else { Some(a >> 4) },
+                        words[pc + 1] as usize,
+                    )
+                };
+                let &(owner, ty, name) = class.symbols.fields.get(index).context("field index")?;
                 let owner = class
                     .symbols
                     .types
@@ -3803,8 +5818,9 @@ fn render(
                     && if is_static {
                         !put
                     } else {
-                        register(&regs, a >> 4)?.text != "this"
-                            && (!put || register(&regs, a & 15)?.text != "this")
+                        register(&regs, receiver_reg.context("missing field receiver")?)?.text
+                            != "this"
+                            && (!put || register(&regs, reg)?.text != "this")
                     };
                 if !(initialized || independent_early_field) {
                     // Independent static reads do not touch the uninitialized receiver.
@@ -3818,7 +5834,9 @@ fn render(
                             && !is_static
                             && put
                             && owner.as_ref() == class.descriptor.as_ref()
-                            && register(&regs, a >> 4)?.text == "this"
+                            && register(&regs, receiver_reg.context("missing field receiver")?)?
+                                .text
+                                == "this"
                             && class.fields.iter().any(|field| !field.is_static
                                 && field.declaring_type == class.descriptor
                                 && field.name.as_ref() == name
@@ -3826,7 +5844,7 @@ fn render(
                         "unsupported field access before constructor initialization"
                     );
                     ensure!(
-                        register(&regs, a & 15)?.text != "this",
+                        register(&regs, reg)?.text != "this",
                         "uninitialized this escapes through field value"
                     );
                     early_field_writes = true;
@@ -3834,7 +5852,10 @@ fn render(
                 let target = if is_static {
                     java_type(owner)?
                 } else {
-                    receiver(&register(&regs, a >> 4)?, owner)?
+                    receiver(
+                        &register(&regs, receiver_reg.context("missing field receiver")?)?,
+                        owner,
+                    )?
                 };
                 let expr = format!("{target}.{display_name}");
                 let label = format!(
@@ -3858,7 +5879,6 @@ fn render(
                         class_label(owner).context("invalid owner")?,
                     ));
                 }
-                let reg = if is_static { a } else { a & 15 };
                 if put {
                     let value = argument(&register(&regs, reg)?, ty)?;
                     out.line(&format!("{expr} = {value};"), &refs);
@@ -3870,7 +5890,12 @@ fn render(
             0x6e..=0x72 | 0x74..=0x78 => {
                 let kind = if op >= 0x74 { op - 6 } else { op };
                 let static_call = kind == 0x71;
-                let inputs: Vec<usize> = if op >= 0x74 {
+                let inputs: Vec<usize> = if let Some(insn) = instruction {
+                    insn.reads
+                        .iter()
+                        .map(|input| usize::from(input.register))
+                        .collect()
+                } else if op >= 0x74 {
                     (words[pc + 2] as usize..words[pc + 2] as usize + a).collect()
                 } else {
                     let n = a >> 4;
@@ -3885,13 +5910,26 @@ fn render(
                     ];
                     all[..n].to_vec()
                 };
-                let call = crate::native_calls::bind_invocation(
-                    op,
-                    pc,
-                    u32::from(words[pc + 1]),
-                    &inputs,
-                    &class.symbols,
-                )?;
+                let local_binding;
+                let call = if let Some(front) = &graph.front_end {
+                    let index = front
+                        .bound
+                        .calls
+                        .binary_search_by_key(&pc, |call| call.pc)
+                        .map_err(|_| {
+                            anyhow::anyhow!("missing shared invocation binding at {pc}")
+                        })?;
+                    &front.bound.calls[index]
+                } else {
+                    local_binding = crate::native_calls::bind_invocation(
+                        op,
+                        pc,
+                        u32::from(words[pc + 1]),
+                        &inputs,
+                        &class.symbols,
+                    )?;
+                    &local_binding
+                };
                 let crate::native_calls::CallTarget::Method {
                     declaring_type: owner,
                     name,
@@ -4165,9 +6203,13 @@ fn render(
                             class_label(owner).context("invalid owner")?,
                         ));
                     }
-                    let consumes_result = words
-                        .get(pc + width)
-                        .is_some_and(|word| matches!(word & 0xff, 0x0a..=0x0c));
+                    let consumes_result = if graph.front_end.is_some() {
+                        call.result.is_some()
+                    } else {
+                        words
+                            .get(pc + width)
+                            .is_some_and(|word| matches!(word & 0xff, 0x0a..=0x0c))
+                    };
                     if ret.as_ref() == "V" || !consumes_result {
                         out.line(&format!("{expr};"), &refs);
                     } else {
@@ -4177,14 +6219,23 @@ fn render(
             }
             0x7b..=0x8c => {
                 let spec = numeric::Unary::decode(op).context("unary opcode")?;
-                let source = argument(&register(&regs, a >> 4)?, spec.input.descriptor())?;
+                let (dst, src) = if let Some(instruction) = instruction {
+                    let (dst, sources, _) = decoded_arithmetic(instruction, regs.len())?;
+                    (dst, sources[0])
+                } else {
+                    (a & 15, a >> 4)
+                };
+                let source = argument(&register(&regs, src)?, spec.input.descriptor())?;
                 let value = out.local(spec.result.descriptor(), &spec.expression(&source), &[])?;
                 ensure!(value.ty == spec.result_descriptor, "unary result type");
-                assign(&mut regs, a & 15, value)?;
+                assign(&mut regs, dst, value)?;
             }
             0x9b..=0xaf | 0xbb..=0xcf => {
                 let spec = numeric::Binary::decode(op).context("binary opcode")?;
-                let (dst, left, right) = if op >= 0xb0 {
+                let (dst, left, right) = if let Some(instruction) = instruction {
+                    let (dst, sources, _) = decoded_arithmetic(instruction, regs.len())?;
+                    (dst, sources[0], sources[1])
+                } else if op >= 0xb0 {
                     (a & 15, a & 15, a >> 4)
                 } else {
                     let packed = words[pc + 1];
@@ -4200,13 +6251,36 @@ fn render(
                 assign(&mut regs, dst, value)?;
             }
             0x90..=0x9a | 0xb0..=0xba | 0xd0..=0xe2 => {
+                let decoded = instruction
+                    .map(|instruction| decoded_arithmetic(instruction, regs.len()))
+                    .transpose()?;
                 if let Some((dst, expression)) =
-                    boolean_bitwise_expression(op, a, words, pc, &regs)?
+                    boolean_bitwise_expression(op, a, words, pc, &regs, decoded.as_ref())?
                 {
                     let value = out.local("Z", &expression, &[])?;
                     assign(&mut regs, dst, value)?;
                 } else {
-                    let (dst, lhs, rhs, kind) = if op <= 0x9a {
+                    let (dst, lhs, rhs, kind) = if let Some((dst, sources, literal)) = &decoded {
+                        let kind = if op <= 0x9a {
+                            op - 0x90
+                        } else if op <= 0xba {
+                            op - 0xb0
+                        } else if op <= 0xd7 {
+                            op - 0xd0
+                        } else {
+                            op - 0xd8
+                        };
+                        (
+                            *dst,
+                            integral(&register(&regs, sources[0])?)?,
+                            if let Some(n) = literal {
+                                n.to_string()
+                            } else {
+                                integral(&register(&regs, sources[1])?)?
+                            },
+                            kind,
+                        )
+                    } else if op <= 0x9a {
                         let w = words[pc + 1];
                         (
                             a,
@@ -4246,7 +6320,7 @@ fn render(
                 }
             }
             0x1d | 0x1e => bail!("unmatched or unproven monitor instruction"),
-            _ => unreachable!(),
+            _ => bail!("unsupported opcode 0x{op:02x} at {pc}"),
         }
         ensure!(
             out.text.len() <= 4 * 1024 * 1024,
@@ -4281,10 +6355,30 @@ mod tests {
     #[test]
     fn terminal_loop_tail_proof_rejects_cycles_and_reentry() {
         let words = [0x0012, 0x0038, 3, 0xfe28, 0x000e];
-        let graph = Graph::new(&words).unwrap();
-        assert!(graph.terminal_tail(4, 4, &words).unwrap());
-        assert!(!graph.terminal_tail(1, 0, &words).unwrap());
-        assert!(!graph.terminal_tail(3, 3, &words).unwrap());
+        let mut graph = Graph::new(&words).unwrap();
+        assert!(graph.non_reentering_tail(4, 0..4, &words).unwrap());
+        assert!(graph.non_reentering_tail(1, 0..0, &words).unwrap());
+        assert!(!graph.non_reentering_tail(3, 0..3, &words).unwrap());
+        // A raw cycle without a separately validated loop remains unsupported.
+        graph.loops.clear();
+        assert!(!graph.non_reentering_tail(1, 0..0, &words).unwrap());
+    }
+    #[test]
+    fn independent_loop_escape_proof_checks_secondary_edges_and_exception_ownership() {
+        let words = [
+            0x0012, 0x0628, 0x1071, 0, 0, 0x000a, 0x0928, 0x1035, 7, 0x2032, 0xfff9, 0x00d8,
+            0x0100, 0xfa28, 0x000f, 0x0212, 0x1235, 7, 0x02d8, 0x0102, 0x00d8, 0x0200, 0xfa28,
+            0x000f,
+        ];
+        let mut graph = Graph::new(&words).unwrap();
+        assert!(graph.non_reentering_tail(2, 7..14, &words).unwrap());
+        // Test the traversal directly, independently of global loop-overlap
+        // rejection: a secondary exit must never disappear in a loop summary.
+        graph.targets[16] = Some(7);
+        assert!(!graph.non_reentering_tail(2, 7..14, &words).unwrap());
+        graph.targets[16] = Some(23);
+        graph.protected.push(2..5);
+        assert!(!graph.non_reentering_tail(2, 7..14, &words).unwrap());
     }
     fn fixture(
         words: Vec<u16>,
@@ -4324,6 +6418,5571 @@ mod tests {
         };
         (class, method)
     }
+    #[test]
+    fn shared_straight_line_consumes_decoded_layout_and_bound_calls() {
+        let (mut class, mut method) =
+            fixture(vec![0x0071, 0, 0, 0x000a, 0x000f], 1, 0, vec![], "I");
+        class.symbols = Arc::new(DexSymbols {
+            types: vec!["Lsample/Source;".into()],
+            strings: vec!["read".into()],
+            protos: vec![("I".into(), vec![])],
+            methods: vec![(0, 0, 0)],
+            ..Default::default()
+        });
+        let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert_eq!(graph.instruction(3).unwrap().unwrap().opcode, 0x0a);
+        assert!(graph.instruction(1).is_err());
+        // Deliberately poison only the legacy layout and raw invoke index after
+        // analysis. If rendering redecodes/rebinds instead of using the shared
+        // front end, this cannot render. Production inputs remain immutable.
+        graph.widths.fill(0);
+        method.code.as_mut().unwrap().instructions[1] = u16::MAX;
+        let mut output = Output::default();
+        let (_, terminal) = render(
+            &class,
+            &method,
+            &graph,
+            0,
+            5,
+            vec![None],
+            &mut output,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(terminal);
+        assert!(output.text.contains("sample.Source.read()"));
+        assert!(
+            output
+                .links
+                .iter()
+                .any(|link| link.label == "sample.Source.read()I")
+        );
+        // Missing shared binding is an invariant failure, never a raw fallback.
+        graph.front_end.as_mut().unwrap().bound.calls.clear();
+        assert!(
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                5,
+                vec![None],
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    fn shared_natural_loop_fixture(goto: u8) -> (DexClass, DexMethod, Vec<Option<Value>>) {
+        let width = usize::from(goto - 0x27);
+        let mut words = vec![
+            0x0012,
+            0x0112,
+            0x1071,
+            0,
+            0,
+            0x3035,
+            (6 + width) as u16,
+            0x0190,
+            0x0001,
+            0x00d8,
+            0x0100,
+        ];
+        let delta = -9i32;
+        words.extend(match goto {
+            0x28 => vec![0xf728],
+            0x29 => vec![0x0029, delta as u16],
+            _ => vec![0x002a, delta as u16, ((delta as u32) >> 16) as u16],
+        });
+        words.push(0x010f);
+        let (mut class, mut method) = fixture(words, 4, 0, vec![], "I");
+        method.code.as_mut().unwrap().outs = 1;
+        class.symbols = Arc::new(DexSymbols {
+            types: vec!["Lsample/Header;".into()],
+            strings: vec!["touch".into()],
+            protos: vec![("V".into(), vec!["I".into()])],
+            methods: vec![(0, 0, 0)],
+            ..Default::default()
+        });
+        let mut regs = vec![None; 4];
+        assign(
+            &mut regs,
+            3,
+            Value {
+                text: "limit".into(),
+                ty: "I".into(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: false,
+            },
+        )
+        .unwrap();
+        (class, method, regs)
+    }
+
+    fn shared_posttest_fixture(ty: &str) -> (DexClass, DexMethod, Vec<Option<Value>>) {
+        let (class, mut method, mut regs) = shared_natural_loop_fixture(0x28);
+        let (value, returned) = match ty {
+            "J" => (0x0181, 0x0110),
+            "Ljava/lang/Object;" => {
+                assign(
+                    &mut regs,
+                    2,
+                    Value {
+                        text: "object".into(),
+                        ty: ty.into(),
+                        literal: None,
+                        wide_literal: None,
+                        raw_bits32: false,
+                    },
+                )
+                .unwrap();
+                (0x2107, 0x0111)
+            }
+            _ => (0x0101, 0x010f),
+        };
+        method.return_type = ty.into();
+        method.code.as_mut().unwrap().instructions = vec![
+            0x0012, 0x1071, 0, 0, value, 0x00d8, 0x0100, 0x3034, 0xfffa, returned,
+        ];
+        (class, method, regs)
+    }
+    #[test]
+    fn shared_posttest_poison_keeps_mandatory_body_exit_values_and_links() {
+        for ty in ["I", "J", "Ljava/lang/Object;"] {
+            let (class, mut method, regs) = shared_posttest_fixture(ty);
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            assert_eq!(
+                graph.shared_loops,
+                vec![Loop {
+                    parent: None,
+                    start: 1,
+                    latch: 7,
+                    guard: None,
+                    exit: 9,
+                    tail: None
+                }]
+            );
+            assert!(graph.shared_branches.is_empty() && graph.shared_loop_edges.is_empty());
+            assert!(!graph.live_at(1, 1));
+            assert!(graph.live_at(9, 1));
+            let mut expected = Output::default();
+            let baseline = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                10,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(!expected.links.is_empty());
+            assert_eq!(expected.text.matches("Header.touch").count(), 1);
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            graph.targets.fill(Some(usize::MAX));
+            let mut actual = Output::default();
+            let result = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                10,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(result == baseline);
+            assert_eq!(actual.text, expected.text);
+            assert_eq!(
+                actual
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>(),
+                expected
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+    #[test]
+    fn malformed_shared_posttest_metadata_rejects_after_valid_baseline() {
+        for mutation in 0..12 {
+            let (class, method, regs) = shared_posttest_fixture("I");
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    10,
+                    regs.clone(),
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_ok()
+            );
+            match mutation {
+                0 => graph.shared_loops[0].start = 4,
+                1 => graph.shared_loops[0].latch = 5,
+                2 => graph.shared_loops[0].exit = 8,
+                3 => graph.shared_loops[0].guard = Some(7),
+                4 => graph.shared_loops[0].parent = Some(1),
+                5 => graph.shared_loops.push(graph.shared_loops[0]),
+                6 => graph.shared_cfg.as_mut().unwrap().blocks[1]
+                    .successors
+                    .swap(0, 1),
+                7 => {
+                    graph
+                        .front_end
+                        .as_mut()
+                        .unwrap()
+                        .ir
+                        .instructions
+                        .iter_mut()
+                        .find(|i| i.pc == 7)
+                        .unwrap()
+                        .branch_target = Some(4)
+                }
+                8 => {
+                    graph
+                        .front_end
+                        .as_mut()
+                        .unwrap()
+                        .ir
+                        .instructions
+                        .iter_mut()
+                        .find(|i| i.pc == 7)
+                        .unwrap()
+                        .reads[0]
+                        .register = 4
+                }
+                9 => {
+                    graph
+                        .front_end
+                        .as_mut()
+                        .unwrap()
+                        .ir
+                        .instructions
+                        .iter_mut()
+                        .find(|i| i.pc == 7)
+                        .unwrap()
+                        .width = 1
+                }
+                10 => graph.shared_branches.push(SharedBranch {
+                    owner: None,
+                    branch: 7,
+                    taken: 1,
+                    fallthrough: 9,
+                    join: 9,
+                }),
+                _ => graph.shared_loop_edges.push(SharedLoopEdge {
+                    owner: 1,
+                    branch: 7,
+                    taken: 1,
+                    fallthrough: 9,
+                    kind: SharedLoopEdgeKind::Continue,
+                }),
+            }
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    10,
+                    regs,
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
+    #[test]
+    fn shared_posttest_budget_and_malformed_raw_target_do_not_retry_legacy() {
+        let (class, method, _) = shared_posttest_fixture("I");
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        let mut work = 0;
+        assert!(
+            decoded_posttest_loop(
+                &graph.front_end.as_ref().unwrap().ir,
+                graph.shared_cfg.as_ref().unwrap(),
+                &mut work
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("work budget")
+        );
+        assert_eq!(work, 0);
+        // Target the const operand, which looks like a return/throw opcode.
+        for operand in [0x000f, 0x0027] {
+            let (class, method) = fixture(
+                vec![0x0013, operand, 0x0038, 0xffff, 0x000e],
+                1,
+                0,
+                vec![],
+                "V",
+            );
+            assert!(Graph::straight_line(&class, &method).is_err());
+        }
+        for words in [
+            vec![0x0038, 5, 0x0012, 0x0039, 0xfffe, 0x000e],
+            vec![0x000e, 0x0038, 0xffff, 0x000e],
+            vec![0x0012, 0x0029, 0xffff, 0x0038, 0xfffd, 0x000e],
+        ] {
+            let (class, method) = fixture(words, 1, 0, vec![], "V");
+            assert!(Graph::straight_line(&class, &method).unwrap().is_none());
+        }
+    }
+
+    fn shared_loop_body_fixture(empty: bool) -> (DexClass, DexMethod, Vec<Option<Value>>) {
+        let (class, mut method, regs) = shared_natural_loop_fixture(0x28);
+        method.code.as_mut().unwrap().instructions = if empty {
+            vec![
+                0x0012, 0x0112, 0x1071, 0, 0, 0x3035, 10, 0x0190, 0x0001, 0x00d8, 0x0100, 0x0338,
+                2, 0xf528, 0x010f,
+            ]
+        } else {
+            vec![
+                0x0012, 0x0112, 0x1071, 0, 0, 0x3035, 9, 0x0338, 4, 0x0190, 0x0001, 0x00d8, 0x0100,
+                0xf528, 0x010f,
+            ]
+        };
+        // Both variants exit immediately after the single unconditional latch.
+        method.code.as_mut().unwrap().instructions[6] = 9;
+        (class, method, regs)
+    }
+
+    fn shared_nested_loop_fixture(
+        depth: usize,
+        siblings: bool,
+        edges: bool,
+        bypass: bool,
+        adjacent: bool,
+    ) -> (DexClass, DexMethod, Vec<Option<Value>>) {
+        fn emit(
+            words: &mut Vec<u16>,
+            level: usize,
+            depth: usize,
+            siblings: bool,
+            edges: bool,
+            bypass: bool,
+            adjacent: bool,
+        ) {
+            words.push(((level as u16) << 8) | 0x12);
+            let header = words.len();
+            words.extend([0x1071, 0, level as u16]);
+            let guard = words.len();
+            words.extend([0x9035 | ((level as u16) << 8), 0]);
+            words.extend([0x0890, ((level as u16) << 8) | 8]);
+            if adjacent {
+                words.extend([0xd8 | ((level as u16) << 8), 0x0100 | level as u16]);
+            }
+            let skip = if bypass && level + 1 < depth {
+                let pc = words.len();
+                words.extend([0x0739, 0]);
+                Some(pc)
+            } else {
+                None
+            };
+            if level + 1 < depth {
+                emit(words, level + 1, depth, siblings, edges, bypass, adjacent);
+                if siblings && level == 0 {
+                    emit(words, level + 1, depth, false, edges, bypass, adjacent);
+                }
+            }
+            if let Some(pc) = skip {
+                words[pc + 1] = (words.len() - pc) as u16;
+            }
+            if !adjacent {
+                words.extend([0xd8 | ((level as u16) << 8), 0x0100 | level as u16]);
+            }
+            let mut breaks = Vec::new();
+            if edges {
+                let pc = words.len();
+                words.extend([
+                    0x7032 | ((level as u16) << 8),
+                    (header as isize - pc as isize) as i16 as u16,
+                ]);
+                breaks.push(words.len());
+                words.extend([0x9032 | ((level as u16) << 8), 0]);
+            }
+            let latch = words.len();
+            words.extend([0x0029, (header as isize - latch as isize) as i16 as u16]);
+            let exit = words.len();
+            words[guard + 1] = (exit - guard) as u16;
+            for pc in breaks {
+                words[pc + 1] = (exit - pc) as u16;
+            }
+        }
+        let (class, mut method, _) = shared_natural_loop_fixture(0x28);
+        let mut words = vec![0x0812];
+        emit(&mut words, 0, depth, siblings, edges, bypass, adjacent);
+        words.push(0x080f);
+        method.code.as_mut().unwrap().instructions = words;
+        method.code.as_mut().unwrap().registers = 10;
+        let mut regs = vec![None; 10];
+        for (r, name) in [(7, "mode"), (9, "limit")] {
+            assign(
+                &mut regs,
+                r,
+                Value {
+                    text: name.into(),
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                },
+            )
+            .unwrap();
+        }
+        (class, method, regs)
+    }
+
+    #[test]
+    fn shared_nested_loops_poison_preserves_parent_child_plans_and_carried_state() {
+        for (depth, siblings, edges, bypass, adjacent) in [
+            (2, false, true, true, false),
+            (3, false, true, true, false),
+            (4, false, true, true, false),
+            (2, true, true, true, false),
+            (2, false, false, true, true),
+        ] {
+            let (class, mut method, regs) =
+                shared_nested_loop_fixture(depth, siblings, edges, bypass, adjacent);
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            assert_eq!(graph.shared_loops.len(), depth + usize::from(siblings));
+            assert_eq!(graph.shared_loops[0].parent, None);
+            for region in graph.shared_loops.iter().skip(1) {
+                assert!(region.parent.is_some());
+            }
+            for plan in &graph.shared_branches {
+                assert!(plan.owner.is_some());
+            }
+            for region in &graph.shared_loops {
+                assert!(graph.live_at(region.start, 8));
+                assert_eq!(
+                    graph
+                        .shared_loop_edges
+                        .iter()
+                        .filter(|edge| edge.owner == region.start)
+                        .count(),
+                    if edges { 2 } else { 0 }
+                );
+            }
+            if adjacent {
+                assert_eq!(graph.shared_loops[1].exit, graph.shared_loops[0].latch);
+            }
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let mut expected = Output::default();
+            let baseline = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                expected.text.matches("sample.Header.touch(").count(),
+                graph.shared_loops.len()
+            );
+            assert!(!expected.links.is_empty());
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            graph.targets.fill(Some(usize::MAX));
+            let mut actual = Output::default();
+            let result = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(baseline == result);
+            assert_eq!(expected.text, actual.text);
+            assert_eq!(
+                expected
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>(),
+                actual
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_shared_nested_loops_reject_parent_owner_and_cross_entries() {
+        let (class, method, regs) = shared_nested_loop_fixture(3, false, true, true, false);
+        let end = method.code.as_ref().unwrap().instructions.len();
+        for mutation in 0..10 {
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            let outer = graph.shared_loops[0];
+            let child = graph.shared_loops[1];
+            let grandchild = graph.shared_loops[2];
+            match mutation {
+                0 => graph.shared_loops[1].parent = None,
+                1 => graph.shared_loops[1].parent = Some(grandchild.start),
+                2 => graph.shared_loops[2].parent = Some(outer.start),
+                3 => graph.shared_loops[0].parent = Some(child.start),
+                4 => graph.shared_branches[0].owner = Some(child.start),
+                5 => graph.shared_branches[0].join = child.guard.unwrap() + 2,
+                6 => graph.shared_loop_edges[0].owner = outer.start,
+                7..=9 => {
+                    let pc = if mutation == 9 {
+                        graph.shared_branches[0].branch
+                    } else {
+                        graph
+                            .shared_loop_edges
+                            .iter()
+                            .find(|edge| edge.owner == child.start)
+                            .unwrap()
+                            .branch
+                    };
+                    let ir = &mut graph.front_end.as_mut().unwrap().ir;
+                    ir.instructions
+                        .iter_mut()
+                        .find(|i| i.pc == pc)
+                        .unwrap()
+                        .branch_target = Some(if mutation == 7 {
+                        outer.start
+                    } else if mutation == 8 {
+                        outer.exit
+                    } else {
+                        grandchild.start
+                    });
+                    graph.shared_cfg = Some(
+                        crate::native_cfg::ControlFlowGraph::from_decoded_loop(ir, end).unwrap(),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    end,
+                    regs.clone(),
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        let branch = graph.shared_branches[0].branch;
+        let mut excluded = method;
+        excluded.code.as_mut().unwrap().instructions[branch + 1] =
+            (graph.shared_loops[2].start - branch) as u16;
+        assert!(Graph::straight_line(&class, &excluded).unwrap().is_none());
+        let (class, mut siblings, sibling_regs) =
+            shared_nested_loop_fixture(2, true, true, true, false);
+        let mut graph = Graph::straight_line(&class, &siblings).unwrap().unwrap();
+        render(
+            &class,
+            &siblings,
+            &graph,
+            0,
+            siblings.code.as_ref().unwrap().instructions.len(),
+            sibling_regs.clone(),
+            &mut Output::default(),
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let first = graph.shared_loops[1];
+        let sibling = graph.shared_loops[2];
+        graph.shared_loops[1].parent = Some(sibling.start);
+        assert!(
+            render(
+                &class,
+                &siblings,
+                &graph,
+                0,
+                siblings.code.as_ref().unwrap().instructions.len(),
+                sibling_regs,
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None
+            )
+            .is_err()
+        );
+        let pc = graph
+            .shared_loop_edges
+            .iter()
+            .find(|edge| edge.owner == first.start)
+            .unwrap()
+            .branch;
+        siblings.code.as_mut().unwrap().instructions[pc + 1] =
+            (graph.shared_loops[0].start as isize - pc as isize) as i16 as u16;
+        assert!(Graph::straight_line(&class, &siblings).unwrap().is_none());
+    }
+
+    #[test]
+    fn shared_nested_loop_body_closure_budget_rejects_without_partial_plan() {
+        let (class, method, regs) = shared_nested_loop_fixture(2, false, false, true, false);
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        let len = method.code.as_ref().unwrap().instructions.len();
+        render(
+            &class,
+            &method,
+            &graph,
+            0,
+            len,
+            regs,
+            &mut Output::default(),
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let parent = graph.shared_loops[0];
+        let child = graph.shared_loops[1];
+        let cfg = graph.shared_cfg.as_ref().unwrap();
+        let mut projection = cfg.clone();
+        projection.blocks[cfg.block_at[&parent.latch]]
+            .successors
+            .clear();
+        collapse_shared_loop(&mut projection, cfg, child).unwrap();
+        let postdom = projection.forward_postdominators().unwrap();
+        let mut work = 0;
+        let result = decoded_branch_plans_with_postdom(
+            &graph.front_end.as_ref().unwrap().ir,
+            &projection,
+            len,
+            parent.guard.unwrap() + 2..parent.latch,
+            &[],
+            &[child],
+            &postdom,
+            &mut work,
+        );
+        assert!(result.err().unwrap().to_string().contains("work budget"));
+        assert_eq!(work, 0);
+    }
+
+    #[test]
+    fn shared_nested_loop_depth_budget_renders_four_and_retains_legacy_five() {
+        for depth in [MAX_SHARED_LOOP_DEPTH, MAX_SHARED_LOOP_DEPTH + 1] {
+            let (class, method, regs) =
+                shared_nested_loop_fixture(depth, false, false, false, false);
+            let len = method.code.as_ref().unwrap().instructions.len();
+            let front = crate::native_method::MethodFrontEnd::build(&class, &method).unwrap();
+            let cfg =
+                crate::native_cfg::ControlFlowGraph::from_decoded_loop(&front.ir, len).unwrap();
+            let canonical = decoded_natural_loops(&front.ir, &cfg);
+            let selected = Graph::straight_line(&class, &method).unwrap();
+            if depth == MAX_SHARED_LOOP_DEPTH {
+                assert_eq!(canonical.unwrap().len(), depth);
+                let graph = selected.unwrap();
+                let mut out = Output::default();
+                render(
+                    &class, &method, &graph, 0, len, regs, &mut out, 0, true, None, None,
+                )
+                .unwrap();
+                assert_eq!(out.text.matches("sample.Header.touch(").count(), depth);
+            } else {
+                assert!(
+                    canonical
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("nesting budget")
+                );
+                assert!(selected.is_none());
+            }
+        }
+    }
+
+    fn shared_disjoint_loop_fixture(
+        count: usize,
+        alternative: bool,
+        mixed: bool,
+        adjacent: bool,
+    ) -> (DexClass, DexMethod, Vec<Option<Value>>) {
+        let (class, mut method, mut regs) = shared_natural_loop_fixture(0x28);
+        let mut words = vec![0x0112];
+        if alternative {
+            words.extend([0x0239, 0]);
+        }
+        let mut bypass = None;
+        let mut second = None;
+        let mut join = None;
+        for index in 0..count {
+            if index == 1 {
+                second = Some(words.len());
+            }
+            if index == 2 {
+                join = Some(words.len());
+            }
+            if !adjacent || index == 0 {
+                words.push(0x0012);
+            }
+            let header = words.len();
+            words.extend([0x1071, 0, if adjacent && index > 0 { 1 } else { 0 }]);
+            let guard = words.len();
+            words.extend([0x3035, 0]);
+            let mut exits = Vec::new();
+            if mixed {
+                words.extend([0x00d8, 0x0100]);
+                let pc = words.len();
+                words.extend([0x2032, (header as isize - pc as isize) as i16 as u16]);
+                exits.push(words.len());
+                words.extend([0x3032, 0]);
+            }
+            words.extend([0x0190, 0x0001]);
+            if !mixed {
+                words.extend([0x00d8, 0x0100]);
+            }
+            let latch = words.len();
+            words.push(0x28 | (((header as isize - latch as isize) as i8 as u8 as u16) << 8));
+            let exit = words.len();
+            words[guard + 1] = (exit - guard) as u16;
+            for pc in exits {
+                words[pc + 1] = (exit - pc) as u16;
+            }
+            if alternative && index == 0 {
+                bypass = Some(words.len());
+                words.extend([0x0029, 0]);
+            }
+        }
+        let end = words.len();
+        words.push(0x010f);
+        if alternative {
+            words[2] = (second.unwrap() - 1) as u16;
+            let pc = bypass.unwrap();
+            words[pc + 1] = (join.unwrap_or(end) - pc) as u16;
+        }
+        method.code.as_mut().unwrap().instructions = words;
+        assign(
+            &mut regs,
+            2,
+            Value {
+                text: "mode".into(),
+                ty: "I".into(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: false,
+            },
+        )
+        .unwrap();
+        (class, method, regs)
+    }
+
+    #[test]
+    fn shared_disjoint_loops_poison_preserves_all_owners_plans_links_and_state() {
+        for (count, alternative, mixed, adjacent) in [
+            (2, false, true, false),
+            (3, false, true, false),
+            (2, true, true, false),
+            (3, true, true, false),
+            (2, false, false, true),
+        ] {
+            let (class, mut method, regs) =
+                shared_disjoint_loop_fixture(count, alternative, mixed, adjacent);
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            assert_eq!(graph.shared_loops.len(), count);
+            assert_eq!(
+                graph.shared_loop_edges.len(),
+                if mixed { 2 * count } else { 0 }
+            );
+            assert_eq!(graph.shared_branches.len(), usize::from(alternative));
+            for region in &graph.shared_loops {
+                assert!(graph.live_at(region.start, 1));
+                assert_eq!(
+                    graph
+                        .shared_loop_edges
+                        .iter()
+                        .filter(|edge| edge.owner == region.start)
+                        .count(),
+                    if mixed { 2 } else { 0 }
+                );
+            }
+            if adjacent {
+                assert_eq!(graph.shared_loops[0].exit, graph.shared_loops[1].start);
+            }
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let mut expected = Output::default();
+            let baseline = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(baseline.1);
+            assert_eq!(expected.text.matches("sample.Header.touch(").count(), count);
+            assert!(!expected.links.is_empty());
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            graph.targets.fill(Some(usize::MAX));
+            let mut actual = Output::default();
+            let result = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(baseline == result);
+            assert_eq!(expected.text, actual.text);
+            assert_eq!(
+                expected
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>(),
+                actual
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_shared_disjoint_loops_reject_owner_order_and_cross_entries() {
+        let (class, method, regs) = shared_disjoint_loop_fixture(3, true, true, false);
+        let end = method.code.as_ref().unwrap().instructions.len();
+        for mutation in 0..12 {
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            let other = graph.shared_loops[1];
+            match mutation {
+                0 => graph.shared_loops.swap(0, 1),
+                1 => {
+                    graph.shared_loops.pop();
+                }
+                2 => graph.shared_loops.push(graph.shared_loops[0]),
+                3 => graph.shared_loops[0].exit = other.exit,
+                4 => graph.loops.swap(0, 1),
+                5 => graph.shared_loop_edges[0].owner = other.start,
+                6 => graph.shared_loop_edges[0].taken = other.start,
+                7 => {
+                    graph.shared_loop_edges.pop();
+                }
+                8 => graph.shared_branches[0].join = other.latch,
+                9 | 10 => {
+                    let first_exit = graph.shared_loops[0].exit;
+                    let ir = &mut graph.front_end.as_mut().unwrap().ir;
+                    ir.instructions
+                        .iter_mut()
+                        .find(|i| i.pc == 1)
+                        .unwrap()
+                        .branch_target = Some(if mutation == 9 {
+                        other.guard.unwrap() + 2
+                    } else {
+                        other.latch
+                    });
+                    // Keep the second preheader reachable through the normal
+                    // first-loop exit while adding the bypass interior entry.
+                    ir.instructions
+                        .iter_mut()
+                        .find(|i| i.pc == first_exit)
+                        .unwrap()
+                        .branch_target = Some(other.start - 1);
+                    graph.shared_cfg = Some(
+                        crate::native_cfg::ControlFlowGraph::from_decoded_loop(ir, end).unwrap(),
+                    );
+                }
+                _ => {
+                    let pc = graph.shared_loop_edges[0].branch;
+                    let ir = &mut graph.front_end.as_mut().unwrap().ir;
+                    ir.instructions
+                        .iter_mut()
+                        .find(|i| i.pc == pc)
+                        .unwrap()
+                        .branch_target = Some(other.start);
+                    graph.shared_cfg = Some(
+                        crate::native_cfg::ControlFlowGraph::from_decoded_loop(ir, end).unwrap(),
+                    );
+                }
+            }
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    end,
+                    regs.clone(),
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let baseline = Graph::straight_line(&class, &method).unwrap().unwrap();
+        for target in [
+            baseline.shared_loops[1].guard.unwrap() + 2,
+            baseline.shared_loops[1].latch,
+        ] {
+            let (_, mut excluded, _) = shared_disjoint_loop_fixture(3, true, true, false);
+            excluded.code.as_mut().unwrap().instructions[2] = (target - 1) as u16;
+            assert!(Graph::straight_line(&class, &excluded).unwrap().is_none());
+        }
+        // Extend the first loop around the second while preserving the inner
+        // backedge. The nested increment now selects this bounded parent tree.
+        let (_, mut nested, _) = shared_disjoint_loop_fixture(2, false, false, false);
+        let baseline = Graph::straight_line(&class, &nested).unwrap().unwrap();
+        let outer = baseline.shared_loops[0];
+        let inner = baseline.shared_loops[1];
+        let instructions = &mut nested.code.as_mut().unwrap().instructions;
+        instructions[outer.guard.unwrap() + 1] = (inner.exit + 1 - outer.guard.unwrap()) as u16;
+        instructions[outer.latch] = 0x0128;
+        // Preserve the inner latch and add an enclosing latch at its exit.
+        instructions.insert(
+            inner.exit,
+            0x28 | (((outer.start as isize - inner.exit as isize) as i8 as u8 as u16) << 8),
+        );
+        let front = crate::native_method::MethodFrontEnd::build(&class, &nested).unwrap();
+        let cfg = crate::native_cfg::ControlFlowGraph::from_decoded_loop(
+            &front.ir,
+            nested.code.as_ref().unwrap().instructions.len(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.blocks
+                .iter()
+                .enumerate()
+                .flat_map(|(from, block)| block
+                    .successors
+                    .iter()
+                    .filter(move |edge| edge.target <= from))
+                .count(),
+            2
+        );
+        let selected = Graph::straight_line(&class, &nested).unwrap().unwrap();
+        assert_eq!(selected.shared_loops.len(), 2);
+        assert_eq!(
+            selected.shared_loops[1].parent,
+            Some(selected.shared_loops[0].start)
+        );
+    }
+
+    #[test]
+    fn shared_disjoint_loop_region_budget_preserves_legacy_above_cap() {
+        for count in [MAX_SHARED_LOOPS, MAX_SHARED_LOOPS + 1] {
+            let (class, method, _) = shared_disjoint_loop_fixture(count, false, false, false);
+            let front = crate::native_method::MethodFrontEnd::build(&class, &method).unwrap();
+            let len = method.code.as_ref().unwrap().instructions.len();
+            let cfg =
+                crate::native_cfg::ControlFlowGraph::from_decoded_loop(&front.ir, len).unwrap();
+            let canonical = decoded_natural_loops(&front.ir, &cfg);
+            let selected = Graph::straight_line(&class, &method).unwrap();
+            if count == MAX_SHARED_LOOPS {
+                assert_eq!(canonical.unwrap().len(), count);
+                assert_eq!(selected.unwrap().shared_loops.len(), count);
+            } else {
+                assert!(
+                    canonical
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("region budget")
+                );
+                assert!(selected.is_none());
+            }
+        }
+    }
+
+    fn shared_loop_outer_fixture(variant: usize) -> (DexClass, DexMethod, Vec<Option<Value>>) {
+        let (class, mut method, mut regs) = if variant == 4 {
+            shared_loop_edges_fixture(true)
+        } else {
+            shared_natural_loop_fixture(0x28)
+        };
+        let words = match variant {
+            0 => vec![
+                0x0012, 0x0112, 0x0239, 12, 0x1071, 0, 0, 0x3035, 7, 0x0190, 0x0001, 0x00d8,
+                0x0100, 0xf728, 0x0238, 4, 0x01d8, 0x0101, 0x010f,
+            ],
+            1 => vec![
+                0x0012, 0x0112, 0x0239, 4, 0x0029, 12, 0x1071, 0, 0, 0x3035, 7, 0x0190, 0x0001,
+                0x00d8, 0x0100, 0xf728, 0x0238, 4, 0x01d8, 0x0101, 0x010f,
+            ],
+            2 => vec![
+                0x0012, 0x0112, 0x0239, 4, 0x01d8, 0x0101, 0x1071, 0, 0, 0x3035, 7, 0x0190, 0x0001,
+                0x00d8, 0x0100, 0xf728, 0x0238, 4, 0x01d8, 0x0101, 0x010f,
+            ],
+            3 => vec![
+                0x0012, 0x0112, 0x0239, 13, 0x1071, 0, 0, 0x3035, 7, 0x0190, 0x0001, 0x00d8,
+                0x0100, 0xf728, 0x010f, 0x1112, 0x010f,
+            ],
+            _ => {
+                let mut words = std::mem::take(&mut method.code.as_mut().unwrap().instructions);
+                words.splice(2..2, [0x0239, (words.len() - 1) as u16]);
+                let exit = words.len() - 1;
+                words.splice(exit..exit, [0x0238, 4, 0x01d8, 0x0101]);
+                words
+            }
+        };
+        method.code.as_mut().unwrap().instructions = words;
+        assign(
+            &mut regs,
+            2,
+            Value {
+                text: "mode".into(),
+                ty: "I".into(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: false,
+            },
+        )
+        .unwrap();
+        (class, method, regs)
+    }
+
+    #[test]
+    fn shared_loop_outer_poison_preserves_bypass_prefix_tail_and_terminal_arms() {
+        for variant in 0..5 {
+            let (class, mut method, regs) = shared_loop_outer_fixture(variant);
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let region = graph.shared_loops[0];
+            assert_eq!(region.start, if matches!(variant, 1 | 2) { 6 } else { 4 });
+            assert_eq!(
+                graph.shared_branches.len(),
+                if variant == 3 {
+                    1
+                } else if variant == 4 {
+                    3
+                } else {
+                    2
+                }
+            );
+            let outer = graph.shared_branches[0];
+            assert_eq!(outer.branch, 2);
+            assert_eq!(
+                outer.join,
+                if variant == 2 {
+                    region.start
+                } else if variant == 3 {
+                    17
+                } else {
+                    region.exit
+                }
+            );
+            assert_eq!(
+                graph.shared_loop_edges.len(),
+                if variant == 4 { 4 } else { 0 }
+            );
+            assert!(graph.live_at(region.start, 1));
+            if variant != 3 {
+                assert!(graph.live_at(region.start, 2));
+            }
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let mut expected = Output::default();
+            let baseline = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(baseline.1);
+            assert!(!expected.links.is_empty());
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            graph.targets.fill(Some(usize::MAX));
+            let mut actual = Output::default();
+            let result = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(baseline == result);
+            assert_eq!(expected.text, actual.text);
+            assert_eq!(
+                expected
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>(),
+                actual
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_shared_loop_outer_plans_and_external_entries_reject_without_retry() {
+        let (class, method, regs) = shared_loop_outer_fixture(0);
+        let end = method.code.as_ref().unwrap().instructions.len();
+        for mutation in 0..9 {
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            match mutation {
+                0 => graph.shared_branches[0].join = 13,
+                1 => graph.shared_branches[0].taken = 9,
+                2 => graph.shared_branches[0].fallthrough = 7,
+                3 => graph.shared_branches[0].branch = 7,
+                4 => graph.shared_branches.swap(0, 1),
+                5 => {
+                    graph.shared_branches.pop();
+                }
+                6 | 7 => {
+                    let ir = &mut graph.front_end.as_mut().unwrap().ir;
+                    ir.instructions
+                        .iter_mut()
+                        .find(|i| i.pc == 2)
+                        .unwrap()
+                        .branch_target = Some(if mutation == 6 { 9 } else { 13 });
+                    graph.shared_cfg = Some(
+                        crate::native_cfg::ControlFlowGraph::from_decoded_loop(ir, end).unwrap(),
+                    );
+                }
+                _ => graph
+                    .front_end
+                    .as_mut()
+                    .unwrap()
+                    .ir
+                    .instructions
+                    .iter_mut()
+                    .find(|i| i.pc == 14)
+                    .unwrap()
+                    .reads
+                    .clear(),
+            }
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    end,
+                    regs.clone(),
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+        for target in [7usize, 9, 13] {
+            let (_, mut excluded, _) = shared_loop_outer_fixture(0);
+            excluded.code.as_mut().unwrap().instructions[3] = (target - 2) as u16;
+            assert!(Graph::straight_line(&class, &excluded).unwrap().is_none());
+        }
+    }
+
+    fn shared_loop_edges_fixture(nested: bool) -> (DexClass, DexMethod, Vec<Option<Value>>) {
+        let (class, mut method, regs) = shared_natural_loop_fixture(0x28);
+        method.code.as_mut().unwrap().instructions = if nested {
+            vec![
+                0x0012,
+                0x0112,
+                0x1071,
+                0,
+                0,
+                0x3035,
+                18,
+                0x0338,
+                9,
+                0x00d8,
+                0x0100,
+                0x3032,
+                (-9i16) as u16,
+                0x0038,
+                10,
+                0x0528,
+                0x00d8,
+                0x0100,
+                0x3032,
+                (-16i16) as u16,
+                0x0038,
+                3,
+                0xec28,
+                0x010f,
+            ]
+        } else {
+            vec![
+                0x0012,
+                0x0112,
+                0x1071,
+                0,
+                0,
+                0x3035,
+                15,
+                0x00d8,
+                0x0100,
+                0x3032,
+                (-7i16) as u16,
+                0x0038,
+                9,
+                0x3032,
+                (-11i16) as u16,
+                0x0038,
+                5,
+                0x0190,
+                0x0001,
+                0xef28,
+                0x010f,
+            ]
+        };
+        (class, method, regs)
+    }
+
+    #[test]
+    fn shared_loop_edge_composition_poison_preserves_order_links_and_carried_state() {
+        for nested in [false, true] {
+            let (class, mut method, regs) = shared_loop_edges_fixture(nested);
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            assert_eq!(graph.shared_loop_edges.len(), 4);
+            assert_eq!(
+                graph
+                    .shared_loop_edges
+                    .iter()
+                    .filter(|e| e.kind == SharedLoopEdgeKind::Break)
+                    .count(),
+                2
+            );
+            assert_eq!(graph.shared_branches.len(), usize::from(nested));
+            if nested {
+                assert_eq!(graph.shared_branches[0].join, 20);
+            }
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let mut expected = Output::default();
+            let baseline = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(expected.text.matches("continue;").count(), 2);
+            assert_eq!(expected.text.matches("break;").count(), 3);
+            assert!(!expected.links.is_empty());
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            graph.targets.fill(Some(usize::MAX));
+            let mut actual = Output::default();
+            let result = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(baseline == result);
+            assert_eq!(expected.text, actual.text);
+            assert_eq!(
+                expected
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>(),
+                actual
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_loop_edge_composition_each_edge_generates_liveness() {
+        let (class, mut method, _) = shared_natural_loop_fixture(0x28);
+        method.code.as_mut().unwrap().registers = 8;
+        method.code.as_mut().unwrap().instructions = vec![
+            0x0012,
+            0x0212,
+            0x1071,
+            0,
+            2,
+            0x1112,
+            0x6035,
+            21,
+            0x7032,
+            (-6i16) as u16,
+            0x0213,
+            2,
+            0x7032,
+            15,
+            0x0113,
+            2,
+            0x7032,
+            (-14i16) as u16,
+            0x0213,
+            3,
+            0x7032,
+            7,
+            0x0113,
+            3,
+            0x00d8,
+            0x0100,
+            0xe828,
+            0x010f,
+        ];
+        let mut regs = vec![None; 8];
+        for (r, name) in [(6, "limit"), (7, "stop")] {
+            assign(
+                &mut regs,
+                r,
+                Value {
+                    text: name.into(),
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                },
+            )
+            .unwrap();
+        }
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert_eq!(graph.shared_loop_edges.len(), 4);
+        render(
+            &class,
+            &method,
+            &graph,
+            0,
+            28,
+            regs,
+            &mut Output::default(),
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        for edge in &graph.shared_loop_edges {
+            let reg = if edge.kind == SharedLoopEdgeKind::Continue {
+                2
+            } else {
+                1
+            };
+            let mut cut = graph.shared_cfg.as_ref().unwrap().clone();
+            let block = cut.block_at[&edge.branch];
+            // The block prefix writes the other register, so this mask
+            // isolates the value observed by the selected special edge.
+            assert!(graph.live_at(cut.blocks[block].start, reg));
+            cut.blocks[block].successors.remove(0);
+            let live = decoded_cfg_liveness(&graph.front_end.as_ref().unwrap().ir, &cut, 8)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                live.bits[block * live.stride] & (1 << reg),
+                0,
+                "edge {}",
+                edge.branch
+            );
+        }
+    }
+
+    #[test]
+    fn shared_loop_edge_composition_each_escape_checks_restored_literal() {
+        for changed in [None, Some(0), Some(1), Some(2), Some(3)] {
+            let mut words = vec![
+                0x0012, 0x0114, 0x2345, 0x7fc1, 0x4035, 0, 0x1201, 0x0112, 0x2101,
+            ];
+            let mut edges = Vec::new();
+            for index in 0..4 {
+                if changed == Some(index) {
+                    words.push(0x0112);
+                }
+                let pc = words.len();
+                words.extend([if index % 2 == 0 { 0x5032 } else { 0x6032 }, 0]);
+                edges.push((pc, index % 2 == 0));
+                if changed == Some(index) {
+                    words.push(0x2101);
+                }
+            }
+            words.extend([0x00d8, 0x0100]);
+            let latch = words.len();
+            words.push(0x28 | (((4isize - latch as isize) as i8 as u8 as u16) << 8));
+            let exit = words.len();
+            words.push(0x010f);
+            words[5] = (exit - 4) as u16;
+            for (pc, continuing) in edges {
+                words[pc + 1] =
+                    (if continuing { 4isize } else { exit as isize } - pc as isize) as i16 as u16;
+            }
+            let end = words.len();
+            let (class, mut method) = fixture(words, 7, 0, vec![], "F");
+            let mut regs = vec![None; 7];
+            for (r, name) in [(4, "limit"), (5, "stop"), (6, "breakAt")] {
+                assign(
+                    &mut regs,
+                    r,
+                    Value {
+                        text: name.into(),
+                        ty: "I".into(),
+                        literal: None,
+                        wide_literal: None,
+                        raw_bits32: false,
+                    },
+                )
+                .unwrap();
+            }
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            assert_eq!(graph.shared_loop_edges.len(), 4);
+            let invariant = loop_invariant_registers(
+                method.code.as_ref().unwrap(),
+                &graph,
+                graph.shared_loops[0],
+            )
+            .unwrap();
+            assert_eq!(invariant[1], changed.is_none(), "edge {changed:?}");
+            let mut expected = Output::default();
+            let baseline = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            );
+            if changed.is_some() {
+                assert!(baseline.is_err());
+                continue;
+            }
+            let baseline = baseline.unwrap();
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            graph.targets.fill(Some(usize::MAX));
+            let mut actual = Output::default();
+            let result = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(baseline == result);
+            assert_eq!(expected.text, actual.text);
+        }
+    }
+
+    #[test]
+    fn shared_loop_edge_collection_total_control_budget_boundary() {
+        // Helper/routing budget proof; repeated identical conditions are not
+        // runtime termination evidence for this synthetic method.
+        for count in [1022usize, 1023] {
+            let mut words = vec![0x0012, 0x0038, 0];
+            for _ in 0..count {
+                let pc = words.len();
+                words.extend([0x0038, (1isize - pc as isize) as i16 as u16]);
+            }
+            let latch = words.len();
+            words.extend([0x0029, (1isize - latch as isize) as i16 as u16]);
+            let exit = words.len();
+            words.push(0x000f);
+            words[2] = (exit - 1) as u16;
+            let (class, method) = fixture(words, 1, 0, vec![], "I");
+            let front = crate::native_method::MethodFrontEnd::build(&class, &method).unwrap();
+            let region = Loop {
+                parent: None,
+                start: 1,
+                latch,
+                guard: Some(1),
+                exit,
+                tail: None,
+            };
+            let canonical = decoded_loop_edges(&front.ir, region);
+            let selected = Graph::straight_line(&class, &method);
+            if count == 1022 {
+                assert_eq!(canonical.unwrap().len(), 1022);
+                assert_eq!(selected.unwrap().unwrap().shared_loop_edges.len(), 1022);
+            } else {
+                assert!(
+                    canonical
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("control budget")
+                );
+                assert!(
+                    selected
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("branch budget")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_shared_loop_edge_collection_rejects_duplicates_order_and_region() {
+        let (class, method, regs) = shared_loop_edges_fixture(true);
+        let end = method.code.as_ref().unwrap().instructions.len();
+        for mutation in 0..9 {
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            match mutation {
+                0 => graph.shared_loop_edges.push(graph.shared_loop_edges[0]),
+                1 => graph.shared_loop_edges.swap(0, 1),
+                2 => {
+                    graph.shared_loop_edges.remove(3);
+                }
+                3 => graph.shared_loop_edges[3].branch = 5,
+                4 => graph.shared_loop_edges[2].taken = 5,
+                5 => graph.shared_loop_edges[3].fallthrough = 23,
+                6 => graph.shared_loop_edges[2].kind = SharedLoopEdgeKind::Break,
+                7 => {
+                    let cfg = graph.shared_cfg.as_mut().unwrap();
+                    let block = cfg.block_at[&18];
+                    cfg.blocks[block].successors.swap(0, 1);
+                }
+                _ => graph
+                    .front_end
+                    .as_mut()
+                    .unwrap()
+                    .ir
+                    .instructions
+                    .iter_mut()
+                    .find(|i| i.pc == 20)
+                    .unwrap()
+                    .reads
+                    .clear(),
+            }
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    end,
+                    regs.clone(),
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    fn shared_loop_continue_fixture(variant: usize) -> (DexClass, DexMethod, Vec<Option<Value>>) {
+        let (class, mut method, regs) = shared_natural_loop_fixture(0x28);
+        method.code.as_mut().unwrap().instructions = match variant {
+            0 => vec![
+                0x0012,
+                0x0112,
+                0x1071,
+                0,
+                0,
+                0x3035,
+                9,
+                0x00d8,
+                0x0100,
+                0x0039,
+                (-7i16) as u16,
+                0x0190,
+                0x0001,
+                0xf528,
+                0x010f,
+            ],
+            1 => vec![
+                0x0012,
+                0x0112,
+                0x1071,
+                0,
+                0,
+                0x3035,
+                13,
+                0x0338,
+                6,
+                0x00d8,
+                0x0100,
+                0x0039,
+                (-9i16) as u16,
+                0x0038,
+                5,
+                0x0190,
+                0x0001,
+                0xf128,
+                0x010f,
+            ],
+            _ => vec![
+                0x0012,
+                0x0112,
+                0x1071,
+                0,
+                0,
+                0x3035,
+                9,
+                0x0190,
+                0x0001,
+                0x00d8,
+                0x0100,
+                0x0039,
+                (-9i16) as u16,
+                0xf528,
+                0x010f,
+            ],
+        };
+        (class, method, regs)
+    }
+
+    #[test]
+    fn shared_loop_continue_poison_preserves_header_sync_links_and_state() {
+        for variant in 0..3 {
+            let (class, mut method, regs) = shared_loop_continue_fixture(variant);
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let edge = graph.edge_kind(SharedLoopEdgeKind::Continue).unwrap();
+            assert_eq!(edge.taken, 2);
+            assert_eq!(edge.branch, if variant == 0 { 9 } else { 11 });
+            assert_eq!(graph.shared_branches.len(), usize::from(variant == 1));
+            assert_eq!(
+                graph
+                    .shared_loop_edges
+                    .iter()
+                    .any(|edge| edge.kind == SharedLoopEdgeKind::Break),
+                variant == 1
+            );
+            if variant == 2 {
+                assert_eq!(edge.fallthrough, graph.shared_loops[0].latch);
+            }
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let mut expected = Output::default();
+            let baseline = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(expected.text.contains("continue;"));
+            assert!(!expected.links.is_empty());
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            graph.targets.fill(Some(usize::MAX));
+            let mut actual = Output::default();
+            let result = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(baseline == result);
+            assert_eq!(expected.text, actual.text);
+            assert_eq!(
+                expected
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>(),
+                actual
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_loop_continue_backedge_generates_header_value_liveness() {
+        let (class, mut method, mut regs) = shared_natural_loop_fixture(0x28);
+        method.code.as_mut().unwrap().registers = 5;
+        method.code.as_mut().unwrap().instructions = vec![
+            0x0012,
+            0x0112,
+            0x1071,
+            0,
+            1,
+            0x3035,
+            9,
+            0x4032,
+            (-5i16) as u16,
+            0x0113,
+            2,
+            0x00d8,
+            0x0100,
+            0xf528,
+            0x000f,
+        ];
+        regs.push(None);
+        assign(
+            &mut regs,
+            4,
+            Value {
+                text: "stop".into(),
+                ty: "I".into(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: false,
+            },
+        )
+        .unwrap();
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert_eq!(
+            graph
+                .edge_kind(SharedLoopEdgeKind::Continue)
+                .unwrap()
+                .branch,
+            7
+        );
+        render(
+            &class,
+            &method,
+            &graph,
+            0,
+            15,
+            regs,
+            &mut Output::default(),
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        // Header call observes v1 only on the continue path: fallthrough writes
+        // it before reaching the ordinary latch, and the exit returns v0.
+        assert!(graph.live_at(7, 1));
+        let mut cut = graph.shared_cfg.as_ref().unwrap().clone();
+        let block = cut.block_at[&7];
+        assert_eq!(cut.blocks[block].start, 7);
+        cut.blocks[block].successors.remove(0);
+        let live = decoded_cfg_liveness(&graph.front_end.as_ref().unwrap().ir, &cut, 5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.bits[block * live.stride] & (1 << 1), 0);
+    }
+
+    #[test]
+    fn shared_loop_continue_restored_literal_checks_early_backedge() {
+        let words = vec![
+            0x0012,
+            0x0114,
+            0x2345,
+            0x7fc1,
+            0x4035,
+            10,
+            0x1201,
+            0x0112,
+            0x2101,
+            0x5032,
+            (-5i16) as u16,
+            0x00d8,
+            0x0100,
+            0xf728,
+            0x010f,
+        ];
+        let (class, mut method) = fixture(words, 6, 0, vec![], "F");
+        let mut regs = vec![None; 6];
+        for (r, name) in [(4, "limit"), (5, "stop")] {
+            assign(
+                &mut regs,
+                r,
+                Value {
+                    text: name.into(),
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                },
+            )
+            .unwrap();
+        }
+        let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        let mut expected = Output::default();
+        let baseline = render(
+            &class,
+            &method,
+            &graph,
+            0,
+            15,
+            regs.clone(),
+            &mut expected,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+        graph.targets.fill(Some(usize::MAX));
+        let mut actual = Output::default();
+        let result = render(
+            &class,
+            &method,
+            &graph,
+            0,
+            15,
+            regs.clone(),
+            &mut actual,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(baseline == result);
+        assert_eq!(actual.text, expected.text);
+        let changed = vec![
+            0x0012,
+            0x0114,
+            0x2345,
+            0x7fc1,
+            0x4035,
+            10,
+            0x1201,
+            0x0112,
+            0x5032,
+            (-4i16) as u16,
+            0x2101,
+            0x00d8,
+            0x0100,
+            0xf728,
+            0x010f,
+        ];
+        let (class, method) = fixture(changed, 6, 0, vec![], "F");
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert!(
+            !loop_invariant_registers(method.code.as_ref().unwrap(), &graph, graph.shared_loops[0])
+                .unwrap()[1]
+        );
+        assert!(
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                15,
+                regs,
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_shared_loop_continue_rejects_cache_operands_and_backedges() {
+        let (class, method, regs) = shared_loop_continue_fixture(1);
+        let end = method.code.as_ref().unwrap().instructions.len();
+        for mutation in 0..8 {
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            match mutation {
+                0 => graph
+                    .shared_loop_edges
+                    .retain(|edge| edge.kind != SharedLoopEdgeKind::Continue),
+                1 => {
+                    graph
+                        .edge_kind_mut(SharedLoopEdgeKind::Continue)
+                        .unwrap()
+                        .branch = 9
+                }
+                2 => {
+                    graph
+                        .edge_kind_mut(SharedLoopEdgeKind::Continue)
+                        .unwrap()
+                        .taken = 5
+                }
+                3 => {
+                    graph
+                        .edge_kind_mut(SharedLoopEdgeKind::Continue)
+                        .unwrap()
+                        .fallthrough = 17
+                }
+                4 => graph
+                    .front_end
+                    .as_mut()
+                    .unwrap()
+                    .ir
+                    .instructions
+                    .iter_mut()
+                    .find(|i| i.pc == 11)
+                    .unwrap()
+                    .reads
+                    .clear(),
+                5 => {
+                    let cfg = graph.shared_cfg.as_mut().unwrap();
+                    let block = cfg.block_at[&11];
+                    cfg.blocks[block].successors.swap(0, 1);
+                }
+                6 => {
+                    let ir = &mut graph.front_end.as_mut().unwrap().ir;
+                    ir.instructions
+                        .iter_mut()
+                        .find(|i| i.pc == 7)
+                        .unwrap()
+                        .branch_target = Some(2);
+                    graph.shared_cfg = Some(
+                        crate::native_cfg::ControlFlowGraph::from_decoded_loop(ir, end).unwrap(),
+                    );
+                }
+                _ => {
+                    let ir = &mut graph.front_end.as_mut().unwrap().ir;
+                    ir.instructions
+                        .iter_mut()
+                        .find(|i| i.pc == 11)
+                        .unwrap()
+                        .branch_target = Some(5);
+                    graph.shared_cfg = Some(
+                        crate::native_cfg::ControlFlowGraph::from_decoded_loop(ir, end).unwrap(),
+                    );
+                }
+            }
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    end,
+                    regs.clone(),
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+        for (pc, delta) in [(8, (-4i16) as u16), (12, (-6i16) as u16)] {
+            let (_, mut excluded, _) = shared_loop_continue_fixture(1);
+            excluded.code.as_mut().unwrap().instructions[pc] = delta;
+            assert!(Graph::straight_line(&class, &excluded).unwrap().is_none());
+        }
+    }
+
+    fn shared_loop_break_fixture(nested: bool) -> (DexClass, DexMethod, Vec<Option<Value>>) {
+        let (class, mut method, regs) = shared_natural_loop_fixture(0x28);
+        method.code.as_mut().unwrap().instructions = if nested {
+            vec![
+                0x0012, 0x0112, 0x1071, 0, 0, 0x3035, 12, 0x0338, 6, 0x0038, 9, 0x0190, 0x0001,
+                0x0190, 0x0001, 0x00d8, 0x0100, 0xf128, 0x010f,
+            ]
+        } else {
+            vec![
+                0x0012, 0x0112, 0x1071, 0, 0, 0x3035, 9, 0x0038, 7, 0x0190, 0x0001, 0x00d8, 0x0100,
+                0xf528, 0x010f,
+            ]
+        };
+        if nested {
+            method.code.as_mut().unwrap().instructions[6] = 13;
+        }
+        (class, method, regs)
+    }
+
+    #[test]
+    fn shared_loop_break_poison_preserves_exit_sync_links_and_state() {
+        for variant in 0..3 {
+            let nested = variant == 1;
+            let (class, mut method, regs) = shared_loop_break_fixture(nested);
+            if variant == 2 {
+                method.code.as_mut().unwrap().instructions = vec![
+                    0x0012, 0x0112, 0x1071, 0, 0, 0x3035, 9, 0x0113, 1, 0x00d8, 0x0100, 0x0038, 3,
+                    0xf528, 0x010f,
+                ];
+            }
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let edge = graph.edge_kind(SharedLoopEdgeKind::Break).unwrap();
+            assert_eq!(
+                edge.branch,
+                if nested {
+                    9
+                } else if variant == 2 {
+                    11
+                } else {
+                    7
+                }
+            );
+            if variant == 2 {
+                assert_eq!(edge.fallthrough, graph.shared_loops[0].latch);
+            }
+            assert_eq!(graph.shared_branches.len(), usize::from(nested));
+            assert!(graph.live_at(edge.branch, 1));
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let mut expected = Output::default();
+            let baseline = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(expected.text.matches("break;").count() >= 2);
+            assert!(!expected.links.is_empty());
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            graph.targets.fill(Some(usize::MAX));
+            let mut actual = Output::default();
+            let result = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(baseline == result);
+            assert_eq!(expected.text, actual.text);
+            assert_eq!(
+                expected
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>(),
+                actual
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_loop_break_restored_float_uses_proven_exit_invariant() {
+        let words = vec![
+            0x0012, 0x0114, 0x2345, 0x7fc1, 0x4035, 10, 0x1201, 0x0112, 0x2101, 0x5032, 5, 0x00d8,
+            0x0100, 0xf728, 0x010f,
+        ];
+        let (class, mut method) = fixture(words, 6, 0, vec![], "F");
+        let mut regs = vec![None; 6];
+        for (r, name) in [(4, "limit"), (5, "stop")] {
+            assign(
+                &mut regs,
+                r,
+                Value {
+                    text: name.into(),
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                },
+            )
+            .unwrap();
+        }
+        let mut legacy = Graph::new(&method.code.as_ref().unwrap().instructions).unwrap();
+        legacy.live = super::super::liveness::analyze(method.code.as_ref().unwrap());
+        let error = render(
+            &class,
+            &method,
+            &legacy,
+            0,
+            15,
+            regs.clone(),
+            &mut Output::default(),
+            0,
+            true,
+            None,
+            None,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported register type conversion I to F"),
+            "{error:#}"
+        );
+        let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        let mut expected = Output::default();
+        let baseline = render(
+            &class,
+            &method,
+            &graph,
+            0,
+            15,
+            regs.clone(),
+            &mut expected,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+        graph.targets.fill(Some(usize::MAX));
+        let mut actual = Output::default();
+        let result = render(
+            &class,
+            &method,
+            &graph,
+            0,
+            15,
+            regs.clone(),
+            &mut actual,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(baseline == result);
+        assert_eq!(actual.text, expected.text);
+        // A break before restoration does not prove the entry literal invariant.
+        let changed = vec![
+            0x0012, 0x0114, 0x2345, 0x7fc1, 0x4035, 10, 0x1201, 0x0112, 0x5032, 6, 0x2101, 0x00d8,
+            0x0100, 0xf728, 0x010f,
+        ];
+        let (class, method) = fixture(changed, 6, 0, vec![], "F");
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        let region = graph.shared_loops[0];
+        let invariant =
+            loop_invariant_registers(method.code.as_ref().unwrap(), &graph, region).unwrap();
+        assert!(!invariant[1]);
+        assert!(
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                15,
+                regs,
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn shared_nested_loop_literal_proof_checks_child_escape_before_restore() {
+        for restored in [true, false] {
+            let mut words = vec![
+                0x0012, 0x0114, 0x2345, 0x7fc1, 0x4035, 18, 0x0312, 0x4335, 11, 0x1201, 0x0112,
+            ];
+            if restored {
+                words.extend([0x2101, 0x5332, 6]);
+            } else {
+                words.extend([0x5332, 7, 0x2101]);
+            }
+            words.extend([
+                0x03d8, 0x0103, 0x0029, 0xfff7, 0x00d8, 0x0100, 0x0029, 0xfff0, 0x010f,
+            ]);
+            let (class, mut method) = fixture(words, 6, 0, vec![], "F");
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            assert_eq!(graph.shared_loops.len(), 2);
+            let invariant = loop_invariant_registers(
+                method.code.as_ref().unwrap(),
+                &graph,
+                graph.shared_loops[0],
+            )
+            .unwrap();
+            assert_eq!(invariant[1], restored);
+            let mut regs = vec![None; 6];
+            for (r, name) in [(4, "limit"), (5, "stop")] {
+                assign(
+                    &mut regs,
+                    r,
+                    Value {
+                        text: name.into(),
+                        ty: "I".into(),
+                        literal: None,
+                        wide_literal: None,
+                        raw_bits32: false,
+                    },
+                )
+                .unwrap();
+            }
+            let mut expected = Output::default();
+            let result = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                23,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            );
+            if !restored {
+                assert!(
+                    result.is_err(),
+                    "child escape must not emit the old literal"
+                );
+                continue;
+            }
+            let baseline = result.unwrap();
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            graph.targets.fill(Some(usize::MAX));
+            let mut actual = Output::default();
+            let poisoned = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                23,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(baseline == poisoned);
+            assert_eq!(expected.text, actual.text);
+        }
+    }
+
+    #[test]
+    fn shared_loop_break_exit_edge_generates_body_liveness() {
+        let words = vec![
+            0x0012, 0x1112, 0x3035, 8, 0x4032, 6, 0x2112, 0x00d8, 0x0100, 0xf828, 0x010f,
+        ];
+        let (class, method) = fixture(words, 5, 0, vec![], "I");
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert_eq!(
+            graph.edge_kind(SharedLoopEdgeKind::Break).unwrap().branch,
+            4
+        );
+        let mut regs = vec![None; 5];
+        for (r, name) in [(3, "limit"), (4, "stop")] {
+            assign(
+                &mut regs,
+                r,
+                Value {
+                    text: name.into(),
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                },
+            )
+            .unwrap();
+        }
+        render(
+            &class,
+            &method,
+            &graph,
+            0,
+            11,
+            regs,
+            &mut Output::default(),
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        // Only the break edge observes the header's v1: continuing execution
+        // overwrites it before the latch and the next header overwrites it too.
+        assert!(graph.live_at(4, 1));
+        let mut cut = graph.shared_cfg.as_ref().unwrap().clone();
+        let block = cut.block_at[&4];
+        assert_eq!(cut.blocks[block].start, 4);
+        cut.blocks[block].successors.remove(0);
+        let live = decoded_cfg_liveness(&graph.front_end.as_ref().unwrap().ir, &cut, 5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.bits[block * live.stride] & (1 << 1), 0);
+    }
+
+    #[test]
+    fn malformed_shared_loop_break_rejects_cached_exit_and_canonical_edges() {
+        let (class, method, regs) = shared_loop_break_fixture(false);
+        let end = method.code.as_ref().unwrap().instructions.len();
+        for mutation in 0..8 {
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            match mutation {
+                0 => graph
+                    .shared_loop_edges
+                    .retain(|edge| edge.kind != SharedLoopEdgeKind::Break),
+                1 => {
+                    graph
+                        .edge_kind_mut(SharedLoopEdgeKind::Break)
+                        .unwrap()
+                        .branch = 9
+                }
+                2 => {
+                    graph
+                        .edge_kind_mut(SharedLoopEdgeKind::Break)
+                        .unwrap()
+                        .taken = 13
+                }
+                3 => {
+                    graph
+                        .edge_kind_mut(SharedLoopEdgeKind::Break)
+                        .unwrap()
+                        .fallthrough = 11
+                }
+                4 => graph
+                    .front_end
+                    .as_mut()
+                    .unwrap()
+                    .ir
+                    .instructions
+                    .iter_mut()
+                    .find(|i| i.pc == 7)
+                    .unwrap()
+                    .reads
+                    .clear(),
+                5 => {
+                    let cfg = graph.shared_cfg.as_mut().unwrap();
+                    let block = cfg.block_at[&7];
+                    cfg.blocks[block].successors.swap(0, 1);
+                }
+                6 => {
+                    let ir = &mut graph.front_end.as_mut().unwrap().ir;
+                    ir.instructions
+                        .iter_mut()
+                        .find(|i| i.pc == 7)
+                        .unwrap()
+                        .branch_target = Some(13);
+                    graph.shared_cfg = Some(
+                        crate::native_cfg::ControlFlowGraph::from_decoded_loop(ir, end).unwrap(),
+                    );
+                }
+                _ => {
+                    graph
+                        .edge_kind_mut(SharedLoopEdgeKind::Break)
+                        .unwrap()
+                        .fallthrough = 14
+                }
+            }
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    end,
+                    regs.clone(),
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+        for words in [
+            vec![
+                0x0012, 0x0112, 0x1071, 0, 0, 0x3035, 11, 0x0038, 9, 0x0138, 8, 0x0190, 0x0001,
+                0x00d8, 0x0100, 0xf328, 0x010f,
+            ],
+            vec![
+                0x0012, 0x0112, 0x1071, 0, 0, 0x3035, 9, 0x0728, 0, 0x0190, 0x0001, 0x00d8, 0x0100,
+                0xf528, 0x010f,
+            ],
+        ] {
+            let (_, mut excluded, _) = shared_loop_break_fixture(false);
+            excluded.code.as_mut().unwrap().instructions = words;
+            assert!(Graph::straight_line(&class, &excluded).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn shared_loop_body_poison_preserves_branch_links_and_carried_state() {
+        for empty in [false, true] {
+            let (class, mut method, regs) = shared_loop_body_fixture(empty);
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            assert_eq!(graph.shared_branches.len(), 1);
+            assert_eq!(graph.shared_branches[0].join, if empty { 13 } else { 11 });
+            assert!(graph.live_at(7, 3));
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let mut expected = Output::default();
+            let baseline = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(!expected.links.is_empty());
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            graph.targets.fill(Some(usize::MAX));
+            let mut actual = Output::default();
+            let result = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(baseline == result);
+            assert_eq!(expected.text, actual.text);
+            assert_eq!(
+                expected
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>(),
+                actual
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_loop_body_sequential_and_nested_plans_own_poisoned_branches() {
+        let variants = [
+            vec![
+                0x0012, 0x0112, 0x1071, 0, 0, 0x3035, 13, 0x0338, 4, 0x0190, 0x0001, 0x0338, 4,
+                0x0190, 0x0001, 0x00d8, 0x0100, 0xf128, 0x010f,
+            ],
+            vec![
+                0x0012, 0x0112, 0x1071, 0, 0, 0x3035, 16, 0x0338, 9, 0x0338, 4, 0x0190, 0x0001,
+                0x0190, 0x0001, 0x0328, 0x0190, 0x0001, 0x00d8, 0x0100, 0xee28, 0x010f,
+            ],
+        ];
+        for (index, words) in variants.into_iter().enumerate() {
+            let (class, mut method, regs) = shared_natural_loop_fixture(0x28);
+            let end = words.len();
+            method.code.as_mut().unwrap().instructions = words;
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            assert!(!graph.shared_loops.is_empty());
+            assert_eq!(graph.shared_branches.len(), 2);
+            assert_eq!(
+                graph
+                    .shared_branches
+                    .iter()
+                    .map(|p| p.join)
+                    .collect::<Vec<_>>(),
+                if index == 0 {
+                    vec![11, 15]
+                } else {
+                    vec![18, 13]
+                }
+            );
+            let mut expected = Output::default();
+            let baseline = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(!expected.links.is_empty());
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            graph.targets.fill(Some(usize::MAX));
+            let mut actual = Output::default();
+            let result = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(result == baseline);
+            assert_eq!(actual.text, expected.text);
+            assert_eq!(
+                expected
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>(),
+                actual
+                    .links
+                    .iter()
+                    .map(|l| (l.start, l.end, &l.label))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_loop_body_restored_float_literal_survives_conditional_merge() {
+        for bits in [1u32, 0x80000000, 0x7fc12345] {
+            let words = vec![
+                0x0014,
+                bits as u16,
+                (bits >> 16) as u16,
+                0x0112,
+                0x4132,
+                10,
+                0x0438,
+                5,
+                0x0201,
+                0x0012,
+                0x2001,
+                0x01d8,
+                0x0101,
+                0xf728,
+                0x000f,
+            ];
+            let (class, mut method) = fixture(words, 5, 0, vec![], "F");
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            assert_eq!(graph.shared_branches.len(), 1);
+            let mut regs = vec![None; 5];
+            assign(
+                &mut regs,
+                4,
+                Value {
+                    text: "limit".into(),
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                },
+            )
+            .unwrap();
+            let mut expected = Output::default();
+            let baseline = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                15,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            graph.targets.fill(Some(usize::MAX));
+            let mut actual = Output::default();
+            let result = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                15,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(baseline == result);
+            assert_eq!(actual.text, expected.text);
+        }
+    }
+
+    #[test]
+    fn malformed_shared_loop_body_rejects_plans_edges_and_operands() {
+        let (class, method, regs) = shared_loop_body_fixture(false);
+        let end = method.code.as_ref().unwrap().instructions.len();
+        for mutation in 0..6 {
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            match mutation {
+                0 => graph.shared_branches.clear(),
+                1 => graph.shared_branches[0].join = 14,
+                2 => graph.shared_branches[0].fallthrough = 7,
+                3 => {
+                    let cfg = graph.shared_cfg.as_mut().unwrap();
+                    let block = cfg.block_at[&7];
+                    cfg.blocks[block].successors[0].target = cfg.block_at[&2];
+                }
+                4 => {
+                    graph
+                        .front_end
+                        .as_mut()
+                        .unwrap()
+                        .ir
+                        .instructions
+                        .iter_mut()
+                        .find(|i| i.pc == 7)
+                        .unwrap()
+                        .branch_target = Some(14)
+                }
+                _ => graph
+                    .front_end
+                    .as_mut()
+                    .unwrap()
+                    .ir
+                    .instructions
+                    .iter_mut()
+                    .find(|i| i.pc == 7)
+                    .unwrap()
+                    .reads
+                    .clear(),
+            }
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    end,
+                    regs.clone(),
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+        for (pc, word) in [(7, 0x0e), (8, 8), (8, (-4i16) as u16), (8, 0)] {
+            let (_, mut excluded, _) = shared_loop_body_fixture(false);
+            excluded.code.as_mut().unwrap().instructions[pc] = word;
+            assert!(Graph::straight_line(&class, &excluded).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn shared_natural_loop_poison_preserves_header_latch_body_links_and_state() {
+        for goto in 0x28..=0x2a {
+            let (class, mut method, regs) = shared_natural_loop_fixture(goto);
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let region = graph.shared_loops[0];
+            assert_eq!(region.start, 2);
+            assert_eq!(region.guard, Some(5));
+            assert_eq!(region.latch, 11);
+            // Only the next header guard reads limit. A single reverse DAG
+            // sweep cannot propagate it across the latch into this body block.
+            assert!(graph.live_at(7, 3));
+            assert!(graph.live_at(region.start, 0) && graph.live_at(region.start, 1));
+            assert!(!graph.live_at(region.start, 2));
+            assert!(graph.live_at(region.exit, 1));
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let mut expected = Output::default();
+            let (expected_state, expected_terminal) = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(expected.text.matches("sample.Header.touch(").count(), 1);
+            assert!(!expected.links.is_empty());
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            graph.targets.fill(Some(usize::MAX));
+            let mut actual = Output::default();
+            let (state, terminal) = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(terminal, expected_terminal);
+            assert!(state == expected_state);
+            assert_eq!(actual.text, expected.text, "latch opcode {goto:02x}");
+            assert_eq!(
+                actual
+                    .links
+                    .iter()
+                    .map(|link| (link.start, link.end, &link.label))
+                    .collect::<Vec<_>>(),
+                expected
+                    .links
+                    .iter()
+                    .map(|link| (link.start, link.end, &link.label))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_natural_loop_poison_consumes_move_invariants_and_exit_cast() {
+        for bits in [1u32, 0x80000000, 0x7fc12345] {
+            let words = vec![
+                0x0014,
+                bits as u16,
+                (bits >> 16) as u16,
+                0x0112,
+                0x4132,
+                8,
+                0x0201,
+                0x0012,
+                0x2001,
+                0x01d8,
+                0x0101,
+                0xf928,
+                0x000f,
+            ];
+            let (class, mut method) = fixture(words, 5, 0, vec![], "F");
+            let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            assert!(!graph.shared_loops.is_empty());
+            let mut regs = vec![None; 5];
+            assign(
+                &mut regs,
+                4,
+                Value {
+                    text: "limit".into(),
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                },
+            )
+            .unwrap();
+            let mut expected = Output::default();
+            let (expected_state, _) = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                13,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            let mut actual = Output::default();
+            let (state, _) = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                13,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(actual.text, expected.text, "float bits {bits:08x}");
+            assert!(state == expected_state);
+        }
+        let (mut class, mut method) = fixture(
+            vec![
+                0x0012, 0x0112, 0x2035, 5, 0x00d8, 0x0100, 0xfb28, 0x011f, 0, 0x0111,
+            ],
+            3,
+            0,
+            vec![],
+            "Ljava/lang/String;",
+        );
+        class.symbols = Arc::new(DexSymbols {
+            types: vec!["Ljava/lang/String;".into()],
+            ..Default::default()
+        });
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert!(!graph.shared_loops.is_empty());
+        let mut regs = vec![None; 3];
+        assign(
+            &mut regs,
+            2,
+            Value {
+                text: "limit".into(),
+                ty: "I".into(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: false,
+            },
+        )
+        .unwrap();
+        let mut expected = Output::default();
+        render(
+            &class,
+            &method,
+            &graph,
+            0,
+            10,
+            regs.clone(),
+            &mut expected,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!expected.text.contains("null ="));
+        assert!(expected.text.contains("java.lang.String"));
+        method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+        let mut actual = Output::default();
+        render(
+            &class,
+            &method,
+            &graph,
+            0,
+            10,
+            regs,
+            &mut actual,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(actual.text, expected.text);
+        assert_eq!(
+            actual
+                .links
+                .iter()
+                .map(|link| (link.start, link.end, &link.label))
+                .collect::<Vec<_>>(),
+            expected
+                .links
+                .iter()
+                .map(|link| (link.start, link.end, &link.label))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn malformed_shared_natural_loop_rejects_metadata_and_edges_without_raw_retry() {
+        use crate::native_cfg::EdgeKind;
+        use crate::native_ir::ValueKind;
+        let (class, method, regs) = shared_natural_loop_fixture(0x28);
+        let baseline = Graph::straight_line(&class, &method).unwrap().unwrap();
+        render(
+            &class,
+            &method,
+            &baseline,
+            0,
+            13,
+            regs.clone(),
+            &mut Output::default(),
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        for mutation in 0..13 {
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let region = graph.shared_loops[0];
+            let header = graph.shared_cfg.as_ref().unwrap().block_at[&region.start];
+            let latch = graph.shared_cfg.as_ref().unwrap().block_at[&region.latch];
+            match mutation {
+                0 => graph.shared_loops.first_mut().unwrap().start += 1,
+                1 => graph.shared_loops.first_mut().unwrap().latch -= 1,
+                2 => graph.shared_loops.first_mut().unwrap().guard = None,
+                3 => graph.shared_loops.first_mut().unwrap().exit += 1,
+                4 => graph.shared_loops.first_mut().unwrap().tail = Some(region.exit),
+                5 => graph.loops.clear(),
+                6 => graph.shared_cfg.as_mut().unwrap().blocks[latch].successors[0].target = latch,
+                7 => {
+                    graph.shared_cfg.as_mut().unwrap().blocks[header].successors[0].kind =
+                        EdgeKind::Exceptional
+                }
+                8 => {
+                    graph
+                        .front_end
+                        .as_mut()
+                        .unwrap()
+                        .ir
+                        .instructions
+                        .iter_mut()
+                        .find(|instruction| instruction.pc == region.latch)
+                        .unwrap()
+                        .branch_target = Some(region.start + 1)
+                }
+                9 => {
+                    graph
+                        .front_end
+                        .as_mut()
+                        .unwrap()
+                        .ir
+                        .instructions
+                        .iter_mut()
+                        .find(|instruction| instruction.pc == region.guard.unwrap())
+                        .unwrap()
+                        .branch_target = Some(region.exit + 1)
+                }
+                10 => {
+                    graph
+                        .front_end
+                        .as_mut()
+                        .unwrap()
+                        .ir
+                        .instructions
+                        .iter_mut()
+                        .find(|instruction| instruction.pc == region.guard.unwrap())
+                        .unwrap()
+                        .reads[0]
+                        .kind = ValueKind::Reference
+                }
+                11 => graph
+                    .front_end
+                    .as_mut()
+                    .unwrap()
+                    .ir
+                    .instructions
+                    .iter_mut()
+                    .find(|instruction| instruction.pc == region.latch)
+                    .unwrap()
+                    .reads
+                    .push(crate::native_ir::RegisterOperand {
+                        register: 0,
+                        kind: ValueKind::Unknown32,
+                    }),
+                _ => {
+                    graph.shared_cfg.as_mut().unwrap().blocks[header].successors[1].target =
+                        latch + 1
+                }
+            }
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    13,
+                    regs.clone(),
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_natural_loop_dominance_and_legacy_routing_are_explicit() {
+        let (class, method) = fixture(
+            vec![0x0038, 4, 0x0038, 5, 0x00d8, 0x0100, 0xfc28, 0x000e],
+            1,
+            0,
+            vec![],
+            "V",
+        );
+        assert!(Graph::straight_line(&class, &method).unwrap().is_none());
+        let ir = crate::native_ir::DecodedMethod::decode(method.code.as_ref().unwrap()).unwrap();
+        let cfg = crate::native_cfg::ControlFlowGraph::from_decoded_loop(&ir, 8).unwrap();
+        assert!(
+            decoded_natural_loop(&ir, &cfg)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not uniquely dominated")
+        );
+        // The formerly excluded two-backedge nested shape is now canonical.
+        let (class, method) = fixture(
+            vec![0x0038, 8, 0x0038, 4, 0x0000, 0xfd28, 0x0000, 0xf928, 0x000e],
+            1,
+            0,
+            vec![],
+            "V",
+        );
+        let nested = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert_eq!(nested.shared_loops.len(), 2);
+        assert_eq!(nested.shared_loops[1].parent, Some(0));
+        for words in [
+            vec![0x0038, 7, 0x0038, 5, 0x0000, 0xfb28, 0xfa28, 0x000e],
+            vec![0x0038, 5, 0x0000, 0xfd28, 0x0000, 0x000e],
+            vec![0x0038, 5, 0x0022, 0, 0xfc28, 0x000e],
+            vec![0x0038, 5, 0x001d, 0x001e, 0xfc28, 0x000e],
+            vec![0x0038, 5, 0x002b, 0, 0, 0xfb28, 0x000e],
+        ] {
+            let (class, method) = fixture(words, 1, 0, vec![], "V");
+            assert!(Graph::straight_line(&class, &method).unwrap().is_none());
+        }
+        let (class, mut method, _) = shared_natural_loop_fixture(0x28);
+        method.name = "<init>".into();
+        assert!(Graph::straight_line(&class, &method).unwrap().is_none());
+        method.name = "run".into();
+        method.code.as_mut().unwrap().tries = 1;
+        assert!(Graph::straight_line(&class, &method).unwrap().is_none());
+    }
+
+    #[test]
+    fn shared_natural_loop_retained_literal_slots_are_never_assignment_targets() {
+        let (class, method, _) = shared_natural_loop_fixture(0x28);
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        let slot = Value {
+            text: "null".into(),
+            ty: "Ljava/lang/Object;".into(),
+            literal: Some(0),
+            wide_literal: None,
+            raw_bits32: false,
+        };
+        let mut value = Value {
+            text: "0".into(),
+            ty: "I".into(),
+            literal: Some(0),
+            wide_literal: None,
+            raw_bits32: false,
+        };
+        let mut output = Output::default();
+        graph
+            .carry_loop_values(&[Some(slot.clone())], &[Some(value.clone())], &mut output)
+            .unwrap();
+        assert!(output.text.is_empty());
+        value.literal = Some(1);
+        value.text = "1".into();
+        assert!(
+            graph
+                .carry_loop_values(&[Some(slot)], &[Some(value)], &mut output)
+                .is_err()
+        );
+    }
+
+    fn shared_composition_fixture(
+        nested: bool,
+        terminal_inner: bool,
+    ) -> (DexClass, DexMethod, Vec<Option<Value>>) {
+        let mut words = if nested {
+            vec![
+                0x0038,
+                8,
+                0x0139,
+                4,
+                0x1212,
+                if terminal_inner { 0x020f } else { 0x0228 },
+                0x2212,
+                0x0228,
+                0x3212,
+                0x020f,
+            ]
+        } else {
+            vec![
+                0x0038, 4, 0x1212, 0x0228, 0x2212, 0x0139, 4, 0x1312, 0x0228, 0x2312, 0x0290,
+                0x0302, 0x020f,
+            ]
+        };
+        words.splice(0..0, [0x0071, 0, 0]);
+        let (mut class, method) = fixture(words, 4, 0, vec![], "I");
+        class.symbols = Arc::new(DexSymbols {
+            types: vec!["Lsample/Source;".into()],
+            strings: vec!["touch".into()],
+            protos: vec![("V".into(), vec![])],
+            methods: vec![(0, 0, 0)],
+            ..Default::default()
+        });
+        let mut regs = vec![None; 4];
+        for r in [0, 1] {
+            assign(
+                &mut regs,
+                r,
+                Value {
+                    text: format!("input{r}"),
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                },
+            )
+            .unwrap();
+        }
+        (class, method, regs)
+    }
+
+    #[test]
+    fn shared_forward_composition_poison_preserves_plans_liveness_and_navigation() {
+        for (nested, terminal) in [(false, false), (true, false), (true, true)] {
+            let (class, mut method, regs) = shared_composition_fixture(nested, terminal);
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            assert_eq!(graph.shared_branches.len(), 2);
+            assert!(graph.shared_live.is_some());
+            assert!(graph.live.is_none());
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let mut expected = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(expected.text.matches("sample.Source.touch()").count(), 1);
+            assert!(!expected.links.is_empty());
+            if !nested {
+                let first = graph.shared_branches[0].join;
+                let second = graph.shared_branches[1].join;
+                assert!(graph.live_at(first, 1) && graph.live_at(first, 2));
+                assert!(!graph.live_at(first, 0) && !graph.live_at(first, 3));
+                assert!(graph.live_at(second, 2) && graph.live_at(second, 3));
+                assert!(!graph.live_at(second, 0) && !graph.live_at(second, 1));
+            } else {
+                assert!(graph.live_at(graph.shared_branches[0].join, 2));
+                assert_eq!(graph.live_at(graph.shared_branches[1].join, 2), !terminal);
+                if terminal {
+                    assert_eq!(graph.shared_branches[1].join, 9);
+                }
+            }
+            for instruction in graph
+                .front_end
+                .as_ref()
+                .unwrap()
+                .ir
+                .instructions
+                .iter()
+                .filter(|instruction| matches!(instruction.opcode, 0x28..=0x2a | 0x32..=0x3d))
+            {
+                method.code.as_mut().unwrap().instructions
+                    [instruction.pc..instruction.pc + instruction.width]
+                    .fill(u16::MAX);
+            }
+            graph.targets.fill(Some(usize::MAX));
+            let mut actual = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(actual.text, expected.text);
+            assert_eq!(
+                actual
+                    .links
+                    .iter()
+                    .map(|link| (link.start, link.end, &link.label))
+                    .collect::<Vec<_>>(),
+                expected
+                    .links
+                    .iter()
+                    .map(|link| (link.start, link.end, &link.label))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_shared_forward_composition_rejects_edges_and_region_joins() {
+        use crate::native_cfg::{Edge, EdgeKind};
+        for nested in [false, true] {
+            let (class, method, regs) = shared_composition_fixture(nested, false);
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let baseline = Graph::straight_line(&class, &method).unwrap().unwrap();
+            render(
+                &class,
+                &method,
+                &baseline,
+                0,
+                end,
+                regs.clone(),
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            for mutation in 0..7 {
+                let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+                let inner_pc = graph.shared_branches[1].branch;
+                let inner_block = graph.shared_cfg.as_ref().unwrap().block_at[&inner_pc];
+                match mutation {
+                    0 => graph.shared_branches[1].join -= 1,
+                    1 => graph.shared_branches[1].join = end + 1,
+                    2 => graph.shared_branches[1].join = graph.shared_branches[0].join + 1,
+                    3 => {
+                        graph.shared_cfg.as_mut().unwrap().blocks[inner_block].successors[0].kind =
+                            EdgeKind::Exceptional
+                    }
+                    4 => graph.shared_cfg.as_mut().unwrap().blocks[inner_block]
+                        .successors
+                        .push(Edge {
+                            target: inner_block + 1,
+                            kind: EdgeKind::Normal,
+                        }),
+                    5 => {
+                        let instruction = graph
+                            .front_end
+                            .as_mut()
+                            .unwrap()
+                            .ir
+                            .instructions
+                            .iter_mut()
+                            .find(|instruction| instruction.pc == inner_pc)
+                            .unwrap();
+                        instruction.branch_target = Some(end - 1);
+                    }
+                    _ => graph.shared_branches.swap(0, 1),
+                }
+                assert!(
+                    render(
+                        &class,
+                        &method,
+                        &graph,
+                        0,
+                        end,
+                        regs.clone(),
+                        &mut Output::default(),
+                        0,
+                        true,
+                        None,
+                        None
+                    )
+                    .is_err(),
+                    "nested={nested}, mutation={mutation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_forward_composition_liveness_uses_decoded_reads_and_wide_spans() {
+        let (class, method, _) = shared_composition_fixture(false, false);
+        let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        let first = graph.shared_branches[0].join;
+        assert!(graph.live_at(first, 1));
+        graph
+            .front_end
+            .as_mut()
+            .unwrap()
+            .ir
+            .instructions
+            .iter_mut()
+            .find(|instruction| instruction.pc == first)
+            .unwrap()
+            .reads[0]
+            .register = 0;
+        graph.shared_live = decoded_cfg_liveness(
+            &graph.front_end.as_ref().unwrap().ir,
+            graph.shared_cfg.as_ref().unwrap(),
+            4,
+        )
+        .unwrap();
+        assert!(graph.live_at(first, 0));
+        assert!(!graph.live_at(first, 1));
+        let (class, method) = fixture(
+            vec![0x0438, 5, 0x0216, 1, 0x0328, 0x0216, 2, 0x0210],
+            5,
+            0,
+            vec![],
+            "J",
+        );
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        let join = graph.shared_branches[0].join;
+        assert!(graph.live_at(join, 2) && graph.live_at(join, 3));
+        assert!(!graph.live_at(join, 0) && !graph.live_at(join, 1));
+    }
+
+    #[test]
+    fn shared_forward_composition_liveness_budget_retains_registers() {
+        let mut words = Vec::new();
+        for _ in 0..2050 {
+            words.extend([0x0038, 3, 0x0000]);
+        }
+        words.push(0x000e);
+        let (_, method) = fixture(words, u16::MAX, 0, vec![], "V");
+        let code = method.code.as_ref().unwrap();
+        let ir = crate::native_ir::DecodedMethod::decode(code).unwrap();
+        let cfg = crate::native_cfg::ControlFlowGraph::from_decoded(&ir, code.instructions.len())
+            .unwrap();
+        assert!(
+            decoded_cfg_liveness(&ir, &cfg, usize::from(code.registers))
+                .unwrap()
+                .is_none()
+        );
+        let mut graph = Graph::empty(code.instructions.len());
+        graph.shared_cfg = Some(cfg);
+        assert!(graph.live_at(0, 0));
+        assert!(graph.live_at(0, 65534));
+    }
+
+    fn shared_diamond_fixture(op: u8, goto: u8) -> (DexClass, DexMethod, Vec<Option<Value>>) {
+        let goto_width = usize::from(goto - 0x27);
+        let taken = 3 + goto_width;
+        let mut words = vec![
+            u16::from(op) | if op < 0x38 { 0x1000 } else { 0 },
+            taken as u16,
+            0x1212,
+        ];
+        words.extend(match goto {
+            0x28 => vec![u16::from(goto) | ((goto_width + 1) as u16) << 8],
+            0x29 => vec![u16::from(goto), (goto_width + 1) as u16],
+            _ => vec![u16::from(goto), (goto_width + 1) as u16, 0],
+        });
+        words.extend([0x2212, 0x020f]);
+        let (class, method) = fixture(words, 3, 0, vec![], "I");
+        let regs = vec![
+            Some(Value {
+                text: "left".into(),
+                ty: "I".into(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: false,
+            }),
+            Some(Value {
+                text: "right".into(),
+                ty: "I".into(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: false,
+            }),
+            None,
+        ];
+        (class, method, regs)
+    }
+
+    #[test]
+    fn shared_diamond_consumes_decoded_blocks_edges_and_conditions() {
+        for op in 0x32..=0x3d {
+            for goto in 0x28..=0x2a {
+                let (class, mut method, regs) = shared_diamond_fixture(op, goto);
+                let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+                assert!(graph.shared_cfg.is_some());
+                let end = method.code.as_ref().unwrap().instructions.len();
+                let mut expected = Output::default();
+                render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    end,
+                    regs.clone(),
+                    &mut expected,
+                    0,
+                    true,
+                    None,
+                    None,
+                )
+                .unwrap();
+                assert!(expected.text.contains("int v0;"));
+                let instructions = &graph.front_end.as_ref().unwrap().ir.instructions;
+                for instruction in instructions
+                    .iter()
+                    .filter(|instruction| matches!(instruction.opcode, 0x28..=0x2a | 0x32..=0x3d))
+                {
+                    method.code.as_mut().unwrap().instructions
+                        [instruction.pc..instruction.pc + instruction.width]
+                        .fill(u16::MAX);
+                }
+                graph.targets.fill(Some(usize::MAX));
+                let mut actual = Output::default();
+                render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    end,
+                    regs,
+                    &mut actual,
+                    0,
+                    true,
+                    None,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(
+                    actual.text, expected.text,
+                    "condition {op:02x}, goto {goto:02x}"
+                );
+            }
+        }
+        for op in [0x32, 0x33, 0x38, 0x39] {
+            let (class, mut method, mut regs) = shared_diamond_fixture(op, 0x28);
+            regs[0].as_mut().unwrap().ty = "Ljava/lang/String;".into();
+            regs[1].as_mut().unwrap().ty = "Ljava/lang/Object;".into();
+            let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            method.code.as_mut().unwrap().instructions[0..2].fill(u16::MAX);
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let mut actual = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(actual.text.contains(if op < 0x38 {
+                "((java.lang.Object) left)"
+            } else {
+                "left"
+            }));
+            if op >= 0x38 {
+                assert!(actual.text.contains("null"));
+            }
+        }
+    }
+
+    #[test]
+    fn shared_diamond_uses_canonical_no_goto_and_terminal_joins() {
+        for words in [
+            vec![0x0038, 3, 0x1212, 0x020f],
+            vec![0x0038, 4, 0x1212, 0x020f, 0x2212, 0x020f],
+        ] {
+            let (class, mut method) = fixture(words, 3, 0, vec![], "I");
+            let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let mut regs = vec![None; 3];
+            for r in [0, 2] {
+                assign(
+                    &mut regs,
+                    r,
+                    Value {
+                        text: "input".into(),
+                        ty: "I".into(),
+                        literal: None,
+                        wide_literal: None,
+                        raw_bits32: false,
+                    },
+                )
+                .unwrap();
+            }
+            let expected_join = if end == 4 { 3 } else { end };
+            assert_eq!(graph.shared_branches[0].join, expected_join);
+            let mut expected = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            method.code.as_mut().unwrap().instructions[0..2].fill(u16::MAX);
+            let mut actual = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(actual.text, expected.text);
+        }
+    }
+
+    #[test]
+    fn shared_diamond_poison_preserves_effectful_prefix_navigation() {
+        let (mut class, mut method, regs) = shared_diamond_fixture(0x32, 0x28);
+        class.symbols = Arc::new(DexSymbols {
+            types: vec!["Lsample/Source;".into()],
+            strings: vec!["touch".into()],
+            protos: vec![("V".into(), vec![])],
+            methods: vec![(0, 0, 0)],
+            ..Default::default()
+        });
+        method
+            .code
+            .as_mut()
+            .unwrap()
+            .instructions
+            .splice(0..0, [0x0071, 0, 0]);
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        let end = method.code.as_ref().unwrap().instructions.len();
+        let mut expected = Output::default();
+        render(
+            &class,
+            &method,
+            &graph,
+            0,
+            end,
+            regs.clone(),
+            &mut expected,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!expected.links.is_empty());
+        assert_eq!(expected.text.matches("sample.Source.touch()").count(), 1);
+        for instruction in graph
+            .front_end
+            .as_ref()
+            .unwrap()
+            .ir
+            .instructions
+            .iter()
+            .filter(|instruction| matches!(instruction.opcode, 0x28..=0x2a | 0x32..=0x3d))
+        {
+            method.code.as_mut().unwrap().instructions
+                [instruction.pc..instruction.pc + instruction.width]
+                .fill(u16::MAX);
+        }
+        let mut actual = Output::default();
+        render(
+            &class,
+            &method,
+            &graph,
+            0,
+            end,
+            regs,
+            &mut actual,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(actual.text, expected.text);
+        assert_eq!(
+            actual
+                .links
+                .iter()
+                .map(|link| (link.start, link.end, &link.label))
+                .collect::<Vec<_>>(),
+            expected
+                .links
+                .iter()
+                .map(|link| (link.start, link.end, &link.label))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn shared_diamond_eligibility_preserves_excluded_legacy_shapes() {
+        // A sole malformed backward condition is now selected for posttest
+        // validation and fails closed instead of retrying legacy rendering.
+        let (class, method) = fixture(vec![0x0038, 0xffff, 0x000e], 3, 0, vec![], "V");
+        assert!(Graph::straight_line(&class, &method).is_err());
+        for words in [
+            vec![0x0038, 4, 0x0000, 0xff28, 0x000e],
+            vec![0x002b, 0, 0],
+            vec![0x0022, 0],
+            vec![0x0024, 0, 0],
+            vec![0x001d, 0x001e, 0x000e],
+        ] {
+            let (class, method) = fixture(words, 3, 0, vec![], "V");
+            assert!(Graph::straight_line(&class, &method).unwrap().is_none());
+        }
+        let (class, mut method, _) = shared_diamond_fixture(0x32, 0x28);
+        method.name = "<init>".into();
+        assert!(Graph::straight_line(&class, &method).unwrap().is_none());
+        method.name = "run".into();
+        method.code.as_mut().unwrap().tries = 1;
+        assert!(Graph::straight_line(&class, &method).unwrap().is_none());
+        let (class, method) = fixture(vec![0x000e], 0, 0, vec![], "V");
+        assert!(
+            Graph::straight_line(&class, &method)
+                .unwrap()
+                .unwrap()
+                .shared_cfg
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_shared_diamond_gotos_never_retry_raw() {
+        use crate::native_ir::{PoolKind, PoolReference, RegisterOperand, ValueKind};
+        for op in 0x28..=0x2a {
+            let (class, method, regs) = shared_diamond_fixture(0x38, op);
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let baseline = Graph::straight_line(&class, &method).unwrap().unwrap();
+            render(
+                &class,
+                &method,
+                &baseline,
+                0,
+                end,
+                regs.clone(),
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            for mutation in 0..8 {
+                let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+                let goto = &mut graph.front_end.as_mut().unwrap().ir.instructions[2];
+                match mutation {
+                    0 => goto.reads.push(RegisterOperand {
+                        register: 0,
+                        kind: ValueKind::Unknown32,
+                    }),
+                    1 => goto.writes.push(RegisterOperand {
+                        register: 0,
+                        kind: ValueKind::Unknown32,
+                    }),
+                    2 => goto.width += 1,
+                    3 => goto.may_throw = true,
+                    4 => goto.literal = Some(0),
+                    5 => {
+                        goto.reference = Some(PoolReference {
+                            kind: PoolKind::Type,
+                            index: 0,
+                        })
+                    }
+                    6 => goto.prototype = Some(0),
+                    _ => goto.payload_target = Some(0),
+                }
+                assert!(
+                    render(
+                        &class,
+                        &method,
+                        &graph,
+                        0,
+                        end,
+                        regs.clone(),
+                        &mut Output::default(),
+                        0,
+                        true,
+                        None,
+                        None
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_shared_diamond_never_retries_raw_cfg() {
+        use crate::native_cfg::{Edge, EdgeKind};
+        use crate::native_ir::{PoolKind, PoolReference, ValueKind};
+        let (class, method, regs) = shared_diamond_fixture(0x32, 0x28);
+        let end = method.code.as_ref().unwrap().instructions.len();
+        let baseline = Graph::straight_line(&class, &method).unwrap().unwrap();
+        render(
+            &class,
+            &method,
+            &baseline,
+            0,
+            end,
+            regs.clone(),
+            &mut Output::default(),
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        for mutation in 0..24 {
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let branch = &mut graph.front_end.as_mut().unwrap().ir.instructions[0];
+            match mutation {
+                0 => branch.reads.clear(),
+                1 => branch.reads.push(branch.reads[0]),
+                2 => branch.reads[0].kind = ValueKind::Bits32,
+                3 => branch.reads[1].kind = ValueKind::Reference,
+                4 => branch.reads[0].register = 3,
+                5 => branch.writes.push(branch.reads[0]),
+                6 => branch.width = 1,
+                7 => branch.may_throw = true,
+                8 => branch.literal = Some(0),
+                9 => {
+                    branch.reference = Some(PoolReference {
+                        kind: PoolKind::Type,
+                        index: 0,
+                    })
+                }
+                10 => branch.prototype = Some(0),
+                11 => branch.payload_target = Some(0),
+                12 => branch.branch_target = None,
+                13 => branch.branch_target = Some(1),
+                14 => branch.branch_target = Some(end),
+                15 => branch.branch_target = Some(5),
+                16 => graph.shared_cfg.as_mut().unwrap().blocks[0]
+                    .successors
+                    .swap(0, 1),
+                17 => {
+                    graph.shared_cfg.as_mut().unwrap().blocks[0].successors[0].kind =
+                        EdgeKind::Exceptional
+                }
+                18 => {
+                    graph.shared_cfg.as_mut().unwrap().blocks[0].successors[0].target = usize::MAX
+                }
+                19 => graph.shared_cfg.as_mut().unwrap().blocks[1]
+                    .successors
+                    .push(Edge {
+                        target: 2,
+                        kind: EdgeKind::Normal,
+                    }),
+                20 => graph.shared_cfg.as_mut().unwrap().blocks[1].start += 1,
+                21 => {
+                    graph.shared_cfg.as_mut().unwrap().block_at.remove(&2);
+                }
+                22 => graph.shared_branches[0].join -= 1,
+                _ => graph.front_end.as_mut().unwrap().ir.instructions[2].branch_target = Some(4),
+            }
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    end,
+                    regs.clone(),
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_throw_ignores_poisoned_raw_operands() {
+        for (ty, literal, declared, caught, expected) in [
+            (
+                "Ljava/lang/RuntimeException;",
+                None,
+                false,
+                false,
+                "failure",
+            ),
+            ("Ljava/io/IOException;", None, true, false, "failure"),
+            ("I", Some(0), false, false, "null"),
+            ("Ljava/lang/Throwable;", None, false, true, "caught"),
+        ] {
+            let (class, mut method) = fixture(vec![0x0127], 2, 0, vec![], "V");
+            if declared {
+                method.thrown_types.push(ty.into());
+            }
+            let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            if caught {
+                graph.caught_values.borrow_mut().insert("failure".into());
+                graph
+                    .catch_rethrows
+                    .borrow_mut()
+                    .insert("failure".into(), "caught".into());
+            }
+            let regs = vec![
+                None,
+                Some(Value {
+                    text: "failure".into(),
+                    ty: ty.into(),
+                    literal,
+                    wide_literal: None,
+                    raw_bits32: false,
+                }),
+            ];
+            let mut baseline = Output::default();
+            let (_, terminal) = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                1,
+                regs.clone(),
+                &mut baseline,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(terminal);
+            method.code.as_mut().unwrap().instructions[0] = u16::MAX;
+            let mut actual = Output::default();
+            let (_, terminal) = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                1,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(terminal);
+            assert_eq!(actual.text, baseline.text);
+            assert!(actual.text.contains(&format!("throw {expected};")));
+        }
+    }
+
+    #[test]
+    fn malformed_shared_throw_never_retries_raw() {
+        use crate::native_ir::{PoolKind, PoolReference, ValueKind};
+        let (class, method) = fixture(vec![0x0127], 2, 0, vec![], "V");
+        let regs = vec![
+            None,
+            Some(Value {
+                text: "failure".into(),
+                ty: "Ljava/lang/RuntimeException;".into(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: false,
+            }),
+        ];
+        let baseline = Graph::straight_line(&class, &method).unwrap().unwrap();
+        render(
+            &class,
+            &method,
+            &baseline,
+            0,
+            1,
+            regs.clone(),
+            &mut Output::default(),
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        for mutation in 0..12 {
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let instruction = &mut graph.front_end.as_mut().unwrap().ir.instructions[0];
+            match mutation {
+                0 => instruction.reads.clear(),
+                1 => instruction.reads.push(instruction.reads[0]),
+                2 => instruction.writes.push(instruction.reads[0]),
+                3 => instruction.reads[0].kind = ValueKind::Unknown32,
+                4 => instruction.reads[0].register = 2,
+                5 => instruction.width = 2,
+                6 => instruction.may_throw = false,
+                7 => instruction.literal = Some(0),
+                8 => {
+                    instruction.reference = Some(PoolReference {
+                        kind: PoolKind::Type,
+                        index: 0,
+                    })
+                }
+                9 => instruction.prototype = Some(0),
+                10 => instruction.branch_target = Some(0),
+                _ => instruction.payload_target = Some(0),
+            }
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    1,
+                    regs.clone(),
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_throw_preserves_constructor_and_terminal_guards() {
+        let (mut class, mut method) = fixture(vec![0x0127], 2, 0, vec![], "V");
+        method.name = "<init>".into();
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        let regs = vec![
+            None,
+            Some(Value {
+                text: "failure".into(),
+                ty: "Ljava/lang/RuntimeException;".into(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: false,
+            }),
+        ];
+        method.code.as_mut().unwrap().instructions[0] = u16::MAX;
+        let mut actual = Output::default();
+        let (_, terminal) = render(
+            &class,
+            &method,
+            &graph,
+            0,
+            1,
+            regs.clone(),
+            &mut actual,
+            0,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(terminal);
+        assert!(actual.text.contains("throw failure;"));
+        assert!(actual.text.contains("super();"));
+        class.superclass = Some("Lsample/UnknownSuper;".into());
+        let error = render(
+            &class,
+            &method,
+            &graph,
+            0,
+            1,
+            regs,
+            &mut Output::default(),
+            0,
+            false,
+            None,
+            None,
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("throw before initialization"));
+        let (class, method) = fixture(vec![0x0027, 0x000e], 1, 0, vec![], "V");
+        assert!(Graph::straight_line(&class, &method).is_err());
+    }
+
+    fn shared_array_type_fixture(op: u8) -> (DexClass, DexMethod, Vec<Option<Value>>) {
+        let mut regs = vec![None; 6];
+        let mut set = |r, ty: &str, text: &str| {
+            assign(
+                &mut regs,
+                r,
+                Value {
+                    text: text.into(),
+                    ty: ty.into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                },
+            )
+            .unwrap()
+        };
+        let (mut words, ret) = match op {
+            0x1f => {
+                set(0, "Ljava/lang/Object;", "source");
+                (vec![0x001f, 0], "Ljava/lang/String;")
+            }
+            0x20 => {
+                set(2, "Ljava/lang/Object;", "source");
+                (vec![0x2020, 0], "Z")
+            }
+            0x21 => {
+                set(2, "[I", "array");
+                (vec![0x2021], "I")
+            }
+            0x23 => {
+                set(2, "I", "size");
+                (vec![0x2023, 1], "[Ljava/lang/String;")
+            }
+            _ => {
+                let put = op >= 0x4b;
+                let family = op - if put { 0x4b } else { 0x44 };
+                let element = ["I", "J", "Ljava/lang/String;", "Z", "B", "C", "S"][family as usize];
+                set(2, &format!("[{element}"), "array");
+                set(3, "I", "index");
+                if put {
+                    set(
+                        0,
+                        if family == 2 {
+                            "Ljava/lang/Object;"
+                        } else if family >= 4 {
+                            "I"
+                        } else {
+                            element
+                        },
+                        "source",
+                    );
+                }
+                (vec![u16::from(op), 0x0302], if put { "V" } else { element })
+            }
+        };
+        words.push(if ret == "V" {
+            0x0e
+        } else if wide(ret) {
+            0x10
+        } else if reference(ret) {
+            0x11
+        } else {
+            0x0f
+        });
+        let (mut class, method) = fixture(words, 6, 0, vec![], ret);
+        class.symbols = Arc::new(DexSymbols {
+            types: vec!["Ljava/lang/String;".into(), "[Ljava/lang/String;".into()],
+            ..Default::default()
+        });
+        (class, method, regs)
+    }
+
+    #[test]
+    fn shared_array_types_ignore_poisoned_raw_operands_and_references() {
+        for op in (0x1f..=0x21).chain([0x23]).chain(0x44..=0x51) {
+            let (class, mut method, regs) = shared_array_type_fixture(op);
+            let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let mut expected = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            let mut actual = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(actual.text, expected.text, "array/type opcode {op:02x}");
+            assert_eq!(
+                actual
+                    .links
+                    .iter()
+                    .map(|link| (link.start, link.end, &link.label))
+                    .collect::<Vec<_>>(),
+                expected
+                    .links
+                    .iter()
+                    .map(|link| (link.start, link.end, &link.label))
+                    .collect::<Vec<_>>()
+            );
+            if op == 0x4d {
+                assert!(
+                    actual
+                        .text
+                        .contains("((java.lang.Object[]) array)[index] = source;")
+                );
+            }
+            if (0x4f..=0x51).contains(&op) {
+                assert!(actual.text.contains("[index] = ("));
+            }
+        }
+    }
+
+    #[test]
+    fn shared_array_type_constructor_guards_consume_all_decoded_inputs() {
+        for op in (0x1f..=0x21).chain([0x23]).chain(0x44..=0x51) {
+            let (class, mut method, regs) = shared_array_type_fixture(op);
+            let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let end = graph.front_end.as_ref().unwrap().ir.instructions[0].width;
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut Output::default(),
+                0,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+            for operand in &graph.front_end.as_ref().unwrap().ir.instructions[0].reads {
+                let mut guarded = regs.clone();
+                guarded[usize::from(operand.register)]
+                    .as_mut()
+                    .unwrap()
+                    .text = "this".into();
+                let error = render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    end,
+                    guarded,
+                    &mut Output::default(),
+                    0,
+                    false,
+                    None,
+                    None,
+                )
+                .err()
+                .expect("constructor guard must reject");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("uninitialized this used by array/type operation"),
+                    "opcode {op:02x}, register {}, {error}",
+                    operand.register
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_array_types_consume_changed_valid_type_identity() {
+        for op in [0x1f, 0x20, 0x23] {
+            let (mut class, mut method, regs) = shared_array_type_fixture(op);
+            if op != 0x20 {
+                method.return_type = "Ljava/lang/Object;".into();
+            }
+            let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+            symbols.types.push(if op == 0x23 {
+                "[Ljava/lang/Integer;".into()
+            } else {
+                "Ljava/lang/Integer;".into()
+            });
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            graph.front_end.as_mut().unwrap().ir.instructions[0]
+                .reference
+                .as_mut()
+                .unwrap()
+                .index = 2;
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let mut actual = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(actual.text.contains("java.lang.Integer"));
+            assert!(
+                actual
+                    .links
+                    .iter()
+                    .any(|link| link.label == "java.lang.Integer")
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_shared_array_types_never_retry_raw() {
+        use crate::native_ir::{PoolKind, PoolReference, ValueKind};
+        for op in (0x1f..=0x21).chain([0x23]).chain(0x44..=0x51) {
+            let (class, method, regs) = shared_array_type_fixture(op);
+            let baseline = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let end = method.code.as_ref().unwrap().instructions.len();
+            render(
+                &class,
+                &method,
+                &baseline,
+                0,
+                end,
+                regs.clone(),
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            for mutation in 0..23 {
+                let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+                let instruction = &mut graph.front_end.as_mut().unwrap().ir.instructions[0];
+                match mutation {
+                    0 => instruction.reads.clear(),
+                    1 => instruction.reads.push(instruction.reads[0]),
+                    2 => instruction.writes.push(crate::native_ir::RegisterOperand {
+                        register: 0,
+                        kind: ValueKind::Bits32,
+                    }),
+                    3 if !instruction.writes.is_empty() => instruction.writes.clear(),
+                    4 => instruction.reads[0].kind = ValueKind::Unknown32,
+                    5 if !instruction.writes.is_empty() => {
+                        instruction.writes[0].kind = ValueKind::Unknown32
+                    }
+                    6 => instruction.reads[0].register = 6,
+                    7 if !instruction.writes.is_empty() => instruction.writes[0].register = 6,
+                    8 if instruction.reference.is_some() => instruction.reference = None,
+                    9 => {
+                        instruction.reference = Some(PoolReference {
+                            kind: PoolKind::Field,
+                            index: 0,
+                        })
+                    }
+                    10 => {
+                        instruction.reference = Some(PoolReference {
+                            kind: PoolKind::Type,
+                            index: 65536,
+                        })
+                    }
+                    11 => {
+                        instruction.reference = Some(PoolReference {
+                            kind: PoolKind::Type,
+                            index: 2,
+                        })
+                    }
+                    12 => instruction.literal = Some(0),
+                    13 => instruction.may_throw = false,
+                    14 => instruction.width += 1,
+                    15 => instruction.branch_target = Some(0),
+                    16 => instruction.payload_target = Some(0),
+                    17 => instruction.prototype = Some(0),
+                    18 if op == 0x1f => instruction.writes[0].register = 4,
+                    19 if instruction.reads.len() >= 2 => {
+                        instruction.reads[1].kind = ValueKind::Unknown32
+                    }
+                    20 if op == 0x45 => instruction.writes[0].register = 5,
+                    21 if op >= 0x4b => instruction.reads[2].kind = ValueKind::Unknown32,
+                    22 if op == 0x4c => instruction.reads[2].register = 5,
+                    _ => continue,
+                }
+                assert!(
+                    render(
+                        &class,
+                        &method,
+                        &graph,
+                        0,
+                        end,
+                        regs.clone(),
+                        &mut Output::default(),
+                        0,
+                        true,
+                        None,
+                        None
+                    )
+                    .is_err(),
+                    "array/type opcode {op:02x}, mutation {mutation}"
+                );
+            }
+        }
+    }
+
+    fn shared_field_fixture(op: u8) -> (DexClass, DexMethod, Vec<Option<Value>>) {
+        let is_static = op >= 0x60;
+        let put = if is_static { op >= 0x67 } else { op >= 0x59 };
+        let family = if op >= 0x67 {
+            op - 0x67
+        } else if is_static {
+            op - 0x60
+        } else if put {
+            op - 0x59
+        } else {
+            op - 0x52
+        };
+        let ty = ["I", "J", "Lsample/Example;", "Z", "B", "C", "S"][family as usize];
+        let words = vec![
+            u16::from(op) | if is_static { 0 } else { 0x2000 },
+            0,
+            if put {
+                0x0e
+            } else if wide(ty) {
+                0x10
+            } else if reference(ty) {
+                0x11
+            } else {
+                0x0f
+            },
+        ];
+        let (mut class, method) = fixture(words, 4, 0, vec![], if put { "V" } else { ty });
+        class.symbols = Arc::new(DexSymbols {
+            types: vec![class.descriptor.clone(), ty.into()],
+            strings: vec!["value".into()],
+            fields: vec![(0, 1, 0)],
+            ..Default::default()
+        });
+        let mut regs = vec![None; 4];
+        assign(
+            &mut regs,
+            2,
+            Value {
+                text: "receiver".into(),
+                ty: class.descriptor.to_string(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: false,
+            },
+        )
+        .unwrap();
+        if put {
+            assign(
+                &mut regs,
+                0,
+                Value {
+                    text: "source".into(),
+                    ty: ty.into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                },
+            )
+            .unwrap();
+        }
+        (class, method, regs)
+    }
+
+    #[test]
+    fn shared_fields_ignore_poisoned_raw_operands_and_references() {
+        for op in 0x52..=0x6d {
+            let (class, mut method, regs) = shared_field_fixture(op);
+            let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let mut expected = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                3,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            let mut actual = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                3,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(actual.text, expected.text, "field opcode {op:02x}");
+            assert_eq!(
+                actual
+                    .links
+                    .iter()
+                    .map(|link| (link.start, link.end, &link.label))
+                    .collect::<Vec<_>>(),
+                expected
+                    .links
+                    .iter()
+                    .map(|link| (link.start, link.end, &link.label))
+                    .collect::<Vec<_>>(),
+                "field navigation {op:02x}"
+            );
+            assert!(
+                actual
+                    .links
+                    .iter()
+                    .any(|link| link.label.starts_with("sample.Example.value:"))
+            );
+            if (0x59..=0x5f).contains(&op) {
+                assert!(actual.text.contains("receiver.value = source"));
+            }
+        }
+    }
+
+    #[test]
+    fn shared_fields_consume_changed_valid_pool_identity() {
+        for op in 0x52..=0x6d {
+            let (mut class, method, regs) = shared_field_fixture(op);
+            let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+            symbols.strings.push("other".into());
+            symbols.fields.push((0, 1, 1));
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            graph.front_end.as_mut().unwrap().ir.instructions[0]
+                .reference
+                .as_mut()
+                .unwrap()
+                .index = 1;
+            let mut actual = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                3,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(actual.text.contains(".other"), "field opcode {op:02x}");
+            assert!(
+                actual
+                    .links
+                    .iter()
+                    .any(|link| link.label.starts_with("sample.Example.other:"))
+            );
+            assert!(
+                !actual
+                    .links
+                    .iter()
+                    .any(|link| link.label.starts_with("sample.Example.value:"))
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_shared_fields_never_retry_raw_operands_or_references() {
+        use crate::native_ir::{PoolKind, PoolReference, ValueKind};
+        for op in 0x52..=0x6d {
+            let (class, method, regs) = shared_field_fixture(op);
+            let baseline = Graph::straight_line(&class, &method).unwrap().unwrap();
+            render(
+                &class,
+                &method,
+                &baseline,
+                0,
+                3,
+                regs.clone(),
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            for mutation in 0..20 {
+                let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+                let instruction = &mut graph.front_end.as_mut().unwrap().ir.instructions[0];
+                match mutation {
+                    0 => instruction.reads.push(crate::native_ir::RegisterOperand {
+                        register: 0,
+                        kind: ValueKind::Bits32,
+                    }),
+                    1 => instruction.writes.push(crate::native_ir::RegisterOperand {
+                        register: 0,
+                        kind: ValueKind::Bits32,
+                    }),
+                    2 if !instruction.reads.is_empty() => {
+                        instruction.reads.pop();
+                    }
+                    3 if !instruction.writes.is_empty() => instruction.writes.clear(),
+                    4 if !instruction.reads.is_empty() => {
+                        instruction.reads[0].kind = ValueKind::Unknown32
+                    }
+                    5 if !instruction.writes.is_empty() => {
+                        instruction.writes[0].kind = ValueKind::Unknown32
+                    }
+                    6 if !instruction.reads.is_empty() => instruction.reads[0].register = 4,
+                    7 if !instruction.writes.is_empty() => instruction.writes[0].register = 4,
+                    8 => instruction.reference = None,
+                    9 => {
+                        instruction.reference = Some(PoolReference {
+                            kind: PoolKind::Type,
+                            index: 0,
+                        })
+                    }
+                    10 => {
+                        instruction.reference = Some(PoolReference {
+                            kind: PoolKind::Field,
+                            index: 65536,
+                        })
+                    }
+                    11 => {
+                        instruction.reference = Some(PoolReference {
+                            kind: PoolKind::Field,
+                            index: 1,
+                        })
+                    }
+                    12 => instruction.literal = Some(0),
+                    13 => instruction.may_throw = false,
+                    14 => instruction.width = 1,
+                    15 => instruction.branch_target = Some(0),
+                    16 if instruction.reads.len() == 2 => {
+                        instruction.reads[1].kind = ValueKind::Unknown32
+                    }
+                    17 if instruction
+                        .writes
+                        .first()
+                        .is_some_and(|operand| operand.kind == ValueKind::Wide64) =>
+                    {
+                        instruction.writes[0].register = 3
+                    }
+                    18 if instruction
+                        .reads
+                        .last()
+                        .is_some_and(|operand| operand.kind == ValueKind::Wide64) =>
+                    {
+                        instruction.reads.last_mut().unwrap().register = 3
+                    }
+                    19 => instruction.payload_target = Some(0),
+                    _ => continue,
+                }
+                assert!(
+                    render(
+                        &class,
+                        &method,
+                        &graph,
+                        0,
+                        3,
+                        regs.clone(),
+                        &mut Output::default(),
+                        0,
+                        true,
+                        None,
+                        None
+                    )
+                    .is_err(),
+                    "field opcode {op:02x}, mutation {mutation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_arithmetic_ignores_poisoned_raw_operands() {
+        for op in (0x2d..=0x31).chain(0x7b..=0x8f).chain(0x90..=0xe2) {
+            let (words, left_ty, right_ty, ret, dst) = match op {
+                0x2d..=0x31 => {
+                    let spec = numeric::Compare::decode(op).unwrap();
+                    (
+                        vec![0x0400 | u16::from(op), 0x0200],
+                        spec.input.descriptor(),
+                        spec.input.descriptor(),
+                        "I",
+                        4,
+                    )
+                }
+                0x7b..=0x8f => {
+                    let spec = numeric::Unary::decode(op).unwrap();
+                    (
+                        vec![0x0400 | u16::from(op)],
+                        spec.input.descriptor(),
+                        "I",
+                        spec.result_descriptor,
+                        4,
+                    )
+                }
+                0x90..=0xcf => {
+                    let spec = numeric::Binary::decode(op).unwrap();
+                    let words = if op >= 0xb0 {
+                        vec![0x2000 | u16::from(op)]
+                    } else {
+                        vec![0x0400 | u16::from(op), 0x0200]
+                    };
+                    (
+                        words,
+                        spec.left.descriptor(),
+                        spec.right.descriptor(),
+                        spec.result.descriptor(),
+                        if op >= 0xb0 { 0 } else { 4 },
+                    )
+                }
+                _ => (
+                    if op <= 0xd7 {
+                        vec![0x0400 | u16::from(op), 0xfffd]
+                    } else {
+                        vec![0x0400 | u16::from(op), 0xfd00]
+                    },
+                    "I",
+                    "I",
+                    "I",
+                    4,
+                ),
+            };
+            let mut words = words;
+            words.push((dst << 8) | if wide(ret) { 0x10 } else { 0x0f });
+            let (class, mut method) = fixture(words, 6, 0, vec![], ret);
+            let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let mut regs = vec![None; 6];
+            for (register, ty, name) in [(0, left_ty, "left"), (2, right_ty, "right")] {
+                assign(
+                    &mut regs,
+                    register,
+                    Value {
+                        text: name.into(),
+                        ty: ty.into(),
+                        literal: None,
+                        wide_literal: None,
+                        raw_bits32: false,
+                    },
+                )
+                .unwrap();
+            }
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let mut expected = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            let mut actual = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(actual.text, expected.text, "opcode {op:02x}");
+        }
+    }
+
+    #[test]
+    fn shared_boolean_arithmetic_ignores_poisoned_raw_operands() {
+        for op in [
+            0x95u8, 0x96, 0x97, 0xb5, 0xb6, 0xb7, 0xd5, 0xd6, 0xd7, 0xdd, 0xde, 0xdf,
+        ] {
+            let (mut words, dst) = if op <= 0x97 {
+                (vec![0x0400 | u16::from(op), 0x0200], 4)
+            } else if op <= 0xb7 {
+                (vec![0x2000 | u16::from(op)], 0)
+            } else if op <= 0xd7 {
+                (vec![0x0400 | u16::from(op), 1], 4)
+            } else {
+                (vec![0x0400 | u16::from(op), 0x0100], 4)
+            };
+            words.push((dst << 8) | 0x0f);
+            let (class, mut method) = fixture(words, 5, 0, vec![], "Z");
+            let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let mut regs = vec![None; 5];
+            for r in [0, 2] {
+                assign(
+                    &mut regs,
+                    r,
+                    Value {
+                        text: format!("flag{r}"),
+                        ty: "Z".into(),
+                        literal: None,
+                        wide_literal: None,
+                        raw_bits32: false,
+                    },
+                )
+                .unwrap();
+            }
+            let end = method.code.as_ref().unwrap().instructions.len();
+            let mut expected = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs.clone(),
+                &mut expected,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+            let mut actual = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                end,
+                regs,
+                &mut actual,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(actual.text, expected.text, "boolean opcode {op:02x}");
+            assert!(actual.text.contains("boolean"));
+        }
+    }
+
+    #[test]
+    fn malformed_shared_arithmetic_never_retries_raw() {
+        use crate::native_ir::ValueKind;
+        for op in [
+            0x2du8, 0x2f, 0x31, 0x7b, 0x81, 0x8d, 0x90, 0xa3, 0xb0, 0xc3, 0xd0, 0xd8,
+        ] {
+            let (left_ty, right_ty, ret) = match op {
+                0x2d..=0x31 => {
+                    let spec = numeric::Compare::decode(op).unwrap();
+                    (spec.input.descriptor(), spec.input.descriptor(), "I")
+                }
+                0x7b..=0x8f => {
+                    let spec = numeric::Unary::decode(op).unwrap();
+                    (spec.input.descriptor(), "I", spec.result_descriptor)
+                }
+                0x90..=0xcf => {
+                    let spec = numeric::Binary::decode(op).unwrap();
+                    (
+                        spec.left.descriptor(),
+                        spec.right.descriptor(),
+                        spec.result.descriptor(),
+                    )
+                }
+                _ => ("I", "I", "I"),
+            };
+            let mut words = match op {
+                0x2d..=0x31 | 0x90..=0xaf => vec![u16::from(op), 0x0200, 0x000f],
+                0xd0..=0xe2 => vec![u16::from(op), 1, 0x000f],
+                0xb0..=0xcf => vec![0x2000 | u16::from(op), 0x000f],
+                _ => vec![u16::from(op), 0x000f],
+            };
+            *words.last_mut().unwrap() = if wide(ret) { 0x0010 } else { 0x000f };
+            let (class, method) = fixture(words, 6, 0, vec![], ret);
+            let mut regs = vec![None; 6];
+            let original = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let instruction = &original.front_end.as_ref().unwrap().ir.instructions[0];
+            for (index, operand) in instruction.reads.iter().enumerate() {
+                let ty = if index == 0 { left_ty } else { right_ty };
+                assign(
+                    &mut regs,
+                    usize::from(operand.register),
+                    Value {
+                        text: format!("input{index}"),
+                        ty: ty.into(),
+                        literal: None,
+                        wide_literal: None,
+                        raw_bits32: false,
+                    },
+                )
+                .unwrap();
+            }
+            let end = method.code.as_ref().unwrap().instructions.len();
+            render(
+                &class,
+                &method,
+                &original,
+                0,
+                end,
+                regs.clone(),
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            for mutation in 0..16 {
+                let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+                let instruction = &mut graph.front_end.as_mut().unwrap().ir.instructions[0];
+                match mutation {
+                    0 => instruction.reads.clear(),
+                    1 => instruction.writes.clear(),
+                    2 => instruction.reads[0].kind = ValueKind::Reference,
+                    3 => instruction.writes[0].kind = ValueKind::Reference,
+                    4 => instruction.reads[0].register = 6,
+                    5 => instruction.writes[0].register = 6,
+                    6 => {
+                        instruction.literal = if instruction.literal.is_some() {
+                            None
+                        } else {
+                            Some(0)
+                        }
+                    }
+                    7 => instruction.may_throw = !instruction.may_throw,
+                    8 => instruction.branch_target = Some(0),
+                    9 => instruction.width += 1,
+                    10 => instruction.reads.push(instruction.reads[0]),
+                    11 => instruction.writes.push(instruction.writes[0]),
+                    12 if (0xb0..=0xcf).contains(&op) => instruction.writes[0].register = 4,
+                    13 if op >= 0xd0 => {
+                        instruction.literal = Some(if op <= 0xd7 { 32768 } else { 128 })
+                    }
+                    14 if instruction.reads[0].kind == ValueKind::Wide64 => {
+                        instruction.reads[0].register = 5
+                    }
+                    15 if matches!(op, 0xa3 | 0xc3) => {
+                        instruction.reads[1].kind = ValueKind::Wide64
+                    }
+                    _ => continue,
+                }
+                assert!(
+                    render(
+                        &class,
+                        &method,
+                        &graph,
+                        0,
+                        end,
+                        regs.clone(),
+                        &mut Output::default(),
+                        0,
+                        true,
+                        None,
+                        None
+                    )
+                    .is_err(),
+                    "opcode {op:02x}, mutation {mutation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_results_and_returns_ignore_poisoned_raw_operands() {
+        for (result_op, return_op, ty, registers) in [
+            (0x0a, 0x0f, "I", 1),
+            (0x0b, 0x10, "J", 2),
+            (0x0c, 0x11, "Ljava/lang/Object;", 1),
+        ] {
+            let (mut class, mut method) = fixture(
+                vec![0x0071, 0, 0, result_op, return_op],
+                registers,
+                0,
+                vec![],
+                ty,
+            );
+            class.symbols = Arc::new(DexSymbols {
+                types: vec!["Lsample/Source;".into()],
+                strings: vec!["read".into()],
+                protos: vec![(ty.into(), vec![])],
+                methods: vec![(0, 0, 0)],
+                ..Default::default()
+            });
+            let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            method.code.as_mut().unwrap().instructions[3..5].fill(u16::MAX);
+            let mut output = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                5,
+                vec![None; usize::from(registers)],
+                &mut output,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(
+                output.text.contains("sample.Source.read()"),
+                "{}",
+                output.text
+            );
+        }
+
+        let (class, mut method) = fixture(vec![0x000e], 0, 0, vec![], "V");
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        method.code.as_mut().unwrap().instructions[0] = u16::MAX;
+        let mut output = Output::default();
+        render(
+            &class,
+            &method,
+            &graph,
+            0,
+            1,
+            vec![],
+            &mut output,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(output.text.contains("return;"));
+    }
+
+    #[test]
+    fn malformed_shared_results_and_returns_never_retry_raw() {
+        use crate::native_ir::ValueKind;
+        for (words, ret, registers, target) in [
+            (vec![0x0071, 0, 0, 0x000a, 0x000f], "I", 1, 1),
+            (vec![0x0071, 0, 0, 0x000b, 0x0010], "J", 2, 1),
+            (
+                vec![0x0071, 0, 0, 0x000c, 0x0011],
+                "Ljava/lang/Object;",
+                1,
+                1,
+            ),
+            (vec![0x0071, 0, 0, 0x000a, 0x000f], "I", 1, 2),
+            (vec![0x0071, 0, 0, 0x000b, 0x0010], "J", 2, 2),
+            (
+                vec![0x0071, 0, 0, 0x000c, 0x0011],
+                "Ljava/lang/Object;",
+                1,
+                2,
+            ),
+            (vec![0x0012, 0x000f], "I", 1, 1),
+            (vec![0x000e], "V", 0, 0),
+        ] {
+            let (mut class, method) = fixture(words, registers, 0, vec![], ret);
+            class.symbols = Arc::new(DexSymbols {
+                types: vec!["Lsample/Source;".into()],
+                strings: vec!["read".into()],
+                protos: vec![(ret.into(), vec![])],
+                methods: vec![(0, 0, 0)],
+                ..Default::default()
+            });
+            for mutation in 0..5 {
+                let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+                let insn = &mut graph.front_end.as_mut().unwrap().ir.instructions[target];
+                match mutation {
+                    0 => {
+                        if insn.opcode == 0x0e {
+                            insn.reads.push(crate::native_ir::RegisterOperand {
+                                register: 0,
+                                kind: ValueKind::Bits32,
+                            });
+                        } else if insn.opcode <= 0x0c {
+                            insn.writes.clear();
+                        } else {
+                            insn.reads.clear();
+                        }
+                    }
+                    1 => {
+                        if insn.opcode <= 0x0c && insn.opcode != 0x0e {
+                            insn.writes[0].kind = ValueKind::Bits32;
+                        } else if insn.opcode == 0x0e {
+                            insn.writes.push(crate::native_ir::RegisterOperand {
+                                register: 0,
+                                kind: ValueKind::Bits32,
+                            });
+                        } else {
+                            insn.reads[0].kind = ValueKind::Unknown32;
+                        }
+                    }
+                    2 => insn.literal = Some(1),
+                    3 => insn.may_throw = true,
+                    _ => insn.width = 2,
+                }
+                let error = render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    method.code.as_ref().unwrap().instructions.len(),
+                    vec![None; usize::from(registers)],
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None,
+                )
+                .err()
+                .expect("malformed shared result/return must reject");
+                assert!(error.to_string().contains("shared"), "{error:#}");
+            }
+        }
+
+        let (mut class, method) = fixture(vec![0x0071, 0, 0, 0x000a, 0x000f], 2, 0, vec![], "I");
+        class.symbols = Arc::new(DexSymbols {
+            types: vec!["Lsample/Source;".into()],
+            strings: vec!["read".into()],
+            protos: vec![("I".into(), vec![])],
+            methods: vec![(0, 0, 0)],
+            ..Default::default()
+        });
+        let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        graph.front_end.as_mut().unwrap().ir.instructions[1].writes[0].register = 1;
+        let error = render(
+            &class,
+            &method,
+            &graph,
+            0,
+            5,
+            vec![None; 2],
+            &mut Output::default(),
+            0,
+            true,
+            None,
+            None,
+        )
+        .err()
+        .expect("shared result destination must remain bound to its call");
+        assert!(error.to_string().contains("shared move-result destination"));
+    }
+
+    #[test]
+    fn shared_straight_line_consumes_move_and_constant_operands() {
+        // Poison every raw operand (including opcode-byte operands) only after
+        // shared decoding. Each case must still use its decoded source,
+        // destination and literal. Production bytecode remains immutable.
+        let constants = [
+            (vec![0xf012], "I", "-1"),
+            (vec![0x0013, 0x8000], "I", "-32768"),
+            (vec![0x0014, 0x4321, 0x8765], "I", "-2023406815"),
+            (vec![0x0015, 0x8000], "I", "-2147483648"),
+            (vec![0x0016, 0x8000], "J", "-32768L"),
+            (vec![0x0017, 0, 0x8000], "J", "-2147483648L"),
+            (
+                vec![0x0018, 0x4321, 0x8765, 0xcba9, 0xfed0],
+                "J",
+                "-85344463938567391L",
+            ),
+            (vec![0x0019, 0x8000], "J", "-9223372036854775808L"),
+        ];
+        for (constant, ty, expected) in constants {
+            let first_move = if ty == "J" { 0x04 } else { 0x01 };
+            for encoding in 0..3 {
+                let op = first_move + encoding;
+                let movement = match encoding {
+                    0 => vec![0x0200 | op],
+                    1 => vec![0x0200 | op, 0],
+                    _ => vec![op, 2, 0],
+                };
+                let mut words = constant.clone();
+                words.extend(movement);
+                let operands_end = words.len();
+                words.push(if ty == "J" { 0x0210 } else { 0x020f });
+                let (class, mut method) = fixture(words, 4, 0, vec![], ty);
+                let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+                method.code.as_mut().unwrap().instructions[..operands_end].fill(0xffff);
+                let mut output = Output::default();
+                render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    operands_end + 1,
+                    vec![None; 4],
+                    &mut output,
+                    0,
+                    true,
+                    None,
+                    None,
+                )
+                .unwrap();
+                assert!(
+                    output.text.contains(&format!("return {expected};")),
+                    "{}",
+                    output.text
+                );
+            }
+        }
+        // move-object retains the null-bit-pattern interpretation while also
+        // consuming shared operands for all three instruction encodings.
+        for movement in [vec![0x0207], vec![0x0208, 0], vec![0x0009, 2, 0]] {
+            let mut words = vec![0x0012];
+            words.extend(movement);
+            let operands_end = words.len();
+            words.push(0x0211);
+            let (class, mut method) = fixture(words, 3, 0, vec![], "Ljava/lang/Object;");
+            let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            method.code.as_mut().unwrap().instructions[..operands_end].fill(0xffff);
+            let mut output = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                operands_end + 1,
+                vec![None; 3],
+                &mut output,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(output.text.contains("null"));
+        }
+    }
+
+    #[test]
+    fn shared_straight_line_invalid_move_constant_operands_do_not_retry_raw() {
+        use crate::native_ir::ValueKind;
+        let (class, method) = fixture(vec![0x7012, 0x0101, 0x010f], 2, 0, vec![], "I");
+        for mutation in 0..9 {
+            let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            let insns = &mut graph.front_end.as_mut().unwrap().ir.instructions;
+            match mutation {
+                0 => insns[0].literal = None,
+                1 => insns[0].literal = Some(i64::MAX),
+                2 => insns[0].writes.clear(),
+                3 => insns[0].writes[0].kind = ValueKind::Wide64,
+                4 => insns[1].reads.clear(),
+                5 => insns[1].reads[0].kind = ValueKind::Reference,
+                6 => insns[1].reads[0].register = 2,
+                7 => insns[1].writes[0].register = 2,
+                _ => insns[1].literal = Some(7),
+            }
+            let error = render(
+                &class,
+                &method,
+                &graph,
+                0,
+                3,
+                vec![None; 2],
+                &mut Output::default(),
+                0,
+                true,
+                None,
+                None,
+            )
+            .err()
+            .expect("malformed shared operands must reject");
+            assert!(error.to_string().contains("shared"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn shared_straight_line_consumes_reference_constant_operands() {
+        for constant in [vec![0x001a, 0], vec![0x001b, 0, 0]] {
+            let mut words = constant.clone();
+            words.push(0x0011);
+            let (mut class, mut method) = fixture(words, 1, 0, vec![], "Ljava/lang/String;");
+            class.symbols = Arc::new(DexSymbols {
+                strings: vec!["quote \" and newline\n".into()],
+                ..Default::default()
+            });
+            let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+            method.code.as_mut().unwrap().instructions[..constant.len()].fill(u16::MAX);
+            let mut output = Output::default();
+            render(
+                &class,
+                &method,
+                &graph,
+                0,
+                constant.len() + 1,
+                vec![None],
+                &mut output,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(
+                output
+                    .text
+                    .contains("return \"quote \\\" and newline\\n\";"),
+                "{}",
+                output.text
+            );
+        }
+
+        let (mut class, mut method) =
+            fixture(vec![0x001c, 0, 0x0011], 1, 0, vec![], "Ljava/lang/Class;");
+        class.symbols = Arc::new(DexSymbols {
+            types: vec!["Lsample/Target;".into()],
+            ..Default::default()
+        });
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        method.code.as_mut().unwrap().instructions[..2].fill(u16::MAX);
+        let mut output = Output::default();
+        render(
+            &class,
+            &method,
+            &graph,
+            0,
+            3,
+            vec![None],
+            &mut output,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(output.text.contains("sample.Target.class"));
+        assert!(
+            output
+                .links
+                .iter()
+                .any(|link| link.label == "sample.Target")
+        );
+    }
+
+    #[test]
+    fn shared_straight_line_invalid_reference_constants_do_not_retry_raw() {
+        use crate::native_ir::{PoolKind, ValueKind};
+        for (op, words, ret) in [
+            (0x1a, vec![0x001a, 0, 0x0011], "Ljava/lang/String;"),
+            (0x1b, vec![0x001b, 0, 0, 0x0011], "Ljava/lang/String;"),
+            (0x1c, vec![0x001c, 0, 0x0011], "Ljava/lang/Class;"),
+        ] {
+            let (mut class, method) = fixture(words, 1, 0, vec![], ret);
+            class.symbols = Arc::new(DexSymbols {
+                strings: vec!["text".into()],
+                types: vec!["Lsample/Target;".into()],
+                ..Default::default()
+            });
+            for mutation in 0..9 {
+                let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+                let instruction = &mut graph.front_end.as_mut().unwrap().ir.instructions[0];
+                match mutation {
+                    0 => instruction.reference = None,
+                    1 => {
+                        instruction.reference.as_mut().unwrap().kind = if op == 0x1c {
+                            PoolKind::String
+                        } else {
+                            PoolKind::Type
+                        }
+                    }
+                    2 => instruction.writes.clear(),
+                    3 => instruction.writes[0].kind = ValueKind::Bits32,
+                    4 => instruction.writes[0].register = 1,
+                    5 => instruction.reads.push(instruction.writes[0]),
+                    6 => instruction.literal = Some(0),
+                    7 => instruction.may_throw = false,
+                    _ => instruction.reference.as_mut().unwrap().index = u32::MAX,
+                }
+                let error = render(
+                    &class,
+                    &method,
+                    &graph,
+                    0,
+                    method.code.as_ref().unwrap().instructions.len(),
+                    vec![None],
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None,
+                )
+                .err()
+                .expect("malformed shared reference constant must reject");
+                assert!(
+                    mutation == 8 || error.to_string().contains("shared"),
+                    "{error:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_straight_line_eligibility_reads_boundaries_not_operand_words() {
+        let (class, method) = fixture(vec![0x0013, 0x0038, 0x000f], 1, 0, vec![], "I");
+        assert!(Graph::straight_line(&class, &method).unwrap().is_some());
+        assert!(reconstruct("sample.Example", &class, &method).is_ok());
+        for words in [vec![0x0028], vec![0x0022], vec![0x0024], vec![0x001d]] {
+            let (class, method) = fixture(words, 1, 0, vec![], "V");
+            assert!(Graph::straight_line(&class, &method).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn shared_straight_line_invalid_inputs_do_not_retry_legacy_renderer() {
+        for words in [
+            vec![0x000a, 0x000f],
+            vec![0x0112, 0x000f],
+            vec![0x0013],
+            vec![0x0012, 0x000f, 0x1012],
+            vec![0x0012, 0x000f, 0x0000],
+        ] {
+            let (class, method) = fixture(words, 1, 0, vec![], "I");
+            assert!(Graph::straight_line(&class, &method).is_err());
+            assert!(reconstruct("sample.Example", &class, &method).is_err());
+        }
+    }
+
+    #[test]
+    fn shared_straight_line_unlowered_ir_opcode_rejects_without_panicking() {
+        let (class, method) = fixture(vec![0x00ff, 0, 0x0011], 1, 0, vec![], "Ljava/lang/Object;");
+        assert!(Graph::straight_line(&class, &method).unwrap().is_some());
+        assert!(reconstruct("sample.Example", &class, &method).is_err());
+    }
+
+    #[test]
+    fn shared_straight_line_move_exception_without_handler_rejects() {
+        let (class, method) = fixture(vec![0x000d, 0x0011], 1, 0, vec![], "Ljava/lang/Object;");
+        assert!(Graph::straight_line(&class, &method).unwrap().is_some());
+        let error = reconstruct("sample.Example", &class, &method)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("move-exception outside handled entry")
+        );
+    }
+
     // Independent evaluator for this test's emitted straight-line Java subset.
     // Unknown syntax fails rather than being treated as equivalent.
     fn eval_narrow_java(body: &str, input: i32) -> i32 {
@@ -5398,10 +13057,45 @@ mod tests {
             "I",
         );
         let body = reconstruct("sample.Example", &c, &m).unwrap();
-        let test = body.text.find("boolean ").unwrap();
-        let update = body.text.find("v0 = v").unwrap();
-        assert!(test < update);
-        assert!(body.text.ends_with("        return v0;\n"));
+        let loop_start = body.text.find("while (true) {").unwrap();
+        let slots: Vec<_> = body.text[..loop_start]
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("int ")?
+                    .split_once(" = ")
+                    .map(|(name, _)| name)
+            })
+            .collect();
+        assert_eq!(slots.len(), 2, "separate header and exit slots");
+        let test = body.text.find("if (").unwrap();
+        let assignment = |slot: &str| {
+            let pattern = format!("{slot} = ");
+            let line = body
+                .text
+                .lines()
+                .find(|line| line.trim().starts_with(&pattern))
+                .unwrap();
+            body.text.find(line).unwrap()
+        };
+        // Cleanup may inline the one-use boolean snapshot. Its condition still
+        // reads the decremented temporary before either slot receives a copy.
+        let decremented = body.text[loop_start..test]
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("int ")?
+                    .split_once(" = ")
+                    .map(|(name, _)| name)
+            })
+            .unwrap();
+        assert!(body.text[test..].starts_with(&format!("if ({decremented} <= 0)")));
+        assert!(test < assignment(slots[0]));
+        assert!(test < assignment(slots[1]));
+        assert!(
+            body.text
+                .ends_with(&format!("        return {};\n", slots[1]))
+        );
     }
     #[test]
     fn loops_reject_interior_entries_and_overlapping_backedges() {

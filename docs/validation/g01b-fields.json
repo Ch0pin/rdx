@@ -1,0 +1,107 @@
+{
+  "date": "2026-09-26",
+  "increment": "G01-B-fields",
+  "state": "Complete for bounded scope; G01-B and G01 remain open",
+  "gaps": [
+    "M01",
+    "M06"
+  ],
+  "scope": "Shared decoded receiver, value/destination and field-pool reference for all 28 instance/static field encodings (0x52..0x6d) in eligible straight-line rendering.",
+  "delegation": {
+    "implementation": "gpt-6-sol",
+    "integration_tests": "gpt-6-sol",
+    "independent_review": "gpt-6-astra",
+    "integration_and_full_validation": "parent"
+  },
+  "validation": {
+    "default_suite": {
+      "passed": 792,
+      "failed": 0,
+      "ignored": 82
+    },
+    "selected_jvm_tests": {
+      "passed": 1,
+      "failed": 0,
+      "target": "native_shared_fields::fields_jvm_preserves_identity_bits_null_exceptions_order_and_initialization",
+      "generated_fixtures": 40,
+      "unique_opcodes": 28,
+      "java_types": 9
+    },
+    "public_negatives": 48,
+    "production_invariant_tests": "Three private all-encoding tests: raw operand/reference poisoning with text/navigation parity, changed valid shared pool identity, malformed operands/references/metadata with successful typed baseline and wide-last-slot boundaries.",
+    "review": "Independent Astra and parent review passed; corrected no-op wrong-kind mutation and omitted-store detection in typed JVM checks.",
+    "clippy": "cargo clippy --locked -j 2 --all-targets -- -D warnings: passed",
+    "format": "cargo fmt --all -- --check: passed",
+    "diff": "git diff --check: passed",
+    "build": "cargo build --release --locked -j 2 --bin rdx: passed"
+  },
+  "corpus": {
+    "file": "com.android.vending.apk",
+    "sha256": "c9910583fc93af2b750bde69d3db89a625359e19281adb5b3aa607b640d64ee5",
+    "concrete_methods": 268289,
+    "before_reconstructed": 260225,
+    "after_reconstructed": 260225,
+    "fallback_methods": 8064,
+    "entire_report_identical": true,
+    "report_sha256": "54ec0d59c0dd5148cd40bed1a9779babf5cd989455cda43a106aa05d882776f9",
+    "metric": "Pinned APK reconstruction, not universal coverage or semantic accuracy"
+  },
+  "search": {
+    "query": "getClass",
+    "sample_classes": 300,
+    "runs_per_binary": 3,
+    "exact_matches_and_corpus_equal": true,
+    "matches": 53,
+    "timings": {
+      "before": {
+        "cold": [
+          0.237460709,
+          0.223586208,
+          0.223656625
+        ],
+        "warm": [
+          0.001231209,
+          0.001239708,
+          0.00120775
+        ]
+      },
+      "after": {
+        "cold": [
+          0.244249791,
+          0.2295735,
+          0.22569
+        ],
+        "warm": [
+          0.001234,
+          0.001221542,
+          0.001228334
+        ]
+      }
+    },
+    "median_seconds": {
+      "before": {
+        "cold": 0.223656625,
+        "warm": 0.001231209
+      },
+      "after": {
+        "cold": 0.2295735,
+        "warm": 0.001228334
+      }
+    },
+    "timing_note": "Three alternating paired runs after other checks finished; local 300-class sample, load excluded. Cold median 223.657 ms to 229.574 ms (+2.6%, 5.9 ms); warm 1.231 ms to 1.228 ms. Added helper is fixed-size with constant work; sample is not a universal performance guarantee."
+  },
+  "hashes": {
+    "target/validation/rdx-before-g01b-fields": "fc66f63ee03d1f1e4d42d6517f06c35dc82dacb0e23001a1beb4949760373193",
+    "target/release/rdx": "99f946cf1302743d464ab5753d513c9e121fb165487fe4dda1234ff3bb45bee8",
+    "src/native_java/method.rs": "99046a086bfa137369953630e81b0bedff83a006633c8431701364063328253b",
+    "tests/native_shared_fields.rs": "61f56689eada26eb3b171bffdb53c457a4508daacbf62abc6ba52c0db8ea9b67"
+  },
+  "limits": [
+    "No full visitor or delivery unit closed.",
+    "No expansion of eligibility or field semantics; legacy routes and constructor behavior retained.",
+    "New JVM matrix covers first static get initialization, not constructor early-field execution, volatile concurrency, resolution/access failures or initialization failure precedence.",
+    "Array/type and throw operand migration, shared CFG and general SSA/type-driven emission remain open.",
+    "Pinned corpus reconstruction is not universal coverage or semantic accuracy.",
+    "No release, GUI deployment, commit or push."
+  ]
+}

@@ -1,0 +1,114 @@
+{
+  "date": "2026-09-26",
+  "increment": "G01-B-throw",
+  "state": "Complete; bounded G01-B complete for currently supported eligible straight-line operands; G01 remains open",
+  "gaps": [
+    "M01",
+    "M06"
+  ],
+  "scope": "Shared throw source operand (0x27) in eligible straight-line rendering, preserving existing exception/prologue/terminal behavior.",
+  "delegation": {
+    "implementation": "gpt-6-sol",
+    "integration_tests": "gpt-6-sol",
+    "independent_review": "gpt-6-astra",
+    "integration_and_full_validation": "parent"
+  },
+  "validation": {
+    "default_suite": {
+      "passed": 805,
+      "failed": 0,
+      "ignored": 84
+    },
+    "selected_jvm_tests": {
+      "passed": 1,
+      "failed": 0,
+      "target": "native_shared_throw::throw_jvm_preserves_identity_null_conversion_and_preceding_effects",
+      "generated_methods": 17,
+      "exception_outcomes": 23,
+      "effect_count_checks": 5
+    },
+    "public_positives": 18,
+    "public_negatives": 19,
+    "production_invariant_tests": "Three private tests: poison unchecked/declared checked/null/mapped precise-rethrow operands; 12 malformed shared mutations with valid baseline; poisoned constructor and terminal guards.",
+    "review": "Independent Astra and parent review passed. Audited remaining raw operand consumers to establish bounded G01-B closure.",
+    "clippy": "cargo clippy --locked -j 2 --all-targets -- -D warnings: passed",
+    "format": "cargo fmt --all -- --check: passed",
+    "diff": "git diff --check: passed",
+    "build": "cargo build --release --locked -j 2 --bin rdx: passed"
+  },
+  "corpus": {
+    "file": "com.android.vending.apk",
+    "sha256": "c9910583fc93af2b750bde69d3db89a625359e19281adb5b3aa607b640d64ee5",
+    "concrete_methods": 268289,
+    "before_reconstructed": 260225,
+    "after_reconstructed": 260225,
+    "fallback_methods": 8064,
+    "entire_report_identical": true,
+    "report_sha256": "54ec0d59c0dd5148cd40bed1a9779babf5cd989455cda43a106aa05d882776f9",
+    "metric": "Pinned APK reconstruction, not universal coverage or semantic accuracy"
+  },
+  "search": {
+    "query": "getClass",
+    "sample_classes": 300,
+    "runs_per_binary": 3,
+    "exact_matches_and_corpus_equal": true,
+    "matches": 53,
+    "timings": {
+      "before": {
+        "cold": [
+          0.224478083,
+          0.223511375,
+          0.23351125
+        ],
+        "warm": [
+          0.001196416,
+          0.001268458,
+          0.00125225
+        ]
+      },
+      "after": {
+        "cold": [
+          0.224272583,
+          0.225278041,
+          0.22669375
+        ],
+        "warm": [
+          0.001190667,
+          0.001198,
+          0.001251042
+        ]
+      }
+    },
+    "median_seconds": {
+      "before": {
+        "cold": 0.224478083,
+        "warm": 0.00125225
+      },
+      "after": {
+        "cold": 0.225278041,
+        "warm": 0.001198
+      }
+    },
+    "timing_note": "Three alternating paired runs after other checks; local 300-class sample, load excluded. Cold median 224.478 ms to 225.278 ms (+0.36%, 0.800 ms); warm 1.252 ms to 1.198 ms. Not a universal performance claim."
+  },
+  "hashes": {
+    "target/validation/rdx-before-g01b-throw": "664c114bedee2768f4931012d041cc24dc56383c16422d7a687541dd707d97bc",
+    "target/release/rdx": "783124025abe300d620e7108955e9c5543ca8d8383bdf61bc7aed2840d134d9d",
+    "src/native_java/method.rs": "f0267c7ffb07c428c87ef99900ceb395ba430ff62f9962472d84245adbdca7e6",
+    "tests/native_shared_throw.rs": "9044f3f79193ed615f5d3c567b778cbbfd29fcb3d7bbd80de79ff3f1ce5c6b5a"
+  },
+  "bounded_g01b_audit": {
+    "complete": "All successfully emitted non-invocation operand families in current eligible Graph.front_end straight-line rendering consume shared operands.",
+    "remaining_raw": "Opcode word access, nop validity and eligibility scan; explicit legacy/excluded branches, handlers, monitors, new-instance and filled/payload arrays. Rejected modern opcodes remain unsupported.",
+    "next": "G01-C-start: decoded CFG integration for one forward conditional diamond."
+  },
+  "limits": [
+    "No full visitor or delivery unit closed; G01 remains open.",
+    "No eligibility or exception-hierarchy expansion; legacy paths retained.",
+    "Constructor prologue positive is structural, excluded from JVM execution.",
+    "Initializer negative validates forbidden checked throws metadata with null body, not runtime checked clinit throw.",
+    "No new protected handler, shared CFG or general SSA/type-driven emission proof.",
+    "Pinned corpus reconstruction is not universal coverage or semantic accuracy.",
+    "No release, GUI deployment, commit or push."
+  ]
+}

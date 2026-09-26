@@ -1,0 +1,105 @@
+{
+  "date": "2026-09-25",
+  "increment": "G01-B-reference-constants",
+  "state": "Complete for bounded scope; G01-B and G01 remain open",
+  "gaps": [
+    "M01",
+    "M06"
+  ],
+  "scope": "const-string, const-string/jumbo and const-class destinations/pool references consume shared decoded IR in eligible straight-line rendering.",
+  "delegation": {
+    "implementation": "gpt-6-sol",
+    "integration_tests": "gpt-6-sol",
+    "independent_review": "gpt-6-astra",
+    "integration_and_full_validation": "parent"
+  },
+  "validation": {
+    "default_suite": {
+      "passed": 775,
+      "failed": 0,
+      "ignored": 79
+    },
+    "selected_jvm_tests": {
+      "passed": 1,
+      "failed": 0,
+      "behavioral_checks": 6,
+      "target": "native_shared_reference_constants::reference_constants_jvm_preserves_units_identity_and_class_initialization_order"
+    },
+    "production_invariant_tests": "Two private tests: poison raw words for all three encodings; nine invalid shared mutations per encoding reject (27 cases).",
+    "public_cases": "Real jumbo index 65536/destination v3, escaping/Unicode/surrogates, object/array/primitive class links, overwritten references and class-literal lexical effect order.",
+    "review": "Sol implementation self-review, parent inspection, independent Astra review: no blockers",
+    "clippy": "cargo clippy --locked -j 2 --all-targets -- -D warnings: passed",
+    "format": "cargo fmt --all -- --check: passed",
+    "diff": "git diff --check: passed",
+    "build": "cargo build --release --locked -j 2 --bin rdx: passed"
+  },
+  "corpus": {
+    "file": "com.android.vending.apk",
+    "sha256": "c9910583fc93af2b750bde69d3db89a625359e19281adb5b3aa607b640d64ee5",
+    "concrete_methods": 268289,
+    "before_reconstructed": 260225,
+    "after_reconstructed": 260225,
+    "fallback_methods": 8064,
+    "entire_report_identical": true,
+    "report_sha256": "54ec0d59c0dd5148cd40bed1a9779babf5cd989455cda43a106aa05d882776f9",
+    "metric": "Pinned APK reconstruction, not whole-process completion or semantic accuracy"
+  },
+  "search": {
+    "query": "getClass",
+    "sample_classes": 300,
+    "runs_per_binary": 3,
+    "exact_matches_and_corpus_equal": true,
+    "matches": 53,
+    "timings": {
+      "before": {
+        "cold": [
+          0.223878416,
+          0.224096417,
+          0.224992459
+        ],
+        "warm": [
+          0.001203333,
+          0.001224125,
+          0.001267291
+        ]
+      },
+      "after": {
+        "cold": [
+          0.231309375,
+          0.228875625,
+          0.228872167
+        ],
+        "warm": [
+          0.0012005,
+          0.001252209,
+          0.001189334
+        ]
+      }
+    },
+    "median_seconds": {
+      "before": {
+        "cold": 0.224096417,
+        "warm": 0.001224125
+      },
+      "after": {
+        "cold": 0.228875625,
+        "warm": 0.0012005
+      }
+    },
+    "timing_note": "Three alternating before/after runs after compilation, lint and full regression; 300-class local sample; load excluded."
+  },
+  "hashes": {
+    "target/validation/rdx-before-g01b-reference": "806961e21be207fc2f0d70f51e2d52f559391a24bddd9830be09def291173741",
+    "target/release/rdx": "fbf9a0aed8942b4190884a096aa27957968033fddba087c18495978610a5b5d8",
+    "src/native_java/method.rs": "b32b824d03c7f2cf93bdaf5a3900cacb99d77fce3147c8049a8cfd556699c841",
+    "tests/native_shared_reference_constants.rs": "4c949689f51c70d842271f82bb47909e66f276cb67ca9ac3c32f1b957ab1fb8b"
+  },
+  "limits": [
+    "No full visitor or delivery unit closed.",
+    "Shared route eligibility unchanged; allocation/handler/control-flow routes remain legacy.",
+    "String constants retain existing inline emission; full string-resolution effect timing not established.",
+    "Class literal lexical position is preserved and JVM identity/non-initialization checked; missing-class/first-resolution failure timing not tested.",
+    "Result/return and other operand families, shared CFG/SSA/type-driven emission remain open.",
+    "No release, GUI deployment, commit or push."
+  ]
+}

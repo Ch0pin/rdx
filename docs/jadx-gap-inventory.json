@@ -1,0 +1,1793 @@
+{
+  "audit_date": "2026-09-25",
+  "upstream_commit": "28ff15e4ae69950aebea110a13e5ab895d234dfc",
+  "scope": "11 pre-decompile + 52 AUTO/RESTRUCTURE transformation positions; not all JADX subsystems",
+  "passes": [
+    {
+      "id": "P01",
+      "phase": "Pre",
+      "order": 1,
+      "name": "SignatureProcessor",
+      "role": "Parse generic signatures",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G08",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Parse and propagate class, field and method generic signatures; validate malformed and erased signatures.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/SignatureProcessor.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "P02",
+      "phase": "Pre",
+      "order": 2,
+      "name": "OverrideMethodVisitor",
+      "role": "Resolve override families",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G08",
+      "evidence": "native_hierarchy and native_java/mod.rs inherited exception lookup; no general override pass",
+      "gap": "Resolve bridges, covariant returns and generic override families; preserve checked-exception contracts.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/OverrideMethodVisitor.java",
+      "upstream_metadata": {
+        "desc": "Mark override methods and revert type erasure",
+        "runAfter": [],
+        "runBefore": [
+          "TypeInferenceVisitor",
+          "RenameVisitor"
+        ]
+      }
+    },
+    {
+      "id": "P03",
+      "phase": "Pre",
+      "order": 3,
+      "name": "AddAndroidConstants",
+      "role": "Provide Android constants",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G10",
+      "evidence": "src/resource_table.rs and src/native_resource_attributes.rs provide related resources, not a general constants pass",
+      "gap": "Resolve framework constants with type/context and collision checks; resource annotations alone are insufficient.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/prepare/AddAndroidConstants.java",
+      "upstream_metadata": {
+        "desc": "Insert Android constants from resource mapping file",
+        "runAfter": [],
+        "runBefore": [
+          "CollectConstValues"
+        ]
+      }
+    },
+    {
+      "id": "P04",
+      "phase": "Pre",
+      "order": 4,
+      "name": "DeobfuscatorVisitor",
+      "role": "Infer deobfuscated names",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G12",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Define deterministic configurable inferred names and mapping precedence across classes and members.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/deobf/DeobfuscatorVisitor.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "P05",
+      "phase": "Pre",
+      "order": 5,
+      "name": "SourceFileRename",
+      "role": "Use source-file names",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G12",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Recover eligible names from source metadata without collisions or broken identity links.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/rename/SourceFileRename.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "P06",
+      "phase": "Pre",
+      "order": 6,
+      "name": "RenameVisitor",
+      "role": "Make identifiers legal and unique",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G08",
+      "evidence": "src/native_java/names.rs::member/qualified; class/member emission uses injective aliases; tests/native_annotations.rs and names unit tests",
+      "gap": "Extend injective display aliases to global override-family and cross-class naming consistency.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/rename/RenameVisitor.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "P07",
+      "phase": "Pre",
+      "order": 7,
+      "name": "SaveDeobfMapping",
+      "role": "Persist name mappings",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G12",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Round-trip mappings with original DEX identity and stable output across sessions.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/deobf/SaveDeobfMapping.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "P08",
+      "phase": "Pre",
+      "order": 8,
+      "name": "UsageInfoVisitor",
+      "role": "Build usage relationships",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G07",
+      "evidence": "native usage indexing; separate implementation, not upstream usage graph parity",
+      "gap": "Expose transformation-safe usage dependencies and invalidate them after rewrites; navigation indexing alone is insufficient.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/usage/UsageInfoVisitor.java",
+      "upstream_metadata": {
+        "desc": "Scan class and methods to collect usage info and class dependencies",
+        "runAfter": [
+          "SignatureProcessor",
+          "OverrideMethodVisitor",
+          "RenameVisitor"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "P09",
+      "phase": "Pre",
+      "order": 9,
+      "name": "CollectConstValues",
+      "role": "Collect global constants",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G10",
+      "evidence": "src/native_dex_metadata.rs::static_values and native_java/mod.rs::render_field render encoded values, not global collection",
+      "gap": "Collect and substitute constants with owner/type/ambiguity and initialization-order safeguards.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/prepare/CollectConstValues.java",
+      "upstream_metadata": {
+        "desc": "Collect and store values from static final fields",
+        "runAfter": [
+          "UsageInfoVisitor"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "P10",
+      "phase": "Pre",
+      "order": 10,
+      "name": "ProcessAnonymous",
+      "role": "Identify anonymous classes",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G07",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Discover candidates and captures while rejecting classes with observable identity or incompatible uses.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/ProcessAnonymous.java",
+      "upstream_metadata": {
+        "desc": "Mark anonymous and lambda classes (for future inline)",
+        "runAfter": [
+          "UsageInfoVisitor"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "P11",
+      "phase": "Pre",
+      "order": 11,
+      "name": "ProcessMethodsForInline",
+      "role": "Identify inline candidates",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G07",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Build method candidate/dependency analysis, including recursion and access constraints.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/ProcessMethodsForInline.java",
+      "upstream_metadata": {
+        "desc": "Mark methods for future inline",
+        "runAfter": [
+          "UsageInfoVisitor"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M01",
+      "phase": "Main",
+      "order": 1,
+      "name": "CheckCode",
+      "role": "Validate input code",
+      "condition": null,
+      "status": "Partial",
+      "closed": false,
+      "unit": "G01",
+      "evidence": "native_ir / native_cfg validate operands and boundaries; not the full upstream checks",
+      "gap": "Make shared decoded-instruction checks govern emission; retain rejection diagnostics and offsets.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/CheckCode.java",
+      "upstream_metadata": {
+        "desc": "Check and remove bad or incorrect code",
+        "runAfter": [],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M02",
+      "phase": "Main",
+      "order": 2,
+      "name": "DebugInfoAttachVisitor",
+      "role": "Attach debug metadata",
+      "condition": "args.isDebugInfo()",
+      "status": "Missing",
+      "closed": false,
+      "unit": "G09",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Decode DEX debug programs into validated line/local scopes, including malformed programs.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/debuginfo/DebugInfoAttachVisitor.java",
+      "upstream_metadata": {
+        "desc": "Attach debug information (variable names and types, instruction lines)",
+        "runAfter": [],
+        "runBefore": [
+          "BlockSplitter",
+          "SSATransform"
+        ]
+      }
+    },
+    {
+      "id": "M03",
+      "phase": "Main",
+      "order": 3,
+      "name": "AttachTryCatchVisitor",
+      "role": "Attach exception regions",
+      "condition": null,
+      "status": "Partial",
+      "closed": false,
+      "unit": "G05",
+      "evidence": "native_cfg / native_ssa retain handlers and exceptional state; no complete normalized exception regions",
+      "gap": "Normalize nested, overlapping and shared handlers using pre-write exceptional states.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/AttachTryCatchVisitor.java",
+      "upstream_metadata": {
+        "desc": "Attach try/catch info to instructions",
+        "runAfter": [],
+        "runBefore": [
+          "ProcessInstructionsVisitor"
+        ]
+      }
+    },
+    {
+      "id": "M04",
+      "phase": "Main",
+      "order": 4,
+      "name": "AttachCommentsVisitor",
+      "role": "Attach comments",
+      "condition": "args.getCommentsLevel() != CommentsLevel.NONE",
+      "status": "Missing",
+      "closed": false,
+      "unit": "G09",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Define comment provenance and source-span attachment; preserve it through transformations.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/AttachCommentsVisitor.java",
+      "upstream_metadata": {
+        "desc": "Attach user code comments",
+        "runAfter": [],
+        "runBefore": [
+          "ProcessInstructionsVisitor"
+        ]
+      }
+    },
+    {
+      "id": "M05",
+      "phase": "Main",
+      "order": 5,
+      "name": "AttachMethodDetails",
+      "role": "Bind method details",
+      "condition": null,
+      "status": "Partial",
+      "closed": false,
+      "unit": "G01",
+      "evidence": "native_method::MethodFrontEnd bound calls now drive eligible straight-line production invokes; other shapes use bind_invocation. See G01-A evidence. SSA call values remain selectively consumed.",
+      "gap": "Use one signature binding model through analysis and emission, including wide and polymorphic calls.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/AttachMethodDetails.java",
+      "upstream_metadata": {
+        "desc": "Attach method details for invoke instructions",
+        "runAfter": [],
+        "runBefore": [
+          "BlockSplitter",
+          "MethodInvokeVisitor"
+        ]
+      }
+    },
+    {
+      "id": "M06",
+      "phase": "Main",
+      "order": 6,
+      "name": "ProcessInstructionsVisitor",
+      "role": "Normalize instructions",
+      "condition": null,
+      "status": "Partial",
+      "closed": false,
+      "unit": "G01",
+      "evidence": "native_ir operand decoding; G01-B integrates move, constant, move-result, return, arithmetic, field, array/type and throw operands into eligible straight-line emission; no complete semantic instruction normalization",
+      "gap": "Make semantic instruction normalization canonical for emission, without losing effects or offsets.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/ProcessInstructionsVisitor.java",
+      "upstream_metadata": {
+        "desc": "Init instructions info",
+        "runAfter": [],
+        "runBefore": [
+          "BlockSplitter"
+        ]
+      }
+    },
+    {
+      "id": "M07",
+      "phase": "Main",
+      "order": 7,
+      "name": "BlockSplitter",
+      "role": "Split basic blocks",
+      "condition": null,
+      "status": "Partial",
+      "closed": false,
+      "unit": "G01",
+      "evidence": "native_cfg decoded blocks/successors govern eligible forward conditionals and single-loop body composition and multiple conditional break/continue edges through G01-C-loop-edge-composition; broader loop/exception and synthetic block parity incomplete Atomic outer-region projection now also supports forward regions around/bypassing one loop. G01-C-disjoint-loop-composition supports up to 32 nonoverlapping loops and their outer regions. G01-C-nested-loop-composition adds up to four parent-owned levels and atomic child projections while retaining full cyclic proofs. G01-C-posttest-loop adds one straight-line mandatory-body region with decoded conditional latch and distinct exit values.",
+      "gap": "Share block boundaries and exceptional edges with emission; handle synthetic blocks explicitly.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/blocks/BlockSplitter.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "M08",
+      "phase": "Main",
+      "order": 8,
+      "name": "BlockProcessor",
+      "role": "Process block graph",
+      "condition": null,
+      "status": "Partial",
+      "closed": false,
+      "unit": "G01",
+      "evidence": "Canonical single-loop metadata/dominance, forward body plans and revalidated ordered break/continue collections govern selected loop emission; broader block transformations and loop topology remain incomplete G01-C-loop-outer-composition rederives atomic outer plans while retaining original cyclic dominance. Disjoint region collection uses one dominator computation and bounded membership work, with owner-tagged loop edges and shared projections. G01-C-nested-loop-composition adds up to four parent-owned levels and atomic child projections while retaining full cyclic proofs. G01-C-posttest-loop adds one straight-line mandatory-body region with decoded conditional latch and distinct exit values.",
+      "gap": "Complete required graph transformations and loop metadata over the canonical CFG.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/blocks/BlockProcessor.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "M09",
+      "phase": "Main",
+      "order": 9,
+      "name": "BlockFinisher",
+      "role": "Finish block graph",
+      "condition": null,
+      "status": "Partial",
+      "closed": false,
+      "unit": "G01",
+      "evidence": "Canonical CFG validation, revalidated body joins/break/continue edges and decoded fixed-point loop liveness govern selected Java rendering; upstream block finishing not fully reproduced Outer ownership/joins and external body/latch entries are now revalidated against the canonical CFG. Root rederivation validates all disjoint regions/edge owners/plans; complete cyclic liveness spans successive or alternative loops. G01-C-nested-loop-composition adds up to four parent-owned levels and atomic child projections while retaining full cyclic proofs. G01-C-posttest-loop adds one straight-line mandatory-body region with decoded conditional latch and distinct exit values.",
+      "gap": "Validate reciprocal edges and normalized block invariants before downstream passes.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/blocks/BlockFinisher.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "M10",
+      "phase": "Main",
+      "order": 10,
+      "name": "SSATransform",
+      "role": "Build SSA",
+      "condition": null,
+      "status": "Partial",
+      "closed": false,
+      "unit": "G02",
+      "evidence": "src/native_ssa.rs::SsaMethod::build; production constructor analysis consumes SSA, general Java expression emission does not",
+      "gap": "Make reaching values and pruned phis drive Java expressions; add safe phi simplification.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/ssa/SSATransform.java",
+      "upstream_metadata": {
+        "desc": "Calculate Single Side Assign (SSA) variables",
+        "runAfter": [
+          "BlockProcessor"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M11",
+      "phase": "Main",
+      "order": 11,
+      "name": "MoveInlineVisitor",
+      "role": "Eliminate moves",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G02",
+      "evidence": "native_java/cleanup and readable transformations; no general SSA move elimination",
+      "gap": "Substitute SSA moves with dominance, exceptional-use and source-mapping checks.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/MoveInlineVisitor.java",
+      "upstream_metadata": {
+        "desc": "Inline redundant move instructions",
+        "runAfter": [
+          "SSATransform"
+        ],
+        "runBefore": [
+          "CodeShrinkVisitor"
+        ]
+      }
+    },
+    {
+      "id": "M12",
+      "phase": "Main",
+      "order": 12,
+      "name": "ConstructorVisitor",
+      "role": "Recover constructors",
+      "condition": null,
+      "status": "Partial",
+      "closed": false,
+      "unit": "G03",
+      "evidence": "native_constructors plus bounded native_java/allocation_lowering integration",
+      "gap": "Prove initialization identity, exactly-once initialization and effect order across aliases and branches.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/ConstructorVisitor.java",
+      "upstream_metadata": {
+        "desc": "Replace invoke with constructor call",
+        "runAfter": [
+          "SSATransform",
+          "MoveInlineVisitor"
+        ],
+        "runBefore": [
+          "TypeInferenceVisitor"
+        ]
+      }
+    },
+    {
+      "id": "M13",
+      "phase": "Main",
+      "order": 13,
+      "name": "InitCodeVariables",
+      "role": "Create code variables",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G02",
+      "evidence": "native_java/method register values and local names; no shared SSA code-variable stage",
+      "gap": "Group SSA values into legal Java locals without combining incompatible lifetimes or types.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/InitCodeVariables.java",
+      "upstream_metadata": {
+        "desc": "Initialize code variables",
+        "runAfter": [
+          "SSATransform"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M14",
+      "phase": "Main",
+      "order": 14,
+      "name": "MarkFinallyVisitor",
+      "role": "Extract finally blocks",
+      "condition": "args.isExtractFinally()",
+      "status": "Custom",
+      "closed": false,
+      "unit": "G05",
+      "evidence": "src/native_java/finally_regions.rs and synchronized.rs are wired; bounded duplicate cleanup, multiple normal monitor releases and selected inner catches",
+      "gap": "Generalize cleanup extraction and monitor ownership beyond exact bounded patterns.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/finaly/MarkFinallyVisitor.java",
+      "upstream_metadata": {
+        "desc": "Search and mark duplicate code generated for finally block",
+        "runAfter": [
+          "SSATransform"
+        ],
+        "runBefore": [
+          "ConstInlineVisitor"
+        ]
+      }
+    },
+    {
+      "id": "M15",
+      "phase": "Main",
+      "order": 15,
+      "name": "ConstInlineVisitor",
+      "role": "Inline constants",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G04",
+      "evidence": "native_java/cleanup folds selected constants/class literals; no full SSA pass",
+      "gap": "Substitute typed SSA constants without changing evaluation order or exceptional behavior.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/ConstInlineVisitor.java",
+      "upstream_metadata": {
+        "desc": "Inline constant registers into instructions",
+        "runAfter": [
+          "SSATransform",
+          "MarkFinallyVisitor"
+        ],
+        "runBefore": [
+          "TypeInferenceVisitor"
+        ]
+      }
+    },
+    {
+      "id": "M16",
+      "phase": "Main",
+      "order": 16,
+      "name": "TypeInferenceVisitor",
+      "role": "Infer types",
+      "condition": null,
+      "status": "Partial",
+      "closed": false,
+      "unit": "G02",
+      "evidence": "src/native_types.rs::InferredTypes::infer; opt-in native_method analysis and coverage audit, no general production Java-emitter consumer",
+      "gap": "Integrate inferred types into emission; close hierarchy joins, arrays, narrowing and wide coherence gaps.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/typeinference/TypeInferenceVisitor.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "M17",
+      "phase": "Main",
+      "order": 17,
+      "name": "DebugInfoApplyVisitor",
+      "role": "Apply debug metadata",
+      "condition": "args.isDebugInfo()",
+      "status": "Missing",
+      "closed": false,
+      "unit": "G09",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Apply validated names/scopes to surviving values without stale aliases or collisions.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/debuginfo/DebugInfoApplyVisitor.java",
+      "upstream_metadata": {
+        "desc": "Apply debug info to registers (type and names)",
+        "runAfter": [
+          "SSATransform",
+          "TypeInferenceVisitor"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M18",
+      "phase": "Main",
+      "order": 18,
+      "name": "FixTypesVisitor",
+      "role": "Repair types",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G02",
+      "evidence": "native_java casts and conversions handle selected patterns; no complete typed-IR repair",
+      "gap": "Insert required casts/conversions in typed IR; validate assignments and overloads.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/typeinference/FixTypesVisitor.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "M19",
+      "phase": "Main",
+      "order": 19,
+      "name": "FinishTypeInference",
+      "role": "Validate final types",
+      "condition": null,
+      "status": "Partial",
+      "closed": false,
+      "unit": "G02",
+      "evidence": "analysis diagnostics exist; no complete final typed-IR gate before Java emission",
+      "gap": "Require a final typed-IR legality gate; unresolved cases must remain explicit fallbacks.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/typeinference/FinishTypeInference.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "M20",
+      "phase": "Main",
+      "order": 20,
+      "name": "AdjustForIfMergeVisitor",
+      "role": "Prepare condition merging",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G04",
+      "evidence": "native_java/condition_cleanup handles selected guard/ternary shapes",
+      "gap": "Merge CFG conditions only when edge, short-circuit and effect-order proofs hold.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/AdjustForIfMergeVisitor.java",
+      "upstream_metadata": {
+        "desc": "Move instructions between if blocks that can't be inlined but are safe to push through the if to allow the ifs to merge",
+        "runAfter": [
+          "FinishTypeInference"
+        ],
+        "runBefore": [
+          "RegionMakerVisitor"
+        ]
+      }
+    },
+    {
+      "id": "M21",
+      "phase": "Main",
+      "order": 21,
+      "name": "ProcessKotlinInternals",
+      "role": "Recover Kotlin internals",
+      "condition": "args.getUseKotlinMethodsForVarNames() != JadxArgs.UseKotlinMethodsForVarNames.DISABLE",
+      "status": "Missing",
+      "closed": false,
+      "unit": "G09",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Identify supported Kotlin patterns and metadata with explicit unsupported boundaries.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/kotlin/ProcessKotlinInternals.java",
+      "upstream_metadata": {
+        "desc": "Use variable names from Kotlin intrinsic1 methods",
+        "runAfter": [
+          "InitCodeVariables",
+          "DebugInfoApplyVisitor"
+        ],
+        "runBefore": [
+          "CodeRenameVisitor"
+        ]
+      }
+    },
+    {
+      "id": "M22",
+      "phase": "Main",
+      "order": 22,
+      "name": "CodeRenameVisitor",
+      "role": "Rename code entities",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G08",
+      "evidence": "native_java/names and display_names; local naming rather than global rename parity",
+      "gap": "Keep declaration/use names consistent across scopes, captures and override families.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/rename/CodeRenameVisitor.java",
+      "upstream_metadata": {
+        "desc": "Rename variables and other entities in methods",
+        "runAfter": [
+          "InitCodeVariables",
+          "DebugInfoApplyVisitor"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M23",
+      "phase": "Main",
+      "order": 23,
+      "name": "InlineMethods",
+      "role": "Inline methods",
+      "condition": "args.isInlineMethods()",
+      "status": "Missing",
+      "closed": false,
+      "unit": "G07",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Inline eligible bodies with receiver/argument evaluation, access, recursion and exception safety.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/InlineMethods.java",
+      "upstream_metadata": {
+        "desc": "Inline methods (previously marked in MarkMethodsForInline)",
+        "runAfter": [
+          "TypeInferenceVisitor"
+        ],
+        "runBefore": [
+          "ModVisitor"
+        ]
+      }
+    },
+    {
+      "id": "M24",
+      "phase": "Main",
+      "order": 24,
+      "name": "GenericTypesVisitor",
+      "role": "Infer generic uses",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G08",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Infer generic call-site and expression types from parsed signatures and hierarchy constraints.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/GenericTypesVisitor.java",
+      "upstream_metadata": {
+        "desc": "Fix and apply generic type info",
+        "runAfter": [
+          "TypeInferenceVisitor"
+        ],
+        "runBefore": [
+          "CodeShrinkVisitor",
+          "MethodInvokeVisitor"
+        ]
+      }
+    },
+    {
+      "id": "M25",
+      "phase": "Main",
+      "order": 25,
+      "name": "ShadowFieldVisitor",
+      "role": "Resolve shadowed fields",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G08",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Qualify or rename fields across inheritance/captures without changing binding.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/ShadowFieldVisitor.java",
+      "upstream_metadata": {
+        "desc": "Fix shadowed field access",
+        "runAfter": [
+          "TypeInferenceVisitor"
+        ],
+        "runBefore": [
+          "CodeShrinkVisitor"
+        ]
+      }
+    },
+    {
+      "id": "M26",
+      "phase": "Main",
+      "order": 26,
+      "name": "DeboxingVisitor",
+      "role": "Remove redundant boxing",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G04",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Prove boxing/unboxing removal preserves null exceptions, identity and overload selection.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/DeboxingVisitor.java",
+      "upstream_metadata": {
+        "desc": "Remove primitives boxing",
+        "runAfter": [],
+        "runBefore": [
+          "CodeShrinkVisitor",
+          "ProcessVariables"
+        ]
+      }
+    },
+    {
+      "id": "M27",
+      "phase": "Main",
+      "order": 27,
+      "name": "AnonymousClassVisitor",
+      "role": "Recover anonymous expressions",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G07",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Lower proven anonymous classes and captures into expressions while preserving initialization order.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/AnonymousClassVisitor.java",
+      "upstream_metadata": {
+        "desc": "Prepare anonymous class for inline",
+        "runAfter": [],
+        "runBefore": [
+          "ModVisitor",
+          "CodeShrinkVisitor"
+        ]
+      }
+    },
+    {
+      "id": "M28",
+      "phase": "Main",
+      "order": 28,
+      "name": "ModVisitor",
+      "role": "Normalize instruction patterns",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G03",
+      "evidence": "native_java method/allocation special cases; no equivalent general IR pass",
+      "gap": "Extend typed normalization beyond selected allocation and method special cases.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/ModVisitor.java",
+      "upstream_metadata": {
+        "desc": "Modify method instructions",
+        "runAfter": [],
+        "runBefore": [
+          "CodeShrinkVisitor",
+          "ProcessVariables"
+        ]
+      }
+    },
+    {
+      "id": "M29",
+      "phase": "Main",
+      "order": 29,
+      "name": "CodeShrinkVisitor",
+      "role": "Shrink expressions before regions",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G04",
+      "evidence": "native_java/cleanup and readable; bounded expression/text cleanup",
+      "gap": "Perform effect-aware SSA substitution and dead-value removal, not only textual cleanup.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/shrink/CodeShrinkVisitor.java",
+      "upstream_metadata": {
+        "desc": "Inline variables to make code smaller",
+        "runAfter": [
+          "ModVisitor"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M30",
+      "phase": "Main",
+      "order": 30,
+      "name": "ReplaceNewArray",
+      "role": "Recover array initializers",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G04",
+      "evidence": "native_java array emission handles selected initializers",
+      "gap": "Fold allocation/store chains with alias, escape, exception and store-order checks.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/ReplaceNewArray.java",
+      "upstream_metadata": {
+        "desc": "Replace new-array and sequence of array-put to new filled-array instruction",
+        "runAfter": [
+          "CodeShrinkVisitor"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M31",
+      "phase": "Main",
+      "order": 31,
+      "name": "RegionMakerVisitor",
+      "role": "Build structured regions",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G06",
+      "evidence": "native_java/method recursive Graph renderer; no shared region IR",
+      "gap": "Create common region IR over typed CFG; account for every executable edge.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/regions/RegionMakerVisitor.java",
+      "upstream_metadata": {
+        "desc": "Pack blocks into regions for code generation",
+        "runAfter": [],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M32",
+      "phase": "Main",
+      "order": 32,
+      "name": "IfRegionVisitor",
+      "role": "Simplify conditional regions",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G06",
+      "evidence": "native_java/method and condition_cleanup for supported branches",
+      "gap": "Transform shared IF regions with short-circuit, join and live-out preservation.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/regions/IfRegionVisitor.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "M33",
+      "phase": "Main",
+      "order": 33,
+      "name": "SwitchOverStringVisitor",
+      "role": "Recover string switches",
+      "condition": "args.isRestoreSwitchOverString()",
+      "status": "Missing",
+      "closed": false,
+      "unit": "G06",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Recognize hash/equals dispatch including hash collisions and null behavior.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/regions/SwitchOverStringVisitor.java",
+      "upstream_metadata": {
+        "desc": "Restore switch over string",
+        "runAfter": [
+          "IfRegionVisitor"
+        ],
+        "runBefore": [
+          "ReturnVisitor"
+        ]
+      }
+    },
+    {
+      "id": "M34",
+      "phase": "Main",
+      "order": 34,
+      "name": "ReturnVisitor",
+      "role": "Normalize returns",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G06",
+      "evidence": "native_java/method terminal paths and cleanup",
+      "gap": "Normalize terminal regions without moving returns across cleanup or side effects.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/regions/ReturnVisitor.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "M35",
+      "phase": "Main",
+      "order": 35,
+      "name": "CleanRegions",
+      "role": "Clean region structure",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G06",
+      "evidence": "native_java/condition_cleanup; no shared region IR",
+      "gap": "Remove redundant region wrappers without losing edge ownership or source mappings.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/regions/CleanRegions.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "M36",
+      "phase": "Main",
+      "order": 36,
+      "name": "MethodThrowsVisitor",
+      "role": "Infer throws declarations",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G05",
+      "evidence": "native_java/throwing and mod.rs checked-exception guards",
+      "gap": "Combine body/call/handler analysis with legal override-family checked exceptions.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/MethodThrowsVisitor.java",
+      "upstream_metadata": {
+        "desc": "Scan methods to collect thrown exceptions",
+        "runAfter": [
+          "RegionMakerVisitor"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M37",
+      "phase": "Main",
+      "order": 37,
+      "name": "CodeShrinkVisitor",
+      "role": "Shrink expressions after regions",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G04",
+      "evidence": "native_java/cleanup and readable; bounded expression/text cleanup",
+      "gap": "Run region-aware shrinking separately after region/throws changes and revalidate effects.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/shrink/CodeShrinkVisitor.java",
+      "upstream_metadata": {
+        "desc": "Inline variables to make code smaller",
+        "runAfter": [
+          "ModVisitor"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M38",
+      "phase": "Main",
+      "order": 38,
+      "name": "MethodInvokeVisitor",
+      "role": "Repair invocation expressions",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G08",
+      "evidence": "signature-aware calls and native_java/varargs_cleanup; incomplete overload/generic parity",
+      "gap": "Preserve overload choice, varargs, generics, receiver casts and exact evaluation order.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/MethodInvokeVisitor.java",
+      "upstream_metadata": {
+        "desc": "Process additional info for method invocation (overload, vararg)",
+        "runAfter": [
+          "CodeShrinkVisitor",
+          "ModVisitor"
+        ],
+        "runBefore": [
+          "SimplifyVisitor"
+        ]
+      }
+    },
+    {
+      "id": "M39",
+      "phase": "Main",
+      "order": 39,
+      "name": "SimplifyVisitor",
+      "role": "Simplify expressions",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G04",
+      "evidence": "native_java/cleanup, condition_cleanup, readable and operations",
+      "gap": "Use typed expression rewrites with numeric overflow, NaN, null and effect safeguards.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/SimplifyVisitor.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "M40",
+      "phase": "Main",
+      "order": 40,
+      "name": "CheckRegions",
+      "role": "Verify regions",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G06",
+      "evidence": "native_java rejection guards; no independent complete region-edge verifier",
+      "gap": "Independently verify emitted region edges against CFG, including exceptions and abrupt exits.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/regions/CheckRegions.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "M41",
+      "phase": "Main",
+      "order": 41,
+      "name": "EnumVisitor",
+      "role": "Recover enum declarations",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G07",
+      "evidence": "src/native_java/enums.rs::Plan::analyze wired by mod.rs; fieldless erased enums; tests/native_enums.rs includes JVM checks",
+      "gap": "Extend fieldless-enum recovery to state, constructor arguments and constant-specific classes.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/EnumVisitor.java",
+      "upstream_metadata": {
+        "desc": "Restore enum classes",
+        "runAfter": [
+          "CodeShrinkVisitor",
+          "ModVisitor",
+          "ReplaceNewArray",
+          "IfRegionVisitor",
+          "CheckRegions"
+        ],
+        "runBefore": [
+          "ExtractFieldInit"
+        ]
+      }
+    },
+    {
+      "id": "M42",
+      "phase": "Main",
+      "order": 42,
+      "name": "FixSwitchOverEnum",
+      "role": "Recover enum switches",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G06",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Remove proven mapping-array dispatch and recover enum labels without changing initialization effects.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/FixSwitchOverEnum.java",
+      "upstream_metadata": {
+        "desc": "Simplify synthetic code in switch over enum",
+        "runAfter": [
+          "CodeShrinkVisitor",
+          "EnumVisitor"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M43",
+      "phase": "Main",
+      "order": 43,
+      "name": "NonFinalResIdsVisitor",
+      "role": "Handle non-final resource IDs",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G10",
+      "evidence": "Resource annotations/navigation preserve numeric Java semantics; they do not implement non-final resource-field transformation",
+      "gap": "Handle resource field finality and legal switch use; do not replace literals with invented R fields.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/gradle/NonFinalResIdsVisitor.java",
+      "upstream_metadata": {
+        "desc": "Detect usage of android resource constants in cases where constant expressions are required.",
+        "runAfter": [
+          "FixSwitchOverEnum"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M44",
+      "phase": "Main",
+      "order": 44,
+      "name": "ExtractFieldInit",
+      "role": "Extract field initializers",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G07",
+      "evidence": "Encoded static values and rendering clinit blocks exist; extracting ctor/clinit assignments into field declarations does not",
+      "gap": "Move only proven equivalent ctor/clinit assignments, preserving ordering and constructor delegation.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/ExtractFieldInit.java",
+      "upstream_metadata": {
+        "desc": "Move duplicated field initialization from constructors",
+        "runAfter": [
+          "ModVisitor"
+        ],
+        "runBefore": [
+          "ClassModifier"
+        ]
+      }
+    },
+    {
+      "id": "M45",
+      "phase": "Main",
+      "order": 45,
+      "name": "FixAccessModifiers",
+      "role": "Repair access modifiers",
+      "condition": null,
+      "status": "Missing",
+      "closed": false,
+      "unit": "G08",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Analyze cross-class/member access and apply minimal consistent source repairs.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/fixaccessmodifiers/FixAccessModifiers.java",
+      "upstream_metadata": {
+        "desc": "Change class and method access modifiers if needed",
+        "runAfter": [
+          "ModVisitor"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M46",
+      "phase": "Main",
+      "order": 46,
+      "name": "ClassModifier",
+      "role": "Normalize classes",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G07",
+      "evidence": "native_java/mod.rs class header and modifiers",
+      "gap": "Handle synthetic/inner class structure and member cleanup with identity/use checks.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/ClassModifier.java",
+      "upstream_metadata": {
+        "desc": "Remove synthetic classes, methods and fields",
+        "runAfter": [
+          "ModVisitor",
+          "FixAccessModifiers",
+          "ProcessAnonymous",
+          "ExtractFieldInit"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M47",
+      "phase": "Main",
+      "order": 47,
+      "name": "LoopRegionVisitor",
+      "role": "Recover loop forms",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G06",
+      "evidence": "src/native_java/method.rs loop rendering now checks non-reentry and distinct header/exit liveness; tests/native_backward_loop_exit.rs and native_loop_header_liveout.rs",
+      "gap": "Recover general for/while/do/iterator forms, nested exits and header/exit live-outs.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/regions/LoopRegionVisitor.java",
+      "upstream_metadata": {
+        "desc": "Convert 'while' loops to 'for' loops (indexed or for-each)",
+        "runAfter": [],
+        "runBefore": [
+          "ProcessVariables"
+        ]
+      }
+    },
+    {
+      "id": "M48",
+      "phase": "Main",
+      "order": 48,
+      "name": "SwitchBreakVisitor",
+      "role": "Normalize switch exits",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G06",
+      "evidence": "native_java/method handles selected switch exits",
+      "gap": "Handle fall-through, shared tails and labeled loop/switch exits using region ownership.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/regions/SwitchBreakVisitor.java",
+      "upstream_metadata": {
+        "desc": "Optimize 'break' instruction: common code extract, remove unreachable",
+        "runAfter": [
+          "LoopRegionVisitor"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M49",
+      "phase": "Main",
+      "order": 49,
+      "name": "MarkMethodsForInline",
+      "role": "Mark inlineable methods",
+      "condition": "args.isInlineMethods()",
+      "status": "Missing",
+      "closed": false,
+      "unit": "G07",
+      "evidence": "No equivalent dedicated pass identified in the source audit.",
+      "gap": "Recompute safe inline eligibility after transformations; avoid stale candidates.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/MarkMethodsForInline.java",
+      "upstream_metadata": {
+        "desc": "Mark synthetic static methods for inline",
+        "runAfter": [
+          "FixAccessModifiers",
+          "ClassModifier"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M50",
+      "phase": "Main",
+      "order": 50,
+      "name": "ProcessVariables",
+      "role": "Place variable declarations",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G02",
+      "evidence": "native_java/liveness and method register/local handling",
+      "gap": "Perform SSA-to-Java scope placement and phi destruction across loops and handlers.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/regions/variables/ProcessVariables.java",
+      "upstream_metadata": null
+    },
+    {
+      "id": "M51",
+      "phase": "Main",
+      "order": 51,
+      "name": "ApplyVariableNames",
+      "role": "Apply final variable names",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G09",
+      "evidence": "src/native_java/display_names.rs::rename; no complete debug/Kotlin naming recovery",
+      "gap": "Combine debug/Kotlin/generated names consistently after scope and variable transformations.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/ApplyVariableNames.java",
+      "upstream_metadata": {
+        "desc": "Try to guess variable name from usage",
+        "runAfter": [
+          "ProcessVariables"
+        ],
+        "runBefore": []
+      }
+    },
+    {
+      "id": "M52",
+      "phase": "Main",
+      "order": 52,
+      "name": "PrepareForCodeGen",
+      "role": "Prepare final Java generation",
+      "condition": null,
+      "status": "Custom",
+      "closed": false,
+      "unit": "G11",
+      "evidence": "native_java/mod.rs and readable emission preparation; not upstream parity",
+      "gap": "Validate final typed-region legality, names, spans and Java emission before publishing source.",
+      "upstream_path": "jadx-core/src/main/java/jadx/core/dex/visitors/PrepareForCodeGen.java",
+      "upstream_metadata": {
+        "desc": "Prepare instructions for code generation pass",
+        "runAfter": [
+          "CodeShrinkVisitor",
+          "ClassModifier",
+          "ProcessVariables"
+        ],
+        "runBefore": []
+      }
+    }
+  ],
+  "delivery_units": [
+    {
+      "id": "G01",
+      "title": "Canonical instructions, calls and CFG",
+      "state": "In progress",
+      "dependencies": [],
+      "acceptance": "Migrate a bounded straight-line emission path to MethodAnalysis first, then branches; retain the existing path until parity is demonstrated. Validate operand boundaries, wide calls, exceptional edges, source offsets and hot-path performance.",
+      "existing_tests": [
+        "tests/native_ir.rs",
+        "tests/native_cfg.rs",
+        "tests/native_calls.rs",
+        "tests/native_dominators.rs"
+      ]
+    },
+    {
+      "id": "G02",
+      "title": "SSA variables and typed emission",
+      "state": "Blocked",
+      "dependencies": [
+        "G01"
+      ],
+      "acceptance": "Make typed SSA values govern expression construction and Java locals. Validate branch/loop phis, register reuse, handler pre-write state, null/boolean/int ambiguity, arrays and wide words; compile and execute representative output.",
+      "existing_tests": [
+        "tests/native_ssa.rs",
+        "tests/native_types.rs",
+        "tests/native_loop_header_liveout.rs"
+      ]
+    },
+    {
+      "id": "G03",
+      "title": "Constructor and instruction normalization",
+      "state": "Blocked",
+      "dependencies": [
+        "G02"
+      ],
+      "acceptance": "Validate aliasing, this/super delegation, uninitialized values, argument captures and allocation/exception timing; integrate in typed expression emission.",
+      "existing_tests": [
+        "tests/native_constructors.rs",
+        "tests/native_allocation_lowering.rs",
+        "tests/native_nested_allocations.rs"
+      ]
+    },
+    {
+      "id": "G04",
+      "title": "Effect-aware expressions and shrinking",
+      "state": "Blocked",
+      "dependencies": [
+        "G03"
+      ],
+      "acceptance": "Validate move/constant substitution, arrays, boxing and simplification with ordered side-effect traces, throwing operands and numeric edge cases. Exercise both shrink positions.",
+      "existing_tests": [
+        "tests/native_region_effects.rs",
+        "tests/native_numeric_invariants.rs",
+        "tests/native_arrays.rs"
+      ]
+    },
+    {
+      "id": "G05",
+      "title": "Exception, finally and monitor regions",
+      "state": "Blocked",
+      "dependencies": [
+        "G04"
+      ],
+      "acceptance": "Normalize nested/shared handlers and cleanup ownership; verify cleanup exactly once on normal/exceptional exits, rethrows, nested monitors and checked exceptions.",
+      "existing_tests": [
+        "tests/native_exceptions.rs",
+        "tests/native_nested_cleanup.rs",
+        "tests/native_synchronized.rs"
+      ]
+    },
+    {
+      "id": "G06",
+      "title": "General region construction and verification",
+      "state": "Blocked",
+      "dependencies": [
+        "G05"
+      ],
+      "acceptance": "Use shared region IR for if/switch/loops and an independent edge verifier. Test multiple latches, backward/shared exits, fall-through, string hash collisions, enum dispatch and nested labeled exits.",
+      "existing_tests": [
+        "tests/native_control_flow.rs",
+        "tests/native_multiple_latches.rs",
+        "tests/native_shared_switch_tails.rs",
+        "tests/native_backward_loop_exit.rs"
+      ]
+    },
+    {
+      "id": "G07",
+      "title": "Class-level transformations",
+      "state": "Blocked",
+      "dependencies": [
+        "G06"
+      ],
+      "acceptance": "Validate anonymous/captured classes, enum state, field initialization, synthetic members and method inlining with cross-method usage invalidation, class initialization order and object identity checks.",
+      "existing_tests": [
+        "tests/native_enums.rs",
+        "tests/native_initializers.rs",
+        "tests/native_fields.rs",
+        "tests/native_xrefs.rs"
+      ]
+    },
+    {
+      "id": "G08",
+      "title": "Generics, overrides, names and access",
+      "state": "Blocked",
+      "dependencies": [
+        "G07"
+      ],
+      "acceptance": "Parse generic signatures and resolve hierarchy families; compile overload, bridge, shadowing, varargs and access fixtures; preserve original symbol/navigation identity.",
+      "existing_tests": [
+        "tests/native_hierarchy.rs",
+        "tests/native_override_throws.rs",
+        "tests/native_annotations.rs"
+      ]
+    },
+    {
+      "id": "G09",
+      "title": "Debug, Kotlin and naming metadata",
+      "state": "Blocked",
+      "dependencies": [
+        "G08"
+      ],
+      "acceptance": "Validate DEX debug programs and metadata, apply scopes/names only to surviving values, and test Kotlin supported-pattern boundaries and comment/span preservation.",
+      "existing_tests": [
+        "tests/native_dex_metadata.rs",
+        "tests/native_branch_navigation.rs"
+      ]
+    },
+    {
+      "id": "G10",
+      "title": "Constants and resource transformations",
+      "state": "Blocked",
+      "dependencies": [
+        "G09"
+      ],
+      "acceptance": "Validate framework/app constant identity, ambiguities, non-final R fields and switch legality; retain original numeric meaning and resource navigation.",
+      "existing_tests": [
+        "tests/resource_resolution.rs",
+        "tests/native_resources.rs"
+      ]
+    },
+    {
+      "id": "G11",
+      "title": "Code generation and recovery gate",
+      "state": "Blocked",
+      "dependencies": [
+        "G10"
+      ],
+      "acceptance": "Require legal typed regions and stable spans before source publication. Verify per-method recovery, cancellation, deterministic output, Java compilation and navigation after every presentation rewrite.",
+      "existing_tests": [
+        "tests/native_java.rs",
+        "tests/native_pipeline.rs",
+        "tests/native_branch_navigation.rs"
+      ]
+    },
+    {
+      "id": "G12",
+      "title": "Optional deobfuscation and mapping parity",
+      "state": "Blocked",
+      "dependencies": [
+        "G11"
+      ],
+      "acceptance": "Implement and test configurable name inference, source-file names and mapping round-trips without altering original DEX identities. Optional behavior remains open until tested or explicitly excluded.",
+      "existing_tests": [
+        "tests/native_annotations.rs"
+      ]
+    }
+  ],
+  "increments": [
+    {
+      "id": "G01-A",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M05",
+        "M06"
+      ],
+      "scope": "Shared decoded instruction boundaries/opcodes/widths and ordinary invocation reads/bindings/result ownership in eligible straight-line emission. Non-call operand lowering and CFG/SSA/type-driven emission remain open.",
+      "evidence": "validation/g01a-shared-front-end.json"
+    },
+    {
+      "id": "G01-B",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M06"
+      ],
+      "scope": "All successfully rendered non-invocation operand families in currently supported eligible shared straight-line rendering consume decoded operands. Excluded legacy shapes, rejected opcodes, nop validity and eligibility scanning remain outside this bounded closure.",
+      "evidence": "validation/g01b-throw.json",
+      "next": "G01-C-start: production shared CFG integration for one forward conditional diamond."
+    },
+    {
+      "id": "G01-B-start",
+      "parent": "G01-B",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M06"
+      ],
+      "scope": "All nine move encodings (0x01..0x09) and eight numeric constant encodings (0x12..0x19) consume shared decoded read/write registers and literals in eligible straight-line rendering.",
+      "evidence": "validation/g01b-move-constants.json"
+    },
+    {
+      "id": "G01-B-reference-constants",
+      "parent": "G01-B",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M06"
+      ],
+      "scope": "Shared operands and pool references for const-string, const-string/jumbo and const-class in eligible straight-line rendering.",
+      "evidence": "validation/g01b-reference-constants.json"
+    },
+    {
+      "id": "G01-B-results-returns",
+      "parent": "G01-B",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M05",
+        "M06"
+      ],
+      "scope": "Shared move-result and return-family operands in eligible straight-line rendering; preserve pending result ownership, type/width checks and constructor initialization guards. Excludes move-exception and throw.",
+      "evidence": "validation/g01b-results-returns.json"
+    },
+    {
+      "id": "G01-B-arithmetic",
+      "parent": "G01-B",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M06"
+      ],
+      "scope": "Shared operands for numeric comparison, unary/conversion and binary arithmetic (normal, 2addr and literal forms) in eligible straight-line rendering; preserve existing numeric lowering.",
+      "evidence": "validation/g01b-arithmetic.json"
+    },
+    {
+      "id": "G01-B-fields",
+      "parent": "G01-B",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M06"
+      ],
+      "scope": "Shared instance/static field operands and pool references (0x52..0x6d) in eligible straight-line rendering; preserve receiver/value evaluation, field identity, type/width checks and materialization.",
+      "evidence": "validation/g01b-fields.json"
+    },
+    {
+      "id": "G01-B-array-types",
+      "parent": "G01-B",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M06"
+      ],
+      "scope": "Shared operands/type references for 18 check-cast, instance-of, array-length, new-array and array get/put encodings in eligible straight-line rendering. Preserve exception/materialization order and type/fallback boundaries; filled/payload arrays remain separate.",
+      "evidence": "validation/g01b-array-types.json"
+    },
+    {
+      "id": "G01-B-throw",
+      "parent": "G01-B",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M06"
+      ],
+      "scope": "Shared throw operand 0x27 in eligible straight-line rendering. Preserve exception type/null behavior, constructor guards, effects and terminal instruction checks. Handler move-exception remains outside eligible scope.",
+      "evidence": "validation/g01b-throw.json"
+    },
+    {
+      "id": "G01-C-start",
+      "parent": "G01",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M07",
+        "M06"
+      ],
+      "scope": "Build CFG from shared DecodedMethod and consume its block successors/join and decoded conditions in production for one forward conditional diamond (0x32..0x3d, optional forward goto 0x28..0x2a). Preserve existing rendering semantics; exclude nested branches, loops/backedges, switches/payloads, try/monitor and allocation-specific paths. Decoded join-tail liveness and terminal-arm/bypass shapes included; constructors excluded.",
+      "acceptance": [
+        "Raw branch operand/offset poisoning after shared decode cannot change emitted behavior or links.",
+        "Invalid decoded targets and inconsistent canonical CFG edges fail without raw retry.",
+        "JVM signed/reference/null comparisons exercise both arms, effects and merged values.",
+        "Full regression/lint/build, pinned-corpus report and exact search coordinates/timing gates."
+      ],
+      "evidence": "validation/g01c-start.json"
+    },
+    {
+      "id": "G01-C-forward-composition",
+      "parent": "G01",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M07",
+        "M09",
+        "M06"
+      ],
+      "scope": "Canonical per-branch plans, postdominance/region-closure joins and decoded normal-CFG liveness for existing sequential/nested forward conditionals. Preserve excluded constructor, loop, switch, payload, try/monitor and allocation paths.",
+      "acceptance": [
+        "Poison multiple raw branches/targets; decoded joins, conditions, liveness and links remain canonical.",
+        "Reject inconsistent edges and invalid cross-region joins.",
+        "JVM sibling/nested effects exactly once and wide/reference/dead-live merged values.",
+        "Full regression/lint/build, pinned-corpus and exact search coordinates/timing gates."
+      ],
+      "evidence": "validation/g01c-forward-composition.json"
+    },
+    {
+      "id": "G01-C-natural-loop",
+      "parent": "G01",
+      "state": "Complete for bounded eligible pretest loops; G01 remains open",
+      "gaps": [
+        "M01",
+        "M07",
+        "M08",
+        "M09",
+        "M06"
+      ],
+      "scope": "One existing reducible pretest loop with one forward guard, straight-line body, dominated unconditional backedge and sole guard exit. Canonical decoded CFG/loop metadata and fixed-point liveness govern production; excluded shapes preserve legacy routing.",
+      "acceptance": [
+        "Raw header/latch operand/target poisoning preserves emitted behavior, links and loop-carried values.",
+        "Reject non-dominated and cross-region edges without raw retry.",
+        "JVM zero/one/many iterations with ordered effects and wide/reference loop-carried values.",
+        "Full regression/lint/build, pinned-corpus and search/link/timing gates."
+      ],
+      "evidence": "validation/g01c-natural-loop.json"
+    },
+    {
+      "id": "G01-C-loop-body-composition",
+      "parent": "G01",
+      "state": "Complete for bounded forward body composition; G01 remains open",
+      "gaps": [
+        "M01",
+        "M07",
+        "M08",
+        "M09",
+        "M06"
+      ],
+      "scope": "Compose existing forward conditional regions inside one natural-loop body, retaining the single unconditional latch and sole guard exit. Initially exclude branches to header/exit (continue/break), terminal arms, nested loops and extra latches.",
+      "acceptance": [
+        "Decoded CFG edges, region closure, dominance and loop membership govern nested/sequential body diamonds; malformed cross-region data rejects without raw retry.",
+        "Poison raw body branches/targets while preserving source, navigation and carried values.",
+        "JVM validate dead incompatible versus wide/reference liveouts, loop-carried swaps and per-iteration effects/exceptions.",
+        "Full regression/lint/build, pinned-corpus and exact search/link/timing gates."
+      ],
+      "evidence": "validation/g01c-loop-body-composition.json"
+    },
+    {
+      "id": "G01-C-loop-break",
+      "parent": "G01",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M07",
+        "M08",
+        "M09",
+        "M06"
+      ],
+      "scope": "One conditional body edge to the existing common loop exit, retaining the single unconditional latch and current forward body diamonds. Continue, body terminal arms, nested loops and distinct exit destinations remain legacy.",
+      "acceptance": [
+        "Canonical exit-edge metadata drives break conditions and exit-slot synchronization; cyclic CFG dominance and fixed-point liveness remain authoritative.",
+        "Poison raw break operands/targets and cached metadata; malformed selected graphs reject without raw retry.",
+        "JVM zero/early/normal exits with header-defined values, wide/reference carried swaps, exact effects and exception identity.",
+        "Full regression/lint/build, pinned-corpus and exact search/navigation/timing gates."
+      ],
+      "evidence": "validation/g01c-loop-break.json"
+    },
+    {
+      "id": "G01-C-loop-continue",
+      "parent": "G01",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M07",
+        "M08",
+        "M09",
+        "M06"
+      ],
+      "scope": "One conditional body edge to the same header, retaining the unconditional latch, body diamonds and at most one common-exit break.",
+      "acceptance": [
+        "Canonical second-backedge metadata and snapshot header-slot synchronization.",
+        "Full cyclic liveness; planning cuts only taken continue edge.",
+        "JVM skipped effects, header reexecution, wide/reference swaps and combined break/continue ordering.",
+        "Raw poison and malformed canonical rejection without retry; full regression/lint/build/corpus/search gates."
+      ],
+      "evidence": "validation/g01c-loop-continue.json"
+    },
+    {
+      "id": "G01-C-loop-edge-composition",
+      "parent": "G01",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M07",
+        "M08",
+        "M09",
+        "M06"
+      ],
+      "scope": "Bounded collection of conditional break/continue edges to the same header/common exit, retaining one unconditional latch and forward body diamonds. Distinct headers/exits, unconditional body exits, terminal arms and nested loops remain legacy.",
+      "acceptance": [
+        "Canonical ordered edge collection; each edge validated at root and used for condition/fallthrough/slot synchronization.",
+        "Full cyclic liveness and restored-literal proofs include every conditional edge; planning cuts only taken special edges.",
+        "JVM sequential/nested multiple-edge ordering, skipped effects, wide/reference snapshots and exception identity.",
+        "Duplicate/cross-region metadata rejects without raw retry; full regression/lint/build/corpus/search gates."
+      ],
+      "evidence": "validation/g01c-loop-edge-composition.json"
+    },
+    {
+      "id": "G01-C-loop-outer-composition",
+      "parent": "G01",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M07",
+        "M08",
+        "M09",
+        "M06"
+      ],
+      "scope": "Existing acyclic forward regions before/after/around one canonical loop, including bypassing it; loop atomic for outer planning, full cyclic CFG retained. Multiple/nested loops remain outside scope.",
+      "acceptance": [
+        "Validate outer/loop region ownership and joins; reject external entries into loop body/latch.",
+        "Full cyclic dominance/liveness remains authoritative; preserve current body plans and carried-value synchronization.",
+        "JVM skipped/taken loop joins, wide/reference exit values, effects and exception identity.",
+        "Raw poison and malformed canonical rejection without retry; full regression/lint/build/corpus/search gates."
+      ],
+      "evidence": "validation/g01c-loop-outer-composition.json"
+    },
+    {
+      "id": "G01-C-disjoint-loop-composition",
+      "parent": "G01",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M07",
+        "M08",
+        "M09",
+        "M06"
+      ],
+      "scope": "Up to 32 nonoverlapping canonical pretest loops within existing forward regions; per-region ownership and full cyclic liveness. Nested/intersecting loops retain legacy handling.",
+      "acceptance": [
+        "Each loop owns its header, latch, exit, special edges and body plans; outer projection treats each as atomic.",
+        "Preserve full cyclic dominance/liveness across sequential and alternative loops, including wide/reference values and bypass paths.",
+        "JVM-check two/three loops, skipped effects and exception ordering; reject cross-owner entries and malformed metadata without raw retry.",
+        "Pass private/public regression, lint/build, pinned corpus and search gates."
+      ],
+      "evidence": "validation/g01c-disjoint-loop-composition.json"
+    },
+    {
+      "id": "G01-C-nested-loop-composition",
+      "parent": "G01",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M07",
+        "M08",
+        "M09",
+        "M06"
+      ],
+      "scope": "Up to four parent-owned canonical nested pretest levels, 32 total loops and 1024 controls; atomic inner-loop body planning with complete cyclic dominance/liveness. Deeper nesting, cross-owner/labeled exits, intersecting/irreducible regions and terminal bodies retain legacy handling.",
+      "acceptance": [
+        "Validate loop parent ownership and nesting/work budgets; collapse each inner loop atomically for enclosing-body planning.",
+        "Preserve per-loop break/continue ownership and inner/outer carried values with original CFG dominance/liveness.",
+        "JVM-check nested zero/multiple iterations, wide/reference values, effects and exception prefixes; malformed parent/cross-owner entries reject without raw retry.",
+        "Pass private/public regression, lint/build, pinned corpus and search gates."
+      ],
+      "evidence": "validation/g01c-nested-loop-composition.json"
+    },
+    {
+      "id": "G01-C-posttest-loop",
+      "parent": "G01",
+      "state": "Complete",
+      "gaps": [
+        "M01",
+        "M07",
+        "M08",
+        "M09",
+        "M06"
+      ],
+      "scope": "One canonical posttest loop with sole conditional backedge and fallthrough exit; straight-line prefix, body and exit tail. No other conditions/gotos, terminal loop body or nesting.",
+      "acceptance": [
+        "Use canonical dominance, loop membership and decoded latch condition in production rendering.",
+        "JVM-check mandatory first iteration, carried wide/reference values and ordered effects/exceptions.",
+        "Reject malformed selected metadata without raw retry; unsupported shapes retain established handling.",
+        "Pass private/public regression, lint/build, pinned corpus and search gates."
+      ],
+      "evidence": "validation/g01c-posttest-loop.json"
+    },
+    {
+      "id": "G01-C-posttest-body-composition",
+      "parent": "G01",
+      "state": "Ready",
+      "gaps": [
+        "M01",
+        "M07",
+        "M08",
+        "M09",
+        "M06"
+      ],
+      "scope": "One canonical posttest loop with bounded forward diamonds in its body, the same conditional latch and sole exit. Additional exits/continues, outer/nested compositions remain outside scope.",
+      "acceptance": [
+        "Cut only the canonical latch backedge for forward body planning; preserve complete cyclic dominance and liveness.",
+        "Validate joins and ownership without admitting alternate loop exits or entries.",
+        "JVM-check mandatory first iteration, branch-dependent carried/exit values, ordered effects and exceptions.",
+        "Reject malformed selected metadata without raw retry; pass regression, lint/build, corpus and search gates."
+      ],
+      "evidence": null
+    }
+  ],
+  "progress_metrics": {
+    "scope": "63 inventoried AUTO/RESTRUCTURE and pre-decompile pass positions, not all JADX subsystems or weighted effort",
+    "pass_positions_with_some_implementation": 40,
+    "pass_positions_total": 63,
+    "implementation_presence_percent": 63.492063492063494,
+    "fully_closed_pass_positions": 0,
+    "fully_closed_delivery_units": 0,
+    "delivery_units_total": 12,
+    "overall_effort_completion_percent": null,
+    "note": "Presence is not completion. Partial/custom implementations have no verified effort weights; a defensible overall completion percentage is unavailable."
+  }
+}

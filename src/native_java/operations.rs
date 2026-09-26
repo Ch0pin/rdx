@@ -5,26 +5,68 @@ use super::{
 use crate::native_dex::DexClass;
 use anyhow::{Context, Result, bail, ensure};
 
+/// Register roles shared by decoded IR and the legacy operand reader.
+#[derive(Clone, Copy)]
+pub(super) struct Operands {
+    pub dst: usize,
+    pub reads: [usize; 3],
+    pub read_count: usize,
+    pub type_index: Option<usize>,
+}
+impl Operands {
+    pub fn legacy(op: u8, a: usize, operand: u16) -> Self {
+        let (dst, reads, read_count) = match op {
+            0x1c => (a, [0; 3], 0),
+            0x1f => (a, [a, 0, 0], 1),
+            0x20 | 0x21 | 0x23 | 0x8d..=0x8f => (a & 15, [a >> 4, 0, 0], 1),
+            0x44..=0x4a => (
+                a,
+                [usize::from(operand & 255), usize::from(operand >> 8), 0],
+                2,
+            ),
+            0x4b..=0x51 => (
+                0,
+                [usize::from(operand & 255), usize::from(operand >> 8), a],
+                3,
+            ),
+            _ => unreachable!(),
+        };
+        Self {
+            dst,
+            reads,
+            read_count,
+            type_index: matches!(op, 0x1c | 0x1f | 0x20 | 0x23).then_some(usize::from(operand)),
+        }
+    }
+    /// Preserve the legacy constructor guard's value/array/index order for stores.
+    pub fn guarded_inputs(self, op: u8) -> [usize; 3] {
+        if (0x4b..=0x51).contains(&op) {
+            [self.reads[2], self.reads[0], self.reads[1]]
+        } else {
+            self.reads
+        }
+    }
+}
+
 pub(super) fn emit(
     class: &DexClass,
     op: u8,
-    a: usize,
-    operand: u16,
+    operands: Operands,
     regs: &mut [Option<Value>],
     out: &mut Output,
 ) -> Result<()> {
     match op {
         0x8d..=0x8f => {
             let ty = ["B", "C", "S"][(op - 0x8d) as usize];
-            let input = integral(&register(regs, a >> 4)?)?;
+            let input = integral(&register(regs, operands.reads[0])?)?;
             let value = out.local(ty, &format!("({}) ({input})", java_type(ty)?), &[])?;
-            assign(regs, a & 15, value)?;
+            assign(regs, operands.dst, value)?;
         }
         0x1c | 0x1f | 0x20 | 0x23 => {
             let ty = class
                 .symbols
                 .types
-                .get(operand as usize)
+                .get(operands.type_index.context("missing type index")?)
                 .context("type index")?;
             let display = java_type(ty)?;
             let refs_at = |offset| {
@@ -39,11 +81,11 @@ pub(super) fn emit(
                         &format!("{display}.class"),
                         &refs_at(0),
                     )?;
-                    assign(regs, a, value)?;
+                    assign(regs, operands.dst, value)?;
                 }
                 0x1f => {
                     ensure!(reference(ty), "check-cast requires reference type");
-                    let input = register(regs, a)?;
+                    let input = register(regs, operands.reads[0])?;
                     ensure!(
                         reference(&input.ty) || input.literal == Some(0),
                         "cast of nonreference"
@@ -56,11 +98,11 @@ pub(super) fn emit(
                         format!("((java.lang.Object) {})", input.text)
                     };
                     let value = out.local(ty, &format!("(({display}) {input})"), &refs_at(2))?;
-                    assign(regs, a, value)?;
+                    assign(regs, operands.dst, value)?;
                 }
                 0x20 => {
                     ensure!(reference(ty), "instance-of requires reference type");
-                    let input = register(regs, a >> 4)?;
+                    let input = register(regs, operands.reads[0])?;
                     ensure!(
                         reference(&input.ty) || input.literal == Some(0),
                         "instance-of on nonreference"
@@ -76,11 +118,11 @@ pub(super) fn emit(
                         &format!("{prefix}{display}"),
                         &refs_at(prefix.chars().count()),
                     )?;
-                    assign(regs, a & 15, value)?;
+                    assign(regs, operands.dst, value)?;
                 }
                 0x23 => {
                     ensure!(ty.starts_with('['), "new-array requires array type");
-                    let size = integral(&register(regs, a >> 4)?)?;
+                    let size = integral(&register(regs, operands.reads[0])?)?;
                     let dimensions = ty.bytes().take_while(|b| *b == b'[').count();
                     let base = java_type(&ty[dimensions..])?;
                     let expression = format!("new {base}[{size}]{}", "[]".repeat(dimensions - 1));
@@ -88,27 +130,27 @@ pub(super) fn emit(
                         .map(|s| vec![(4, base.chars().count(), s)])
                         .unwrap_or_default();
                     let value = out.local(ty, &expression, &refs)?;
-                    assign(regs, a & 15, value)?;
+                    assign(regs, operands.dst, value)?;
                 }
                 _ => unreachable!(),
             }
         }
         0x21 => {
-            let array = register(regs, a >> 4)?;
+            let array = register(regs, operands.reads[0])?;
             ensure!(
                 array.ty.starts_with('['),
                 "array-length requires known array type"
             );
             let value = out.local("I", &format!("{}.length", array.text), &[])?;
-            assign(regs, a & 15, value)?;
+            assign(regs, operands.dst, value)?;
         }
         0x44..=0x51 => {
-            let array = register(regs, (operand & 255) as usize)?;
+            let array = register(regs, operands.reads[0])?;
             let element = array
                 .ty
                 .strip_prefix('[')
                 .context("array access requires known array type")?;
-            let index = integral(&register(regs, (operand >> 8) as usize)?)?;
+            let index = integral(&register(regs, operands.reads[1])?)?;
             let put = op >= 0x4b;
             let family = op - if put { 0x4b } else { 0x44 };
             ensure!(
@@ -125,7 +167,7 @@ pub(super) fn emit(
                 "array opcode/component mismatch or unsupported wide element"
             );
             if put {
-                let value = register(regs, a)?;
+                let value = register(regs, operands.reads[2])?;
                 // A reference store must perform the VM's array store check,
                 // never a synthetic component downcast before that check.
                 let (array_text, value_text) = if reference(element) {
@@ -152,7 +194,7 @@ pub(super) fn emit(
                 out.line(&format!("{array_text}[{index}] = {value_text};"), &[]);
             } else {
                 let value = out.local(element, &format!("{}[{index}]", array.text), &[])?;
-                assign(regs, a, value)?;
+                assign(regs, operands.dst, value)?;
             }
         }
         _ => bail!("unsupported array/type operation"),

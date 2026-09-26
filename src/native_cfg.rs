@@ -2,7 +2,8 @@
 //!
 //! The split/connect phases follow JADX's Apache-2.0 licensed `BlockSplitter`
 //! at commit 28ff15e4ae69950aebea110a13e5ab895d234dfc. Unlike JADX, this module
-//! operates on raw DEX code units, retains goto instructions, has no synthetic
+//! provides a raw DEX builder and validated canonical decoded builders, retains
+//! goto instructions, has no synthetic
 //! enter/exit blocks or SSA attributes, and conservatively isolates every
 //! protected instruction before adding exceptional edges. Payload code units
 //! are metadata and never appear in a block. Reachability starts at the method
@@ -48,6 +49,303 @@ pub struct ControlFlowGraph {
 impl ControlFlowGraph {
     pub fn build(code: &DexCode) -> Result<Self> {
         build(code)
+    }
+}
+
+impl ControlFlowGraph {
+    /// Build the bounded forward-only graph directly from canonical decoded
+    /// instructions. A separate decoded builder admits selected natural loops;
+    /// handlers, payloads and other loop shapes retain the raw CFG builder.
+    pub(crate) fn from_decoded(ir: &crate::native_ir::DecodedMethod, len: usize) -> Result<Self> {
+        Self::decoded_impl(ir, len, false)
+    }
+    pub(crate) fn from_decoded_loop(
+        ir: &crate::native_ir::DecodedMethod,
+        len: usize,
+    ) -> Result<Self> {
+        Self::decoded_impl(ir, len, true)
+    }
+    fn decoded_impl(
+        ir: &crate::native_ir::DecodedMethod,
+        len: usize,
+        cyclic: bool,
+    ) -> Result<Self> {
+        ensure!(
+            !ir.instructions.is_empty() && len <= MAX_CODE_UNITS,
+            "invalid decoded CFG size"
+        );
+        let mut leaders = BTreeSet::from([0]);
+        let mut end = 0;
+        for instruction in &ir.instructions {
+            ensure!(
+                instruction.pc == end && instruction.width > 0,
+                "noncontiguous decoded CFG instructions"
+            );
+            end = end
+                .checked_add(instruction.width)
+                .context("decoded CFG width overflow")?;
+            ensure!(end <= len, "decoded CFG instruction exceeds method");
+            ensure!(
+                instruction.payload_target.is_none(),
+                "payload in forward decoded CFG"
+            );
+            if matches!(instruction.opcode, 0x28..=0x2a | 0x32..=0x3d) {
+                let target = instruction
+                    .branch_target
+                    .context("missing decoded CFG target")?;
+                ensure!(
+                    target != instruction.pc && target < len && (cyclic || target > instruction.pc),
+                    "nonforward decoded CFG target"
+                );
+                leaders.insert(target);
+            } else {
+                ensure!(
+                    instruction.branch_target.is_none(),
+                    "target on nonbranch decoded instruction"
+                );
+            }
+            if matches!(instruction.opcode, 0x0e..=0x11 | 0x27..=0x2a | 0x32..=0x3d) && end < len {
+                leaders.insert(end);
+            }
+        }
+        ensure!(
+            end == len && leaders.len() <= MAX_BLOCKS,
+            "decoded CFG coverage/budget mismatch"
+        );
+        let mut blocks: Vec<BasicBlock> = Vec::with_capacity(leaders.len());
+        let mut block_at = HashMap::with_capacity(ir.instructions.len());
+        for instruction in &ir.instructions {
+            if leaders.contains(&instruction.pc) {
+                blocks.push(BasicBlock {
+                    start: instruction.pc,
+                    end: instruction.pc,
+                    instructions: Vec::new(),
+                    successors: Vec::new(),
+                });
+            }
+            let index = blocks
+                .len()
+                .checked_sub(1)
+                .context("missing decoded CFG entry")?;
+            block_at.insert(instruction.pc, index);
+            blocks[index].instructions.push(instruction.pc);
+            blocks[index].end = instruction.pc + instruction.width;
+        }
+        ensure!(
+            blocks.len() == leaders.len(),
+            "decoded CFG target is not an instruction boundary"
+        );
+        for block in &mut blocks {
+            let last_pc = *block
+                .instructions
+                .last()
+                .context("empty decoded CFG block")?;
+            let instruction = &ir.instructions[ir
+                .instructions
+                .binary_search_by_key(&last_pc, |instruction| instruction.pc)
+                .unwrap()];
+            if let Some(target) = instruction.branch_target {
+                block.successors.push(Edge {
+                    target: *block_at
+                        .get(&target)
+                        .context("decoded CFG target boundary")?,
+                    kind: EdgeKind::Normal,
+                });
+            }
+            if !matches!(instruction.opcode, 0x0e..=0x11 | 0x27..=0x2a) {
+                block.successors.push(Edge {
+                    target: *block_at
+                        .get(&block.end)
+                        .context("decoded CFG falls off method")?,
+                    kind: EdgeKind::Normal,
+                });
+            }
+        }
+        let graph = Self { blocks, block_at };
+        graph.validate_decoded_impl(ir, len, cyclic)?;
+        Ok(graph)
+    }
+
+    /// Immediate postdominators for a forward DAG with a virtual terminal exit.
+    /// Successor-chain intersection follows the Cooper/Harvey/Kennedy approach
+    /// used by JADX's pinned DominatorTree.java; reversing the DAG removes its
+    /// iterative fixed point. This is not the full upstream dominator visitor.
+    pub(crate) fn forward_postdominators(&self) -> Result<Vec<usize>> {
+        let exit = self.blocks.len();
+        let mut parents = vec![exit; exit + 1];
+        let mut work = 20_000_000usize;
+        for index in (0..exit).rev() {
+            let mut common = None;
+            for edge in &self.blocks[index].successors {
+                ensure!(
+                    edge.kind == EdgeKind::Normal && edge.target > index && edge.target < exit,
+                    "invalid forward postdominator edge"
+                );
+                let mut left = common.unwrap_or(edge.target);
+                let mut right = edge.target;
+                while left != right {
+                    ensure!(work > 0, "forward postdominator work budget");
+                    work -= 1;
+                    if left < right {
+                        left = parents[left];
+                    } else {
+                        right = parents[right];
+                    }
+                }
+                common = Some(left);
+            }
+            parents[index] = common.unwrap_or(exit);
+        }
+        Ok(parents)
+    }
+
+    /// Validate the stored canonical edges against decoded terminators, without
+    /// rebuilding blocks or consulting raw branch words.
+    pub(crate) fn validate_decoded(
+        &self,
+        ir: &crate::native_ir::DecodedMethod,
+        len: usize,
+    ) -> Result<()> {
+        self.validate_decoded_impl(ir, len, false)
+    }
+    pub(crate) fn validate_decoded_loop(
+        &self,
+        ir: &crate::native_ir::DecodedMethod,
+        len: usize,
+    ) -> Result<()> {
+        self.validate_decoded_impl(ir, len, true)
+    }
+    fn validate_decoded_impl(
+        &self,
+        ir: &crate::native_ir::DecodedMethod,
+        len: usize,
+        cyclic: bool,
+    ) -> Result<()> {
+        ensure!(
+            !self.blocks.is_empty()
+                && self.blocks.len() <= MAX_BLOCKS
+                && self.block_at.len() == ir.instructions.len(),
+            "invalid decoded CFG layout"
+        );
+        let mut cursor = 0;
+        let mut instruction_index = 0;
+        for (block_index, block) in self.blocks.iter().enumerate() {
+            ensure!(
+                block.start == cursor && !block.instructions.is_empty(),
+                "noncontiguous decoded CFG blocks"
+            );
+            for &pc in &block.instructions {
+                let instruction = ir
+                    .instructions
+                    .get(instruction_index)
+                    .context("extra decoded CFG instruction")?;
+                ensure!(
+                    pc == cursor
+                        && instruction.pc == pc
+                        && instruction.width > 0
+                        && self.block_at.get(&pc) == Some(&block_index),
+                    "decoded CFG instruction identity mismatch"
+                );
+                ensure!(
+                    instruction.payload_target.is_none(),
+                    "payload in forward decoded CFG"
+                );
+                cursor = cursor
+                    .checked_add(instruction.width)
+                    .context("decoded CFG width overflow")?;
+                instruction_index += 1;
+                ensure!(cursor <= len, "decoded CFG instruction exceeds method");
+                if cursor < block.end {
+                    ensure!(
+                        !matches!(instruction.opcode, 0x0e..=0x11 | 0x27..=0x2a | 0x32..=0x3d)
+                            && instruction.branch_target.is_none(),
+                        "decoded CFG terminator inside block"
+                    );
+                }
+            }
+            ensure!(cursor == block.end, "decoded CFG block end mismatch");
+            let last = &ir.instructions[instruction_index - 1];
+            let mut expected = [None; 2];
+            let mut count = 0;
+            if matches!(last.opcode, 0x28..=0x2a | 0x32..=0x3d) {
+                let target = last.branch_target.context("missing decoded CFG target")?;
+                ensure!(
+                    target != last.pc && target < len && (cyclic || target > last.pc),
+                    "nonforward decoded CFG target"
+                );
+                let target_index = *self
+                    .block_at
+                    .get(&target)
+                    .context("decoded CFG target boundary")?;
+                ensure!(
+                    self.blocks
+                        .get(target_index)
+                        .is_some_and(|block| block.start == target),
+                    "decoded CFG target enters block interior"
+                );
+                expected[count] = Some(target_index);
+                count += 1;
+            } else {
+                ensure!(
+                    last.branch_target.is_none(),
+                    "target on nonbranch decoded instruction"
+                );
+            }
+            if !matches!(last.opcode, 0x0e..=0x11 | 0x27..=0x2a) {
+                let target_index = *self
+                    .block_at
+                    .get(&cursor)
+                    .context("decoded CFG falls off method")?;
+                ensure!(
+                    self.blocks
+                        .get(target_index)
+                        .is_some_and(|block| block.start == cursor),
+                    "decoded CFG fallthrough enters block interior"
+                );
+                expected[count] = Some(target_index);
+                count += 1;
+            }
+            ensure!(
+                block.successors.len() == count
+                    && block
+                        .successors
+                        .iter()
+                        .zip(expected)
+                        .all(|(edge, target)| edge.kind == EdgeKind::Normal
+                            && Some(edge.target) == target
+                            && (cyclic || edge.target > block_index)),
+                "decoded CFG successors differ from terminator"
+            );
+        }
+        ensure!(
+            cursor == len && instruction_index == ir.instructions.len(),
+            "decoded CFG coverage mismatch"
+        );
+        let mut reachable = vec![false; self.blocks.len()];
+        reachable[0] = true;
+        if cyclic {
+            let mut pending = vec![0];
+            while let Some(index) = pending.pop() {
+                for edge in &self.blocks[index].successors {
+                    if !reachable[edge.target] {
+                        reachable[edge.target] = true;
+                        pending.push(edge.target);
+                    }
+                }
+            }
+            ensure!(
+                reachable.iter().all(|seen| *seen),
+                "unreachable decoded CFG block"
+            );
+        } else {
+            for (index, block) in self.blocks.iter().enumerate() {
+                ensure!(reachable[index], "unreachable decoded CFG block");
+                for edge in &block.successors {
+                    reachable[edge.target] = true;
+                }
+            }
+        }
+        Ok(())
     }
 }
 

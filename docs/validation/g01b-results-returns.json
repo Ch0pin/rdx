@@ -1,0 +1,107 @@
+{
+  "date": "2026-09-25",
+  "increment": "G01-B-results-returns",
+  "state": "Complete for bounded scope; G01-B and G01 remain open",
+  "gaps": [
+    "M01",
+    "M05",
+    "M06"
+  ],
+  "scope": "Shared decoded move-result destinations and return operands for 0x0a..0x0c and 0x0e..0x11 in eligible straight-line rendering; pending result ownership and constructor/type checks preserved.",
+  "delegation": {
+    "implementation": "gpt-6-sol",
+    "integration_tests": "gpt-6-sol",
+    "independent_review": "gpt-6-sol, reused reviewer after Astra start was blocked by agent thread limit",
+    "integration_and_full_validation": "parent"
+  },
+  "validation": {
+    "default_suite": {
+      "passed": 781,
+      "failed": 0,
+      "ignored": 80
+    },
+    "selected_jvm_tests": {
+      "passed": 1,
+      "failed": 0,
+      "target": "native_shared_results_returns::results_returns_jvm_preserves_identity_raw_bits_effects_and_exceptions",
+      "generated_methods": 12,
+      "typed_input_vectors": 16,
+      "effect_exception_scenarios": 3
+    },
+    "production_invariant_tests": "Two private tests: raw operand poisoning for all seven opcodes, 40 malformed shared operand/metadata cases, one post-binding destination mismatch.",
+    "public_cases": "Five value types and void, result/input overwrites, consecutive call results, orphan/separated/wrong-kind/void results, return-kind and constructor guard negatives.",
+    "review": "Independent Sol review and parent inspection: no blockers. Bound-result consistency check added after review.",
+    "clippy": "cargo clippy --locked -j 2 --all-targets -- -D warnings: passed",
+    "format": "cargo fmt --all -- --check: passed",
+    "diff": "git diff --check: passed",
+    "build": "cargo build --release --locked -j 2 --bin rdx: passed"
+  },
+  "corpus": {
+    "file": "com.android.vending.apk",
+    "sha256": "c9910583fc93af2b750bde69d3db89a625359e19281adb5b3aa607b640d64ee5",
+    "concrete_methods": 268289,
+    "before_reconstructed": 260225,
+    "after_reconstructed": 260225,
+    "fallback_methods": 8064,
+    "entire_report_identical": true,
+    "report_sha256": "54ec0d59c0dd5148cd40bed1a9779babf5cd989455cda43a106aa05d882776f9",
+    "metric": "Pinned APK reconstruction, not universal coverage or semantic accuracy"
+  },
+  "search": {
+    "query": "getClass",
+    "sample_classes": 300,
+    "runs_per_binary": 3,
+    "exact_matches_and_corpus_equal": true,
+    "matches": 53,
+    "timings": {
+      "before": {
+        "cold": [
+          0.230078125,
+          0.229305417,
+          0.226145083
+        ],
+        "warm": [
+          0.001194291,
+          0.001192333,
+          0.001212333
+        ]
+      },
+      "after": {
+        "cold": [
+          0.233843333,
+          0.2413685,
+          0.236690334
+        ],
+        "warm": [
+          0.001255792,
+          0.001247834,
+          0.00122875
+        ]
+      }
+    },
+    "median_seconds": {
+      "before": {
+        "cold": 0.229305417,
+        "warm": 0.001194291
+      },
+      "after": {
+        "cold": 0.236690334,
+        "warm": 0.001247834
+      }
+    },
+    "timing_note": "Three alternating before/after runs after all other checks; local 300-class sample, load excluded. Cold median +3.2% (~7.4 ms); warm +0.054 ms. New ownership validation uses logarithmic lookups, no per-result linear scan."
+  },
+  "hashes": {
+    "target/validation/rdx-before-g01b-results": "fbf9a0aed8942b4190884a096aa27957968033fddba087c18495978610a5b5d8",
+    "target/release/rdx": "7c7dcf4e0bd535f5426ffd924a8fd619f23cdafd4d907d4982f9d03e75c98486",
+    "src/native_java/method.rs": "1cfbff699209497a01229fea671ef306b0ac1554d6fbf5bf6dde64e5bf565bf3",
+    "tests/native_shared_results_returns.rs": "bfc54cb9e6cf69a3d22ad660ea2d6b0f10f52078e9d58c52a9e9625262c3d615"
+  },
+  "limits": [
+    "No full visitor or delivery unit closed.",
+    "Shared route eligibility unchanged; branches/handlers/allocation routes retain legacy behavior.",
+    "Move-exception and throw excluded; arithmetic, field and array/type operands remain unmigrated.",
+    "Existing result type/coercion semantics retained; no claim of general SSA/type inference.",
+    "No release, GUI deployment, commit or push."
+  ]
+}

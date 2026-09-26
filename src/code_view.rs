@@ -12,8 +12,6 @@ use syntect::{
     easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet, util::LinesWithEndings,
 };
 
-const LONG_LINE: usize = 4_000;
-
 fn exported_component_tint(theme: CodeTheme) -> Color32 {
     if theme.is_light() {
         Color32::from_rgba_unmultiplied(130, 65, 195, 45)
@@ -234,13 +232,11 @@ pub struct CodeDocument {
     last_galley_pos: Option<egui::Pos2>,
     #[cfg(test)]
     last_editor_id: Option<egui::Id>,
-    plain: bool,
     cache: Option<Cache>,
 }
 impl CodeDocument {
     pub fn new(text: String, syntax: &str) -> Self {
         let end = text.len();
-        let plain = text[..end].split('\n').any(|line| line.len() > LONG_LINE);
         Self {
             selection_key: None,
             selection_occurrences: Vec::new(),
@@ -275,7 +271,6 @@ impl CodeDocument {
             last_galley_pos: None,
             #[cfg(test)]
             last_editor_id: None,
-            plain,
             cache: None,
         }
     }
@@ -660,9 +655,7 @@ impl CodeDocument {
         let syntax = set
             .find_syntax_by_extension(extension)
             .or_else(|| set.find_syntax_by_name(&self.syntax));
-        if !self.plain
-            && let Some(syntax) = syntax
-        {
+        if let Some(syntax) = syntax {
             let mut highlighter = HighlightLines::new(syntax, palette);
             for line in LinesWithEndings::from(text) {
                 match highlighter.highlight_line(line, set) {
@@ -729,9 +722,6 @@ impl CodeDocument {
             });
         }
 
-        if self.plain {
-            ui.label("Very long lines: syntax coloring disabled to keep the viewer responsive.");
-        }
         let palette = &themes().themes[theme.key()];
         let background = palette
             .settings
@@ -2294,9 +2284,35 @@ mod tests {
         let doc = CodeDocument::new(source.clone(), "java");
         assert_eq!(doc.text(), source);
         assert_eq!(doc.preview_end, source.len());
-        assert!(doc.plain);
         assert_eq!(doc.job(CodeTheme::Ocean, 14.0).text, source);
         let doc = CodeDocument::new("x\n".repeat(10_000), "txt");
         assert_eq!(doc.job(CodeTheme::Ocean, 14.0).text.lines().count(), 10_000);
+    }
+
+    #[test]
+    fn long_lines_keep_syntax_colors_through_end_and_following_lines() {
+        let source = format!(
+            "public class Demo {{ String value = \"{}\"; int after = 42; }}\npublic class Tail {{}}\n",
+            "λ".repeat(8_192)
+        );
+        let doc = CodeDocument::new(source.clone(), "java");
+        for theme in [CodeTheme::Ocean, CodeTheme::SolarizedLight] {
+            let job = doc.job(theme, 14.0);
+            assert_eq!(job.text, source);
+            let color_at = |offset| {
+                job.sections
+                    .iter()
+                    .find(|section| section.byte_range.contains(&offset))
+                    .unwrap()
+                    .format
+                    .color
+            };
+            let keyword = color_at(0);
+            let string = color_at(source.find('λ').unwrap());
+            assert_ne!(keyword, string);
+            assert_eq!(string, color_at(source.rfind('λ').unwrap()));
+            assert_ne!(string, color_at(source.find("int after").unwrap()));
+            assert_eq!(keyword, color_at(source.rfind("public").unwrap()));
+        }
     }
 }

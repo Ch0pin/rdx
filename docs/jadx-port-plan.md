@@ -1,133 +1,24 @@
 # Native JADX pipeline port
 
+Latest scoped update: [JADX-guided loop exit comparison](validation/jadx-loop-comparison.md)
+and [pinned APK coverage evidence](validation/coverage-jadx-loops.json).
+The 2026-09-25 loop batch integrates graph-based escape checks and distinct
+header/exit register liveness into the current renderer. It does not complete
+the general SSA-to-region pipeline or certify a whole upstream visitor as ported.
+
 Reference: JADX 1.5.6, commit `28ff15e4ae69950aebea110a13e5ab895d234dfc`,
 [`Jadx.getRegionsModePasses`](https://github.com/skylot/jadx/blob/28ff15e4ae69950aebea110a13e5ab895d234dfc/jadx-core/src/main/java/jadx/core/Jadx.java).
-This is the implementation checklist, not a claim that the pipeline is already ported.
+The active implementation checklist is [jadx-gap-inventory.md](jadx-gap-inventory.md).
 Runtime and production analysis remain Rust only.
 
-## Current source audit (2026-09-21)
+## Historical implementation notes
 
-**The infrastructure is partly ported; the general Java reconstruction pipeline is not.**
-`native_java/method.rs::Graph::constructor_binding` lazily builds decoded IR, CFG,
-SSA and bound calls for constructor analysis. Most other Java output still uses
-that file's mutable-register renderer. Adding analysis modules alone therefore
-does not make their invariants apply to all displayed Java.
-
-Status meanings: **Ported** means an identified upstream algorithm is translated
-and validated in its stated scope; **Partial** means only part of the upstream
-pass or its integration exists; **Custom** means RDX provides related behavior
-through a different implementation; **Missing** means no equivalent dedicated
-pass was identified. No complete visitor below is certified as Ported.
-The dominator algorithm is a scoped port inside Partial block processing.
-This is a source audit, not a formal proof that every missing feature is absent.
-
-### Complete pinned visitor inventory
-
-Inventory transcribed from pinned `Jadx.java`, including all 11 pre-decompile
-visitors and every constructor-added visitor in `getRegionsModePasses`, in source
-order. Conditional visitors are marked, without assuming they are enabled.
-Repeated `CodeShrinkVisitor` entries are intentional. The three optional
-`DotGraphVisitor.dumpRaw/dump/dumpRegions` diagnostic hooks are excluded from the
-transformation rows; RDX has no equivalent graph visualization in this mapping.
-SIMPLE/FALLBACK modes and plugin-injected passes are outside this reconstruction
-pipeline inventory. DEX loading precedes it; Java code generation follows it.
-
-| Order | JADX visitor | Status | RDX evidence / remaining difference |
-| --- | --- | --- | --- |
-| Pre 1 | `SignatureProcessor` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Pre 2 | `OverrideMethodVisitor` | Custom | native_hierarchy and native_java/mod.rs inherited exception lookup; no general override pass |
-| Pre 3 | `AddAndroidConstants` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Pre 4 | `DeobfuscatorVisitor` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Pre 5 | `SourceFileRename` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Pre 6 | `RenameVisitor` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Pre 7 | `SaveDeobfMapping` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Pre 8 | `UsageInfoVisitor` | Custom | native usage indexing; separate implementation, not upstream usage graph parity |
-| Pre 9 | `CollectConstValues` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Pre 10 | `ProcessAnonymous` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Pre 11 | `ProcessMethodsForInline` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 1 | `CheckCode` | Partial | native_ir / native_cfg validate operands and boundaries; not the full upstream checks |
-| Main 2 | `DebugInfoAttachVisitor` (conditional) | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 3 | `AttachTryCatchVisitor` | Partial | native_cfg / native_ssa retain handlers and exceptional state; no complete normalized exception regions |
-| Main 4 | `AttachCommentsVisitor` (conditional) | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 5 | `AttachMethodDetails` | Partial | native_calls / native_call_values bind signatures and results; metadata coverage remains partial |
-| Main 6 | `ProcessInstructionsVisitor` | Partial | native_ir operand decoding; no complete semantic instruction normalization |
-| Main 7 | `BlockSplitter` | Partial | native_cfg basic blocks; synthetic block parity incomplete |
-| Main 8 | `BlockProcessor` | Partial | native_dominators analysis; block transformations and general loop metadata incomplete |
-| Main 9 | `BlockFinisher` | Partial | CFG edge validation exists; upstream block finishing not fully reproduced |
-| Main 10 | `SSATransform` | Partial | native_ssa word identities and phis; general Java renderer does not consume them |
-| Main 11 | `MoveInlineVisitor` | Custom | native_java/cleanup and readable transformations; no general SSA move elimination |
-| Main 12 | `ConstructorVisitor` | Partial | native_constructors plus bounded native_java/allocation_lowering integration |
-| Main 13 | `InitCodeVariables` | Custom | native_java/method register values and local names; no shared SSA code-variable stage |
-| Main 14 | `MarkFinallyVisitor` (conditional) | Custom | native_java/method handles selected catch/rethrow shapes; synchronized.rs covers validated single-release monitor regions |
-| Main 15 | `ConstInlineVisitor` | Custom | native_java/cleanup folds selected constants/class literals; no full SSA pass |
-| Main 16 | `TypeInferenceVisitor` | Partial | native_types bounded assignment/use propagation; unresolved values and emitter integration remain |
-| Main 17 | `DebugInfoApplyVisitor` (conditional) | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 18 | `FixTypesVisitor` | Custom | native_java casts and conversions handle selected patterns; no complete typed-IR repair |
-| Main 19 | `FinishTypeInference` | Partial | analysis diagnostics exist; no complete final typed-IR gate before Java emission |
-| Main 20 | `AdjustForIfMergeVisitor` | Custom | native_java/condition_cleanup handles selected guard/ternary shapes |
-| Main 21 | `ProcessKotlinInternals` (conditional) | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 22 | `CodeRenameVisitor` | Custom | native_java/names and display_names; local naming rather than global rename parity |
-| Main 23 | `InlineMethods` (conditional) | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 24 | `GenericTypesVisitor` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 25 | `ShadowFieldVisitor` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 26 | `DeboxingVisitor` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 27 | `AnonymousClassVisitor` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 28 | `ModVisitor` | Custom | native_java method/allocation special cases; no equivalent general IR pass |
-| Main 29 | `CodeShrinkVisitor` | Custom | native_java/cleanup and readable; bounded expression/text cleanup |
-| Main 30 | `ReplaceNewArray` | Custom | native_java array emission handles selected initializers |
-| Main 31 | `RegionMakerVisitor` | Custom | native_java/method recursive Graph renderer; no shared region IR |
-| Main 32 | `IfRegionVisitor` | Custom | native_java/method and condition_cleanup for supported branches |
-| Main 33 | `SwitchOverStringVisitor` (conditional) | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 34 | `ReturnVisitor` | Custom | native_java/method terminal paths and cleanup |
-| Main 35 | `CleanRegions` | Custom | native_java/condition_cleanup; no shared region IR |
-| Main 36 | `MethodThrowsVisitor` | Custom | native_java/throwing and mod.rs checked-exception guards |
-| Main 37 | `CodeShrinkVisitor` | Custom | native_java/cleanup and readable; bounded expression/text cleanup |
-| Main 38 | `MethodInvokeVisitor` | Custom | signature-aware calls and native_java/varargs_cleanup; incomplete overload/generic parity |
-| Main 39 | `SimplifyVisitor` | Custom | native_java/cleanup, condition_cleanup, readable and operations |
-| Main 40 | `CheckRegions` | Custom | native_java rejection guards; no independent complete region-edge verifier |
-| Main 41 | `EnumVisitor` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 42 | `FixSwitchOverEnum` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 43 | `NonFinalResIdsVisitor` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 44 | `ExtractFieldInit` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 45 | `FixAccessModifiers` | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 46 | `ClassModifier` | Custom | native_java/mod.rs class header and modifiers |
-| Main 47 | `LoopRegionVisitor` | Custom | native_java/method handles selected loop shapes |
-| Main 48 | `SwitchBreakVisitor` | Custom | native_java/method handles selected switch exits |
-| Main 49 | `MarkMethodsForInline` (conditional) | Missing | No equivalent dedicated native pass identified; existing related syntax support does not establish a port |
-| Main 50 | `ProcessVariables` | Custom | native_java/liveness and method register/local handling |
-| Main 51 | `ApplyVariableNames` | Custom | native_java/names and readable; no complete debug/Kotlin name recovery |
-| Main 52 | `PrepareForCodeGen` | Custom | native_java/mod.rs and readable emission preparation; not upstream parity |
-
-### Supporting layers and evidence
-
-| Layer | Status | Evidence and boundary |
-| --- | --- | --- |
-| DEX parsing and metadata | Partial | `src/native_dex.rs`, `native_dex_metadata.rs`, `tests/native_dex_metadata.rs`; pinned parser attribution in `third_party/jadx/README.md` |
-| Dominator algorithm | Ported, scoped | `src/native_dominators.rs`; graph-oracle validation recorded below; does not complete BlockProcessor |
-| SSA / calls / types / constructors | Partial | `tests/native_pipeline.rs`, `native_calls.rs`, `native_call_values.rs`, `native_constructors.rs`; analysis acceptance is not Java correctness |
-| Java source and navigation | Custom | `src/native_java/`, `tests/native_branch_navigation.rs`, `native_annotations.rs`, `native_fields.rs`; text rewrites maintain spans, but are not a general typed expression IR |
-| Semantic validation | Partial | [Focused semantic check](focused-semantic-check.md): bounded modeled scenarios, negative controls, and one known allocation timing difference; no whole-corpus equivalence claim |
-
-### Latest measured output baseline
-
-The local `target/validation/current-full-vending-coverage.json` reports 63,315
-classes, 268,289 concrete methods, 235,760 Java reconstructions (**87.88%**) and
-32,529 fallbacks. This is the existing measured artifact, not a fresh audit run.
-Earlier Zoom/Expedia numbers below are historical, not measurements of today's
-renderer. First-failure categories are not independent feature coverage scores.
-
-| First rejection | Methods | Primary workstream |
-| --- | ---: | --- |
-| Effectful instruction between allocation and constructor | 6,696 | Constructor and effect-aware expression integration |
-| Nested or multiple try regions | 4,947 | Exception normalization and region construction |
-| Allocation constructor mismatch | 3,084 | Constructor identities and hierarchy integration |
-| Unsupported loop interior edge | 2,180 | General loop regions and edge verification |
-| Unsupported Java type name | 2,157 | Global naming and source generation |
-
-Monitor-enter (`0x1d`) additionally accounts for 1,410 first rejections. Printing
-the `synchronized` method modifier was already supported at that baseline. The
-monitor-region increment below now handles the reported Hilt shape; the 1,410
-count is historical and has not been remeasured across the full corpus.
+The [canonical gap inventory](jadx-gap-inventory.md) supersedes the earlier
+2026-09-21 status table, implementation ordering and 87.88% baseline. It records
+all 63 pinned visitor positions, verified RDX integration, remaining behavior
+and completion gates. The sections below retain earlier implementation evidence;
+their counts and limitations describe the increment when recorded, not necessarily
+the current renderer. Current corpus evidence is linked at the top of this file.
 
 ### Shared method context: first integration increment
 

@@ -1,0 +1,106 @@
+{
+  "date": "2026-09-26",
+  "increment": "G01-B-arithmetic",
+  "state": "Complete for bounded scope; G01-B and G01 remain open",
+  "gaps": [
+    "M01",
+    "M06"
+  ],
+  "scope": "Shared decoded arithmetic operands for all 109 comparison, unary/conversion, normal binary, 2addr and literal encodings in eligible straight-line rendering; preserve existing numeric semantics and boolean fast paths.",
+  "delegation": {
+    "implementation": "gpt-6-sol",
+    "integration_tests": "gpt-6-sol",
+    "independent_review": "gpt-6-astra",
+    "integration_and_full_validation": "parent"
+  },
+  "validation": {
+    "default_suite": {
+      "passed": 785,
+      "failed": 0,
+      "ignored": 81
+    },
+    "selected_jvm_tests": {
+      "passed": 1,
+      "failed": 0,
+      "target": "native_shared_arithmetic::arithmetic_jvm_matches_independent_boundary_references",
+      "generated_fixtures": 128,
+      "unique_opcodes": 109,
+      "input_combinations": 11728
+    },
+    "production_invariant_tests": "Raw operand poisoning for all 109 arithmetic encodings and 12 boolean cases; typed successful baselines followed by operand count/kind/bounds/metadata, 2addr identity, literal overflow, wide tail and narrow shift-RHS rejection.",
+    "review": "Independent Astra review and parent inspection passed; removed redundant heap allocation and strengthened negative baselines after review.",
+    "clippy": "cargo clippy --locked -j 2 --all-targets -- -D warnings: passed",
+    "format": "cargo fmt --all -- --check: passed",
+    "diff": "git diff --check: passed",
+    "build": "cargo build --release --locked -j 2 --bin rdx: passed"
+  },
+  "corpus": {
+    "file": "com.android.vending.apk",
+    "sha256": "c9910583fc93af2b750bde69d3db89a625359e19281adb5b3aa607b640d64ee5",
+    "concrete_methods": 268289,
+    "before_reconstructed": 260225,
+    "after_reconstructed": 260225,
+    "fallback_methods": 8064,
+    "entire_report_identical": true,
+    "report_sha256": "54ec0d59c0dd5148cd40bed1a9779babf5cd989455cda43a106aa05d882776f9",
+    "metric": "Pinned APK reconstruction, not universal coverage or semantic accuracy"
+  },
+  "search": {
+    "query": "getClass",
+    "sample_classes": 300,
+    "runs_per_binary": 3,
+    "exact_matches_and_corpus_equal": true,
+    "matches": 53,
+    "timings": {
+      "before": {
+        "cold": [
+          0.228948625,
+          0.223340792,
+          0.230081375
+        ],
+        "warm": [
+          0.001227417,
+          0.00124625,
+          0.001173875
+        ]
+      },
+      "after": {
+        "cold": [
+          0.223144833,
+          0.225042041,
+          0.226617208
+        ],
+        "warm": [
+          0.001190042,
+          0.001153292,
+          0.001245083
+        ]
+      }
+    },
+    "median_seconds": {
+      "before": {
+        "cold": 0.228948625,
+        "warm": 0.001227417
+      },
+      "after": {
+        "cold": 0.225042041,
+        "warm": 0.001190042
+      }
+    },
+    "timing_note": "Three alternating paired runs after other checks finished; local 300-class sample, load excluded. Cold median 228.949 ms to 225.042 ms (-1.7%); warm 1.227 ms to 1.190 ms. Not a universal performance claim."
+  },
+  "hashes": {
+    "target/validation/rdx-before-g01b-arithmetic": "7c7dcf4e0bd535f5426ffd924a8fd619f23cdafd4d907d4982f9d03e75c98486",
+    "target/release/rdx": "fc66f63ee03d1f1e4d42d6517f06c35dc82dacb0e23001a1beb4949760373193",
+    "src/native_java/method.rs": "0663c67c577a510f2dcbf54518954a8f51c8869139cbbb6287cb9a767e608bfc",
+    "tests/native_shared_arithmetic.rs": "36ebc1771aae5a30287973ed347e2db12781c43a5ac2ac46824ec969dbf4aaf2"
+  },
+  "limits": [
+    "No full visitor or delivery unit closed.",
+    "Shared route eligibility unchanged; legacy branches/handlers/allocation routes preserved.",
+    "Field, array/type and throw operand migration remains open; no general CFG/SSA/type-driven emission.",
+    "Arithmetic NaN payload identity not proved: JVM oracle canonicalizes NaNs.",
+    "Pinned corpus reconstruction is not universal coverage or semantic accuracy.",
+    "No release, GUI deployment, commit or push."
+  ]
+}

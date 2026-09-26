@@ -14,6 +14,22 @@ use crate::{
 };
 use anyhow::{Context, Result};
 
+/// Shared inexpensive decoding and call binding. Java straight-line emission
+/// consumes this front end directly; graph/SSA analyses build on the same data.
+pub struct MethodFrontEnd {
+    pub ir: DecodedMethod,
+    pub bound: BoundCalls,
+}
+
+impl MethodFrontEnd {
+    pub fn build(class: &DexClass, method: &DexMethod) -> Result<Self> {
+        let code = method.code.as_ref().context("method has no code")?;
+        let ir = DecodedMethod::decode(code).context("instruction analysis")?;
+        let bound = BoundCalls::bind(code, &ir, &class.symbols).context("call binding")?;
+        Ok(Self { ir, bound })
+    }
+}
+
 pub struct MethodAnalysis<'a> {
     class: &'a DexClass,
     method: &'a DexMethod,
@@ -27,10 +43,9 @@ pub struct MethodAnalysis<'a> {
 impl<'a> MethodAnalysis<'a> {
     pub fn build(class: &'a DexClass, method: &'a DexMethod) -> Result<Self> {
         let code = method.code.as_ref().context("method has no code")?;
-        let ir = DecodedMethod::decode(code).context("instruction analysis")?;
+        let MethodFrontEnd { ir, bound } = MethodFrontEnd::build(class, method)?;
         let cfg = ControlFlowGraph::build(code).context("block analysis")?;
         let ssa = SsaMethod::build(code, &ir, &cfg).context("SSA analysis")?;
-        let bound = BoundCalls::bind(code, &ir, &class.symbols).context("call binding")?;
         let calls = SsaCalls::bind(&bound, &ssa).context("SSA call binding")?;
         Ok(Self {
             class,

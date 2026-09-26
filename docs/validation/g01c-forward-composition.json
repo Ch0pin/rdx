@@ -1,0 +1,129 @@
+{
+  "date": "2026-09-26",
+  "increment": "G01-C-forward-composition",
+  "state": "Complete for eligible sequential/nested forward conditionals; G01 and full visitor positions remain open",
+  "gaps": [
+    "M01",
+    "M07",
+    "M09",
+    "M06"
+  ],
+  "upstream": {
+    "commit": "28ff15e4ae69950aebea110a13e5ab895d234dfc",
+    "paths": [
+      "jadx-core/src/main/java/jadx/core/dex/visitors/blocks/BlockSplitter.java",
+      "jadx-core/src/main/java/jadx/core/dex/visitors/blocks/DominatorTree.java"
+    ],
+    "adaptation": "Canonical split/connect data plus reversed forward-DAG CHK postdominator chain intersection; terminal-aware region closure preserves existing rendering. Not full visitor parity."
+  },
+  "scope": "Canonical per-branch successor/join plans and decoded normal-CFG liveness govern existing sequential/nested forward conditions. Single-condition layouts retained.",
+  "delegation": {
+    "implementation": "gpt-6-sol",
+    "integration_tests": "gpt-6-sol",
+    "independent_review": "gpt-6-astra",
+    "integration_and_full_validation": "parent"
+  },
+  "validation": {
+    "default_suite": {
+      "passed": 819,
+      "failed": 0,
+      "ignored": 86
+    },
+    "public_positives": 12,
+    "public_negatives": 8,
+    "selected_jvm_tests": {
+      "passed": 1,
+      "failed": 0,
+      "generated_methods": 12,
+      "outcomes": 1225,
+      "effect_and_exception_trace_scenarios": 425,
+      "command": "cargo test --test native_shared_cfg_composition -- --include-ignored",
+      "focused_result": "3 passed, 0 failed, 0 ignored"
+    },
+    "private_tests": {
+      "passed": 4,
+      "poison_shapes": [
+        "sequential",
+        "nested",
+        "nested with early terminal arm"
+      ],
+      "malformed_plan_and_edge_mutations": 14,
+      "additional": "Nonempty navigation links and direct join live masks; decoded read mutation changes liveness; wide spans; synthetic helper-level storage-budget fallback retains registers."
+    },
+    "review": "Astra independent design/code/private-tests/JVM-oracle review and parent inspection passed. Early source-layout/fixture assumptions corrected without changing established runtime behavior.",
+    "clippy": "cargo clippy --locked -j 2 --all-targets -- -D warnings: passed",
+    "format": "cargo fmt --all -- --check: passed",
+    "diff": "git diff --check: passed",
+    "build": "cargo build --release --locked -j 2 --bin rdx: passed"
+  },
+  "corpus": {
+    "file": "com.android.vending.apk",
+    "sha256": "c9910583fc93af2b750bde69d3db89a625359e19281adb5b3aa607b640d64ee5",
+    "concrete_methods": 268289,
+    "before_reconstructed": 260225,
+    "after_reconstructed": 260225,
+    "fallback_methods": 8064,
+    "entire_report_identical": true,
+    "report_sha256": "54ec0d59c0dd5148cd40bed1a9779babf5cd989455cda43a106aa05d882776f9",
+    "metric": "Pinned APK reconstruction, not universal coverage or semantic accuracy"
+  },
+  "search": {
+    "query": "getClass",
+    "sample_classes": 300,
+    "runs_per_binary": 3,
+    "exact_matches_and_corpus_equal": true,
+    "matches": 53,
+    "timings": {
+      "before": {
+        "cold": [
+          0.228993958,
+          0.226178917,
+          0.237586209
+        ],
+        "warm": [
+          0.00121825,
+          0.001260166,
+          0.001268584
+        ]
+      },
+      "after": {
+        "cold": [
+          0.233637167,
+          0.227121167,
+          0.224893833
+        ],
+        "warm": [
+          0.001240333,
+          0.0012395,
+          0.001193417
+        ]
+      }
+    },
+    "median_seconds": {
+      "before": {
+        "cold": 0.228993958,
+        "warm": 0.001260166
+      },
+      "after": {
+        "cold": 0.227121167,
+        "warm": 0.0012395
+      }
+    },
+    "timing_note": "Three alternating paired runs over300classes after other gates; cold median228.994ms to227.121ms, warm1.260ms to1.240ms. Small local sample, not a universal performance claim."
+  },
+  "hashes": {
+    "target/validation/rdx-before-g01c-forward-composition": "b0fdcc31edfca041513419ae7598e6a9f6a3d5e1bd80ee548c1086b39c8c68b8",
+    "target/release/rdx": "ce7faeba9e11f958b86e83102fb14efbe03982a359759d65c7e10cf8edd752a0",
+    "src/native_cfg.rs": "89e31b8e433336ca3c9a64c5c3430536a79332d917a31cc87d72415bdbea4726",
+    "src/native_java/method.rs": "df1b3e477a8a8c4c34339133b98be3ccae7eb1648b3193f8bfd6ffbc52af80d1",
+    "tests/native_shared_cfg_composition.rs": "6c465a2ec7425e9aaa03050df53a840588f8665100b1b278065deafb70bc12f7"
+  },
+  "limits": [
+    "Constructors, loops/backedges, switches/payloads, handlers/monitors and allocation-specific paths retain legacy routing.",
+    "Raw eligibility scan remains; selected malformed shared data cannot retry raw rendering.",
+    "Full MethodAnalysis keeps raw CFG builder; no general SSA/type-driven emission or full upstream block transformation parity.",
+    "Liveness storage budget32MiB/work16million retains all registers on exhaustion; helper-level synthetic4101-block budget test exceeds production branch limit and is not support evidence."
+  ],
+  "next": "G01-C-natural-loop: one existing reducible pretest loop with one dominated backedge/exit, canonical loop metadata and decoded fixed-point liveness.",
+  "delivery": "No release, GUI deployment, commit or push."
+}

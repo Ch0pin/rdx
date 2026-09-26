@@ -61,9 +61,11 @@ goto instructions and original offsets, excludes payload data, and conservativel
 isolates protected instructions for exceptional edges. It does not yet implement
 JADX's synthetic block transformations, SSA or region construction. Dominator
 analysis is a separate stage described below.
-This stage is exposed through a separate corpus audit; the GUI source renderer
-still uses the existing register-value lowering. See
-[`docs/jadx-port-plan.md`](../../docs/jadx-port-plan.md) for the remaining passes.
+The raw stage remains available for full method analysis. G01-C-start additionally
+builds blocks from shared decoded instructions and makes the GUI renderer consume
+their edges and joins for one eligible forward conditional, while retaining the
+existing register-value lowering. See the
+[canonical inventory](../../docs/jadx-gap-inventory.md) for remaining integration.
 
 `src/native_dominators.rs` adapts pinned
 [`DominatorTree.java`](https://github.com/skylot/jadx/blob/28ff15e4ae69950aebea110a13e5ab895d234dfc/jadx-core/src/main/java/jadx/core/dex/visitors/blocks/DominatorTree.java):
@@ -216,6 +218,25 @@ nested/multiple-release/mixed exception shapes. It is a partial implementation,
 not a complete port of the upstream region maker. Original SPDX/license terms
 and notices remain covered by the files above.
 
+## Loop escape regions
+
+`native_java/method.rs` follows the control-flow membership and exit-path approach
+of pinned JADX's
+[`LoopInfo.java`](https://github.com/skylot/jadx/blob/28ff15e4ae69950aebea110a13e5ab895d234dfc/jadx-core/src/main/java/jadx/core/dex/attributes/nodes/LoopInfo.java)
+and
+[`LoopRegionMaker.java`](https://github.com/skylot/jadx/blob/28ff15e4ae69950aebea110a13e5ab895d234dfc/jadx-core/src/main/java/jadx/core/dex/visitors/regions/maker/LoopRegionMaker.java).
+Instruction address order alone does not determine whether an edge leaves a
+loop. RDX discovers its supported loop regions before validating escape paths,
+then follows the original normal edges to reject reentry. Separately validated
+downstream loops may remain on an escape path; this is not a termination proof.
+Protected instructions require a separate exception-ownership proof and are
+excluded from this lowering.
+
+This is a bounded Rust adaptation of the approach, not a full port of JADX's
+dominator-frontier outblock selection or loop visitors. RDX can duplicate a
+shared continuation into mutually exclusive exits, subject to its existing
+work and output limits. It does not introduce a Java runtime dependency.
+
 ## Class and package display aliases
 
 `native_java/names.rs` follows the separation of original identity and valid
@@ -254,3 +275,147 @@ The Rust generator reads exact DEX symbol descriptors, always selects the exact
 overload, uses positional argument names, and calls that captured overload.
 Each snippet is scoped inside `Java.perform` so pasted snippets cannot overwrite
 one another's method handles. Class-wide and field snippets are not implemented.
+
+## G01-A shared front-end integration
+
+`native_method::MethodFrontEnd` now shares the existing attributed
+`native_ir` instruction decoder and `native_calls` signature binder between
+full method analysis and eligible straight-line Java rendering. Production
+rendering consumes decoded instruction boundaries and invocation bindings.
+G01-B incrementally adds decoded move, numeric constant, reference constant,
+move-result, return and arithmetic operands (109 comparison/unary/binary encodings).
+Arithmetic preserves the existing native numeric lowering and boolean fast paths;
+this is operand integration, not full ProcessInstructionsVisitor parity.
+G01-B-fields adds shared field operands and pool identity for 28 instance/static
+encodings, retaining existing resolution, effects and constructor guards.
+G01-B-array-types adds 18 array/type encodings using normalized operands for
+shared and legacy lowering, preserving existing exception and store checks.
+G01-B-throw adds shared throw operands without changing exception/prologue logic.
+G01-B is complete only for currently supported eligible straight-line operands.
+G01-C-start builds canonical blocks and successors from decoded instructions,
+following BlockSplitter split/connect and target-identity handling. Production
+consumes those edges, the join, decoded branch operands and decoded tail liveness
+for one eligible forward conditional. This includes terminal-arm and bypass shapes;
+constructor branches and complex/excluded legacy shapes remain separate work.
+Synthetic blocks, exception normalization and general SSA/type-driven emission
+remain open. This integration adds no claim of full
+`CheckCode`, `AttachMethodDetails` or `ProcessInstructionsVisitor` parity.
+See the [canonical gap inventory](../../docs/jadx-gap-inventory.md) and
+[G01-A evidence](../../docs/validation/g01a-shared-front-end.md).
+
+## G01-C forward composition
+
+Production forward conditional rendering now consumes per-branch canonical plans,
+reverse-DAG postdominators and terminal-aware region closure. Postdominator chain
+intersection follows the Cooper/Harvey/Kennedy approach used by pinned
+`DominatorTree.java`, applied to the reversed forward-only graph with a virtual
+terminal exit. This bounded adaptation is not full visitor parity.
+Decoded block live-in bitsets use successor union and reverse kill/gen transfer,
+with conservative retain-all behavior when storage/work budgets are exhausted.
+Existing single-condition layouts remain stable; sequential/nested forward
+conditions now share the same decoded data. Loops, exceptions, constructors and
+allocation-specific paths retain their existing routes.
+See [G01-C-forward-composition evidence](../../docs/validation/g01c-forward-composition.md).
+
+## G01-C natural loop
+
+The selected pretest-loop path adapts `BlockProcessor.markLoops`' dominating
+successor rule for identifying a backedge. The existing dominator analysis and
+reverse predecessor closure prove single-entry loop membership. The bounded
+renderer accepts one guard, one unconditional latch, a straight-line body and
+one guard exit. Canonical metadata is revalidated before emission. Decoded
+liveness now iterates to a fixed point for this cyclic graph, with conservative
+retain-all behavior on budget exhaustion.
+
+This is not full BlockProcessor or loop-restructuring parity. Body conditionals,
+multiple latches/exits, nested loops, exceptions and allocation-specific paths
+retain legacy routing. See [G01-C-natural-loop evidence](../../docs/validation/g01c-natural-loop.md).
+
+## G01-C loop body composition
+
+The selected single-loop path now composes forward body conditionals using the
+existing canonical postdominator/region-closure planner. A planning copy cuts only
+the latch backedge. Dominance, natural-loop membership and fixed-point liveness
+continue to use the complete cyclic graph. Root validation recomputes body plans;
+selected malformed plans cannot fall back to raw branch operands.
+
+This combines the bounded BlockProcessor/DominatorTree adaptations described
+above, not full upstream loop visitor parity. Body terminal arms, break/continue,
+nested loops and multiple latches remain outside the selected path. See
+[G01-C-loop-body-composition evidence](../../docs/validation/g01c-loop-body-composition.md).
+
+## G01-C common-exit loop break
+
+The bounded BlockProcessor/DominatorTree adaptation now admits one conditional
+body break to the existing guard exit. Canonical metadata validates that edge;
+the planning copy removes its taken successor while the complete cyclic CFG
+retains dominance and liveness authority. Exit slots preserve header and early
+exit values, including proven restored literals. This is not full upstream
+visitor parity. Continue, multiple breaks and nested loops remain outside the
+selected scope. See [G01-C-loop-break evidence](../../docs/validation/g01c-loop-break.md).
+
+## G01-C conditional loop continue
+
+The bounded BlockProcessor/DominatorTree adaptation admits one conditional
+backedge to the same dominating header, alongside one unconditional latch and
+optional common-exit break. Canonical edge metadata drives condition rendering
+and snapshot header-slot synchronization. Planning cuts taken continue/break
+edges while full cyclic liveness preserves them. LoopRegionMaker's synthetic
+continue insertion was inspected as a reference, not ported wholesale. Multiple
+conditional backedges and nested loops remain outside this increment. See
+[G01-C-loop-continue evidence](../../docs/validation/g01c-loop-continue.md).
+
+## G01-C loop edge composition
+
+The bounded BlockProcessor/DominatorTree adaptation now collects multiple
+conditional break/continue edges targeting the same header/common exit, retaining
+one unconditional latch. Root validation recomputes the ordered collection; full
+cyclic dominance/liveness and restored-literal proofs include every edge. Forward
+planning removes taken special edges, preserving actual fallthrough. Binary-search
+lookups and the existing 1,024 total-control budget bound the widened route.
+This is not full visitor or nested-loop parity. See
+[G01-C-loop-edge-composition evidence](../../docs/validation/g01c-loop-edge-composition.md).
+
+## G01-C outer loop composition
+
+The bounded single-loop BlockProcessor/DominatorTree adaptation now composes
+acyclic regions before/after/around the loop, including bypasses. Outer planning
+projects the loop to its header-to-exit edge and hides interior successors; the
+complete cyclic graph remains the liveness/dominance authority. Canonical guard
+selection uses the header terminator, and merged body/outer plans reject interior
+joins or external body/latch entries. This is not full visitor or nested-loop
+parity. See [G01-C-loop-outer-composition evidence](../../docs/validation/g01c-loop-outer-composition.md).
+
+## G01-C disjoint loop composition
+
+The bounded BlockProcessor.markLoops/registerLoops adaptation now collects up to
+32 nonoverlapping canonical pretest loops. Dominators are computed once; each
+region owns its latch, guard, exit and conditional break/continue edges. Shared
+body and atomic outer projections support sequential and alternative loops,
+while original cyclic CFG liveness spans all regions. Root validation rederives
+regions, owner-tagged edges and plans. Membership and body planning have shared
+work budgets, in addition to the existing 1,024-control bound.
+
+Nested/intersecting loops and unsupported exits remain on existing handling.
+This is not full upstream visitor parity. See
+[G01-C-disjoint-loop-composition evidence](../../docs/validation/g01c-disjoint-loop-composition.md).
+
+## G01-C nested loop composition
+
+The native bounded adaptation uses BlockProcessor.processNestedLoops as a
+reference for nearest-containing parent ownership. Up to four levels share
+body-planning work budgets; immediate children collapse atomically during
+parent planning while complete cyclic CFG remains authoritative for liveness
+and dominance. Malformed parent/edge/branch caches reject without raw retry.
+This does not complete the upstream visitor. See
+[validation](../../docs/validation/g01c-nested-loop-composition.md).
+
+## G01-C posttest loop
+
+The bounded native specialization references LoopRegionMaker.process(),
+makeLoopRegion() and isExitAtLoopEnd() at the pinned revision. Canonical
+membership/dominance and decoded conditional-latch operands drive a mandatory
+straight-line body with one exit. Discarded type preview does not hoist runtime
+effects, and distinct exit snapshots preserve body-only liveouts. This is not
+complete condition-at-end region parity. See
+[validation](../../docs/validation/g01c-posttest-loop.md).

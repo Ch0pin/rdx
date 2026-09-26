@@ -4,6 +4,58 @@ All application runtime paths use Rust. Java fallback has been removed. The
 native implementation adapts algorithms from pinned JADX sources; it does not
 embed or execute JADX.
 
+## Current pipeline increment
+
+[G01-A](validation/g01a-shared-front-end.md) integrates shared decoded instruction
+boundaries and invocation bindings into eligible straight-line rendering without
+adding CFG/SSA analysis to every method. The [gap inventory](jadx-gap-inventory.md)
+tracks the remaining operand, CFG and typed-emission work; G01 remains open.
+[G01-B-start](validation/g01b-move-constants.md) additionally routes all nine move encodings and eight numeric constant
+encodings through shared decoded operands. [G01-B-reference-constants](validation/g01b-reference-constants.md) extends the same route to string, jumbo-string and class
+constant destinations/pool references. [G01-B-results-returns](validation/g01b-results-returns.md)
+adds decoded result/return operands and bound-result destination checks.
+[G01-B-arithmetic](validation/g01b-arithmetic.md) migrates all 109 comparison,
+unary/conversion, binary, 2addr and literal arithmetic encodings, including boolean
+fast paths. Fixed-size operand storage avoids per-instruction heap allocation.
+[G01-B-fields](validation/g01b-fields.md) adds all 28 instance/static field
+encodings, including decoded pool identity and receiver/value registers.
+[G01-B-array-types](validation/g01b-array-types.md) adds 18 cast, type-test,
+array-length, new-array and array-access encodings through a fixed-size operand
+structure shared with legacy lowering. [G01-B-throw](validation/g01b-throw.md)
+adds the terminal throw operand, preserving existing exception and constructor
+guards. This completes operand integration for currently supported eligible
+straight-line methods. [G01-C-start](validation/g01c-start.md) now integrates
+decoded blocks, successors, joins, branch operands and join-tail liveness for one
+eligible forward conditional. [G01-C-forward-composition](validation/g01c-forward-composition.md)
+extends this to eligible sequential/nested forward conditionals with canonical
+per-branch joins and decoded CFG liveness.
+[G01-C-natural-loop](validation/g01c-natural-loop.md) adds one existing reducible
+pretest loop with a straight-line body, one dominated unconditional latch and one
+guard exit. Canonical loop metadata and decoded fixed-point liveness govern the
+selected path. [G01-C-loop-body-composition](validation/g01c-loop-body-composition.md)
+adds sequential/nested forward body conditionals with canonical plans and
+revalidated joins. A temporary planning graph cuts the latch backedge; the full
+cyclic graph still governs dominance and liveness. Broader loop/exception
+integration and general typed emission remain open.
+[G01-C-loop-break](validation/g01c-loop-break.md) adds one conditional body break
+to the existing common exit, with canonical exit metadata and synchronization.
+Full cyclic liveness retains the break edge. Selected exit slots reuse proven
+restored-literal invariants; legacy synchronization remains unchanged.
+[G01-C-loop-continue](validation/g01c-loop-continue.md) adds one conditional
+backedge to the same header alongside the unconditional latch and optional break.
+Canonical metadata drives decoded conditions, actual fallthrough and snapshot
+header-slot synchronization; complete cyclic liveness retains both backedges.
+[G01-C-loop-edge-composition](validation/g01c-loop-edge-composition.md) generalizes
+break/continue metadata to an ordered collection within the same loop. Each edge
+participates in canonical validation, planning, liveness and invariant proofs;
+the existing 1,024-control bound remains enforced. Binary-search lookups avoid
+rescanning the instruction stream for each backedge.
+[G01-C-loop-outer-composition](validation/g01c-loop-outer-composition.md) composes
+forward regions before/after/around one loop, including bypass and outer return
+arms. Atomic outer planning retains the full cyclic graph for liveness; guard
+selection uses the header terminator and interior-entry/ownership checks remain.
+Validation and remaining effect-model limits are recorded in the inventory.
+
 ## Working
 
 - APK and raw little-endian DEX 035/037/038/039/040 loading, multidex inventories,
@@ -467,3 +519,55 @@ on overriding methods. Some DEX patterns require an explicit source normalizatio
 policy: allocating an object without ever invoking a constructor, for example,
 has no directly equivalent Java `new` expression. Increasing acceptance by
 silently dropping such an allocation would change observable behavior.
+
+### JADX-guided loop regions and exit values (2026-09-25)
+
+A comparison against pinned JADX 1.5.6 identified two reusable gaps: treating
+backward-address exits as loop-interior edges, and losing header-defined values
+which are live after a loop but not at its entry. The native renderer now
+validates escape paths by control flow and retains a separate exit frame for
+ordinary guarded loops when needed. `aadd.c` and `a.t(byte[])` now reconstruct
+on the pinned Play Store APK.
+
+The same corpus reconstructs **260,225 / 268,289 methods (96.994286%)**, a net
+gain of **716** over the preceding checkpoint; **8,064** fallbacks remain.
+First-rejection counts for `undefined register` fall from 887 to 173 and for
+`unsupported loop interior edge` from 841 to 284. Other reasons can increase
+when an earlier blocker is removed; these categories are not independent
+feature-coverage measurements.
+
+The change preserves reentry and exception-ownership guards. Shared continuations
+may be duplicated into mutually exclusive exits, so output can be more verbose
+than JADX's. It is not the complete upstream SSA/region pipeline. See the
+[comparison and reproducible commands](validation/jadx-loop-comparison.md) and
+[coverage evidence](validation/coverage-jadx-loops.json).
+
+### Shared disjoint loops (G01-C)
+
+The shared decoded route now supports up to 32 nonoverlapping canonical pretest
+loops in forward regions, including sequential loops, alternatives and bypasses.
+Loop-local edge ownership prevents one loop's break handling from affecting
+another; full cyclic CFG liveness preserves values needed by later loops. Body
+and outer projections share planning work; selected malformed metadata rejects
+without retrying raw operands. Nested/intersecting loops retain existing handling.
+See [validation](validation/g01c-disjoint-loop-composition.md) for evidence and
+explicit limits; this does not close a complete JADX visitor.
+
+### Shared nested loops (G01-C)
+
+The shared decoded route now composes up to four parent-owned canonical pretest
+loop levels within 32 total loops. Child regions are atomic during parent-body
+planning; original cyclic CFG dominance and liveness still govern carried values.
+Owner-local breaks/continues and parent ownership after child exit are validated.
+Cross-owner exits and unsupported shapes retain legacy handling. See
+[validation](validation/g01c-nested-loop-composition.md) for gates and limits.
+
+### Shared posttest loop (G01-C)
+
+A single straight-line posttest loop now uses a canonical conditional latch and
+sole fallthrough exit. The body runs before the first condition check; distinct
+exit slots preserve values defined inside the body and consumed after exit.
+The latch condition is evaluated before carried-value snapshots are copied.
+Malformed targets and selected metadata reject without retrying raw operands.
+Additional controls and nested loops retain established handling. See
+[validation](validation/g01c-posttest-loop.md) for evidence and limits.

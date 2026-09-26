@@ -1,0 +1,122 @@
+{
+  "date": "2026-09-26",
+  "increment": "G01-C-start",
+  "state": "Complete for one eligible forward conditional; G01 and whole visitor positions remain open",
+  "gaps": [
+    "M01",
+    "M07",
+    "M06"
+  ],
+  "upstream": {
+    "commit": "28ff15e4ae69950aebea110a13e5ab895d234dfc",
+    "path": "jadx-core/src/main/java/jadx/core/dex/visitors/blocks/BlockSplitter.java",
+    "adaptation": "Split/connect and target identity; not synthetic block or exception normalization parity"
+  },
+  "scope": "Decoded blocks, canonical successors/join, decoded conditions/gotos and decoded linear join-tail liveness drive eligible single forward conditional rendering. Shared-tail, no-goto bypass and terminal-arm shapes supported.",
+  "delegation": {
+    "implementation": "gpt-6-sol",
+    "integration_tests": "gpt-6-sol",
+    "independent_review": "gpt-6-astra",
+    "integration_and_full_validation": "parent"
+  },
+  "validation": {
+    "default_suite": {
+      "passed": 813,
+      "failed": 0,
+      "ignored": 85
+    },
+    "public_positives": 28,
+    "public_negatives": 11,
+    "selected_jvm_tests": {
+      "passed": 1,
+      "failed": 0,
+      "generated_methods": 28,
+      "outcomes": 336,
+      "effect_and_exception_trace_scenarios": 10,
+      "command": "cargo test --test native_shared_cfg -- --include-ignored",
+      "focused_result": "3 passed, 0 failed, 0 ignored"
+    },
+    "private_tests": {
+      "passed": 6,
+      "raw_condition_goto_combinations": 36,
+      "malformed_branch_cfg_mutations": 24,
+      "malformed_goto_mutations": 24,
+      "additional": "Reference/null poisoning; canonical bypass and terminal joins; nonempty call navigation preserved after poisoning; excluded routing and straight-line no-CFG checks"
+    },
+    "review": "Astra independent review and parent inspection passed; checked canonical edges/join/condition/liveness consumption, failure boundaries, effect oracle and navigation checks",
+    "clippy": "cargo clippy --locked -j 2 --all-targets -- -D warnings: passed",
+    "format": "cargo fmt --all -- --check: passed",
+    "diff": "git diff --check: passed",
+    "build": "cargo build --release --locked -j 2 --bin rdx: passed"
+  },
+  "corpus": {
+    "file": "com.android.vending.apk",
+    "sha256": "c9910583fc93af2b750bde69d3db89a625359e19281adb5b3aa607b640d64ee5",
+    "concrete_methods": 268289,
+    "before_reconstructed": 260225,
+    "after_reconstructed": 260225,
+    "fallback_methods": 8064,
+    "entire_report_identical": true,
+    "report_sha256": "54ec0d59c0dd5148cd40bed1a9779babf5cd989455cda43a106aa05d882776f9",
+    "metric": "Pinned APK reconstruction, not universal coverage or semantic accuracy"
+  },
+  "search": {
+    "query": "getClass",
+    "sample_classes": 300,
+    "runs_per_binary": 3,
+    "exact_matches_and_corpus_equal": true,
+    "matches": 53,
+    "timings": {
+      "before": {
+        "cold": [
+          0.222491541,
+          0.225295292,
+          0.221377583
+        ],
+        "warm": [
+          0.001250041,
+          0.001190417,
+          0.001196583
+        ]
+      },
+      "after": {
+        "cold": [
+          0.226014667,
+          0.22117425,
+          0.225552834
+        ],
+        "warm": [
+          0.00121925,
+          0.00122425,
+          0.001248541
+        ]
+      }
+    },
+    "median_seconds": {
+      "before": {
+        "cold": 0.222491541,
+        "warm": 0.001196583
+      },
+      "after": {
+        "cold": 0.225552834,
+        "warm": 0.00122425
+      }
+    },
+    "timing_note": "Three alternating pairs over 300 classes after other gates; cold median 222.492 ms to 225.553 ms (+1.38%, 3.061 ms), warm 1.197 ms to 1.224 ms. Small local sample, not a universal performance claim."
+  },
+  "hashes": {
+    "target/validation/rdx-before-g01c-start": "783124025abe300d620e7108955e9c5543ca8d8383bdf61bc7aed2840d134d9d",
+    "target/release/rdx": "b0fdcc31edfca041513419ae7598e6a9f6a3d5e1bd80ee548c1086b39c8c68b8",
+    "src/native_cfg.rs": "ec9fd2393ac531d585fd781b978b7a1bfdad24d464b5297243580fa989ff2499",
+    "src/native_java/method.rs": "1bf7f661aa7cc424678df060187bce7540e0b5535052f40cd811f3cb851437f2",
+    "tests/native_shared_cfg.rs": "c851eac9cda472b0be114a69306444ed06220b147870da962c9147ace48254f4"
+  },
+  "limits": [
+    "Constructors, multiple conditions, backedges/loops, switches/payloads, handlers/monitors and allocation-specific shapes retain existing routes.",
+    "Uses existing register-value lowering; no general SSA/type-driven emission or complete BlockSplitter parity.",
+    "Raw eligibility scan remains; selected shared validation failure never retries raw rendering.",
+    "Full analysis MethodAnalysis still uses the existing raw CFG builder; this decoded builder is integrated into the bounded Java renderer route."
+  ],
+  "next": "G01-C-forward-composition: canonical per-branch joins and decoded CFG liveness for existing sequential/nested forward conditionals.",
+  "delivery": "No release, GUI deployment, commit or push."
+}

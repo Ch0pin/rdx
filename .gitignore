@@ -10,3 +10,9 @@ __pycache__/
 .env.*
 *.pem
 *.key
+
+# Local development inventories and corpus evidence
+/local/
+/docs/jadx-gap-*
+/docs/jadx-port-plan.md
+/docs/validation/

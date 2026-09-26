@@ -31,7 +31,6 @@ removed XOR negations, and one super-to-virtual dispatch replacement.
 
 - `cargo test --release focused_`: four test functions, containing the scenarios above.
 - `cargo test --release --test native_exceptions --test native_allocation_captures --test native_allocation_lowering`: 51 tests passed. This overlaps two of the focused tests; counts must not be added as independent cases.
-- `RDX_TEST_APK=/Users/ch0pin/Desktop/BugBounty/mango-db/com.android.vending.apk cargo test --release --test native_backup_accuracy -- --ignored`: five APK regression tests passed. These check reconstruction, retained calls, headers and metadata, not live Android execution.
 - `cargo clippy --all-targets -- -D warnings`: passed.
 - Logs: `target/validation/focused-semantics.log`, `semantic-regressions.log`, `semantic-apk-checks.log`, `semantic-clippy.log`.
 

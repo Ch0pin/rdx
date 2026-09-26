@@ -40,8 +40,7 @@ attribute parsing of pinned JADX v1.5.6
 to native Rust. Its string-pool reader and bounded XML emitter are RDX code.
 The decoder validates input/chunk/string boundaries, supports UTF-8/UTF-16
 pools, and handles common Android typed attribute values without a Java runtime.
-Resource IDs remain numeric: ARSC symbol lookup and manifest enum/flag names
-are not yet ported. This is not the complete upstream resources subsystem.
+RDX also implements resource-table lookup and supported manifest enum/flag names. This is not the complete upstream resources subsystem.
 
 ## Native Java reconstruction
 
@@ -65,7 +64,7 @@ The raw stage remains available for full method analysis. G01-C-start additional
 builds blocks from shared decoded instructions and makes the GUI renderer consume
 their edges and joins for one eligible forward conditional, while retaining the
 existing register-value lowering. See the
-[canonical inventory](../../docs/jadx-gap-inventory.md) for remaining integration.
+[native engine documentation](../../docs/native-engine.md) for remaining integration.
 
 `src/native_dominators.rs` adapts pinned
 [`DominatorTree.java`](https://github.com/skylot/jadx/blob/28ff15e4ae69950aebea110a13e5ab895d234dfc/jadx-core/src/main/java/jadx/core/dex/visitors/blocks/DominatorTree.java):
@@ -300,8 +299,7 @@ constructor branches and complex/excluded legacy shapes remain separate work.
 Synthetic blocks, exception normalization and general SSA/type-driven emission
 remain open. This integration adds no claim of full
 `CheckCode`, `AttachMethodDetails` or `ProcessInstructionsVisitor` parity.
-See the [canonical gap inventory](../../docs/jadx-gap-inventory.md) and
-[G01-A evidence](../../docs/validation/g01a-shared-front-end.md).
+See [native engine documentation](../../docs/native-engine.md).
 
 ## G01-C forward composition
 
@@ -315,7 +313,7 @@ with conservative retain-all behavior when storage/work budgets are exhausted.
 Existing single-condition layouts remain stable; sequential/nested forward
 conditions now share the same decoded data. Loops, exceptions, constructors and
 allocation-specific paths retain their existing routes.
-See [G01-C-forward-composition evidence](../../docs/validation/g01c-forward-composition.md).
+See [native engine documentation](../../docs/native-engine.md).
 
 ## G01-C natural loop
 
@@ -329,7 +327,7 @@ retain-all behavior on budget exhaustion.
 
 This is not full BlockProcessor or loop-restructuring parity. Body conditionals,
 multiple latches/exits, nested loops, exceptions and allocation-specific paths
-retain legacy routing. See [G01-C-natural-loop evidence](../../docs/validation/g01c-natural-loop.md).
+retain legacy routing. See [native engine documentation](../../docs/native-engine.md).
 
 ## G01-C loop body composition
 
@@ -342,7 +340,7 @@ selected malformed plans cannot fall back to raw branch operands.
 This combines the bounded BlockProcessor/DominatorTree adaptations described
 above, not full upstream loop visitor parity. Body terminal arms, break/continue,
 nested loops and multiple latches remain outside the selected path. See
-[G01-C-loop-body-composition evidence](../../docs/validation/g01c-loop-body-composition.md).
+[native engine documentation](../../docs/native-engine.md).
 
 ## G01-C common-exit loop break
 
@@ -352,7 +350,7 @@ the planning copy removes its taken successor while the complete cyclic CFG
 retains dominance and liveness authority. Exit slots preserve header and early
 exit values, including proven restored literals. This is not full upstream
 visitor parity. Continue, multiple breaks and nested loops remain outside the
-selected scope. See [G01-C-loop-break evidence](../../docs/validation/g01c-loop-break.md).
+selected scope. See [native engine documentation](../../docs/native-engine.md).
 
 ## G01-C conditional loop continue
 
@@ -363,7 +361,7 @@ and snapshot header-slot synchronization. Planning cuts taken continue/break
 edges while full cyclic liveness preserves them. LoopRegionMaker's synthetic
 continue insertion was inspected as a reference, not ported wholesale. Multiple
 conditional backedges and nested loops remain outside this increment. See
-[G01-C-loop-continue evidence](../../docs/validation/g01c-loop-continue.md).
+[native engine documentation](../../docs/native-engine.md).
 
 ## G01-C loop edge composition
 
@@ -374,7 +372,7 @@ cyclic dominance/liveness and restored-literal proofs include every edge. Forwar
 planning removes taken special edges, preserving actual fallthrough. Binary-search
 lookups and the existing 1,024 total-control budget bound the widened route.
 This is not full visitor or nested-loop parity. See
-[G01-C-loop-edge-composition evidence](../../docs/validation/g01c-loop-edge-composition.md).
+[native engine documentation](../../docs/native-engine.md).
 
 ## G01-C outer loop composition
 
@@ -384,7 +382,7 @@ projects the loop to its header-to-exit edge and hides interior successors; the
 complete cyclic graph remains the liveness/dominance authority. Canonical guard
 selection uses the header terminator, and merged body/outer plans reject interior
 joins or external body/latch entries. This is not full visitor or nested-loop
-parity. See [G01-C-loop-outer-composition evidence](../../docs/validation/g01c-loop-outer-composition.md).
+parity. See [native engine documentation](../../docs/native-engine.md).
 
 ## G01-C disjoint loop composition
 
@@ -398,7 +396,7 @@ work budgets, in addition to the existing 1,024-control bound.
 
 Nested/intersecting loops and unsupported exits remain on existing handling.
 This is not full upstream visitor parity. See
-[G01-C-disjoint-loop-composition evidence](../../docs/validation/g01c-disjoint-loop-composition.md).
+[native engine documentation](../../docs/native-engine.md).
 
 ## G01-C nested loop composition
 
@@ -408,7 +406,7 @@ body-planning work budgets; immediate children collapse atomically during
 parent planning while complete cyclic CFG remains authoritative for liveness
 and dominance. Malformed parent/edge/branch caches reject without raw retry.
 This does not complete the upstream visitor. See
-[validation](../../docs/validation/g01c-nested-loop-composition.md).
+[native engine documentation](../../docs/native-engine.md).
 
 ## G01-C posttest loop
 
@@ -418,4 +416,4 @@ membership/dominance and decoded conditional-latch operands drive a mandatory
 straight-line body with one exit. Discarded type preview does not hoist runtime
 effects, and distinct exit snapshots preserve body-only liveouts. This is not
 complete condition-at-end region parity. See
-[validation](../../docs/validation/g01c-posttest-loop.md).
+[native engine documentation](../../docs/native-engine.md).

@@ -55,4 +55,4 @@ fail a later stage; graph acceptance is never counted as dominator acceptance.
 Operand decoding is audited independently of graph construction: an operand failure
 does not conceal graph diagnostics for the same method.
 
-See [the pinned pass mapping and measured baseline](jadx-port-plan.md).
+See [validation](validation.md) for test scope and interpretation.

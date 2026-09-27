@@ -38,13 +38,17 @@ remain visible as labelled DEX disassembly. See [engine coverage and limitations
 
 Click an image to view it at full size.
 
-| Light theme | Dark theme |
-| --- | --- |
-| [![Java source in RDX's light theme](docs/images/rdx-light.png)](docs/images/rdx-light.png) | [![Java source in RDX's dark theme](docs/images/rdx-dark.png)](docs/images/rdx-dark.png) |
+**Light theme**
+
+<a href="docs/images/rdx-light.png"><img src="docs/images/rdx-light.png" width="540" alt="Java source in RDX light theme"></a>
+
+**Dark theme**
+
+<a href="docs/images/rdx-dark.png"><img src="docs/images/rdx-dark.png" width="540" alt="Java source in RDX dark theme"></a>
 
 **Manifest inspection with exported components highlighted**
 
-[![Decoded Android manifest with an exported receiver highlighted](docs/images/rdx-manifest.png)](docs/images/rdx-manifest.png)
+<a href="docs/images/rdx-manifest.png"><img src="docs/images/rdx-manifest.png" width="540" alt="Decoded Android manifest with an exported receiver highlighted"></a>
 
 ## MCP: connect your assistant
 

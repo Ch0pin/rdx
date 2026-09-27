@@ -23,6 +23,7 @@ pub enum Icon {
     Image,
     Code,
     Plugin,
+    Copy,
 }
 
 /// A compact, font-independent icon drawn in a shared 24-unit coordinate space.
@@ -32,7 +33,8 @@ pub fn paint(ui: &egui::Ui, rect: Rect, icon: Icon) {
     let origin = rect.center() - Vec2::splat(12.0 * scale);
     let point = |x: f32, y: f32| origin + Vec2::new(x, y) * scale;
     let accent = match icon {
-        Icon::Classes | Icon::Code | Icon::Dex => (91, 153, 220),
+        Icon::Classes | Icon::Code => (91, 153, 220),
+        Icon::Dex => (111, 190, 84),
         Icon::Assets | Icon::Image => (61, 173, 150),
         Icon::Resources | Icon::Folder | Icon::Open => (201, 157, 72),
         Icon::Manifest | Icon::Signature => (104, 166, 109),
@@ -209,14 +211,36 @@ pub fn paint(ui: &egui::Ui, rect: Rect, icon: Icon) {
             }
         }
         Icon::Dex => {
-            box_at(6., 6., 12., 12.);
-            for i in [8., 12., 16.] {
-                line((i, 3.), (i, 6.));
-                line((i, 18.), (i, 21.));
-                line((3., i), (6., i));
-                line((18., i), (21., i));
+            // A solid dome, antennae, limbs and contrasting eyes stay legible at 18 px.
+            line((8., 5.), (6.5, 2.5));
+            line((16., 5.), (17.5, 2.5));
+            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                [
+                    point(6., 10.),
+                    point(6., 2.),
+                    point(18., 2.),
+                    point(18., 10.),
+                ],
+                true,
+                tint,
+                Stroke::NONE,
+            ));
+            let solid_box = |x: f32, y: f32, w: f32, h: f32| {
+                painter.rect_filled(
+                    Rect::from_min_size(point(x, y), Vec2::new(w, h) * scale),
+                    1.2 * scale,
+                    tint,
+                );
+            };
+            solid_box(6., 11., 12., 7.);
+            solid_box(2.5, 11., 2.5, 7.);
+            solid_box(19., 11., 2.5, 7.);
+            solid_box(8., 17., 2.8, 4.5);
+            solid_box(13.2, 17., 2.8, 4.5);
+            let eye = ui.visuals().panel_fill;
+            for x in [9., 15.] {
+                painter.circle_filled(point(x, 7.5), 0.8 * scale, eye);
             }
-            box_at(10., 10., 4., 4.);
         }
         Icon::Signature => {
             path(
@@ -265,6 +289,14 @@ pub fn paint(ui: &egui::Ui, rect: Rect, icon: Icon) {
             path(&[(12., 17.), (12., 21.), (17., 21.)], false, false);
             line((9., 12.), (15., 12.));
         }
+        Icon::Copy => {
+            box_at(8., 8., 12., 13.);
+            path(
+                &[(5., 16.), (3., 16.), (3., 3.), (15., 3.), (15., 5.)],
+                false,
+                false,
+            );
+        }
     }
 }
 
@@ -275,7 +307,17 @@ pub fn small(ui: &mut egui::Ui, icon: Icon) {
 
 pub fn button(ui: &mut egui::Ui, icon: Icon, tooltip: &str, enabled: bool) -> egui::Response {
     ui.add_enabled_ui(enabled, |ui| {
-        let response = ui.add(egui::Button::new("").min_size(Vec2::splat(28.0)));
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+        response
+            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tooltip));
+        let visuals = ui.style().interact(&response);
+        if response.hovered() || response.has_focus() || response.is_pointer_button_down_on() {
+            ui.painter().rect_filled(rect, 3.0, visuals.weak_bg_fill);
+        }
+        if response.has_focus() {
+            ui.painter()
+                .rect_stroke(rect, 3.0, visuals.bg_stroke, egui::StrokeKind::Inside);
+        }
         paint(
             ui,
             Rect::from_center_size(response.rect.center(), Vec2::splat(20.0)),

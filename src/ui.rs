@@ -225,6 +225,7 @@ impl Tab {
 }
 
 pub struct App {
+    toolbar_icon: Option<egui::TextureHandle>,
     mcp_server: Option<rdx::mcp::Server>,
     show_mcp: bool,
     mcp_error: String,
@@ -260,6 +261,10 @@ pub struct App {
     tabs: Vec<Tab>,
     selected: usize,
     revealed_tab: Option<Target>,
+    tabs_keep_open: bool,
+    menu_auto_hide: bool,
+    menu_hovered: bool,
+    tabs_hovered: bool,
     #[cfg(test)]
     tab_ui_controls: Vec<(String, egui::Rect)>,
     history: Vec<JumpLocation>,
@@ -279,6 +284,27 @@ pub struct App {
 }
 
 impl App {
+    fn open_new_instance(&mut self) {
+        match std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        }) {
+            Ok(mut child) => {
+                // Reap the independent process when it exits without blocking the UI.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(error) => {
+                self.status = format!("Could not open a new RDX instance: {error}");
+                self.diagnostics.push(self.status.clone());
+            }
+        }
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
         let settings_store = SettingsStore::new();
         let (preferences, settings_error) = match settings_store.load() {
@@ -296,7 +322,7 @@ impl App {
         search.restore_preferences(&preferences.search);
         let mut usages = UsagesWindow::default();
         usages.keep_open = preferences.usages_keep_open;
-        let last_preferences = snapshot_preferences(
+        let mut last_preferences = snapshot_preferences(
             &cc.egui_ctx,
             theme,
             font_size,
@@ -305,16 +331,12 @@ impl App {
             search.preferences(),
             usages.keep_open,
         );
-        cc.egui_ctx.all_styles_mut(|style| {
-            style
-                .text_styles
-                .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
-        });
+        last_preferences.tabs_keep_open = preferences.tabs_keep_open;
+        last_preferences.menu_auto_hide = preferences.menu_auto_hide;
+        crate::ui_style::install(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
         Self {
+            toolbar_icon: None,
             mcp_server: None,
             show_mcp: false,
             mcp_error: String::new(),
@@ -354,6 +376,10 @@ impl App {
             tabs: Vec::new(),
             selected: 0,
             revealed_tab: None,
+            tabs_keep_open: preferences.tabs_keep_open,
+            menu_auto_hide: preferences.menu_auto_hide,
+            menu_hovered: false,
+            tabs_hovered: false,
             #[cfg(test)]
             tab_ui_controls: Vec::new(),
             history: Vec::new(),
@@ -427,7 +453,7 @@ impl App {
     }
 
     fn persist_preferences(&mut self, ctx: &egui::Context) {
-        let preferences = snapshot_preferences(
+        let mut preferences = snapshot_preferences(
             ctx,
             self.theme,
             self.font_size,
@@ -436,6 +462,8 @@ impl App {
             self.search.preferences(),
             self.usages.keep_open,
         );
+        preferences.tabs_keep_open = self.tabs_keep_open;
+        preferences.menu_auto_hide = self.menu_auto_hide;
         if preferences == self.last_preferences {
             return;
         }
@@ -1334,11 +1362,18 @@ impl App {
                 self.tab_ui_controls.push(("views".into(), views.rect));
                 #[cfg(not(test))]
                 let _ = views;
+                ui.checkbox(&mut self.tabs_keep_open, "Keep open")
+                    .on_hover_text("Keep the tab bar visible");
+                if let Some(text) = self.tabs.get(self.selected).and_then(Tab::text)
+                    && icons::button(ui, Icon::Copy, "Copy source", true).clicked()
+                {
+                    ui.ctx().copy_text(text.to_owned());
+                }
                 egui::ScrollArea::horizontal()
                     .id_salt("tabs")
                     .max_width(ui.available_width())
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             for (i, tab) in self.tabs.iter().enumerate() {
                                 if tab.pinned {
                                     icons::small(ui, Icon::Pin);
@@ -1362,8 +1397,18 @@ impl App {
                                     label.to_owned()
                                 };
                                 let response = ui
-                                    .selectable_label(self.selected == i, label)
+                                    .add(egui::Button::new(label).frame(false))
                                     .on_hover_text(&tab.name);
+                                if self.selected == i {
+                                    let accent = ui.visuals().selection.stroke.color;
+                                    ui.painter().line_segment(
+                                        [
+                                            response.rect.left_bottom() + egui::vec2(0.0, 2.0),
+                                            response.rect.right_bottom() + egui::vec2(0.0, 2.0),
+                                        ],
+                                        egui::Stroke::new(2.0, accent),
+                                    );
+                                }
                                 if reveal && self.selected == i {
                                     response.scroll_to_me(Some(egui::Align::Center));
                                 }
@@ -1420,10 +1465,14 @@ impl App {
                                         ui.close_menu();
                                     }
                                 });
-                                if ui.small_button("×").clicked() {
+                                if ui
+                                    .add(egui::Button::new("×").small().frame(false))
+                                    .on_hover_text("Close view")
+                                    .clicked()
+                                {
                                     action = Some((i, TabAction::Close));
                                 }
-                                ui.separator();
+                                ui.add_space(5.0);
                             }
                         });
                     });
@@ -1958,7 +2007,15 @@ fn tree_entry(
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
         let visuals = ui.style().interact_selectable(&response, selected);
         if selected || response.hovered() || response.has_focus() {
-            ui.painter().rect_filled(rect, 4.0, visuals.bg_fill);
+            ui.painter().rect_filled(
+                rect,
+                3.0,
+                if selected {
+                    ui.visuals().selection.bg_fill
+                } else {
+                    visuals.bg_fill
+                },
+            );
         }
         icons::paint(
             ui,
@@ -2143,194 +2200,306 @@ impl eframe::App for App {
         }
         let mut choose_file =
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O));
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.add_space(5.0);
-            ui.horizontal_wrapped(|ui| {
-                let accent = if ui.visuals().dark_mode {
-                    egui::Color32::from_rgb(105, 195, 230)
-                } else {
-                    egui::Color32::from_rgb(0, 91, 125)
-                };
-                ui.heading(egui::RichText::new("RDX").color(accent));
-                ui.separator();
-                plain_menu_bar(ui, |ui| {
-                    ui.menu_button("File", |ui| {
-                        if ui.button("Open APK / DEX…").clicked() {
-                            choose_file = true;
-                            ui.close_menu();
-                        }
-                        if ui
-                            .add_enabled(
-                                self.path.is_some() && !self.busy,
-                                egui::Button::new("Reload"),
-                            )
-                            .clicked()
-                        {
-                            self.open(self.path.clone().unwrap(), ctx);
-                            ui.close_menu();
-                        }
+        let screen = ctx.screen_rect();
+        let reveal = egui::Rect::from_min_size(
+            screen.min,
+            egui::vec2(screen.width(), if self.menu_hovered { 48.0 } else { 8.0 }),
+        );
+        let show_menu = !self.menu_auto_hide
+            || ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| reveal.contains(p)))
+            || ctx.memory(|m| m.any_popup_open());
+        self.menu_hovered = show_menu;
+        if show_menu {
+            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    let texture = self.toolbar_icon.get_or_insert_with(|| {
+                        let icon =
+                            image::load_from_memory(include_bytes!("../assets/icons/rdx.png"))
+                                .expect("bundled app icon")
+                                .resize_exact(48, 48, image::imageops::FilterType::Lanczos3)
+                                .to_rgba8();
+                        ctx.load_texture(
+                            "rdx-toolbar-icon",
+                            egui::ColorImage::from_rgba_unmultiplied([48, 48], &icon),
+                            egui::TextureOptions::LINEAR,
+                        )
                     });
-                    ui.menu_button("View", |ui| {
-                        if ui.checkbox(&mut self.word_wrap, "Word wrap").clicked() {
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        ui.menu_button("Settings", |ui| {
-                            ui.horizontal(|ui| {
-                                icons::small(ui, Icon::Settings);
-                                ui.strong("Preferences");
-                            });
+                    let launch = ui
+                        .add(
+                            egui::Button::image(egui::Image::new((
+                                texture.id(),
+                                egui::vec2(24.0, 24.0),
+                            )))
+                            .frame(false),
+                        )
+                        .on_hover_text("Open a new RDX instance");
+                    launch.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            true,
+                            "Open a new RDX instance",
+                        )
+                    });
+                    if launch.clicked() {
+                        self.open_new_instance();
+                    }
+                    ui.separator();
+                    plain_menu_bar(ui, |ui| {
+                        ui.menu_button("File", |ui| {
+                            if ui.button("New instance").clicked() {
+                                self.open_new_instance();
+                                ui.close_menu();
+                            }
                             ui.separator();
-                            ui.menu_button("Interface theme", |ui| {
-                                let mut appearance =
-                                    ctx.options(|options| options.theme_preference);
-                                for (value, label) in [
-                                    (egui::ThemePreference::System, "System"),
-                                    (egui::ThemePreference::Light, "Light"),
-                                    (egui::ThemePreference::Dark, "Dark"),
-                                ] {
-                                    if ui.selectable_value(&mut appearance, value, label).clicked()
-                                    {
-                                        ctx.set_theme(appearance);
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                            ui.menu_button("Code theme", |ui| {
-                                for (light, label) in [(true, "Light"), (false, "Dark")] {
-                                    if !light { ui.separator(); }
-                                    ui.weak(label);
-                                    for theme in CodeTheme::ALL.into_iter().filter(|theme| theme.is_light() == light) {
-                                        if ui.selectable_value(&mut self.theme, theme, theme.label()).clicked() {
+                            if ui.button("Open APK / DEX…").clicked() {
+                                choose_file = true;
+                                ui.close_menu();
+                            }
+                            if ui
+                                .add_enabled(
+                                    self.path.is_some() && !self.busy,
+                                    egui::Button::new("Reload"),
+                                )
+                                .clicked()
+                            {
+                                self.open(self.path.clone().unwrap(), ctx);
+                                ui.close_menu();
+                            }
+                        });
+                        ui.menu_button("View", |ui| {
+                            ui.checkbox(&mut self.tabs_keep_open, "Keep tabs open");
+                            ui.checkbox(&mut self.menu_auto_hide, "Autohide");
+                            if ui.checkbox(&mut self.word_wrap, "Word wrap").clicked() {
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            ui.menu_button("Settings", |ui| {
+                                ui.horizontal(|ui| {
+                                    icons::small(ui, Icon::Settings);
+                                    ui.strong("Preferences");
+                                });
+                                ui.separator();
+                                ui.menu_button("Interface theme", |ui| {
+                                    let mut appearance =
+                                        ctx.options(|options| options.theme_preference);
+                                    for (value, label) in [
+                                        (egui::ThemePreference::System, "System"),
+                                        (egui::ThemePreference::Light, "Light"),
+                                        (egui::ThemePreference::Dark, "Dark"),
+                                    ] {
+                                        if ui
+                                            .selectable_value(&mut appearance, value, label)
+                                            .clicked()
+                                        {
+                                            ctx.set_theme(appearance);
                                             ui.close_menu();
                                         }
                                     }
-                                }
-                            });
-                            ui.menu_button("Code font", |ui| {
-                                for font in CodeFont::ALL {
-                                    if ui.selectable_value(&mut self.code_font, font, font.label()).clicked() {
-                                        ui.close_menu();
+                                });
+                                ui.menu_button("Code theme", |ui| {
+                                    for (light, label) in [(true, "Light"), (false, "Dark")] {
+                                        if !light {
+                                            ui.separator();
+                                        }
+                                        ui.weak(label);
+                                        for theme in CodeTheme::ALL
+                                            .into_iter()
+                                            .filter(|theme| theme.is_light() == light)
+                                        {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut self.theme,
+                                                    theme,
+                                                    theme.label(),
+                                                )
+                                                .clicked()
+                                            {
+                                                ui.close_menu();
+                                            }
+                                        }
                                     }
-                                }
+                                });
+                                ui.menu_button("Code font", |ui| {
+                                    for font in CodeFont::ALL {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.code_font,
+                                                font,
+                                                font.label(),
+                                            )
+                                            .clicked()
+                                        {
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Code font size");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.font_size)
+                                            .range(10.0..=28.0)
+                                            .speed(0.5)
+                                            .suffix(" px"),
+                                    );
+                                });
+                                ui.separator();
+                                ui.weak("Changes save automatically");
                             });
-                            ui.horizontal(|ui| {
-                                ui.label("Code font size");
-                                ui.add(
-                                    egui::DragValue::new(&mut self.font_size)
-                                        .range(10.0..=28.0)
-                                        .speed(0.5)
-                                        .suffix(" px"),
-                                );
-                            });
-                            ui.separator();
-                            ui.weak("Changes save automatically");
                         });
-                    });
-                    ui.menu_button("Search", |ui| {
-                        let can_find = self.tabs.get(self.selected)
-                            .is_some_and(|tab| matches!(tab.content, Content::Text(_)));
-                        if ui.add_enabled(can_find, egui::Button::new("Find in file…")
-                            .shortcut_text("Cmd/Ctrl+F")).clicked() {
-                            self.open_file_find();
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        for mode in SearchMode::ALL {
-                            if ui.button(mode.label()).clicked() {
-                                self.search.open_mode(mode);
+                        ui.menu_button("Search", |ui| {
+                            let can_find = self
+                                .tabs
+                                .get(self.selected)
+                                .is_some_and(|tab| matches!(tab.content, Content::Text(_)));
+                            if ui
+                                .add_enabled(
+                                    can_find,
+                                    egui::Button::new("Find in file…").shortcut_text("Cmd/Ctrl+F"),
+                                )
+                                .clicked()
+                            {
+                                self.open_file_find();
                                 ui.close_menu();
                             }
-                        }
+                            ui.separator();
+                            for mode in SearchMode::ALL {
+                                if ui.button(mode.label()).clicked() {
+                                    self.search.open_mode(mode);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        ui.menu_button("Tools", |ui| {
+                            if ui.button("MCP Server…").clicked() {
+                                self.show_mcp = true;
+                                ui.close_menu();
+                            }
+                            if ui.button("Plugins…").clicked() {
+                                self.show_plugins = true;
+                                ui.close_menu();
+                            }
+                        });
+                        ui.menu_button("Navigate", |ui| {
+                            if ui
+                                .add_enabled(
+                                    self.can_history(false),
+                                    egui::Button::new("Back").shortcut_text("Alt+Left"),
+                                )
+                                .clicked()
+                            {
+                                self.go_back(ctx);
+                                ui.close_menu();
+                            }
+                            if ui
+                                .add_enabled(
+                                    self.can_history(true),
+                                    egui::Button::new("Forward").shortcut_text("Alt+Right"),
+                                )
+                                .clicked()
+                            {
+                                self.go_forward(ctx);
+                                ui.close_menu();
+                            }
+                        });
                     });
-                    ui.menu_button("Tools", |ui| {
-                        if ui.button("MCP Server…").clicked() {
-                            self.show_mcp = true;
-                            ui.close_menu();
-                        }
-                        if ui.button("Plugins…").clicked() {
-                            self.show_plugins = true;
-                            ui.close_menu();
-                        }
-                    });
-                    ui.menu_button("Navigate", |ui| {
-                        if ui
-                            .add_enabled(
-                                self.can_history(false),
-                                egui::Button::new("Back").shortcut_text("Alt+Left"),
+                    ui.separator();
+                    choose_file |=
+                        icons::button(ui, Icon::Open, "Open APK / DEX (Cmd/Ctrl+O)", true)
+                            .clicked();
+                    if icons::button(
+                        ui,
+                        Icon::Reload,
+                        "Reload project",
+                        self.path.is_some() && !self.busy,
+                    )
+                    .clicked()
+                    {
+                        self.open(self.path.clone().unwrap(), ctx);
+                    }
+                    if icons::button(
+                        ui,
+                        Icon::Back,
+                        "Back to previous reference (Alt+Left)",
+                        self.can_history(false),
+                    )
+                    .clicked()
+                    {
+                        self.go_back(ctx);
+                    }
+                    if icons::button(
+                        ui,
+                        Icon::Forward,
+                        "Forward to next reference (Alt+Right)",
+                        self.can_history(true),
+                    )
+                    .clicked()
+                    {
+                        self.go_forward(ctx);
+                    }
+                    if icons::button(ui, Icon::Plugin, "Manage plugins", true).clicked() {
+                        self.show_plugins = true;
+                    }
+                    if icons::button(ui, Icon::Search, "Code search (Cmd/Ctrl+Shift+F)", true)
+                        .clicked()
+                    {
+                        self.search.open_mode(SearchMode::Code);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.checkbox(&mut self.menu_auto_hide, "Autohide");
+                        let running = self.mcp_server.is_some();
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(62.0, 28.0), egui::Sense::click());
+                        let color = if running {
+                            egui::Color32::from_rgb(55, 180, 95)
+                        } else {
+                            egui::Color32::from_gray(140)
+                        };
+                        ui.painter().circle_filled(
+                            egui::pos2(rect.left() + 9.0, rect.center().y),
+                            5.0,
+                            color,
+                        );
+                        ui.painter().text(
+                            egui::pos2(rect.left() + 21.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            "MCP",
+                            egui::TextStyle::Button.resolve(ui.style()),
+                            ui.visuals().text_color(),
+                        );
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                true,
+                                "MCP server controls",
                             )
+                        });
+                        if response
+                            .on_hover_text(if running {
+                                "MCP active — open controls"
+                            } else {
+                                "MCP inactive — open controls"
+                            })
                             .clicked()
                         {
-                            self.go_back(ctx);
-                            ui.close_menu();
-                        }
-                        if ui.add_enabled(self.can_history(true), egui::Button::new("Forward").shortcut_text("Alt+Right")).clicked() {
-                            self.go_forward(ctx);
-                            ui.close_menu();
+                            self.show_mcp = true;
                         }
                     });
                 });
-                ui.separator();
-                choose_file |=
-                    icons::button(ui, Icon::Open, "Open APK / DEX (Cmd/Ctrl+O)", true).clicked();
-                if icons::button(
-                    ui,
-                    Icon::Reload,
-                    "Reload project",
-                    self.path.is_some() && !self.busy,
-                )
-                .clicked()
-                {
-                    self.open(self.path.clone().unwrap(), ctx);
-                }
-                if icons::button(
-                    ui,
-                    Icon::Back,
-                    "Back to previous reference (Alt+Left)",
-                    self.can_history(false),
-                )
-                .clicked()
-                {
-                    self.go_back(ctx);
-                }
-                if icons::button(ui, Icon::Forward, "Forward to next reference (Alt+Right)", self.can_history(true)).clicked() {
-                    self.go_forward(ctx);
-                }
-                if icons::button(ui, Icon::Plugin, "Manage plugins", true).clicked() {
-                    self.show_plugins = true;
-                }
-                if icons::button(ui, Icon::Search, "Code search (Cmd/Ctrl+Shift+F)", true).clicked()
-                {
-                    self.search.open_mode(SearchMode::Code);
-                }
-                ui.separator();
-                ui.label("Decompilation engine: RDX Native DEX (alpha)");
-                if self.busy {
-                    if self.loading_project {
-                        let percent = (self.loading_progress * 100.0).round() as u8;
-                        ui.add(
-                            egui::ProgressBar::new(self.loading_progress)
-                                .animate(true)
-                                .desired_width(220.0)
-                                .text(format!("Loading / indexing… {percent}%")),
-                        )
-                        .on_hover_text(
-                            "Completed native loading stages; the current indexing stage is still running.",
-                        );
-                    } else {
-                        ui.spinner();
-                    }
-                }
-                if self.asset_busy {
-                    ui.spinner();
-                    ui.label("Reading asset…");
-                }
+                ui.add_space(3.0);
             });
-            if let Some(path) = &self.path {
-                ui.weak(path.display().to_string());
-            }
-            ui.add_space(4.0);
-        });
+        } else {
+            egui::TopBottomPanel::top("toolbar_reveal")
+                .exact_height(5.0)
+                .show(ctx, |ui| {
+                    let rect = ui.max_rect();
+                    ui.painter().hline(
+                        rect.center().x - 16.0..=rect.center().x + 16.0,
+                        rect.center().y,
+                        ui.visuals().widgets.noninteractive.bg_stroke,
+                    );
+                });
+        }
         if choose_file
             && let Some(path) = rfd::FileDialog::new()
                 .add_filter("Android bytecode", &["apk", "dex"])
@@ -2339,7 +2508,31 @@ impl eframe::App for App {
             self.open(path, ctx);
         }
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.label(&self.status);
+            ui.horizontal_wrapped(|ui| {
+                if self.busy && self.loading_project {
+                    let percent = (self.loading_progress * 100.0).round() as u8;
+                    ui.add(egui::ProgressBar::new(self.loading_progress)
+                        .animate(false).desired_width(160.0)
+                        .text(format!("Loading / indexing… {percent}%")))
+                        .on_hover_text("Completed native loading stages; the current indexing stage is still running.");
+                } else if self.busy {
+                    ui.spinner();
+                }
+                if self.asset_busy {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Reading asset…").small());
+                }
+                ui.label(egui::RichText::new(&self.status).small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new("RDX Native DEX · alpha").small().weak())
+                        .on_hover_text(
+                            self.path
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_default(),
+                        );
+                });
+            });
             if !self.diagnostics.is_empty() {
                 egui::CollapsingHeader::new(format!("Diagnostics ({})", self.diagnostics.len()))
                     .show(ui, |ui| {
@@ -2355,21 +2548,30 @@ impl eframe::App for App {
         });
         let mut tree_actions = TreeActions::default();
         egui::SidePanel::left("project")
-            .default_width(300.0)
+            .default_width(260.0)
             .width_range(200.0..=440.0)
             .resizable(true)
             .show(ctx, |ui| {
-                ui.heading("Project");
+                ui.add_space(7.0);
+                ui.label(
+                    egui::RichText::new("PROJECT")
+                        .small()
+                        .strong()
+                        .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(7.0);
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut self.filter)
-                            .hint_text("Filter classes and files…"),
+                            .hint_text("Search classes and files…")
+                            .desired_width(f32::INFINITY),
                     )
                     .changed()
                 {
                     self.rebuild_tree();
                 }
-                ui.separator();
+                ui.add_space(6.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -2410,37 +2612,56 @@ impl eframe::App for App {
                     ui.weak("Native Rust · alpha Java / DEX disassembly · assets");
                 });
             } else {
-                if let Some(target) = self.tab_bar(ui) {
-                    export = Some(target);
+                let top = ui.cursor().min.y;
+                let width = ui.available_width();
+                let reveal_height = if self.tabs_hovered { 42.0 } else { 8.0 };
+                let reveal_rect =
+                    egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, reveal_height));
+                let pointer_inside = ui.input(|i| {
+                    i.pointer
+                        .hover_pos()
+                        .is_some_and(|p| reveal_rect.contains(p))
+                });
+                let show_tabs =
+                    self.tabs_keep_open || pointer_inside || ui.memory(|m| m.any_popup_open());
+                self.tabs_hovered = show_tabs;
+                if show_tabs {
+                    if let Some(target) = self.tab_bar(ui) {
+                        export = Some(target);
+                    }
+                } else {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(width, 4.0), egui::Sense::hover());
+                    ui.painter().hline(
+                        rect.center().x - 16.0..=rect.center().x + 16.0,
+                        top + 2.0,
+                        ui.visuals().widgets.noninteractive.bg_stroke,
+                    );
                 }
                 if let Some(tab) = self.tabs.get_mut(self.selected) {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.weak(&tab.name);
-                        if let Some(text) = tab.text()
-                            && ui.button("Copy source").clicked()
-                        {
-                            ui.ctx().copy_text(text.to_owned());
-                        }
-                        if let Target::File(index) = tab.target {
-                            if let Some(entry) = self
-                                .archive
-                                .as_ref()
-                                .and_then(|a| a.entries.iter().find(|e| e.index == index))
-                            {
-                                ui.weak(format!("{} bytes", entry.size));
+                    if matches!(tab.target, Target::File(_)) {
+                        ui.horizontal_wrapped(|ui| {
+                            if let Target::File(index) = tab.target {
+                                if let Some(entry) = self
+                                    .archive
+                                    .as_ref()
+                                    .and_then(|a| a.entries.iter().find(|e| e.index == index))
+                                {
+                                    ui.weak(format!("{} bytes", entry.size));
+                                }
+                                if is_android_xml(&tab.name)
+                                    && ui
+                                        .add_enabled(
+                                            self.engine.is_some() && !self.busy,
+                                            egui::Button::new("Decode Android XML"),
+                                        )
+                                        .clicked()
+                                {
+                                    decode = Some(index);
+                                }
                             }
-                            if is_android_xml(&tab.name)
-                                && ui
-                                    .add_enabled(
-                                        self.engine.is_some() && !self.busy,
-                                        egui::Button::new("Decode Android XML"),
-                                    )
-                                    .clicked()
-                            {
-                                decode = Some(index);
-                            }
-                        }
-                    });
+                        });
+                    }
                     if let Some(owner) = tab.name.strip_prefix("dex://") {
                         ui.horizontal_wrapped(|ui| {
                             ui.label("X-Refs: exact DEX call-site view, not Java source.");
@@ -2719,6 +2940,8 @@ fn snapshot_preferences(
         code_font: code_font.preference_key().into(),
         word_wrap,
         usages_keep_open,
+        tabs_keep_open: false,
+        menu_auto_hide: false,
         search_keep_open: search.keep_open,
         search,
     }
@@ -2855,6 +3078,7 @@ mod settings_tests {
     fn navigation_test_app() -> App {
         let (tx, rx) = mpsc::channel();
         App {
+            toolbar_icon: None,
             mcp_server: None,
             show_mcp: false,
             mcp_error: String::new(),
@@ -2890,6 +3114,10 @@ mod settings_tests {
             tabs: Vec::new(),
             selected: 0,
             revealed_tab: None,
+            tabs_keep_open: false,
+            menu_auto_hide: false,
+            menu_hovered: false,
+            tabs_hovered: false,
             #[cfg(test)]
             tab_ui_controls: Vec::new(),
             history: Vec::new(),

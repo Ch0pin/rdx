@@ -11,6 +11,7 @@ mod search_index;
 mod search_window;
 mod settings;
 mod ui;
+mod ui_style;
 mod usages;
 mod usages_window;
 mod word_occurrences;

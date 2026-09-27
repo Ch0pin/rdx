@@ -1406,7 +1406,7 @@ impl App {
                                             response.rect.left_bottom() + egui::vec2(0.0, 2.0),
                                             response.rect.right_bottom() + egui::vec2(0.0, 2.0),
                                         ],
-                                        egui::Stroke::new(2.0, accent),
+                                        egui::Stroke::new(2.0_f32, accent),
                                     );
                                 }
                                 if reveal && self.selected == i {

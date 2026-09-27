@@ -54,11 +54,11 @@ fn refine(style: &mut egui::Style) {
     v.extreme_bg_color = field;
     v.faint_bg_color = hover;
     v.hyperlink_color = accent;
-    v.window_stroke = Stroke::new(1.0, border);
+    v.window_stroke = Stroke::new(1.0_f32, border);
     v.window_corner_radius = CornerRadius::same(6);
     v.menu_corner_radius = CornerRadius::same(5);
     v.selection.bg_fill = selection;
-    v.selection.stroke = Stroke::new(1.0, accent);
+    v.selection.stroke = Stroke::new(1.0_f32, accent);
     for widget in [
         &mut v.widgets.noninteractive,
         &mut v.widgets.inactive,
@@ -67,20 +67,20 @@ fn refine(style: &mut egui::Style) {
         &mut v.widgets.open,
     ] {
         widget.corner_radius = CornerRadius::same(4);
-        widget.bg_stroke = Stroke::new(1.0, border);
-        widget.fg_stroke = Stroke::new(1.0, text);
+        widget.bg_stroke = Stroke::new(1.0_f32, border);
+        widget.fg_stroke = Stroke::new(1.0_f32, text);
         widget.expansion = 0.0;
     }
     v.widgets.noninteractive.bg_fill = panel;
     v.widgets.noninteractive.weak_bg_fill = panel;
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, muted);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, muted);
     v.widgets.inactive.bg_fill = field;
     v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
     v.widgets.hovered.bg_fill = hover;
     v.widgets.hovered.weak_bg_fill = hover;
     v.widgets.active.bg_fill = selection;
     v.widgets.active.weak_bg_fill = selection;
-    v.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, accent);
     v.widgets.open.bg_fill = selection;
     v.widgets.open.weak_bg_fill = selection;
 }

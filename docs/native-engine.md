@@ -9,7 +9,8 @@ The engine supports typed instructions, method calls and constructors, fields,
 arrays, arithmetic, branches, switches, and supported loop and exception patterns.
 Shared instruction decoding and signature binding feed reconstruction for eligible
 methods. Control-flow and dominance analysis support bounded compositions of
-branches and loops, including nested pretest loops and simple posttest loops.
+branches and loops, including nested pretest loops and posttest loops with
+bounded forward branches inside their bodies.
 
 Reconstruction is incremental. Unsupported shapes retain native DEX disassembly,
 so the viewer can display reconstructed Java alongside remaining DEX methods.

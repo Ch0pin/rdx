@@ -1211,16 +1211,15 @@ fn decoded_natural_loop(
 }
 // JADX LoopRegionMaker's condition-at-end case identifies the latch condition
 // and builds the mandatory body from the loop start. This specialization keeps
-// a single straight-line body and uses the complete decoded CFG for ownership.
+// bounded forward body regions and uses the complete decoded CFG for ownership.
 fn decoded_posttest_loop(
     ir: &crate::native_ir::DecodedMethod,
     cfg: &crate::native_cfg::ControlFlowGraph,
     work: &mut usize,
 ) -> Result<Loop> {
-    let mut controls = ir
-        .instructions
-        .iter()
-        .filter(|i| matches!(i.opcode, 0x28..=0x2a | 0x32..=0x3d));
+    let mut controls = ir.instructions.iter().filter(|i| {
+        matches!(i.opcode, 0x32..=0x3d) && i.branch_target.is_some_and(|target| target < i.pc)
+    });
     let latch = controls.next().context("missing shared posttest latch")?;
     ensure!(
         controls.next().is_none() && matches!(latch.opcode, 0x32..=0x3d) && latch.width == 2,
@@ -1231,6 +1230,17 @@ fn decoded_posttest_loop(
         .context("missing shared posttest header")?;
     let exit = latch.pc + latch.width;
     ensure!(start < latch.pc, "shared posttest latch is not backward");
+    ensure!(
+        ir.instructions.iter().all(|i| {
+            if !matches!(i.opcode, 0x28..=0x2a | 0x32..=0x3d) || i.pc == latch.pc {
+                return true;
+            }
+            (start..latch.pc).contains(&i.pc)
+                && i.branch_target
+                    .is_some_and(|target| target > i.pc && target <= latch.pc)
+        }),
+        "shared posttest additional control"
+    );
     let header = *cfg
         .block_at
         .get(&start)
@@ -1325,11 +1335,9 @@ fn decoded_natural_loops(
     ir: &crate::native_ir::DecodedMethod,
     cfg: &crate::native_cfg::ControlFlowGraph,
 ) -> Result<Vec<Loop>> {
-    if !ir
-        .instructions
-        .iter()
-        .any(|i| matches!(i.opcode, 0x28..=0x2a))
-    {
+    if !ir.instructions.iter().any(|i| {
+        matches!(i.opcode, 0x28..=0x2a) && i.branch_target.is_some_and(|target| target < i.pc)
+    }) {
         return Ok(vec![decoded_posttest_loop(ir, cfg, &mut 16_000_000)?]);
     }
     // JADX BlockProcessor.markLoops/registerLoops identifies and records
@@ -1531,7 +1539,29 @@ fn decoded_loop_branch_plans(
             decoded_posttest_loop(ir, cfg, &mut 16_000_000)? == regions[0],
             "shared posttest region differs"
         );
-        return Ok(Vec::new());
+        let region = regions[0];
+        if !ir.instructions.iter().any(|i| {
+            (region.start..region.latch).contains(&i.pc) && matches!(i.opcode, 0x32..=0x3d)
+        }) {
+            return Ok(Vec::new());
+        }
+        let mut projection = cfg.clone();
+        let latch = cfg.block_at[&region.latch];
+        // Only remove the conditional backedge. The fallthrough exit remains
+        // canonical, while dominance and liveness use the original cyclic CFG.
+        projection.blocks[latch].successors.remove(0);
+        let mut plans =
+            decoded_branch_plans_in(ir, &projection, len, region.start..region.latch, &[], &[])?;
+        for plan in &mut plans {
+            ensure!(
+                plan.taken <= region.latch
+                    && plan.fallthrough <= region.latch
+                    && plan.join <= region.latch,
+                "shared posttest branch leaves body"
+            );
+            plan.owner = Some(region.start);
+        }
+        return Ok(plans);
     }
     let special = decoded_all_loop_edges(ir, regions)?;
     let depths = regions
@@ -1960,12 +1990,25 @@ impl Graph {
             );
             pc += width;
         }
-        let posttest = backward_gotos == 0
-            && goto_count == 0
-            && condition_count == 1
-            && control[0].1 < control[0].0 as i64;
+        let backward_conditions: Vec<_> = control
+            .iter()
+            .copied()
+            .filter(|&(pc, target)| {
+                matches!(code.instructions[pc] as u8, 0x32..=0x3d) && target < pc as i64
+            })
+            .collect();
+        let posttest = backward_gotos == 0 && backward_conditions.len() == 1;
         if posttest {
-            let (latch, header) = control[0];
+            let (latch, header) = backward_conditions[0];
+            if control.iter().any(|&(pc, target)| {
+                pc != latch
+                    && !(pc as i64 >= header
+                        && pc < latch
+                        && target > pc as i64
+                        && target <= latch as i64)
+            }) {
+                return Ok(None);
+            }
             // Scan real boundaries, never a branch operand interpreted as an opcode.
             // Malformed selected targets fail before excluded terminal-body routing.
             let mut body_pc = 0;
@@ -6553,6 +6596,118 @@ mod tests {
             0x0012, 0x1071, 0, 0, value, 0x00d8, 0x0100, 0x3034, 0xfffa, returned,
         ];
         (class, method, regs)
+    }
+    #[test]
+    fn shared_posttest_body_diamond_preserves_canonical_ownership() {
+        let (class, mut method, regs) = shared_posttest_fixture("I");
+        // Header 1; branch 1 -> 6; goto 5 -> 7; latch 9 -> 1.
+        method.code.as_mut().unwrap().instructions = vec![
+            0x0012, 0x0338, 5, 0x1112, 0x1112, 0x0228, 0x2112, 0x00d8, 0x0100, 0x3034, 0xfff8,
+            0x010f,
+        ];
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert_eq!(graph.shared_loops[0].start, 1);
+        assert_eq!(graph.shared_loops[0].latch, 9);
+        assert_eq!(
+            graph.shared_branches,
+            vec![SharedBranch {
+                owner: Some(1),
+                branch: 1,
+                taken: 6,
+                fallthrough: 3,
+                join: 7,
+            }]
+        );
+        let cfg = graph.shared_cfg.as_ref().unwrap();
+        assert_eq!(cfg.blocks[cfg.block_at[&9]].successors.len(), 2);
+        assert!(
+            crate::native_dominators::DominatorTree::compute(cfg)
+                .unwrap()
+                .dominates(cfg.block_at[&1], cfg.block_at[&9])
+        );
+        assert!(graph.live_at(11, 1));
+        let mut out = Output::default();
+        render(
+            &class,
+            &method,
+            &graph,
+            0,
+            12,
+            regs.clone(),
+            &mut out,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(out.text.contains("while (true)"));
+        assert!(out.text.contains("if ("));
+        for mutation in 0..5 {
+            let mut broken = Graph::straight_line(&class, &method).unwrap().unwrap();
+            match mutation {
+                0 => broken.shared_branches[0].owner = None,
+                1 => broken.shared_branches[0].join = 11,
+                2 => broken.shared_branches.clear(),
+                3 => broken.shared_branches[0].taken = 7,
+                _ => {
+                    let cfg = broken.shared_cfg.as_mut().unwrap();
+                    cfg.blocks[cfg.block_at[&1]].successors[0].target = cfg.block_at[&7];
+                }
+            }
+            let mut rejected = Output::default();
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &broken,
+                    0,
+                    12,
+                    regs.clone(),
+                    &mut rejected,
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err()
+            );
+        }
+        let mut poisoned = Graph::straight_line(&class, &method).unwrap().unwrap();
+        let mut baseline_out = Output::default();
+        let baseline = render(
+            &class,
+            &method,
+            &poisoned,
+            0,
+            12,
+            regs.clone(),
+            &mut baseline_out,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        method.code.as_mut().unwrap().instructions.fill(u16::MAX);
+        poisoned.targets.fill(Some(usize::MAX));
+        let mut actual = Output::default();
+        let result = render(
+            &class,
+            &method,
+            &poisoned,
+            0,
+            12,
+            regs,
+            &mut actual,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(result == baseline);
+        assert_eq!(actual.text, baseline_out.text);
     }
     #[test]
     fn shared_posttest_poison_keeps_mandatory_body_exit_values_and_links() {

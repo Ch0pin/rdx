@@ -2,7 +2,7 @@
 //! (Apache-2.0), commit 28ff15e4ae69950aebea110a13e5ab895d234dfc.
 //! Proven unchanged lock ownership, normal releases and catch-all rethrow.
 //! Typed handlers may remain inside a monitor when their effects share its
-//! cleanup. Reject unmatched, nested and externally entered monitor regions.
+//! cleanup. Reject unmatched and externally entered monitor regions.
 use super::*;
 use crate::{native_dex::DexCode, native_ir::DecodedMethod};
 use std::collections::{HashMap, HashSet};
@@ -16,6 +16,7 @@ pub(super) struct Region {
     pub terminal: bool,
     pub inner_tries: Vec<usize>,
     pub releases: HashSet<usize>,
+    pub dispatch_join: Option<usize>,
 }
 
 fn successors(graph: &Graph, words: &[u16], pc: usize) -> Vec<usize> {
@@ -45,9 +46,16 @@ pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
     let ir = DecodedMethod::decode(code)?;
     let at: HashMap<_, _> = ir.instructions.iter().map(|insn| (insn.pc, insn)).collect();
     let words = &code.instructions;
-    let mut result = Vec::new();
+    let mut result: Vec<Region> = Vec::new();
+    let mut owned_bodies: HashMap<usize, HashSet<usize>> = HashMap::new();
+    let mut owned_cleanup: HashMap<usize, HashSet<usize>> = HashMap::new();
     let mut claimed = HashSet::new();
-    for enter in ir.instructions.iter().filter(|insn| insn.opcode == 0x1d) {
+    for enter in ir
+        .instructions
+        .iter()
+        .rev()
+        .filter(|insn| insn.opcode == 0x1d)
+    {
         ensure!(result.len() < 32, "synchronized region budget exceeded");
         let lock = usize::from(words[enter.pc] >> 8);
         let start = enter.pc + enter.width;
@@ -164,6 +172,50 @@ pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
                         .filter_map(|(ty, handler)| ty.as_ref().map(|_| *handler as usize)),
                 );
             }
+            if insn.opcode == 0x1d {
+                let child = result
+                    .iter()
+                    .find(|r| r.enter == pc)
+                    .context("nested monitor region has not been proven")?;
+                ensure!(
+                    !child.terminal && child.dispatch_join.is_none(),
+                    "nested terminal or dispatch monitor not reconstructed"
+                );
+                // A child's throwing effects dispatch to its own cleanup. Its
+                // exact release/rethrow must in turn dispatch to this cleanup.
+                for cleanup_pc in &owned_cleanup[&pc] {
+                    let cleanup_insn = at[cleanup_pc];
+                    ensure!(
+                        !cleanup_insn.writes.iter().any(|value| {
+                            let first = usize::from(value.register);
+                            first <= lock && lock < first + value.kind.word_count()
+                        }),
+                        "nested monitor cleanup overwrites outer lock"
+                    );
+                    ensure!(
+                        !cleanup_insn.may_throw
+                            || code.try_regions.iter().any(|r| {
+                                dispatches_to_monitor(r)
+                                    && r.start as usize <= *cleanup_pc
+                                    && *cleanup_pc < r.end as usize
+                            })
+                            || cleanup_insn.opcode == 0x1e,
+                        "nested monitor cleanup escapes outer protected range"
+                    );
+                }
+                for child_pc in &owned_bodies[&pc] {
+                    ensure!(
+                        !at[child_pc].writes.iter().any(|value| {
+                            let first = usize::from(value.register);
+                            first <= lock && lock < first + value.kind.word_count()
+                        }),
+                        "nested monitor overwrites outer lock"
+                    );
+                }
+                body.extend(owned_bodies[&pc].iter().copied());
+                pending.push(child.exit + 1);
+                continue;
+            }
             match insn.opcode {
                 0x1e => {
                     ensure!(
@@ -172,7 +224,6 @@ pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
                     );
                     exits.insert(pc);
                 }
-                0x1d => bail!("nested monitor regions not reconstructed"),
                 0x0e..=0x11 => bail!("return bypasses monitor release"),
                 _ => pending.extend(successors(graph, words, pc)),
             }
@@ -184,6 +235,9 @@ pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
         let last_release = *exits.iter().max().unwrap();
         let mut terminal = exits.len() > 1;
         let mut exit = last_release;
+        let mut dispatch_join = None;
+        let mut return_tails = HashSet::new();
+        let mut all_releases_return = true;
         for release in &exits {
             let mut tail = Vec::new();
             let mut next = release + graph.widths[*release];
@@ -200,20 +254,156 @@ pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
                     _ => break None,
                 }
             };
+            if returned.is_some() {
+                return_tails.extend(tail.iter().copied());
+            } else {
+                all_releases_return = false;
+            }
             if let Some(returned) = returned.filter(|_| exits.len() > 1) {
                 body.extend(tail);
                 exit = exit.max(returned);
             } else {
-                ensure!(
-                    *release == last_release,
-                    "multiple monitor releases require immediate returns"
-                );
+                if *release != last_release {
+                    let mut cursor = release + graph.widths[*release];
+                    let mut bridge = HashSet::new();
+                    let mut effectful = false;
+                    loop {
+                        if cursor == last_release + graph.widths[last_release] {
+                            if effectful {
+                                dispatch_join = Some(cursor);
+                            }
+                            break;
+                        }
+                        ensure!(
+                            bridge.len() < 256 && bridge.insert(cursor),
+                            "monitor release continuation cycle or budget"
+                        );
+                        let instruction = at
+                            .get(&cursor)
+                            .context("monitor release continuation boundary")?;
+                        match instruction.opcode {
+                            0x28..=0x2a => {
+                                let target = graph.targets[cursor]
+                                    .context("monitor release continuation jump")?;
+                                if target > last_release
+                                    && target != last_release + graph.widths[last_release]
+                                {
+                                    ensure!(
+                                        dispatch_join.is_none_or(|join| join == target),
+                                        "monitor releases have different continuations"
+                                    );
+                                    dispatch_join = Some(target);
+                                    break;
+                                }
+                                cursor = target;
+                            }
+                            0x0e..=0x11 | 0x27 | 0x1d | 0x1e | 0x2b..=0x3d => bail!(
+                                "monitor release continuation is not bounded straight-line flow"
+                            ),
+                            _ => {
+                                effectful |= instruction.opcode != 0;
+                                cursor += instruction.width;
+                            }
+                        }
+                    }
+                    if effectful {
+                        ensure!(
+                            dispatch_join.is_some(),
+                            "effectful monitor exits lack common continuation"
+                        );
+                    } else if dispatch_join.is_none() {
+                        body.extend(bridge);
+                    }
+                }
                 terminal = false;
             }
         }
+        if let Some(join) = dispatch_join {
+            body.retain(|pc| *pc <= last_release);
+            terminal = false;
+            ensure!(
+                join > last_release && join - last_release <= 16,
+                "monitor final release continuation budget"
+            );
+            let mut cursor = last_release + graph.widths[last_release];
+            while cursor < join {
+                let insn = at
+                    .get(&cursor)
+                    .context("monitor final continuation boundary")?;
+                ensure!(
+                    !matches!(insn.opcode, 0x0e..=0x11 | 0x27..=0x3d | 0x1d | 0x1e),
+                    "monitor final continuation is not straight-line"
+                );
+                cursor += insn.width;
+            }
+            ensure!(cursor == join, "monitor continuation crosses instruction");
+            exit = join - 1;
+        }
+        // Address order may put protected throwing arms after the last normal
+        // release. They remain inside the synchronized body: Java's implicit
+        // release must run after their effects and preserve the original throw.
+        // Admit only a bounded, acyclic suffix whose every path ends in throw,
+        // while every normal release has a no-effect path to return.
+        let late_body: HashSet<_> = body
+            .iter()
+            .copied()
+            .filter(|pc| *pc > last_release && !return_tails.contains(pc))
+            .collect();
+        if !late_body.is_empty() && dispatch_join.is_none() && all_releases_return {
+            ensure!(late_body.len() <= 256, "monitor terminal arm budget");
+            let mut indegree: HashMap<usize, usize> = late_body.iter().map(|&pc| (pc, 0)).collect();
+            for &pc in &late_body {
+                let insn = at[&pc];
+                ensure!(
+                    code.try_regions.iter().any(|region| {
+                        dispatches_to_monitor(region)
+                            && region.start as usize <= pc
+                            && pc < region.end as usize
+                    }),
+                    "monitor terminal arm lacks exact cleanup protection"
+                );
+                ensure!(
+                    !matches!(insn.opcode, 0x0e..=0x11 | 0x1d | 0x1e),
+                    "monitor terminal arm returns or changes lock ownership"
+                );
+                let next = successors(graph, words, pc);
+                ensure!(
+                    (insn.opcode == 0x27 && next.is_empty())
+                        || (insn.opcode != 0x27
+                            && !next.is_empty()
+                            && next.iter().all(|target| late_body.contains(target))),
+                    "monitor terminal arm escapes or falls through"
+                );
+                for target in next {
+                    *indegree.get_mut(&target).unwrap() += 1;
+                }
+            }
+            let mut pending: Vec<_> = indegree
+                .iter()
+                .filter_map(|(&pc, &count)| (count == 0).then_some(pc))
+                .collect();
+            let mut seen = 0;
+            while let Some(pc) = pending.pop() {
+                seen += 1;
+                for target in successors(graph, words, pc) {
+                    let count = indegree.get_mut(&target).unwrap();
+                    *count -= 1;
+                    if *count == 0 {
+                        pending.push(target);
+                    }
+                }
+            }
+            ensure!(seen == late_body.len(), "monitor terminal arm has a cycle");
+            body.extend(return_tails);
+            exit = *body.iter().max().unwrap();
+            terminal = true;
+        }
         ensure!(
             body.iter().all(|pc| *pc <= exit),
-            "monitor body crosses release layout"
+            "monitor body crosses release layout for {:x}: max {:?}, exit {:x}, releases {exits:?}, join {dispatch_join:?}",
+            enter.pc,
+            body.iter().max(),
+            exit
         );
         for insn in &ir.instructions {
             for target in successors(graph, words, insn.pc) {
@@ -221,7 +411,9 @@ pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
                     !body.contains(&target)
                         || body.contains(&insn.pc)
                         || (insn.pc == enter.pc && target == start),
-                    "external edge enters monitor body"
+                    "external edge enters monitor body at {target:x} from {:x} for {:x}",
+                    insn.pc,
+                    enter.pc
                 );
                 ensure!(
                     !cleanup.contains(&target) || cleanup.contains(&insn.pc),
@@ -245,7 +437,13 @@ pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
                 .filter(|insn| insn.pc >= region.start as usize && insn.pc < region.end as usize)
             {
                 ensure!(
-                    !insn.may_throw || body.contains(&insn.pc) || Some(insn.pc) == release,
+                    !insn.may_throw
+                        || body.contains(&insn.pc)
+                        || Some(insn.pc) == release
+                        || owned_cleanup
+                            .iter()
+                            .any(|(child, cleanup)| body.contains(child)
+                                && cleanup.contains(&insn.pc)),
                     "monitor catch-all protects unrelated effects"
                 );
             }
@@ -256,6 +454,8 @@ pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
                 inner_tries.push(index);
             }
         }
+        owned_bodies.insert(enter.pc, body);
+        owned_cleanup.insert(enter.pc, cleanup);
         result.push(Region {
             enter: enter.pc,
             exit,
@@ -264,8 +464,10 @@ pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
             terminal,
             inner_tries,
             releases: exits,
+            dispatch_join,
         });
     }
+    result.sort_by_key(|region| region.enter);
     Ok(result)
 }
 
@@ -278,6 +480,9 @@ pub(super) fn emit(
     out: &mut Output,
     depth: usize,
 ) -> Result<(Vec<Option<Value>>, bool)> {
+    if region.dispatch_join.is_some() {
+        return emit_dispatch(class, method, graph, region, regs, out, depth);
+    }
     let lock = register(&regs, region.lock)?;
     ensure!(reference(&lock.ty), "monitor requires a reference value");
     let mut body = Output {
@@ -330,7 +535,7 @@ pub(super) fn emit(
         rendered_method,
         graph,
         region.enter + 1,
-        region.exit + usize::from(region.terminal),
+        region.exit + 1,
         regs.clone(),
         &mut body,
         depth + 1,
@@ -354,5 +559,269 @@ pub(super) fn emit(
     out.line(&format!("synchronized ({}) {{", lock.text), &[]);
     out.append(paths.remove(0).1);
     out.line("}", &[]);
+    Ok((regs, false))
+}
+
+pub(super) struct Dispatch {
+    releases: Vec<usize>,
+    snapshots: HashMap<usize, Vec<Option<Value>>>,
+    slots: Option<HashMap<usize, Vec<Option<Value>>>>,
+    label: String,
+    selector: String,
+}
+
+pub(super) fn dispatch_release(
+    graph: &Graph,
+    pc: usize,
+    regs: &[Option<Value>],
+    out: &mut Output,
+) -> Result<bool> {
+    let mut stack = graph.monitor_dispatch.borrow_mut();
+    let Some(context) = stack.last_mut() else {
+        return Ok(false);
+    };
+    let Some(index) = context.releases.iter().position(|release| *release == pc) else {
+        return Ok(false);
+    };
+    let mut snapshot = regs.to_vec();
+    for r in 0..snapshot.len() {
+        if let Some(value) = &regs[r] {
+            if value.ty == "<wide-tail>" {
+                continue;
+            }
+            if !(graph.live_at(pc + 1, r) || (wide(&value.ty) && graph.live_at(pc + 1, r + 1))) {
+                snapshot[r] = None;
+                if wide(&value.ty) {
+                    snapshot[r + 1] = None;
+                }
+            }
+        }
+    }
+    if let Some(previous) = context.snapshots.get_mut(&pc) {
+        for r in 0..snapshot.len() {
+            if previous[r] == snapshot[r] {
+                continue;
+            }
+            let left = previous[r]
+                .as_ref()
+                .context("monitor release loses live register")?;
+            let right = snapshot[r]
+                .as_ref()
+                .context("monitor release gains uninitialized live register")?;
+            ensure!(
+                left.ty == right.ty && left.ty != "<wide-tail>",
+                "monitor release has incompatible live register types"
+            );
+            previous[r] = Some(Value {
+                text: "<monitor-merge>".into(),
+                ty: left.ty.clone(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: left.raw_bits32 && right.raw_bits32,
+            });
+        }
+    } else {
+        context.snapshots.insert(pc, snapshot);
+    }
+    if let Some(slots) = &context.slots {
+        carry_loop_values(&slots[&pc], regs, out)?;
+    }
+    out.line(&format!("{} = {index};", context.selector), &[]);
+    out.line(&format!("break {};", context.label), &[]);
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_body(
+    class: &DexClass,
+    method: &DexMethod,
+    graph: &Graph,
+    region: &Region,
+    regs: Vec<Option<Value>>,
+    out: &mut Output,
+    depth: usize,
+    context: Dispatch,
+) -> Result<(Dispatch, Output)> {
+    graph.monitor_dispatch.borrow_mut().push(context);
+    let mut body = Output {
+        sequence: out.sequence,
+        indent: out.indent + 1,
+        ..Default::default()
+    };
+    let rendered = render(
+        class,
+        method,
+        graph,
+        region.enter + 1,
+        region.dispatch_join.unwrap(),
+        regs,
+        &mut body,
+        depth + 1,
+        true,
+        None,
+        None,
+    );
+    let context = graph
+        .monitor_dispatch
+        .borrow_mut()
+        .pop()
+        .context("monitor dispatch context")?;
+    let (_, terminal) = rendered?;
+    ensure!(terminal, "monitor dispatch has unreleased path");
+    ensure!(
+        context.snapshots.len() == region.releases.len(),
+        "monitor dispatch release unreachable"
+    );
+    Ok((context, body))
+}
+
+fn emit_dispatch(
+    class: &DexClass,
+    method: &DexMethod,
+    graph: &Graph,
+    region: &Region,
+    mut regs: Vec<Option<Value>>,
+    out: &mut Output,
+    depth: usize,
+) -> Result<(Vec<Option<Value>>, bool)> {
+    ensure!(
+        region.inner_tries.is_empty(),
+        "monitor dispatch with typed handlers not reconstructed"
+    );
+    ensure!(
+        graph
+            .synchronized
+            .iter()
+            .filter(|child| region.enter < child.enter && child.enter <= region.exit)
+            .all(|child| child.inner_tries.is_empty()),
+        "monitor dispatch with typed child handlers not reconstructed"
+    );
+    let lock = register(&regs, region.lock)?;
+    ensure!(reference(&lock.ty), "monitor requires reference lock");
+    let mut releases: Vec<_> = region.releases.iter().copied().collect();
+    releases.sort_unstable();
+    let selector = format!("monitorExit{}", out.sequence);
+    let label = format!("monitorBody{}", out.sequence);
+    out.sequence += 1;
+    let context = Dispatch {
+        releases,
+        snapshots: HashMap::new(),
+        slots: None,
+        label: label.clone(),
+        selector: selector.clone(),
+    };
+    let caught = graph.caught_values.borrow().clone();
+    let rethrows = graph.catch_rethrows.borrow().clone();
+    let probe = dispatch_body(
+        class,
+        method,
+        graph,
+        region,
+        regs.clone(),
+        out,
+        depth,
+        context,
+    );
+    *graph.caught_values.borrow_mut() = caught;
+    *graph.catch_rethrows.borrow_mut() = rethrows;
+    let (mut context, _) = probe?;
+    let mut slots = HashMap::new();
+    for release in &context.releases {
+        let snapshot = &context.snapshots[release];
+        let mut frame = snapshot.clone();
+        for r in 0..frame.len() {
+            let Some(value) = &snapshot[r] else { continue };
+            if value.ty == "<wide-tail>" {
+                continue;
+            }
+            if !(graph.live_at(release + 1, r)
+                || (wide(&value.ty) && graph.live_at(release + 1, r + 1)))
+            {
+                frame[r] = None;
+                continue;
+            }
+            if regs[r].as_ref() == Some(value)
+                || value.literal.is_some()
+                || value.wide_literal.is_some()
+                || value.text.starts_with('"')
+            {
+                continue;
+            }
+            let initial = match value.ty.as_str() {
+                "Z" => "false",
+                "J" => "0L",
+                "F" => "0.0f",
+                "D" => "0.0d",
+                ty if reference(ty) => "null",
+                _ => "0",
+            };
+            frame[r] = Some(out.local(&value.ty, initial, &[])?);
+            if wide(&value.ty) {
+                frame[r + 1] = snapshot[r + 1].clone();
+            }
+        }
+        slots.insert(*release, frame);
+    }
+    out.line(&format!("int {selector} = -1;"), &[]);
+    context.snapshots.clear();
+    context.slots = Some(slots.clone());
+    let (_, body) = dispatch_body(
+        class,
+        method,
+        graph,
+        region,
+        regs.clone(),
+        out,
+        depth,
+        context,
+    )?;
+    out.sequence = body.sequence;
+    out.line(&format!("{label}: synchronized ({}) {{", lock.text), &[]);
+    out.append(body);
+    out.line("}", &[]);
+    let join = region.dispatch_join.unwrap();
+    let mut paths = Vec::new();
+    let mut ordered: Vec<_> = region.releases.iter().copied().collect();
+    ordered.sort_unstable();
+    for (index, release) in ordered.iter().enumerate() {
+        let mut tail = Output {
+            sequence: out.sequence,
+            indent: out.indent + 1,
+            ..Default::default()
+        };
+        let (values, terminal) = render(
+            class,
+            method,
+            graph,
+            release + 1,
+            join,
+            slots[release].clone(),
+            &mut tail,
+            depth + 1,
+            true,
+            None,
+            None,
+        )?;
+        ensure!(!terminal, "monitor continuation unexpectedly terminal");
+        out.sequence = tail.sequence;
+        paths.push((index, tail, values, false));
+    }
+    merge_path_registers(&mut regs, &mut paths, out, graph, join)?;
+    let path_count = paths.len();
+    for (index, body, _, _) in paths {
+        if index + 1 == path_count {
+            out.line("else {", &[]);
+        } else {
+            out.line(
+                &format!(
+                    "{} ({selector} == {index}) {{",
+                    if index == 0 { "if" } else { "else if" }
+                ),
+                &[],
+            );
+        }
+        out.append(body);
+        out.line("}", &[]);
+    }
     Ok((regs, false))
 }

@@ -7,12 +7,18 @@ mod allocation;
 mod allocation_lowering;
 #[path = "cleanup.rs"]
 mod cleanup;
+#[path = "concat.rs"]
+mod concat;
 #[path = "finally_regions.rs"]
 mod finally_regions;
 #[path = "numeric.rs"]
 mod numeric;
 #[path = "operations.rs"]
 mod operations;
+#[path = "receiver_cleanup.rs"]
+mod receiver_cleanup;
+#[path = "shrink.rs"]
+mod shrink;
 #[path = "synchronized.rs"]
 mod synchronized;
 #[path = "throwing.rs"]
@@ -67,9 +73,21 @@ struct Output {
     indent: usize,
     receiver_locals: std::collections::HashSet<String>,
     inferred_throws: std::collections::BTreeSet<String>,
+    last_local: Option<EmittedLocal>,
+}
+#[derive(Clone)]
+struct EmittedLocal {
+    value: Value,
+    expression: String,
+    refs: Vec<(usize, usize, String)>,
+    byte_start: usize,
+    char_start: usize,
+    link_start: usize,
+    indent: usize,
 }
 impl Output {
     fn append(&mut self, child: Output) {
+        self.last_local = None;
         self.receiver_locals.extend(child.receiver_locals);
         self.inferred_throws.extend(child.inferred_throws);
         for mut link in child.links {
@@ -81,6 +99,7 @@ impl Output {
         self.text.push_str(&child.text);
     }
     fn line(&mut self, text: &str, refs: &[(usize, usize, String)]) {
+        self.last_local = None;
         let spaces = 8 + self.indent * 4;
         let base = self.chars + spaces;
         self.chars += spaces + 1 + text.chars().count();
@@ -114,18 +133,53 @@ impl Output {
         if let Some(label) = class_label(ty) {
             adjusted.push((0, java_type(ty)?.chars().count(), label));
         }
+        let (byte_start, char_start, link_start) = (self.text.len(), self.chars, self.links.len());
         self.line(&format!("{prefix}{expression};"), &adjusted);
         ensure!(
             self.text.len() <= 4 * 1024 * 1024,
             "reconstructed method exceeds output budget"
         );
-        Ok(Value {
+        let value = Value {
             text: name,
             ty: ty.into(),
             literal: None,
             wide_literal: None,
             raw_bits32: false,
-        })
+        };
+        self.last_local = Some(EmittedLocal {
+            value: value.clone(),
+            expression: expression.into(),
+            refs: refs.to_vec(),
+            byte_start,
+            char_start,
+            link_start,
+            indent: self.indent,
+        });
+        Ok(value)
+    }
+
+    // Collapse only two adjacent emitted statements of identical static type.
+    // No expression is moved past a statement, block boundary or conversion.
+    // Metadata comes from local(), never from parsing the rendered Java.
+    fn return_value(&mut self, value: &Value, converted: &str, return_type: &str) {
+        if let Some(local) = self.last_local.take()
+            && local.value == *value
+            && converted == value.text
+            && value.ty == return_type
+            && local.indent == self.indent
+        {
+            self.text.truncate(local.byte_start);
+            self.chars = local.char_start;
+            self.links.truncate(local.link_start);
+            let refs: Vec<_> = local
+                .refs
+                .into_iter()
+                .map(|(start, len, label)| (start + 7, len, label))
+                .collect();
+            self.line(&format!("return {};", local.expression), &refs);
+        } else {
+            self.line(&format!("return {converted};"), &[]);
+        }
     }
 }
 fn class_label(ty: &str) -> Option<String> {
@@ -197,6 +251,705 @@ fn argument(value: &Value, ty: &str) -> Result<String> {
         return Ok(format!("(({}) {})", java_type(ty)?, value.text));
     }
     bail!("unsupported register type conversion {} to {ty}", value.ty)
+}
+
+// DEX constants are untyped bits. A loop may materialize them in Java int
+// locals before a boolean or float use. Reinterpret only when every physical
+// definition (including copied sources and writes after backward edges) is a
+// narrow DEX constant. Boolean uses additionally require the 0/1 domain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConstantDomain {
+    Boolean,
+    Raw32,
+}
+fn constant_register_domain(
+    code: &crate::native_dex::DexCode,
+    graph: &Graph,
+    source: usize,
+    domain: ConstantDomain,
+) -> Result<bool> {
+    if code.instructions.len() > 1024 {
+        return Ok(false);
+    }
+    let mut pending = vec![source];
+    let mut seen = vec![false; code.registers as usize];
+    while let Some(register) = pending.pop() {
+        if register >= seen.len() || register >= usize::from(code.registers - code.ins) {
+            return Ok(false);
+        }
+        if seen[register] {
+            // A copy cycle does not establish a constant value by itself.
+            return Ok(false);
+        }
+        seen[register] = true;
+        let mut found_write = false;
+        let mut pc = 0;
+        while pc < code.instructions.len() {
+            let width = graph.widths[pc];
+            if width == 0 {
+                pc += 1;
+                continue;
+            }
+            let writes = graph.written_in(code, pc, pc + width);
+            let Some(writes) = writes else {
+                return Ok(false);
+            };
+            if writes[register] {
+                found_write = true;
+                match code.instructions[pc] as u8 {
+                    0x12..=0x15 => {
+                        let word = code.instructions[pc];
+                        let opcode = word as u8;
+                        let (dst, literal) = if let Some(instruction) = graph.instruction(pc)? {
+                            ensure!(
+                                instruction.opcode == opcode,
+                                "shared constant opcode differs from selected source"
+                            );
+                            let (dst, literal) = decoded_constant(instruction, seen.len())?;
+                            (dst, i32::try_from(literal)?)
+                        } else {
+                            let dst = if opcode == 0x12 {
+                                ((word >> 8) & 15) as usize
+                            } else {
+                                (word >> 8) as usize
+                            };
+                            let literal = match opcode {
+                                0x12 => ((word as i16) >> 12) as i32,
+                                0x13 => i32::from(code.instructions[pc + 1] as i16),
+                                0x14 => {
+                                    i32::from(code.instructions[pc + 1])
+                                        | (i32::from(code.instructions[pc + 2]) << 16)
+                                }
+                                _ => i32::from(code.instructions[pc + 1] as i16) << 16,
+                            };
+                            (dst, literal)
+                        };
+                        if dst != register
+                            || (domain == ConstantDomain::Boolean && !matches!(literal, 0 | 1))
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    0x01..=0x03 => {
+                        let (dst, copied) = if let Some(instruction) = graph.instruction(pc)? {
+                            decoded_move(instruction, code.registers as usize)?
+                        } else {
+                            let word = code.instructions[pc];
+                            match word as u8 {
+                                0x01 => (((word >> 8) & 15) as usize, (word >> 12) as usize),
+                                0x02 => ((word >> 8) as usize, code.instructions[pc + 1] as usize),
+                                _ => (
+                                    code.instructions[pc + 1] as usize,
+                                    code.instructions[pc + 2] as usize,
+                                ),
+                            }
+                        };
+                        if dst != register {
+                            return Ok(false);
+                        }
+                        pending.push(copied);
+                    }
+                    _ => return Ok(false),
+                }
+            }
+            pc += width;
+        }
+        if !found_write {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn argument_from_register(
+    value: &Value,
+    ty: &str,
+    source: usize,
+    code: &crate::native_dex::DexCode,
+    graph: &Graph,
+) -> Result<String> {
+    if ty == "Z"
+        && value.ty == "I"
+        && value.literal.is_none()
+        && constant_register_domain(code, graph, source, ConstantDomain::Boolean)?
+    {
+        return Ok(format!("({} != 0)", value.text));
+    }
+    if ty == "F"
+        && matches!(value.ty.as_str(), "I" | "Z")
+        && value.literal.is_none()
+        && !value.raw_bits32
+        && constant_register_domain(code, graph, source, ConstantDomain::Raw32)?
+    {
+        return Ok(format!(
+            "java.lang.Float.intBitsToFloat({})",
+            integral(value)?
+        ));
+    }
+    argument(value, ty)
+}
+
+// A DEX boolean return may merge a zero/one literal with the result of a
+// boolean call, especially across a handler that observes the pre-call value.
+// Prove the exact SSA value read by this return. Physical-register scans cannot
+// distinguish that lifetime from unrelated integer writes elsewhere.
+fn proven_boolean_return(
+    class: &DexClass,
+    method: &DexMethod,
+    graph: &Graph,
+    pc: usize,
+    source: usize,
+) -> Result<bool> {
+    let code = method.code.as_ref().context("missing return code")?;
+    if code.instructions.len() > 512 || code.registers > 256 {
+        return Ok(false);
+    }
+    if let Some(front) = &graph.front_end {
+        ensure!(
+            front.ir == crate::native_ir::DecodedMethod::decode(code)?,
+            "selected return operands differ from decoded method"
+        );
+        let bound = crate::native_calls::BoundCalls::bind(code, &front.ir, &class.symbols)?;
+        ensure!(
+            bound == front.bound,
+            "selected call binding differs from decoded method"
+        );
+        let cfg = if graph.shared_loops.is_empty() {
+            crate::native_cfg::ControlFlowGraph::from_decoded(&front.ir, code.instructions.len())?
+        } else {
+            crate::native_cfg::ControlFlowGraph::from_decoded_loop(
+                &front.ir,
+                code.instructions.len(),
+            )?
+        };
+        if let Some(selected) = &graph.shared_cfg {
+            ensure!(
+                *selected == cfg,
+                "selected return CFG differs from decoded method"
+            );
+        }
+        let ssa =
+            crate::native_ssa::SsaMethod::build_with_work_limit(code, &front.ir, &cfg, 2_000_000)?;
+        let calls = crate::native_call_values::SsaCalls::bind(&bound, &ssa)?;
+        return Ok(
+            boolean_return_definition_proven(&front.ir, &ssa, &calls, pc, source)
+                || boolean_return_or_proven(method, &front.ir, &ssa, &calls, pc, source),
+        );
+    }
+    let analysis = crate::native_method::MethodAnalysis::build(class, method)?;
+    Ok(boolean_return_definition_proven(
+        analysis.instructions(),
+        analysis.ssa(),
+        analysis.calls(),
+        pc,
+        source,
+    ) || boolean_return_or_proven(
+        method,
+        analysis.instructions(),
+        analysis.ssa(),
+        analysis.calls(),
+        pc,
+        source,
+    ))
+}
+
+fn boolean_return_definition_proven(
+    ir: &crate::native_ir::DecodedMethod,
+    ssa: &crate::native_ssa::SsaMethod,
+    calls: &crate::native_call_values::SsaCalls,
+    pc: usize,
+    source: usize,
+) -> bool {
+    use crate::native_ssa::DefinitionKind;
+
+    if ssa.definitions.len() > 16_384 {
+        return false;
+    }
+    let Some(return_ir) = ir
+        .instructions
+        .iter()
+        .find(|instruction| instruction.pc == pc)
+    else {
+        return false;
+    };
+    let Some(return_ssa) = ssa
+        .instructions
+        .iter()
+        .find(|instruction| instruction.pc == pc)
+    else {
+        return false;
+    };
+    if return_ir.opcode != 0x0f
+        || return_ssa.reads.len() != 1
+        || usize::from(return_ssa.reads[0].register) != source
+        || return_ssa.reads[0].words.len() != 1
+    {
+        return false;
+    }
+    let root = return_ssa.reads[0].words[0];
+    let mut state = vec![0u8; ssa.definitions.len()];
+    let mut pending = vec![(root, false)];
+    let mut anchors = 0usize;
+    while let Some((id, finished)) = pending.pop() {
+        let Some(definition) = ssa.definitions.get(id) else {
+            return false;
+        };
+        if finished {
+            state[id] = 2;
+            continue;
+        }
+        match state[id] {
+            1 => return false, // cyclic phi needs a separate fixed-point proof
+            2 => continue,
+            _ => {}
+        }
+        state[id] = 1;
+        let dependencies = match definition.kind {
+            DefinitionKind::Parameter | DefinitionKind::Undefined => return false,
+            DefinitionKind::Phi { block } => {
+                let mut phis = ssa.phis.iter().filter(|phi| {
+                    phi.result == id
+                        && phi.block == block
+                        && phi.register == definition.register
+                        && ssa.reachable.get(block) == Some(&true)
+                });
+                let Some(phi) = phis.next() else { return false };
+                if phis.next().is_some() || phi.incoming.is_empty() {
+                    return false;
+                }
+                phi.incoming
+                    .iter()
+                    .map(|(_, value)| *value)
+                    .collect::<Vec<_>>()
+            }
+            DefinitionKind::Instruction { pc, word, .. } => {
+                if word != 0 {
+                    return false;
+                }
+                let Some(instruction) = ir.instructions.iter().find(|i| i.pc == pc) else {
+                    return false;
+                };
+                let Some(ssa_instruction) = ssa.instructions.iter().find(|i| i.pc == pc) else {
+                    return false;
+                };
+                if ssa_instruction.writes.len() != 1
+                    || ssa_instruction.writes[0].register != definition.register
+                    || ssa_instruction.writes[0].words.as_slice() != [id]
+                    || instruction.may_throw
+                    || instruction.reference.is_some()
+                    || instruction.prototype.is_some()
+                    || instruction.branch_target.is_some()
+                    || instruction.payload_target.is_some()
+                {
+                    return false;
+                }
+                match instruction.opcode {
+                    0x12..=0x15 => {
+                        let width = match instruction.opcode {
+                            0x12 => 1,
+                            0x14 => 3,
+                            _ => 2,
+                        };
+                        if instruction.width != width
+                            || !instruction.reads.is_empty()
+                            || !matches!(instruction.literal, Some(0 | 1))
+                        {
+                            return false;
+                        }
+                        anchors += 1;
+                        vec![]
+                    }
+                    0x01..=0x03 => {
+                        let width = usize::from(instruction.opcode - 0x01) + 1;
+                        if instruction.width != width
+                            || instruction.literal.is_some()
+                            || ssa_instruction.reads.len() != 1
+                            || ssa_instruction.reads[0].words.len() != 1
+                        {
+                            return false;
+                        }
+                        vec![ssa_instruction.reads[0].words[0]]
+                    }
+                    0x0a => {
+                        if instruction.width != 1
+                            || instruction.literal.is_some()
+                            || !ssa_instruction.reads.is_empty()
+                            || calls
+                                .calls
+                                .iter()
+                                .filter(|call| {
+                                    call.result.as_ref().is_some_and(|result| {
+                                        result.descriptor.as_ref() == "Z"
+                                            && result.words.as_slice() == [id]
+                                    })
+                                })
+                                .take(2)
+                                .count()
+                                != 1
+                        {
+                            return false;
+                        }
+                        anchors += 1;
+                        vec![]
+                    }
+                    _ => return false,
+                }
+            }
+        };
+        if dependencies.is_empty() {
+            state[id] = 2;
+        } else {
+            pending.push((id, true));
+            pending.extend(
+                dependencies
+                    .into_iter()
+                    .rev()
+                    .map(|dependency| (dependency, false)),
+            );
+        }
+    }
+    anchors != 0
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BooleanDomain {
+    Bottom,
+    Zero,
+    One,
+    Both,
+    Unknown,
+}
+
+impl BooleanDomain {
+    fn join(self, other: Self) -> Self {
+        use BooleanDomain::*;
+        match (self, other) {
+            (Bottom, value) | (value, Bottom) => value,
+            (Unknown, _) | (_, Unknown) => Unknown,
+            (left, right) if left == right => left,
+            _ => Both,
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        use BooleanDomain::*;
+        if self == Bottom || other == Bottom {
+            return Bottom;
+        }
+        if self == Unknown || other == Unknown {
+            return Unknown;
+        }
+        match (self, other) {
+            (Zero, Zero) => Zero,
+            (One, _) | (_, One) => One,
+            _ => Both,
+        }
+    }
+
+    fn proven(self) -> bool {
+        matches!(self, Self::Zero | Self::One | Self::Both)
+    }
+}
+
+enum BooleanNode {
+    Value(BooleanDomain),
+    Copy(usize),
+    Phi(Vec<usize>),
+    Or(usize, usize),
+}
+
+impl BooleanNode {
+    fn dependencies(&self) -> Vec<usize> {
+        match self {
+            Self::Value(_) => vec![],
+            Self::Copy(value) => vec![*value],
+            Self::Phi(values) => values.clone(),
+            Self::Or(left, right) => vec![*left, *right],
+        }
+    }
+
+    fn transfer(&self, values: &[BooleanDomain]) -> BooleanDomain {
+        match self {
+            Self::Value(value) => *value,
+            Self::Copy(source) => values[*source],
+            Self::Phi(incoming) => incoming
+                .iter()
+                .fold(BooleanDomain::Bottom, |value, source| {
+                    value.join(values[*source])
+                }),
+            Self::Or(left, right) => values[*left].or(values[*right]),
+        }
+    }
+}
+
+// A bitwise OR of two DEX boolean words remains a boolean word. The accumulator
+// can be a loop phi, so compute the least fixed point of only the return value's
+// SSA dependency cone. Bottom never proves a cycle without an entry definition.
+fn boolean_return_or_proven(
+    method: &DexMethod,
+    ir: &crate::native_ir::DecodedMethod,
+    ssa: &crate::native_ssa::SsaMethod,
+    calls: &crate::native_call_values::SsaCalls,
+    pc: usize,
+    source: usize,
+) -> bool {
+    use crate::native_ssa::DefinitionKind;
+    use std::collections::{HashSet, VecDeque};
+
+    let Some(code) = method.code.as_ref() else {
+        return false;
+    };
+    if ssa.definitions.len() > 16_384 || code.ins > code.registers {
+        return false;
+    }
+    let Some(return_ir) = ir
+        .instructions
+        .iter()
+        .find(|instruction| instruction.pc == pc)
+    else {
+        return false;
+    };
+    let Some(return_ssa) = ssa
+        .instructions
+        .iter()
+        .find(|instruction| instruction.pc == pc)
+    else {
+        return false;
+    };
+    if return_ir.opcode != 0x0f
+        || return_ssa.reads.len() != 1
+        || usize::from(return_ssa.reads[0].register) != source
+        || return_ssa.reads[0].words.len() != 1
+    {
+        return false;
+    }
+    let root = return_ssa.reads[0].words[0];
+    if root >= ssa.definitions.len() {
+        return false;
+    }
+    let mut boolean_parameters = HashSet::new();
+    let mut parameter = code.registers - code.ins;
+    if method.access_flags & 0x8 == 0 {
+        let Some(next) = parameter.checked_add(1) else {
+            return false;
+        };
+        parameter = next;
+    }
+    for descriptor in &method.parameters {
+        if descriptor.as_ref() == "Z" {
+            boolean_parameters.insert(parameter);
+        }
+        let width = if matches!(descriptor.as_ref(), "J" | "D") {
+            2
+        } else {
+            1
+        };
+        let Some(next) = parameter.checked_add(width) else {
+            return false;
+        };
+        parameter = next;
+    }
+    if parameter != code.registers {
+        return false;
+    }
+
+    let mut nodes: Vec<Option<BooleanNode>> = (0..ssa.definitions.len()).map(|_| None).collect();
+    let mut pending = vec![root];
+    let mut saw_or = false;
+    while let Some(id) = pending.pop() {
+        let Some(definition) = ssa.definitions.get(id) else {
+            return false;
+        };
+        if nodes[id].is_some() {
+            continue;
+        }
+        let node = match definition.kind {
+            DefinitionKind::Parameter => {
+                BooleanNode::Value(if boolean_parameters.contains(&definition.register) {
+                    BooleanDomain::Both
+                } else {
+                    BooleanDomain::Unknown
+                })
+            }
+            DefinitionKind::Undefined => BooleanNode::Value(BooleanDomain::Unknown),
+            DefinitionKind::Phi { block } => {
+                let phis: Vec<_> = ssa
+                    .phis
+                    .iter()
+                    .filter(|phi| {
+                        phi.result == id
+                            && phi.block == block
+                            && phi.register == definition.register
+                    })
+                    .collect();
+                if phis.len() != 1 || ssa.reachable.get(block) != Some(&true) {
+                    BooleanNode::Value(BooleanDomain::Unknown)
+                } else {
+                    let phi = phis[0];
+                    let mut expected = std::collections::BTreeSet::new();
+                    if block == 0 {
+                        expected.insert(None);
+                    }
+                    for (pred, cfg_block) in ssa.graph.blocks.iter().enumerate() {
+                        if ssa.reachable.get(pred) == Some(&true)
+                            && cfg_block.successors.iter().any(|edge| edge.target == block)
+                        {
+                            expected.insert(Some(pred));
+                        }
+                    }
+                    let actual: std::collections::BTreeSet<_> =
+                        phi.incoming.iter().map(|(pred, _)| *pred).collect();
+                    if expected.is_empty()
+                        || actual != expected
+                        || actual.len() != phi.incoming.len()
+                    {
+                        BooleanNode::Value(BooleanDomain::Unknown)
+                    } else {
+                        BooleanNode::Phi(phi.incoming.iter().map(|(_, value)| *value).collect())
+                    }
+                }
+            }
+            DefinitionKind::Instruction { pc, word, block } => {
+                let decoded = ir
+                    .instructions
+                    .iter()
+                    .find(|instruction| instruction.pc == pc);
+                let renamed = ssa
+                    .instructions
+                    .iter()
+                    .find(|instruction| instruction.pc == pc);
+                if word != 0 || ssa.reachable.get(block) != Some(&true) {
+                    BooleanNode::Value(BooleanDomain::Unknown)
+                } else if let (Some(decoded), Some(renamed)) = (decoded, renamed) {
+                    if renamed.writes.len() != 1
+                        || renamed.writes[0].register != definition.register
+                        || renamed.writes[0].words.as_slice() != [id]
+                        || decoded.may_throw
+                        || decoded.reference.is_some()
+                        || decoded.prototype.is_some()
+                        || decoded.branch_target.is_some()
+                        || decoded.payload_target.is_some()
+                    {
+                        BooleanNode::Value(BooleanDomain::Unknown)
+                    } else {
+                        match decoded.opcode {
+                            0x12..=0x15
+                                if decoded.width
+                                    == match decoded.opcode {
+                                        0x12 => 1,
+                                        0x14 => 3,
+                                        _ => 2,
+                                    }
+                                    && decoded.reads.is_empty()
+                                    && renamed.reads.is_empty() =>
+                            {
+                                BooleanNode::Value(match decoded.literal {
+                                    Some(0) => BooleanDomain::Zero,
+                                    Some(1) => BooleanDomain::One,
+                                    _ => BooleanDomain::Unknown,
+                                })
+                            }
+                            0x01..=0x03
+                                if decoded.width == usize::from(decoded.opcode - 0x01) + 1
+                                    && decoded.literal.is_none()
+                                    && renamed.reads.len() == 1
+                                    && renamed.reads[0].words.len() == 1 =>
+                            {
+                                BooleanNode::Copy(renamed.reads[0].words[0])
+                            }
+                            0x0a if decoded.width == 1
+                                && decoded.literal.is_none()
+                                && renamed.reads.is_empty() =>
+                            {
+                                let exact = calls
+                                    .calls
+                                    .iter()
+                                    .filter(|call| {
+                                        call.result.as_ref().is_some_and(|result| {
+                                            result.descriptor.as_ref() == "Z"
+                                                && result.words.as_slice() == [id]
+                                        })
+                                    })
+                                    .take(2)
+                                    .count()
+                                    == 1;
+                                BooleanNode::Value(if exact {
+                                    BooleanDomain::Both
+                                } else {
+                                    BooleanDomain::Unknown
+                                })
+                            }
+                            0x96 | 0xb6
+                                if decoded.width == if decoded.opcode == 0x96 { 2 } else { 1 }
+                                    && decoded.literal.is_none()
+                                    && decoded.reads.len() == 2
+                                    && renamed.reads.len() == 2
+                                    && renamed.reads.iter().all(|read| read.words.len() == 1) =>
+                            {
+                                saw_or = true;
+                                BooleanNode::Or(
+                                    renamed.reads[0].words[0],
+                                    renamed.reads[1].words[0],
+                                )
+                            }
+                            _ => BooleanNode::Value(BooleanDomain::Unknown),
+                        }
+                    }
+                } else {
+                    BooleanNode::Value(BooleanDomain::Unknown)
+                }
+            }
+        };
+        let dependencies = node.dependencies();
+        if dependencies
+            .iter()
+            .any(|dependency| *dependency >= ssa.definitions.len())
+        {
+            return false;
+        }
+        nodes[id] = Some(node);
+        pending.extend(dependencies);
+    }
+    if !saw_or {
+        return false;
+    }
+
+    let mut users = vec![Vec::new(); ssa.definitions.len()];
+    let mut queue = VecDeque::new();
+    let mut queued = vec![false; ssa.definitions.len()];
+    for (id, node) in nodes.iter().enumerate() {
+        if let Some(node) = node {
+            for dependency in node.dependencies() {
+                users[dependency].push(id);
+            }
+            queue.push_back(id);
+            queued[id] = true;
+        }
+    }
+    let mut values = vec![BooleanDomain::Bottom; ssa.definitions.len()];
+    let mut work = 0usize;
+    while let Some(id) = queue.pop_front() {
+        queued[id] = false;
+        work += 1;
+        if work > 2_000_000 {
+            return false;
+        }
+        let next = values[id].join(nodes[id].as_ref().unwrap().transfer(&values));
+        if next != values[id] {
+            values[id] = next;
+            for &user in &users[id] {
+                if !queued[user] {
+                    queued[user] = true;
+                    queue.push_back(user);
+                }
+            }
+        }
+    }
+    values[root].proven()
+        && nodes
+            .iter()
+            .enumerate()
+            .all(|(id, node)| node.is_none() || values[id] != BooleanDomain::Bottom)
 }
 fn boolean_bitwise_expression(
     op: u8,
@@ -813,6 +1566,7 @@ fn loop_slots(
     start: usize,
     out: &mut Output,
     written: Option<&[bool]>,
+    header_needed: Option<&[bool]>,
 ) -> Result<Vec<Option<Value>>> {
     validate_wide_frame(regs)?;
     let mut slots = vec![None; regs.len()];
@@ -823,6 +1577,12 @@ fn loop_slots(
         }
         let live = graph.live_at(start, r) || (wide(&value.ty) && graph.live_at(start, r + 1));
         if live {
+            if header_needed.is_some_and(|needed| !needed[r]) {
+                // Still expose the entry value to a zero-iteration exit, but
+                // do not allocate a Java variable for an unrelated lifetime.
+                assign(&mut slots, r, value.clone())?;
+                continue;
+            }
             if (value.text == "this" || value.literal.is_some() || value.wide_literal.is_some())
                 && written.is_some_and(|writes| !writes[r])
             {
@@ -843,6 +1603,307 @@ fn integral(value: &Value) -> Result<String> {
         "nonintegral arithmetic"
     );
     Ok(value.text.clone())
+}
+
+// A DEX literal has no primitive/reference type until its uses constrain it.
+// At a loop header, the Java slot must already have the carried type before
+// rendering the body. Consume only a fully resolved, untruncated SSA phi for
+// that physical register; all incoming definitions and uses must agree.
+struct LoopLifetimeProof {
+    header_needed: Vec<bool>,
+    exit_null_types: Vec<Option<String>>,
+}
+
+fn promote_loop_entry_literals(
+    class: &DexClass,
+    method: &DexMethod,
+    graph: &Graph,
+    region: Loop,
+    regs: &mut [Option<Value>],
+    written: Option<&[bool]>,
+) -> Result<Option<LoopLifetimeProof>> {
+    let Some(written) = written else {
+        return Ok(None);
+    };
+    let Some(code) = method.code.as_ref() else {
+        return Ok(None);
+    };
+    if code.instructions.len() > 512
+        || graph.loops.len() > 4
+        || !graph
+            .loops
+            .iter()
+            .any(|loop_region| loop_region.start == region.start)
+        || !(0..regs.len()).any(|r| {
+            written.get(r) == Some(&true)
+                && graph.live_at(region.start, r)
+                && regs[r]
+                    .as_ref()
+                    .is_some_and(|value| value.ty == "I" && value.literal.is_some())
+        })
+    {
+        return Ok(None);
+    }
+    if let (Some(front), Some(cfg)) = (&graph.front_end, &graph.shared_cfg) {
+        let Ok(ssa) =
+            crate::native_ssa::SsaMethod::build_with_work_limit(code, &front.ir, cfg, 2_000_000)
+        else {
+            return Ok(None);
+        };
+        let Ok(calls) = crate::native_call_values::SsaCalls::bind(&front.bound, &ssa) else {
+            return Ok(None);
+        };
+        let Ok(types) = crate::native_types::InferredTypes::infer_with_work_limit(
+            method,
+            &front.ir,
+            &ssa,
+            &calls,
+            &class.symbols,
+            2_000_000,
+        ) else {
+            return Ok(None);
+        };
+        if types.wide_pair_issues != 0 {
+            return Ok(None);
+        }
+        apply_loop_literal_types(regs, written, graph, region.start, &ssa, &types)?;
+        return Ok(Some(loop_lifetime_proof(
+            method, graph, region, regs, written, &ssa, &types,
+        )));
+    }
+    // Legacy region selection has no selected decoded IR. Analyze its exact
+    // immutable method once; malformed or unresolved SSA retains the fallback.
+    let Ok(analysis) = crate::native_method::MethodAnalysis::build(class, method) else {
+        return Ok(None);
+    };
+    let Ok(types) = analysis.infer_types() else {
+        return Ok(None);
+    };
+    if types.wide_pair_issues != 0 {
+        return Ok(None);
+    }
+    apply_loop_literal_types(regs, written, graph, region.start, analysis.ssa(), &types)?;
+    Ok(Some(loop_lifetime_proof(
+        method,
+        graph,
+        region,
+        regs,
+        written,
+        analysis.ssa(),
+        &types,
+    )))
+}
+
+// Physical liveness includes uses after the loop. A zero literal that is used
+// only at the exit must remain available on the guard path, but it is not a
+// carried Java local. SSA reads prove that no iteration observes its old
+// lifetime before a new definition; the exit phi proves the null/reference
+// lifetime separately. Other lifetimes retain the ordinary conservative slot.
+fn loop_lifetime_proof(
+    method: &DexMethod,
+    graph: &Graph,
+    region: Loop,
+    regs: &[Option<Value>],
+    written: &[bool],
+    ssa: &crate::native_ssa::SsaMethod,
+    types: &crate::native_types::InferredTypes,
+) -> LoopLifetimeProof {
+    use crate::native_ssa::DefinitionKind;
+    use crate::native_types::{AssignmentBound, TypeResolution};
+
+    let mut proof = LoopLifetimeProof {
+        header_needed: vec![true; regs.len()],
+        exit_null_types: vec![None; regs.len()],
+    };
+    let Some(code) = method.code.as_ref() else {
+        return proof;
+    };
+    if region.guard.is_none()
+        || region.tail.is_some()
+        || region.exit >= code.instructions.len()
+        || method.code.as_ref().is_some_and(|code| {
+            code.try_regions.iter().any(|protected| {
+                (protected.start as usize) < region.exit && region.start < protected.end as usize
+            })
+        })
+    {
+        return proof;
+    }
+    let end = region.body_end(&graph.widths).min(region.exit);
+    let mut reads_entry = vec![false; regs.len()];
+    for instruction in &ssa.instructions {
+        if !(region.start..end).contains(&instruction.pc)
+            || !ssa
+                .graph
+                .block_at
+                .get(&instruction.pc)
+                .is_some_and(|block| ssa.reachable[*block])
+        {
+            continue;
+        }
+        for read in &instruction.reads {
+            for (word, id) in read.words.iter().enumerate() {
+                let r = usize::from(read.register) + word;
+                if r >= regs.len() {
+                    return proof;
+                }
+                if !matches!(
+                    ssa.definitions[*id].kind,
+                    DefinitionKind::Instruction { pc, .. } if (region.start..end).contains(&pc)
+                ) {
+                    reads_entry[r] = true;
+                }
+            }
+        }
+    }
+    for r in 0..regs.len() {
+        let Some(value) = &regs[r] else { continue };
+        if value.ty != "I"
+            || value.literal != Some(0)
+            || written.get(r) != Some(&true)
+            || reads_entry[r]
+            || !graph.live_at(region.start, r)
+            || !graph.live_at(region.exit, r)
+            || (r > 0 && regs[r - 1].as_ref().is_some_and(|v| wide(&v.ty)))
+            || regs[r].as_ref().is_some_and(|v| wide(&v.ty))
+        {
+            continue;
+        }
+        let mut phis = ssa.phis.iter().filter(|phi| {
+            usize::from(phi.register) == r && ssa.graph.blocks[phi.block].start == region.exit
+        });
+        let Some(phi) = phis.next() else { continue };
+        if phis.next().is_some() || phi.incoming.is_empty() {
+            continue;
+        }
+        let inferred = &types.values[phi.result];
+        let TypeResolution::Resolved(ty) = &inferred.resolution else {
+            continue;
+        };
+        let descriptor = ty.as_ref();
+        if !reference(descriptor)
+            || inferred.bounds_truncated
+            || !inferred.assignment.contains(&AssignmentBound::Literal {
+                bits: 0,
+                wide: false,
+            })
+            || !inferred
+                .assignment
+                .contains(&AssignmentBound::Type(ty.clone()))
+            || !inferred.assignment.iter().all(|bound| match bound {
+                AssignmentBound::Literal { bits, wide } => *bits == 0 && !wide,
+                AssignmentBound::Type(found) => found == ty,
+                _ => false,
+            })
+            || !inferred
+                .required_types
+                .iter()
+                .all(|required| required == ty || required.as_ref() == "Ljava/lang/Object;")
+            || !phi.incoming.iter().all(|(_, id)| {
+                let incoming = &types.values[*id];
+                !incoming.bounds_truncated
+                    && (incoming.assignment.as_slice()
+                        == [AssignmentBound::Literal {
+                            bits: 0,
+                            wide: false,
+                        }]
+                        || (incoming.resolution == inferred.resolution
+                            && incoming.assignment.as_slice()
+                                == [AssignmentBound::Type(ty.clone())]))
+            })
+        {
+            continue;
+        }
+        proof.header_needed[r] = false;
+        proof.exit_null_types[r] = Some(descriptor.into());
+    }
+    proof
+}
+
+fn apply_loop_literal_types(
+    regs: &mut [Option<Value>],
+    written: &[bool],
+    graph: &Graph,
+    start: usize,
+    ssa: &crate::native_ssa::SsaMethod,
+    types: &crate::native_types::InferredTypes,
+) -> Result<()> {
+    use crate::native_types::{AssignmentBound, TypeResolution};
+
+    for (r, slot) in regs.iter_mut().enumerate() {
+        let Some(value) = slot else { continue };
+        let Some(bits) = value.literal else { continue };
+        if value.ty != "I" || written.get(r) != Some(&true) || !graph.live_at(start, r) {
+            continue;
+        }
+        let mut phis = ssa.phis.iter().filter(|phi| {
+            usize::from(phi.register) == r && ssa.graph.blocks[phi.block].start == start
+        });
+        let Some(phi) = phis.next() else { continue };
+        if phis.next().is_some() {
+            continue;
+        }
+        let inferred = &types.values[phi.result];
+        let TypeResolution::Resolved(ty) = &inferred.resolution else {
+            continue;
+        };
+        let descriptor = ty.as_ref();
+        if !(matches!(descriptor, "Z" | "F") || reference(descriptor) && bits == 0) {
+            continue;
+        }
+        if descriptor == "Z" && !matches!(bits, 0 | 1) {
+            continue;
+        }
+        if inferred.bounds_truncated
+            || !inferred.assignment.contains(&AssignmentBound::Literal {
+                bits: i64::from(bits),
+                wide: false,
+            })
+            || !inferred
+                .assignment
+                .contains(&AssignmentBound::Type(ty.clone()))
+            || !inferred.assignment.iter().all(|bound| match bound {
+                AssignmentBound::Literal { bits, wide } => {
+                    !wide
+                        && if descriptor == "Z" {
+                            matches!(bits, 0 | 1)
+                        } else {
+                            !reference(descriptor) || *bits == 0
+                        }
+                }
+                AssignmentBound::Type(found) => found == ty,
+                _ => false,
+            })
+            || !inferred.required_types.iter().all(|required| {
+                required == ty
+                    || (reference(descriptor) && required.as_ref() == "Ljava/lang/Object;")
+            })
+            || phi.incoming.is_empty()
+            || !phi.incoming.iter().all(|(_, id)| {
+                let incoming = &types.values[*id];
+                !incoming.bounds_truncated
+                    && incoming.resolution == inferred.resolution
+                    && incoming.assignment.iter().all(|bound| {
+                        !matches!(bound, AssignmentBound::Unknown | AssignmentBound::Undefined)
+                    })
+            })
+        {
+            continue;
+        }
+        let text = match descriptor {
+            "Z" => (bits != 0).to_string(),
+            "F" => Literal::Bits32(bits as u32).render(Kind::Float)?,
+            _ => "null".into(),
+        };
+        *value = Value {
+            text,
+            ty: descriptor.into(),
+            literal: None,
+            wide_literal: None,
+            raw_bits32: false,
+        };
+    }
+    Ok(())
 }
 fn opname(op: u8) -> Result<&'static str> {
     Ok(match op {
@@ -907,6 +1968,7 @@ struct SharedBranch {
 enum SharedLoopEdgeKind {
     Break,
     Continue,
+    Terminal,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SharedLoopEdge {
@@ -1025,6 +2087,16 @@ fn decoded_all_loop_edges(
             SharedLoopEdgeKind::Continue
         } else if target == region.exit {
             SharedLoopEdgeKind::Break
+        } else if target == region.latch + 2
+            && (region.tail == Some(target)
+                || (region.guard.is_some()
+                    && region.exit == region.latch + 4
+                    && ir
+                        .instructions
+                        .iter()
+                        .any(|i| i.pc == region.latch && matches!(i.opcode, 0x32..=0x3d))))
+        {
+            SharedLoopEdgeKind::Terminal
         } else {
             continue;
         };
@@ -1230,17 +2302,27 @@ fn decoded_posttest_loop(
         .context("missing shared posttest header")?;
     let exit = latch.pc + latch.width;
     ensure!(start < latch.pc, "shared posttest latch is not backward");
+    let mut breaks = 0usize;
     ensure!(
         ir.instructions.iter().all(|i| {
             if !matches!(i.opcode, 0x28..=0x2a | 0x32..=0x3d) || i.pc == latch.pc {
                 return true;
             }
-            (start..latch.pc).contains(&i.pc)
-                && i.branch_target
-                    .is_some_and(|target| target > i.pc && target <= latch.pc)
+            if !(start..latch.pc).contains(&i.pc) {
+                return false;
+            }
+            if i.branch_target == Some(exit) {
+                breaks += 1;
+                return matches!(i.opcode, 0x32..=0x3d)
+                    && i.width == 2
+                    && i.pc + i.width <= latch.pc;
+            }
+            i.branch_target
+                .is_some_and(|target| target > i.pc && target <= latch.pc)
         }),
         "shared posttest additional control"
     );
+    ensure!(breaks <= 8, "shared posttest break budget");
     let header = *cfg
         .block_at
         .get(&start)
@@ -1302,7 +2384,15 @@ fn decoded_posttest_loop(
             );
             for edge in &block.successors {
                 ensure!(
-                    members[edge.target] || (index == from && edge.target == out),
+                    members[edge.target]
+                        || (edge.target == out
+                            && (index == from
+                                || (breaks > 0
+                                    && block.instructions.last().is_some_and(|&pc| {
+                                        ir.instructions
+                                            .iter()
+                                            .any(|i| i.pc == pc && i.branch_target == Some(exit))
+                                    })))),
                     "shared posttest additional exit"
                 );
             }
@@ -1331,6 +2421,389 @@ fn decoded_posttest_loop(
         tail: None,
     })
 }
+// Two conditional backedges can share one header while earlier guards leave
+// through a common exit. The last latch's fallthrough is one terminal return;
+// it must stay distinct from the common exit and from the earlier backedge.
+fn decoded_dual_conditional_backedges(
+    ir: &crate::native_ir::DecodedMethod,
+    cfg: &crate::native_cfg::ControlFlowGraph,
+    work: &mut usize,
+) -> Result<Loop> {
+    let backedges: Vec<_> = ir
+        .instructions
+        .iter()
+        .filter(|i| matches!(i.opcode, 0x32..=0x3d) && i.branch_target.is_some_and(|to| to < i.pc))
+        .collect();
+    ensure!(backedges.len() == 2, "shared dual-backedge count");
+    let (early, latch) = (backedges[0], backedges[1]);
+    let start = latch.branch_target.context("shared dual-backedge header")?;
+    ensure!(
+        early.branch_target == Some(start)
+            && start < early.pc
+            && early.pc + early.width < latch.pc
+            && early.width == 2
+            && latch.width == 2,
+        "shared dual-backedge header and order"
+    );
+    let tail = latch.pc + latch.width;
+    let exit = tail + 1;
+    let tail_instruction = ir
+        .instructions
+        .iter()
+        .find(|i| i.pc == tail)
+        .context("shared dual-backedge terminal tail")?;
+    ensure!(
+        matches!(tail_instruction.opcode, 0x0e..=0x11)
+            && tail_instruction.width == 1
+            && ir.instructions.iter().any(|i| i.pc == exit),
+        "shared dual-backedge terminal tail shape"
+    );
+    let mut breaks = 0;
+    let mut terminal_edges = 0;
+    for instruction in &ir.instructions {
+        if (start..=latch.pc).contains(&instruction.pc)
+            && matches!(instruction.opcode, 0x0e..=0x11 | 0x27)
+        {
+            bail!("shared dual-backedge terminal body");
+        }
+        if !matches!(instruction.opcode, 0x28..=0x2a | 0x32..=0x3d)
+            || instruction.pc == early.pc
+            || instruction.pc == latch.pc
+        {
+            continue;
+        }
+        let target = instruction
+            .branch_target
+            .context("shared dual-backedge target")?;
+        if instruction.pc < start {
+            ensure!(
+                target > instruction.pc && target <= start,
+                "shared dual-backedge prefix enters body"
+            );
+        } else if instruction.pc < latch.pc {
+            if target == exit {
+                breaks += 1;
+                ensure!(
+                    matches!(instruction.opcode, 0x32..=0x3d) && instruction.width == 2,
+                    "shared dual-backedge break shape"
+                );
+            } else if target == tail {
+                terminal_edges += 1;
+                ensure!(
+                    matches!(instruction.opcode, 0x32..=0x3d) && instruction.width == 2,
+                    "shared dual-backedge terminal edge shape"
+                );
+            } else {
+                ensure!(
+                    target > instruction.pc && target <= latch.pc,
+                    "shared dual-backedge interior control"
+                );
+            }
+        } else {
+            ensure!(
+                target > instruction.pc && target >= exit,
+                "shared dual-backedge later reentry"
+            );
+        }
+    }
+    ensure!(
+        breaks <= 2 && terminal_edges <= 1,
+        "shared dual-backedge exit budget"
+    );
+    let header = *cfg
+        .block_at
+        .get(&start)
+        .context("shared dual-backedge header block")?;
+    let first = *cfg
+        .block_at
+        .get(&early.pc)
+        .context("shared dual-backedge first block")?;
+    let last = *cfg
+        .block_at
+        .get(&latch.pc)
+        .context("shared dual-backedge latch block")?;
+    let terminal = *cfg
+        .block_at
+        .get(&tail)
+        .context("shared dual-backedge terminal block")?;
+    let common = *cfg
+        .block_at
+        .get(&exit)
+        .context("shared dual-backedge exit block")?;
+    for (index, branch, fallthrough) in
+        [(first, early, early.pc + early.width), (last, latch, tail)]
+    {
+        let block = &cfg.blocks[index];
+        ensure!(
+            block.instructions.last() == Some(&branch.pc)
+                && block.successors.len() == 2
+                && block.successors[0].target == header
+                && cfg.blocks[block.successors[1].target].start == fallthrough,
+            "shared dual-backedge canonical successors"
+        );
+    }
+    ensure!(
+        cfg.blocks[terminal].instructions.as_slice() == [tail]
+            && cfg.blocks[terminal].successors.is_empty()
+            && cfg.blocks[common].start == exit,
+        "shared dual-backedge terminal ownership"
+    );
+    let dominators = crate::native_dominators::DominatorTree::compute(cfg)?;
+    ensure!(
+        dominators.dominates(header, first) && dominators.dominates(header, last),
+        "shared dual-backedge header dominance"
+    );
+    let mut members = vec![false; cfg.blocks.len()];
+    members[header] = true;
+    let mut pending = vec![first, last];
+    while let Some(block) = pending.pop() {
+        ensure!(*work > 0, "shared dual-backedge membership budget");
+        *work -= 1;
+        if members[block] {
+            continue;
+        }
+        members[block] = true;
+        if block != header {
+            pending.extend(dominators.predecessors[block].iter().copied());
+        }
+    }
+    for (index, block) in cfg.blocks.iter().enumerate() {
+        ensure!(*work > 0, "shared dual-backedge ownership budget");
+        *work -= 1;
+        ensure!(
+            members[index] == (header..=last).contains(&index),
+            "shared dual-backedge cross-region membership"
+        );
+        if members[index] {
+            ensure!(
+                dominators.dominates(header, index),
+                "shared dual-backedge non-dominated member"
+            );
+            for edge in &block.successors {
+                let pc = *block
+                    .instructions
+                    .last()
+                    .context("empty dual-backedge block")?;
+                let owner = ir
+                    .instructions
+                    .iter()
+                    .find(|i| i.pc == pc)
+                    .context("missing dual-backedge terminator")?;
+                ensure!(
+                    members[edge.target]
+                        || (edge.target == common && owner.branch_target == Some(exit))
+                        || (edge.target == terminal
+                            && (index == last || owner.branch_target == Some(tail))),
+                    "shared dual-backedge additional exit"
+                );
+            }
+        } else {
+            ensure!(
+                block
+                    .successors
+                    .iter()
+                    .all(|edge| !members[edge.target] || edge.target == header),
+                "shared dual-backedge interior entry"
+            );
+        }
+    }
+    Ok(Loop {
+        parent: None,
+        start,
+        latch: latch.pc,
+        guard: None,
+        exit,
+        tail: Some(tail),
+    })
+}
+// One pretest guard and a conditional latch can have two terminal return
+// tails: the guard's zero-iteration/default return and the body/latch result.
+// Keep both exits inside a terminal loop region, without inventing a common
+// liveout frame or moving either tail's effects across the loop boundary.
+fn decoded_pretest_terminal_loop(
+    ir: &crate::native_ir::DecodedMethod,
+    cfg: &crate::native_cfg::ControlFlowGraph,
+    work: &mut usize,
+) -> Result<Loop> {
+    let mut backedges = ir.instructions.iter().filter(|i| {
+        matches!(i.opcode, 0x32..=0x3d) && i.branch_target.is_some_and(|target| target < i.pc)
+    });
+    let latch = backedges.next().context("missing shared terminal latch")?;
+    ensure!(
+        backedges.next().is_none() && latch.width == 2,
+        "shared terminal latch shape"
+    );
+    let start = latch
+        .branch_target
+        .context("missing shared terminal header")?;
+    let selected = latch.pc + latch.width;
+    let default = selected + 1;
+    ensure!(start < latch.pc, "shared terminal latch is not backward");
+    let selected_return = ir
+        .instructions
+        .iter()
+        .find(|i| i.pc == selected)
+        .context("missing selected terminal return")?;
+    let default_return = ir
+        .instructions
+        .iter()
+        .find(|i| i.pc == default)
+        .context("missing default terminal return")?;
+    ensure!(
+        matches!(selected_return.opcode, 0x0e..=0x11)
+            && matches!(default_return.opcode, 0x0e..=0x11)
+            && selected_return.width == 1
+            && default_return.width == 1
+            && ir.instructions.last() == Some(default_return),
+        "shared terminal exits are not adjacent final returns"
+    );
+    let guards: Vec<_> = ir
+        .instructions
+        .iter()
+        .filter(|i| {
+            (start..latch.pc).contains(&i.pc)
+                && matches!(i.opcode, 0x32..=0x3d)
+                && i.branch_target == Some(default)
+        })
+        .collect();
+    ensure!(guards.len() == 1, "shared terminal default guard identity");
+    let guard = guards[0];
+    let mut selected_edges = 0;
+    ensure!(
+        ir.instructions.iter().all(|i| {
+            if !matches!(i.opcode, 0x28..=0x2a | 0x32..=0x3d) || i.pc == latch.pc {
+                return true;
+            }
+            if i.pc < start {
+                return i
+                    .branch_target
+                    .is_some_and(|target| target > i.pc && target <= start);
+            }
+            if !(start..latch.pc).contains(&i.pc) {
+                return false;
+            }
+            if i.pc == guard.pc {
+                return i.width == 2;
+            }
+            if i.branch_target == Some(selected) {
+                selected_edges += 1;
+                return matches!(i.opcode, 0x32..=0x3d) && i.width == 2;
+            }
+            i.branch_target
+                .is_some_and(|target| target > i.pc && target <= latch.pc)
+        }),
+        "shared terminal additional control"
+    );
+    ensure!(selected_edges <= 1, "shared terminal selected-edge budget");
+    ensure!(
+        ir.instructions.iter().all(|i| {
+            !(start..latch.pc).contains(&i.pc) || !matches!(i.opcode, 0x0e..=0x11 | 0x27)
+        }),
+        "terminal return inside shared loop body"
+    );
+    let header = *cfg
+        .block_at
+        .get(&start)
+        .context("shared terminal header boundary")?;
+    let from = *cfg
+        .block_at
+        .get(&latch.pc)
+        .context("shared terminal latch boundary")?;
+    let selected_block = *cfg
+        .block_at
+        .get(&selected)
+        .context("shared terminal selected boundary")?;
+    let default_block = *cfg
+        .block_at
+        .get(&default)
+        .context("shared terminal default boundary")?;
+    let guard_block = *cfg
+        .block_at
+        .get(&guard.pc)
+        .context("shared terminal guard boundary")?;
+    ensure!(
+        cfg.blocks[from].instructions.last() == Some(&latch.pc)
+            && cfg.blocks[from].successors.len() == 2
+            && cfg.blocks[from].successors[0].target == header
+            && cfg.blocks[from].successors[1].target == selected_block
+            && cfg.blocks[guard_block].instructions.last() == Some(&guard.pc)
+            && cfg.blocks[guard_block].successors.len() == 2
+            && cfg.blocks[guard_block].successors[0].target == default_block
+            && cfg.blocks[selected_block].successors.is_empty()
+            && cfg.blocks[default_block].successors.is_empty(),
+        "shared terminal successor identity"
+    );
+    let dominators = crate::native_dominators::DominatorTree::compute(cfg)?;
+    ensure!(
+        dominators.dominates(header, from),
+        "shared terminal header does not dominate latch"
+    );
+    let mut members = vec![false; cfg.blocks.len()];
+    members[header] = true;
+    members[from] = true;
+    let mut pending = vec![from];
+    while let Some(block) = pending.pop() {
+        if block == header {
+            continue;
+        }
+        for &predecessor in &dominators.predecessors[block] {
+            ensure!(*work > 0, "shared terminal membership work budget");
+            *work -= 1;
+            ensure!(
+                predecessor < cfg.blocks.len(),
+                "synthetic terminal predecessor"
+            );
+            if !members[predecessor] {
+                members[predecessor] = true;
+                pending.push(predecessor);
+            }
+        }
+    }
+    for (index, block) in cfg.blocks.iter().enumerate() {
+        ensure!(*work > 0, "shared terminal membership work budget");
+        *work -= 1;
+        ensure!(
+            members[index] == (header..=from).contains(&index),
+            "shared terminal cross-region membership"
+        );
+        if members[index] {
+            ensure!(
+                dominators.dominates(header, index),
+                "shared terminal non-dominated body"
+            );
+            for edge in &block.successors {
+                ensure!(
+                    members[edge.target]
+                        || (index == guard_block && edge.target == default_block)
+                        || (edge.target == selected_block
+                            && (index == from
+                                || block.instructions.last().is_some_and(|&pc| {
+                                    ir.instructions
+                                        .iter()
+                                        .any(|i| i.pc == pc && i.branch_target == Some(selected))
+                                }))),
+                    "shared terminal additional exit"
+                );
+            }
+        } else {
+            ensure!(
+                block
+                    .successors
+                    .iter()
+                    .all(|edge| { !members[edge.target] || edge.target == header }),
+                "shared terminal interior entry"
+            );
+        }
+    }
+    Ok(Loop {
+        parent: None,
+        start,
+        latch: latch.pc,
+        guard: Some(guard.pc),
+        exit: default + 1,
+        tail: None,
+    })
+}
 fn decoded_natural_loops(
     ir: &crate::native_ir::DecodedMethod,
     cfg: &crate::native_cfg::ControlFlowGraph,
@@ -1338,6 +2811,36 @@ fn decoded_natural_loops(
     if !ir.instructions.iter().any(|i| {
         matches!(i.opcode, 0x28..=0x2a) && i.branch_target.is_some_and(|target| target < i.pc)
     }) {
+        if ir
+            .instructions
+            .iter()
+            .filter(|i| {
+                matches!(i.opcode, 0x32..=0x3d)
+                    && i.branch_target.is_some_and(|target| target < i.pc)
+            })
+            .count()
+            == 2
+        {
+            return Ok(vec![decoded_dual_conditional_backedges(
+                ir,
+                cfg,
+                &mut 16_000_000,
+            )?]);
+        }
+        if ir.instructions.iter().any(|i| {
+            matches!(i.opcode, 0x32..=0x3d)
+                && i.branch_target.is_some_and(|target| target < i.pc)
+                && ir.instructions.iter().any(|guard| {
+                    matches!(guard.opcode, 0x32..=0x3d)
+                        && guard.branch_target == Some(i.pc + i.width + 1)
+                })
+        }) {
+            return Ok(vec![decoded_pretest_terminal_loop(
+                ir,
+                cfg,
+                &mut 16_000_000,
+            )?]);
+        }
         return Ok(vec![decoded_posttest_loop(ir, cfg, &mut 16_000_000)?]);
     }
     // JADX BlockProcessor.markLoops/registerLoops identifies and records
@@ -1534,14 +3037,220 @@ fn decoded_loop_branch_plans(
     regions: &[Loop],
     len: usize,
 ) -> Result<Vec<SharedBranch>> {
+    if regions.len() == 1 && regions[0].guard.is_none() && regions[0].tail.is_some() {
+        let region = regions[0];
+        ensure!(
+            decoded_dual_conditional_backedges(ir, cfg, &mut 16_000_000)? == region,
+            "shared dual-backedge region differs from canonical CFG"
+        );
+        let special = decoded_all_loop_edges(ir, regions)?;
+        let mut projection = cfg.clone();
+        let early = special
+            .iter()
+            .find(|edge| edge.kind == SharedLoopEdgeKind::Continue && edge.owner == region.start)
+            .context("missing shared dual-backedge early continue")?;
+        for pc in [early.branch, region.latch] {
+            let block = &mut projection.blocks[cfg.block_at[&pc]];
+            ensure!(
+                block.successors.len() == 2
+                    && block.successors[0].target == cfg.block_at[&region.start],
+                "shared dual-backedge projection differs from CFG"
+            );
+            block.successors.remove(0);
+        }
+        for edge in &special {
+            if edge.branch == early.branch {
+                continue;
+            }
+            ensure!(
+                matches!(
+                    edge.kind,
+                    SharedLoopEdgeKind::Break | SharedLoopEdgeKind::Terminal
+                ),
+                "shared dual-backedge edge kind"
+            );
+            let block = &mut projection.blocks[cfg.block_at[&edge.branch]];
+            ensure!(
+                block.successors.len() == 2
+                    && cfg.blocks[block.successors[0].target].start == edge.taken
+                    && cfg.blocks[block.successors[1].target].start == edge.fallthrough,
+                "shared dual-backedge projected edge differs from CFG"
+            );
+            block.successors.remove(0);
+        }
+        let mut plans = if ir.instructions.iter().any(|i| {
+            (region.start..region.latch).contains(&i.pc)
+                && matches!(i.opcode, 0x32..=0x3d)
+                && shared_loop_edge_at(&special, i.pc).is_none()
+        }) {
+            decoded_branch_plans_in(
+                ir,
+                &projection,
+                len,
+                region.start..region.latch,
+                &special,
+                &[],
+            )?
+        } else {
+            Vec::new()
+        };
+        for plan in &mut plans {
+            ensure!(
+                plan.taken <= region.latch
+                    && plan.fallthrough <= region.latch
+                    && plan.join <= region.latch,
+                "shared dual-backedge body branch leaves owner"
+            );
+            plan.owner = Some(region.start);
+        }
+        if ir
+            .instructions
+            .iter()
+            .any(|i| i.pc < region.start && matches!(i.opcode, 0x32..=0x3d))
+        {
+            let outer =
+                decoded_branch_plans_in(ir, &projection, len, 0..region.start, &[], regions)?;
+            ensure!(
+                outer.iter().all(|plan| {
+                    plan.taken <= region.start
+                        && plan.fallthrough <= region.start
+                        && plan.join <= region.start
+                }),
+                "shared dual-backedge prefix enters body"
+            );
+            plans.extend(outer);
+        }
+        if ir
+            .instructions
+            .iter()
+            .any(|i| i.pc >= region.exit && matches!(i.opcode, 0x32..=0x3d))
+        {
+            let suffix =
+                decoded_branch_plans_in(ir, &projection, len, region.exit..len, &[], regions)?;
+            ensure!(
+                suffix.iter().all(|plan| plan.branch >= region.exit
+                    && plan.taken >= region.exit
+                    && plan.fallthrough >= region.exit
+                    && plan.join >= region.exit),
+                "shared dual-backedge suffix reenters loop"
+            );
+            plans.extend(suffix);
+        }
+        plans.sort_unstable_by_key(|plan| plan.branch);
+        ensure!(
+            plans.windows(2).all(|pair| pair[0].branch < pair[1].branch),
+            "duplicate shared dual-backedge branch plan"
+        );
+        return Ok(plans);
+    }
+    if regions.len() == 1
+        && regions[0].guard.is_some()
+        && regions[0].exit == len
+        && ir
+            .instructions
+            .iter()
+            .any(|i| i.pc == regions[0].latch && matches!(i.opcode, 0x32..=0x3d))
+    {
+        ensure!(
+            decoded_pretest_terminal_loop(ir, cfg, &mut 16_000_000)? == regions[0],
+            "shared terminal region differs"
+        );
+        let region = regions[0];
+        let special = decoded_all_loop_edges(ir, regions)?;
+        let mut projection = cfg.clone();
+        projection.blocks[cfg.block_at[&region.latch]]
+            .successors
+            .remove(0);
+        for edge in &special {
+            ensure!(
+                edge.kind == SharedLoopEdgeKind::Terminal,
+                "shared terminal edge has wrong owner"
+            );
+            let block = cfg.block_at[&edge.branch];
+            ensure!(
+                projection.blocks[block].successors.len() == 2
+                    && cfg.blocks[projection.blocks[block].successors[0].target].start
+                        == edge.taken
+                    && cfg.blocks[projection.blocks[block].successors[1].target].start
+                        == edge.fallthrough,
+                "shared terminal edge differs from canonical successors"
+            );
+            projection.blocks[block].successors.remove(0);
+        }
+        let mut plans = Vec::new();
+        let prefix_conditions: Vec<_> = ir
+            .instructions
+            .iter()
+            .filter(|i| i.pc < region.start && matches!(i.opcode, 0x32..=0x3d))
+            .collect();
+        ensure!(
+            prefix_conditions.len() <= 1,
+            "shared terminal prefix branch budget"
+        );
+        if let Some(branch) = prefix_conditions.first() {
+            let fallthrough = branch.pc + branch.width;
+            let taken = branch
+                .branch_target
+                .context("shared terminal prefix target")?;
+            let returned = ir
+                .instructions
+                .iter()
+                .find(|i| i.pc == fallthrough)
+                .context("shared terminal prefix return")?;
+            let block = &cfg.blocks[cfg.block_at[&branch.pc]];
+            ensure!(
+                branch.width == 2
+                    && taken == fallthrough + 1
+                    && taken <= region.start
+                    && matches!(returned.opcode, 0x0e..=0x11)
+                    && returned.width == 1
+                    && block.instructions.last() == Some(&branch.pc)
+                    && block.successors.len() == 2
+                    && cfg.blocks[block.successors[0].target].start == taken
+                    && cfg.blocks[block.successors[1].target].start == fallthrough,
+                "shared terminal prefix is not a closed early return"
+            );
+            plans.push(SharedBranch {
+                owner: None,
+                branch: branch.pc,
+                taken,
+                fallthrough,
+                join: taken,
+            });
+        }
+        let body = region.guard.unwrap() + 2..region.latch;
+        if ir.instructions.iter().any(|i| {
+            body.contains(&i.pc)
+                && matches!(i.opcode, 0x32..=0x3d)
+                && shared_loop_edge_at(&special, i.pc).is_none()
+        }) {
+            let mut inner =
+                decoded_branch_plans_in(ir, &projection, len, body.clone(), &special, &[])?;
+            for plan in &mut inner {
+                ensure!(
+                    plan.join <= region.latch
+                        && plan.taken <= region.latch
+                        && plan.fallthrough <= region.latch,
+                    "shared terminal body branch leaves loop"
+                );
+                plan.owner = Some(region.start);
+            }
+            plans.extend(inner);
+        }
+        plans.sort_unstable_by_key(|p| p.branch);
+        return Ok(plans);
+    }
     if regions.len() == 1 && regions[0].guard.is_none() {
         ensure!(
             decoded_posttest_loop(ir, cfg, &mut 16_000_000)? == regions[0],
             "shared posttest region differs"
         );
         let region = regions[0];
+        let special = decoded_all_loop_edges(ir, regions)?;
         if !ir.instructions.iter().any(|i| {
-            (region.start..region.latch).contains(&i.pc) && matches!(i.opcode, 0x32..=0x3d)
+            (region.start..region.latch).contains(&i.pc)
+                && matches!(i.opcode, 0x32..=0x3d)
+                && shared_loop_edge_at(&special, i.pc).is_none()
         }) {
             return Ok(Vec::new());
         }
@@ -1550,8 +3259,27 @@ fn decoded_loop_branch_plans(
         // Only remove the conditional backedge. The fallthrough exit remains
         // canonical, while dominance and liveness use the original cyclic CFG.
         projection.blocks[latch].successors.remove(0);
-        let mut plans =
-            decoded_branch_plans_in(ir, &projection, len, region.start..region.latch, &[], &[])?;
+        for edge in &special {
+            let block = cfg.block_at[&edge.branch];
+            ensure!(
+                edge.kind == SharedLoopEdgeKind::Break
+                    && projection.blocks[block].successors.len() == 2
+                    && cfg.blocks[projection.blocks[block].successors[0].target].start
+                        == edge.taken
+                    && cfg.blocks[projection.blocks[block].successors[1].target].start
+                        == edge.fallthrough,
+                "shared posttest break differs from canonical successors"
+            );
+            projection.blocks[block].successors.remove(0);
+        }
+        let mut plans = decoded_branch_plans_in(
+            ir,
+            &projection,
+            len,
+            region.start..region.latch,
+            &special,
+            &[],
+        )?;
         for plan in &mut plans {
             ensure!(
                 plan.taken <= region.latch
@@ -1859,6 +3587,15 @@ fn decoded_goto(instruction: &crate::native_ir::Instruction) -> Result<usize> {
         .context("missing shared goto target")
 }
 
+#[derive(Clone)]
+struct ProtectedLoopEscape {
+    start: usize,
+    end: usize,
+    label: String,
+    forbidden_writes: Vec<bool>,
+    used: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
 struct Graph {
     front_end: Option<crate::native_method::MethodFrontEnd>,
     shared_cfg: Option<crate::native_cfg::ControlFlowGraph>,
@@ -1867,7 +3604,9 @@ struct Graph {
     shared_branches: Vec<SharedBranch>,
     shared_live: Option<SharedLiveness>,
     synchronized: Vec<synchronized::Region>,
+    monitor_dispatch: std::cell::RefCell<Vec<synchronized::Dispatch>>,
     protected: Vec<std::ops::Range<usize>>,
+    protected_loop_escape: std::cell::RefCell<Option<ProtectedLoopEscape>>,
     caught_values: std::cell::RefCell<std::collections::HashSet<String>>,
     catch_rethrows: std::cell::RefCell<std::collections::HashMap<String, String>>,
     constructor_bindings: std::cell::OnceCell<
@@ -1913,7 +3652,9 @@ impl Graph {
             shared_branches: Vec::new(),
             shared_live: None,
             synchronized: Vec::new(),
+            monitor_dispatch: Default::default(),
             protected: Vec::new(),
+            protected_loop_escape: Default::default(),
             caught_values: Default::default(),
             catch_rethrows: Default::default(),
             constructor_bindings: std::cell::OnceCell::new(),
@@ -1998,15 +3739,73 @@ impl Graph {
             })
             .collect();
         let posttest = backward_gotos == 0 && backward_conditions.len() == 1;
+        let dual_backedges = backward_gotos == 0
+            && backward_conditions.len() == 2
+            && backward_conditions[0].1 == backward_conditions[1].1
+            && backward_conditions[1].0 + 3 < code.instructions.len()
+            && matches!(
+                code.instructions[backward_conditions[1].0 + 2] as u8,
+                0x0e..=0x11
+            );
         if posttest {
             let (latch, header) = backward_conditions[0];
-            if control.iter().any(|&(pc, target)| {
-                pc != latch
-                    && !(pc as i64 >= header
+            let exit = latch + 2;
+            let terminal_pretest = exit + 2 == code.instructions.len()
+                && matches!(code.instructions[exit] as u8, 0x0e..=0x11)
+                && matches!(code.instructions[exit + 1] as u8, 0x0e..=0x11)
+                && control.iter().any(|&(pc, target)| {
+                    pc as i64 >= header
                         && pc < latch
-                        && target > pc as i64
-                        && target <= latch as i64)
+                        && matches!(code.instructions[pc] as u8, 0x32..=0x3d)
+                        && target == (exit + 1) as i64
+                });
+            // The terminal specialization plans at most one prefix return.
+            // A chain of closed early-return arms was already supported by
+            // the ordinary renderer; leave that larger shape on its route.
+            // Malformed prefix edges stay selected and fail canonical proof.
+            if terminal_pretest {
+                let prefix: Vec<_> = control
+                    .iter()
+                    .filter(|&&(pc, _)| (pc as i64) < header)
+                    .collect();
+                if prefix.len() > 1
+                    && prefix.iter().all(|&&(pc, target)| {
+                        matches!(code.instructions[pc] as u8, 0x32..=0x3d)
+                            && target == (pc + 3) as i64
+                            && target <= header
+                            && code
+                                .instructions
+                                .get(pc + 2)
+                                .is_some_and(|word| matches!(*word as u8, 0x0e..=0x11))
+                    })
+                {
+                    return Ok(None);
+                }
+            }
+            let mut breaks = 0usize;
+            if control.iter().any(|&(pc, target)| {
+                if pc == latch {
+                    return false;
+                }
+                if terminal_pretest && (pc as i64) < header {
+                    return !(target > pc as i64 && target <= header);
+                }
+                if terminal_pretest && target == (exit + 1) as i64 {
+                    return !matches!(code.instructions[pc] as u8, 0x32..=0x3d)
+                        || (pc as i64) < header
+                        || pc + 2 > latch;
+                }
+                if target == exit as i64 {
+                    breaks += 1;
+                    return !matches!(code.instructions[pc] as u8, 0x32..=0x3d)
+                        || (pc as i64) < header
+                        || pc + 2 > latch;
+                }
+                !(pc as i64 >= header && pc < latch && target > pc as i64 && target <= latch as i64)
             }) {
+                return Ok(None);
+            }
+            if breaks > 8 {
                 return Ok(None);
             }
             // Scan real boundaries, never a branch operand interpreted as an opcode.
@@ -2025,6 +3824,71 @@ impl Graph {
                 "shared posttest target is not an instruction boundary"
             );
             if terminal {
+                return Ok(None);
+            }
+        } else if dual_backedges {
+            if !code.try_regions.is_empty() {
+                return Ok(None);
+            }
+            let start = backward_conditions[0].1;
+            let early = backward_conditions[0].0;
+            let latch = backward_conditions[1].0;
+            let tail = latch + 2;
+            let exit = tail + 1;
+            // A single prefix return arm followed by this loop belongs to the
+            // established renderer. The bounded outer projection below owns
+            // only the already-proven chain of closed return arms.
+            let prefix: Vec<_> = control
+                .iter()
+                .filter(|&&(pc, _)| (pc as i64) < start)
+                .collect();
+            if !prefix.is_empty()
+                && (prefix.len() < 2
+                    || !prefix.iter().all(|&&(pc, target)| {
+                        matches!(code.instructions[pc] as u8, 0x32..=0x3d)
+                            && target == (pc + 3) as i64
+                            && target <= start
+                            && code
+                                .instructions
+                                .get(pc + 2)
+                                .is_some_and(|word| matches!(*word as u8, 0x0e..=0x11))
+                    }))
+            {
+                return Ok(None);
+            }
+            let mut body_pc = 0;
+            while body_pc <= latch {
+                if body_pc as i64 >= start
+                    && matches!(code.instructions[body_pc] as u8, 0x0e..=0x11 | 0x27)
+                {
+                    return Ok(None);
+                }
+                body_pc += crate::native_cfg::instruction_width(&code.instructions, body_pc)?.0;
+            }
+            let mut breaks = 0;
+            let mut terminal_edges = 0;
+            if control.iter().any(|&(pc, target)| {
+                if pc == early || pc == latch {
+                    return false;
+                }
+                if (pc as i64) < start {
+                    return target <= pc as i64 || target > start;
+                }
+                if pc < latch {
+                    if target == exit as i64 {
+                        breaks += 1;
+                        return false;
+                    }
+                    if target == tail as i64 {
+                        terminal_edges += 1;
+                        return false;
+                    }
+                    return target <= pc as i64 || target > latch as i64;
+                }
+                target <= pc as i64 || target < exit as i64
+            }) || breaks > 2
+                || terminal_edges > 1
+            {
                 return Ok(None);
             }
         } else if backward_gotos == 0 && control.iter().any(|&(pc, target)| target <= pc as i64) {
@@ -2114,7 +3978,7 @@ impl Graph {
             .map_err(|error| anyhow::anyhow!("shared front end: {error:#}"))?;
         let mut graph = Self::empty(code.instructions.len());
         if condition_count != 0 {
-            let cfg = if backward_gotos == 0 && !posttest {
+            let cfg = if backward_gotos == 0 && !posttest && !dual_backedges {
                 crate::native_cfg::ControlFlowGraph::from_decoded(
                     &front_end.ir,
                     code.instructions.len(),
@@ -2125,7 +3989,7 @@ impl Graph {
                     code.instructions.len(),
                 )?
             };
-            if backward_gotos == 0 && !posttest {
+            if backward_gotos == 0 && !posttest && !dual_backedges {
                 graph.shared_branches =
                     decoded_branch_plans(&front_end.ir, &cfg, code.instructions.len())?;
             } else {
@@ -2553,7 +4417,6 @@ impl Graph {
                     && let Some(join) = graph.targets[pos]
                     && join > exit
                 {
-                    tail = Some(exit);
                     // Optimized search loops often jump over a null/default
                     // assignment on the successful exit. Keep both exit paths
                     // in the loop and merge at that forward jump's destination.
@@ -2574,8 +4437,34 @@ impl Graph {
                             common = target;
                         }
                     }
-                    exit = common;
-                    Some(pos)
+                    // Shared success tails are not loop-owned: an independent
+                    // predecessor may jump directly to the latch fallthrough.
+                    // Keep the canonical loop interval in that case; its guard
+                    // is rendered as a proven escape without absorbing effects
+                    // that also execute when the loop is bypassed.
+                    let shared_tail =
+                        graph.targets.iter().enumerate().any(|(from, target)| {
+                            !(start..common).contains(&from)
+                                && target.is_some_and(|to| {
+                                    (exit..common).contains(&to)
+                                        && !graph.pure_exit_tail(to, common, words)
+                                })
+                        }) || graph.switches.iter().enumerate().any(|(from, switch)| {
+                            !(start..common).contains(&from)
+                                && switch.as_ref().is_some_and(|switch| {
+                                    switch.cases.iter().any(|(_, to)| {
+                                        (exit..common).contains(to)
+                                            && !graph.pure_exit_tail(*to, common, words)
+                                    })
+                                })
+                        });
+                    if shared_tail {
+                        None
+                    } else {
+                        tail = Some(exit);
+                        exit = common;
+                        Some(pos)
+                    }
                 } else {
                     None
                 }
@@ -2657,7 +4546,14 @@ impl Graph {
                         "unsupported loop interior edge"
                     );
                 } else {
-                    ensure!(to <= start || to >= body_end, "loop has an interior entry");
+                    ensure!(
+                        to <= start
+                            || to >= body_end
+                            || tail.is_some_and(
+                                |tail| to >= tail && graph.pure_exit_tail(to, exit, words)
+                            ),
+                        "loop has an interior entry"
+                    );
                 }
             }
         }
@@ -2813,6 +4709,28 @@ impl Graph {
         }
         Ok(true)
     }
+    /// A shared default assignment may be copied at an external entry to a
+    /// loop's exit tail. Only straight-line, nonthrowing DEX moves/constants
+    /// are safe to duplicate across those owners.
+    fn pure_exit_tail(&self, start: usize, join: usize, words: &[u16]) -> bool {
+        if start >= join {
+            return false;
+        }
+        let mut pc = start;
+        while pc < join {
+            if pc >= words.len()
+                || self.widths[pc] == 0
+                || self.payloads[pc]
+                || self.targets[pc].is_some()
+                || self.switches[pc].is_some()
+                || !matches!(words[pc] as u8, 0x00..=0x09 | 0x12..=0x19)
+            {
+                return false;
+            }
+            pc += self.widths[pc];
+        }
+        pc == join
+    }
     fn terminal_loop_escape(&self, pc: usize, stop: usize, words: &[u16]) -> bool {
         self.loops.iter().any(|region| {
             region.start <= stop
@@ -2827,6 +4745,69 @@ impl Graph {
                             )
                             .unwrap_or(false)))
         })
+    }
+
+    fn protected_escape(
+        &self,
+        pc: usize,
+        excluded: std::ops::Range<usize>,
+        code: &crate::native_dex::DexCode,
+    ) -> Result<Option<ProtectedLoopEscape>> {
+        let Some(context) = self.protected_loop_escape.borrow().clone() else {
+            return Ok(None);
+        };
+        if excluded.contains(&pc) || pc < context.start || pc >= context.end {
+            return Ok(None);
+        }
+        let words = &code.instructions;
+        let mut seen = std::collections::HashSet::new();
+        let mut pending = vec![pc];
+        while let Some(pc) = pending.pop() {
+            self.tick()?;
+            if pc == context.end {
+                continue;
+            }
+            if excluded.contains(&pc)
+                || pc < context.start
+                || pc >= context.end
+                || self.widths[pc] == 0
+                || self.payloads[pc]
+            {
+                return Ok(None);
+            }
+            if !seen.insert(pc) {
+                continue;
+            }
+            let Some(writes) = self.written_in(code, pc, pc + self.widths[pc]) else {
+                return Ok(None);
+            };
+            if writes
+                .iter()
+                .zip(&context.forbidden_writes)
+                .any(|(write, forbidden)| *write && *forbidden)
+            {
+                return Ok(None);
+            }
+            let op = words[pc] as u8;
+            if matches!(op, 0x0d..=0x11 | 0x27) {
+                return Ok(None);
+            }
+            let mut successors = Vec::new();
+            if let Some(target) = self.targets[pc] {
+                successors.push(target);
+            }
+            if let Some(switch) = &self.switches[pc] {
+                successors.extend(switch.cases.iter().map(|(_, target)| *target));
+            }
+            if !matches!(op, 0x28..=0x2a) {
+                successors.push(pc + self.widths[pc]);
+            }
+            if successors.iter().any(|target| *target <= pc) {
+                return Ok(None);
+            }
+            pending.extend(successors);
+        }
+        Ok(Some(context))
     }
 
     fn reachable(&self, start: usize, stop: usize, words: &[u16]) -> Result<Vec<bool>> {
@@ -3185,11 +5166,28 @@ pub(super) fn reconstruct(
                 .try_regions
                 .iter()
                 .enumerate()
-                .all(|(index, _)| monitor_try(index)
-                    || graph
-                        .synchronized
-                        .iter()
-                        .any(|r| r.inner_tries.contains(&index))),
+                .all(|(index, region)| {
+                    monitor_try(index)
+                        || graph.synchronized.iter().any(|r| r.inner_tries.contains(&index))
+                        // A leading typed try and its terminating handler are
+                        // independent of later monitor ownership. Reject any
+                        // handler edge that enters monitor code or cleanup.
+                        || (region.catches.iter().all(|(ty, _)| ty.is_some())
+                            && graph.synchronized.iter().all(|r| region.end as usize <= r.enter)
+                            && region.catches.iter().all(|(_, handler)| {
+                                graph.reachable(*handler as usize, code.instructions.len(), &code.instructions)
+                                    .is_ok_and(|seen| seen.iter().enumerate().all(|(pc, live)| {
+                                        !live || (pc < code.instructions.len()
+                                            && !matches!(code.instructions[pc] as u8, 0x1d | 0x1e)
+                                            && graph.synchronized.iter().all(|r|
+                                                pc < r.enter || pc > r.exit)
+                                            && code.try_regions.iter().enumerate().all(|(i, protected)|
+                                                !monitor_try(i)
+                                                || pc < protected.start as usize
+                                                || pc >= protected.end as usize))
+                                    }))
+                            }))
+                }),
         "mixed monitor and ordinary exception regions not reconstructed"
     );
     if graph.shared_cfg.is_none()
@@ -3224,6 +5222,81 @@ pub(super) fn reconstruct(
         None,
     )?;
     ensure!(returned, "method falls off end");
+    // DEX may omit Throws even though an exact static call in the rendered
+    // body declares a checked exception. Add it only when the loaded override
+    // family permits that declaration, after successful body reconstruction.
+    if method.name.as_ref() != "<clinit>"
+        && method.thrown_types.is_empty()
+        && let Some(hierarchy) = class.symbols.hierarchy.get()
+    {
+        let mut pc = 0;
+        while pc < code.instructions.len() {
+            let width = graph.widths[pc];
+            if width == 0 {
+                pc += 1;
+                continue;
+            }
+            if matches!(code.instructions[pc] as u8, 0x71 | 0x77)
+                && let Some(&(owner_idx, proto_idx, name_idx)) = class
+                    .symbols
+                    .methods
+                    .get(code.instructions[pc + 1] as usize)
+                && let (Some(owner), Some((ret, args)), Some(name)) = (
+                    class.symbols.types.get(owner_idx as usize),
+                    class.symbols.protos.get(proto_idx as usize),
+                    class.symbols.strings.get(name_idx as usize),
+                )
+                && let Some(thrown_types) = hierarchy
+                    .exact_static_call_thrown_types(owner, name, args, ret)
+                    .or_else(|| {
+                        if owner.as_ref() != class.descriptor.as_ref() {
+                            return None;
+                        }
+                        let mut matches = class.methods.iter().filter(|candidate| {
+                            candidate.access_flags & 8 != 0
+                                && candidate.name.as_ref() == name.as_str()
+                                && candidate.parameters == *args
+                                && candidate.return_type == *ret
+                        });
+                        let candidate = matches.next()?;
+                        if matches.next().is_some() {
+                            return None;
+                        }
+                        throwing::simple_static_parameter_throw(class, candidate)
+                            .map(|ty| vec![std::sync::Arc::<str>::from(ty)])
+                    })
+            {
+                for ty in thrown_types {
+                    if throwing::inferable_checked_type(class, &ty)
+                        && !throwing::locally_caught(
+                            class,
+                            method,
+                            pc,
+                            &Value {
+                                text: String::new(),
+                                ty: ty.to_string(),
+                                literal: None,
+                                wide_literal: None,
+                                raw_bits32: false,
+                            },
+                        )
+                    {
+                        if hierarchy.permits_inferred_checked_throw(class, method, &ty) {
+                            out.inferred_throws.insert(ty.to_string());
+                        } else if !super::inherited_override_exception(class, method).is_some_and(
+                            |declared| {
+                                hierarchy.assignable(&ty, declared)
+                                    == crate::native_hierarchy::Relation::Proven
+                            },
+                        ) {
+                            bail!("Checked static call exceeds inherited throws contract");
+                        }
+                    }
+                }
+            }
+            pc += width;
+        }
+    }
     let mut body = MethodBody {
         text: out.text,
         links: out.links,
@@ -3403,9 +5476,10 @@ fn render_loop(
     method: &DexMethod,
     graph: &Graph,
     region: Loop,
-    regs: Vec<Option<Value>>,
+    mut regs: Vec<Option<Value>>,
     out: &mut Output,
     depth: usize,
+    in_try: bool,
 ) -> Result<Vec<Option<Value>>> {
     ensure!(depth <= 32, "loop nesting exceeds budget");
     let words = &method
@@ -3426,6 +5500,12 @@ fn render_loop(
             .enumerate()
             .all(|(index, protected)| protected.end as usize <= region.start
                 || protected.start as usize >= region.exit
+                || (in_try
+                    && protected.start as usize <= region.start
+                    && region.exit <= protected.end as usize)
+                || (!in_try
+                    && region.start <= protected.start as usize
+                    && protected.end as usize <= region.exit)
                 || graph
                     .synchronized
                     .iter()
@@ -3434,6 +5514,29 @@ fn render_loop(
                         && region.exit <= monitor.exit)),
         "loop overlaps protected region"
     );
+    let no_snapshots = vec![None; regs.len()];
+    let exception_context = in_try.then_some(no_snapshots.as_slice());
+    // A direct common-exit cast proves incoming DEX zero is null. Normalize
+    // before allocating header and exit locals so a zero-iteration guard does
+    // not copy an int local into a reference join. Primitive uses still reject.
+    let exit_cast_register = if region.exit == words.len() {
+        None
+    } else if let Some(instruction) = graph.instruction(region.exit)? {
+        (instruction.opcode == 0x1f)
+            .then(|| decoded_array_type(instruction, regs.len()).map(|cast| cast.dst))
+            .transpose()?
+    } else {
+        words
+            .get(region.exit)
+            .and_then(|word| (*word as u8 == 0x1f).then_some((*word >> 8) as usize))
+    };
+    if let Some(r) = exit_cast_register
+        && let Some(Some(seed)) = regs.get_mut(r)
+        && seed.literal == Some(0)
+    {
+        seed.ty = "Ljava/lang/Object;".into();
+        seed.text = "null".into();
+    }
     let written = graph.written_in(method.code.as_ref().unwrap(), region.start, region.exit);
     let mut header_written = written.clone();
     if regs.iter().any(|value| {
@@ -3454,7 +5557,33 @@ fn render_loop(
             }
         }
     }
-    let slots = loop_slots(&regs, graph, region.start, out, header_written.as_deref())?;
+    let lifetime = promote_loop_entry_literals(
+        class,
+        method,
+        graph,
+        region,
+        &mut regs,
+        header_written.as_deref(),
+    )?;
+    let header_needed = lifetime
+        .as_ref()
+        .map(|proof| proof.header_needed.as_slice());
+    let slots = loop_slots(
+        &regs,
+        graph,
+        region.start,
+        out,
+        header_written.as_deref(),
+        header_needed,
+    )?;
+    let mut carry_slots = slots.clone();
+    if let Some(needed) = header_needed {
+        for (r, slot) in carry_slots.iter_mut().enumerate() {
+            if !needed[r] {
+                *slot = None;
+            }
+        }
+    }
     let has_break = if !graph.shared_loops.is_empty() {
         graph
             .shared_loop_edges
@@ -3472,160 +5601,246 @@ fn render_loop(
     // frame for ordinary guarded loops too (including zero body iterations).
     let posttest = !graph.shared_loops.is_empty() && region.guard.is_none();
     let header_exit = (region.guard.is_some() || posttest)
-        && (0..regs.len()).any(|r| graph.live_at(region.exit, r) && slots[r].is_none());
-    let exit_slots = if region.tail.is_some() || has_break || header_exit || posttest {
-        // Separate exit values from values required only by the next iteration.
-        // In iterator loops the same DEX register may hold a String on the exit
-        // path after holding an Iterator on the backedge.
-        let mut exit_entry = regs.clone();
-        let mut exit_written = if !graph.shared_loops.is_empty() {
-            // The decoded invariant walk proves retained literals at both
-            // the latch and every canonical exit, including conditional break.
-            header_written.clone()
-        } else {
-            written.clone()
-        };
-        if (0..regs.len()).any(|r| {
+        && (0..regs.len()).any(|r| {
             graph.live_at(region.exit, r)
-                && (regs[r].is_none() || (header_exit && slots[r].is_none()))
-        }) {
-            let prefix_end = if let Some(guard) = region.guard {
-                guard
-            } else if posttest {
-                region.latch
+                && (slots[r].is_none() || header_needed.is_some_and(|needed| !needed[r]))
+        });
+    let exit_slots =
+        if region.tail.is_some() || has_break || header_exit || posttest {
+            // Separate exit values from values required only by the next iteration.
+            // In iterator loops the same DEX register may hold a String on the exit
+            // path after holding an Iterator on the backedge.
+            let mut exit_entry = regs.clone();
+            let mut exit_written = if !graph.shared_loops.is_empty() {
+                // The decoded invariant walk proves retained literals at both
+                // the latch and every canonical exit, including conditional break.
+                header_written.clone()
             } else {
-                let mut cursor = region.start;
-                while cursor < region.latch
-                    && graph.targets[cursor].is_none()
-                    && graph.switches[cursor].is_none()
-                    && !graph
-                        .loops
-                        .iter()
-                        .any(|inner| inner.start == cursor && cursor != region.start)
-                    && !matches!(words[cursor] as u8, 0x0e..=0x11 | 0x27)
-                {
-                    cursor += graph.widths[cursor];
-                }
-                cursor
+                written.clone()
             };
-            // The straight-line header dominates every loop escape. Infer newly
-            // established exit types without hoisting any of its effects. Only
-            // literals unchanged by the body may remain literal expressions.
-            let mut preview = Output::default();
-            let (mut header, returned) = render(
-                class,
-                method,
-                graph,
-                region.start,
-                prefix_end,
-                slots.clone(),
-                &mut preview,
-                depth,
-                true,
-                Some(LoopContext {
-                    start: region.start,
-                    slots: &slots,
-                    exit: region.exit,
-                    exit_slots: &slots,
-                }),
-                None,
-            )?;
-            ensure!(!returned, "loop header returns");
-            if let Some(guard) = region.guard
-                && let Some(guard_target) = graph.target(guard)?
-                && guard_target != region.exit
-            {
-                let (values, returned) = render(
+            if (0..regs.len()).any(|r| {
+                graph.live_at(region.exit, r)
+                    && (regs[r].is_none() || (header_exit && slots[r].is_none()))
+            }) {
+                let prefix_end = if let Some(guard) = region.guard {
+                    guard
+                } else if posttest {
+                    // An early break can reach the exit before later body
+                    // definitions. Seed exit types only from the prefix that
+                    // is guaranteed to execute before the first break.
+                    graph
+                        .shared_loop_edges
+                        .iter()
+                        .filter(|edge| {
+                            edge.owner == region.start && edge.kind == SharedLoopEdgeKind::Break
+                        })
+                        .map(|edge| edge.branch)
+                        .min()
+                        .unwrap_or(region.latch)
+                } else {
+                    let mut cursor = region.start;
+                    while cursor < region.latch
+                        && graph.targets[cursor].is_none()
+                        && graph.switches[cursor].is_none()
+                        && !graph
+                            .loops
+                            .iter()
+                            .any(|inner| inner.start == cursor && cursor != region.start)
+                        && !matches!(words[cursor] as u8, 0x0e..=0x11 | 0x27)
+                    {
+                        cursor += graph.widths[cursor];
+                    }
+                    cursor
+                };
+                // The straight-line header dominates every loop escape. Infer newly
+                // established exit types without hoisting any of its effects. Only
+                // literals unchanged by the body may remain literal expressions.
+                let mut preview = Output::default();
+                let (mut header, returned) = render(
                     class,
                     method,
                     graph,
-                    guard_target,
-                    region.exit,
-                    header,
+                    region.start,
+                    prefix_end,
+                    slots.clone(),
                     &mut preview,
                     depth,
                     true,
-                    None,
-                    None,
+                    Some(LoopContext {
+                        start: region.start,
+                        slots: &carry_slots,
+                        exit: region.exit,
+                        exit_slots: &carry_slots,
+                    }),
+                    exception_context,
                 )?;
-                ensure!(!returned, "loop guard tail returns before merge");
-                header = values;
-            }
-            let body_writes = graph.written_in(
-                method.code.as_ref().unwrap(),
-                region
-                    .guard
-                    .map_or(prefix_end, |guard| guard + graph.widths[guard]),
-                region.exit,
-            );
-            for (r, value) in header.iter().enumerate() {
-                if !graph.live_at(region.exit, r)
-                    || (exit_entry[r].is_some() && !(header_exit && slots[r].is_none()))
+                ensure!(!returned, "loop header returns");
+                let body_header = header.clone();
+                if let Some(guard) = region.guard
+                    && let Some(guard_target) = graph.target(guard)?
+                    && guard_target != region.exit
                 {
-                    continue;
+                    let (values, returned) = render(
+                        class,
+                        method,
+                        graph,
+                        guard_target,
+                        region.exit,
+                        header,
+                        &mut preview,
+                        depth,
+                        true,
+                        None,
+                        exception_context,
+                    )?;
+                    ensure!(!returned, "loop guard tail returns before merge");
+                    header = values;
                 }
-                let Some(value) = value else { continue };
-                if value.ty == "<wide-tail>" {
-                    continue;
-                }
-                let mut seed = value.clone();
-                if seed.literal == Some(0)
-                    && if let Some(instruction) = graph.instruction(region.exit)? {
-                        instruction.opcode == 0x1f
-                            && decoded_array_type(instruction, regs.len())?.dst == r
-                    } else {
-                        words
-                            .get(region.exit)
-                            .is_some_and(|word| *word as u8 == 0x1f && (*word >> 8) as usize == r)
+                // If the guard's pure default tail assigns DEX zero while the
+                // straight-line match body establishes a reference in the same
+                // register, both loop exits have a reference value (null/item).
+                // Inspect the body without emitting it; any branch, switch or
+                // terminal instruction declines this narrow type proof.
+                let reference_body_exit =
+                    region
+                        .guard
+                        .and_then(|guard| {
+                            let target = graph.targets[guard]?;
+                            (region.tail.is_some()
+                                && graph.pure_exit_tail(target, region.exit, words)
+                                && method.code.as_ref().unwrap().try_regions.iter().all(
+                                    |protected| {
+                                        protected.end as usize <= guard + graph.widths[guard]
+                                            || protected.start as usize >= region.latch
+                                    },
+                                )
+                                && (guard + graph.widths[guard]..region.latch).all(|pc| {
+                                    graph.widths[pc] == 0
+                                        || (graph.targets[pc].is_none()
+                                            && graph.switches[pc].is_none()
+                                            && !matches!(words[pc] as u8, 0x0e..=0x11 | 0x27))
+                                }))
+                            .then_some(guard)
+                        })
+                        .and_then(|guard| {
+                            let mut dry = Output::default();
+                            render(
+                                class,
+                                method,
+                                graph,
+                                guard + graph.widths[guard],
+                                region.latch,
+                                body_header.clone(),
+                                &mut dry,
+                                depth,
+                                true,
+                                None,
+                                exception_context,
+                            )
+                            .ok()
+                            .and_then(|(values, returned)| (!returned).then_some(values))
+                        });
+                let body_writes = graph.written_in(
+                    method.code.as_ref().unwrap(),
+                    region
+                        .guard
+                        .map_or(prefix_end, |guard| guard + graph.widths[guard]),
+                    region.exit,
+                );
+                for (r, value) in header.iter().enumerate() {
+                    if !graph.live_at(region.exit, r)
+                        || (exit_entry[r].is_some() && !(header_exit && slots[r].is_none()))
+                    {
+                        continue;
                     }
-                {
-                    // A check-cast at the common exit proves this register is a
-                    // reference on every incoming edge, including DEX null.
-                    seed.ty = "Ljava/lang/Object;".into();
-                    seed.text = "null".into();
-                }
-                if (seed.literal.is_some() || seed.wide_literal.is_some())
-                    && body_writes.as_ref().is_some_and(|writes| !writes[r])
-                {
-                    if let Some(writes) = &mut exit_written {
-                        writes[r] = false;
+                    let Some(value) = value else { continue };
+                    if value.ty == "<wide-tail>" {
+                        continue;
                     }
-                } else {
-                    seed.text = if reference(&seed.ty) {
-                        "null"
-                    } else {
-                        match seed.ty.as_str() {
-                            "Z" => "false",
-                            "J" => "0L",
-                            "F" => "0.0f",
-                            "D" => "0.0d",
-                            _ => "0",
+                    let mut seed = value.clone();
+                    if seed.literal == Some(0)
+                        && reference_body_exit.as_ref().is_some_and(|body| {
+                            body.get(r)
+                                .and_then(Option::as_ref)
+                                .is_some_and(|value| reference(&value.ty))
+                        })
+                    {
+                        seed.ty = "Ljava/lang/Object;".into();
+                        seed.text = "null".into();
+                    }
+                    if seed.literal == Some(0)
+                        && if let Some(instruction) = graph.instruction(region.exit)? {
+                            instruction.opcode == 0x1f
+                                && decoded_array_type(instruction, regs.len())?.dst == r
+                        } else {
+                            words.get(region.exit).is_some_and(|word| {
+                                *word as u8 == 0x1f && (*word >> 8) as usize == r
+                            })
                         }
+                    {
+                        // A check-cast at the common exit proves this register is a
+                        // reference on every incoming edge, including DEX null.
+                        seed.ty = "Ljava/lang/Object;".into();
+                        seed.text = "null".into();
                     }
-                    .into();
-                    seed.literal = None;
-                    seed.wide_literal = None;
+                    if (seed.literal.is_some() || seed.wide_literal.is_some())
+                        && body_writes.as_ref().is_some_and(|writes| !writes[r])
+                    {
+                        if let Some(writes) = &mut exit_written {
+                            writes[r] = false;
+                        }
+                    } else {
+                        seed.text = if reference(&seed.ty) {
+                            "null"
+                        } else {
+                            match seed.ty.as_str() {
+                                "Z" => "false",
+                                "J" => "0L",
+                                "F" => "0.0f",
+                                "D" => "0.0d",
+                                _ => "0",
+                            }
+                        }
+                        .into();
+                        seed.literal = None;
+                        seed.wide_literal = None;
+                    }
+                    assign(&mut exit_entry, r, seed)?;
                 }
-                assign(&mut exit_entry, r, seed)?;
             }
-        }
-        ensure!(
-            (0..regs.len()).all(|r| !graph.live_at(region.exit, r) || exit_entry[r].is_some()),
-            "loop exit value has no established entry type"
-        );
-        Some(loop_slots(
-            &exit_entry,
-            graph,
-            region.exit,
-            out,
-            exit_written.as_deref(),
-        )?)
-    } else {
-        None
-    };
+            if let Some(proof) = &lifetime {
+                for (r, ty) in proof.exit_null_types.iter().enumerate() {
+                    let Some(ty) = ty else { continue };
+                    let seed = exit_entry[r]
+                        .as_mut()
+                        .context("loop exit null loses entry definition")?;
+                    ensure!(
+                        seed.ty == "I" && seed.literal == Some(0),
+                        "loop exit null loses literal proof"
+                    );
+                    seed.ty = ty.clone();
+                    seed.text = "null".into();
+                    seed.literal = None;
+                }
+            }
+            ensure!(
+                (0..regs.len()).all(|r| !graph.live_at(region.exit, r) || exit_entry[r].is_some()),
+                "loop exit value has no established entry type"
+            );
+            Some(loop_slots(
+                &exit_entry,
+                graph,
+                region.exit,
+                out,
+                exit_written.as_deref(),
+                None,
+            )?)
+        } else {
+            None
+        };
     let context = LoopContext {
         start: region.start,
-        slots: &slots,
+        slots: &carry_slots,
         exit: region.exit,
         exit_slots: exit_slots.as_ref().unwrap_or(&slots),
     };
@@ -3646,7 +5861,7 @@ fn render_loop(
             depth,
             true,
             Some(context),
-            None,
+            exception_context,
         )?;
         ensure!(!returned, "loop header returns");
         let cond = graph.test(words, guard, false, &header_regs)?;
@@ -3665,7 +5880,7 @@ fn render_loop(
                 depth,
                 true,
                 Some(context),
-                None,
+                exception_context,
             )?
         } else {
             (header_regs.clone(), false)
@@ -3691,7 +5906,7 @@ fn render_loop(
             depth,
             true,
             Some(context),
-            None,
+            exception_context,
         )?
     } else {
         render(
@@ -3705,7 +5920,7 @@ fn render_loop(
             depth,
             true,
             Some(context),
-            None,
+            exception_context,
         )?
     };
     if returned {
@@ -3717,14 +5932,18 @@ fn render_loop(
             "loop body has no continuation"
         );
     } else if let Some(tail) = region.tail {
-        let cond = condition(
-            words[region.latch] as u8,
-            (words[region.latch] >> 8) as usize,
-            &values,
-        )?;
+        let cond = if graph.shared_loops.is_empty() {
+            condition(
+                words[region.latch] as u8,
+                (words[region.latch] >> 8) as usize,
+                &values,
+            )?
+        } else {
+            graph.test(words, region.latch, false, &values)?
+        };
         body.line(&format!("if ({cond}) {{"), &[]);
         body.indent += 1;
-        graph.carry_loop_values(&slots, &values, &mut body)?;
+        graph.carry_loop_values(&carry_slots, &values, &mut body)?;
         body.line("continue;", &[]);
         body.indent -= 1;
         body.line("}", &[]);
@@ -3739,7 +5958,7 @@ fn render_loop(
             depth,
             true,
             Some(context),
-            None,
+            exception_context,
         )?;
         if !returned {
             graph.carry_loop_values(
@@ -3749,6 +5968,36 @@ fn render_loop(
             )?;
             body.line("break;", &[]);
         }
+    } else if region.guard.is_some()
+        && !graph.shared_loops.is_empty()
+        && graph
+            .instruction(region.latch)?
+            .is_some_and(|i| matches!(i.opcode, 0x32..=0x3d))
+    {
+        // The conditional latch either reexecutes the header or falls through
+        // to the selected terminal return. The guard's default return was
+        // emitted above; neither exit needs a fabricated post-loop value.
+        let cond = graph.test(words, region.latch, false, &values)?;
+        body.line(&format!("if ({cond}) {{"), &[]);
+        body.indent += 1;
+        graph.carry_loop_values(&carry_slots, &values, &mut body)?;
+        body.line("continue;", &[]);
+        body.indent -= 1;
+        body.line("}", &[]);
+        let (_, terminal) = render(
+            class,
+            method,
+            graph,
+            region.latch + graph.widths[region.latch],
+            region.exit,
+            values,
+            &mut body,
+            depth,
+            true,
+            Some(context),
+            exception_context,
+        )?;
+        ensure!(terminal, "shared terminal latch exit does not return");
     } else if region.guard.is_none()
         && !matches!(
             graph
@@ -3761,7 +6010,7 @@ fn render_loop(
         // Evaluate the condition before rewriting the loop slots.
         let test = body.local("Z", &cond, &[])?;
         if exit_slots.is_none() {
-            graph.carry_loop_values(&slots, &values, &mut body)?;
+            graph.carry_loop_values(&carry_slots, &values, &mut body)?;
         }
         body.line(&format!("if ({}) {{", test.text), &[]);
         body.indent += 1;
@@ -3774,10 +6023,10 @@ fn render_loop(
         body.indent -= 1;
         body.line("}", &[]);
         if exit_slots.is_some() {
-            graph.carry_loop_values(&slots, &values, &mut body)?;
+            graph.carry_loop_values(&carry_slots, &values, &mut body)?;
         }
     } else {
-        graph.carry_loop_values(&slots, &values, &mut body)?;
+        graph.carry_loop_values(&carry_slots, &values, &mut body)?;
     }
     out.sequence = body.sequence;
     out.line("while (true) {", &[]);
@@ -3918,7 +6167,13 @@ fn validate_catch_order(
 // A protected region can exit through several goto trampolines. Only move
 // those non-effectful instructions into the Java try; handler blocks embedded
 // in its address interval must remain unreachable through normal edges.
-fn protected_normal_exit(graph: &Graph, words: &[u16], start: usize, end: usize) -> Result<usize> {
+fn protected_normal_exit(
+    graph: &Graph,
+    words: &[u16],
+    start: usize,
+    end: usize,
+    loop_start: Option<usize>,
+) -> Result<usize> {
     let mut pending = vec![start];
     let mut seen = vec![false; words.len()];
     let mut exits = std::collections::BTreeSet::new();
@@ -3928,6 +6183,9 @@ fn protected_normal_exit(graph: &Graph, words: &[u16], start: usize, end: usize)
             let mut exit = pc;
             let mut trampolines = std::collections::HashSet::new();
             while exit < words.len() && matches!(words[exit] as u8, 0x28..=0x2a) {
+                if graph.targets[exit] == loop_start {
+                    break;
+                }
                 ensure!(trampolines.insert(exit), "cyclic protected exit");
                 exit = graph.targets[exit].context("missing protected exit target")?;
             }
@@ -4011,6 +6269,39 @@ fn protected_normal_exit(graph: &Graph, words: &[u16], start: usize, end: usize)
     Ok(exits.into_iter().next().unwrap_or(end))
 }
 
+// Split a protected interval at a pure branch when one arm leaves the try
+// before an effectful terminal tail. Each reached suffix retains the original
+// handler set; the branch and its external arm stay outside that catch.
+fn protected_branch_split(
+    graph: &Graph,
+    words: &[u16],
+    entry: usize,
+    start: usize,
+    end: usize,
+    loop_start: Option<usize>,
+) -> Result<Option<usize>> {
+    let Some(escape) = (entry..end).find(|&pc| {
+        graph.widths[pc] != 0
+            && matches!(words[pc] as u8, 0x32..=0x3d)
+            && pc + graph.widths[pc] < end
+            && graph.targets[pc].is_some_and(|target| target >= end)
+    }) else {
+        return Ok(None);
+    };
+    match protected_normal_exit(graph, words, start, end, loop_start) {
+        Ok(_) => return Ok(None),
+        Err(error) if error.to_string() == "protected region has distinct effectful exits" => {}
+        Err(error) => return Err(error),
+    }
+    Ok((entry..escape)
+        .find(|&pc| {
+            graph.widths[pc] != 0
+                && matches!(words[pc] as u8, 0x32..=0x3d)
+                && graph.targets[pc].is_some_and(|target| target > escape && target < end)
+        })
+        .or(Some(escape)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_try(
     class: &DexClass,
@@ -4021,6 +6312,7 @@ fn render_try(
     regs: Vec<Option<Value>>,
     out: &mut Output,
     depth: usize,
+    enclosing_loop: Option<LoopContext<'_>>,
 ) -> Result<(Vec<Option<Value>>, usize, bool)> {
     ensure!(depth <= 32, "exception nesting exceeds budget");
     let words = &method
@@ -4030,16 +6322,34 @@ fn render_try(
         .instructions;
     let start = region.start as usize;
     let end = region.end as usize;
+    if let Some(context) = enclosing_loop {
+        ensure!(
+            context.start <= start
+                && end <= context.exit
+                && region
+                    .catches
+                    .iter()
+                    .all(|(_, handler)| (*handler as usize) < context.exit),
+            "inner try handler escapes enclosing loop"
+        );
+    }
     validate_wide_frame(&regs)?;
     ensure!(
         end <= stop && !region.catches.is_empty(),
         "try crosses enclosing region"
     );
-    let normal_end = protected_normal_exit(graph, words, start, end)?;
+    let normal_end = protected_normal_exit(
+        graph,
+        words,
+        start,
+        end,
+        enclosing_loop.map(|context| context.start),
+    )?;
     ensure!(
         normal_end <= stop,
         "try continuation crosses enclosing region"
     );
+    let normal_reachable = graph.reachable(start, normal_end, words)?;
     ensure!(
         method
             .code
@@ -4055,10 +6365,14 @@ fn render_try(
                     .any(|monitor| monitor.tries.contains(&index))
                     || other.start <= region.start
                     || normal_end <= other.start as usize
+                    // Handler-local try blocks can lie between the protected
+                    // body and its forward continuation without being executed
+                    // by that body's normal path.
+                    || !(other.start as usize..other.end as usize)
+                        .any(|pc| pc < normal_end && normal_reachable.get(pc).copied().unwrap_or(false))
             }),
         "protected continuation crosses another exception region"
     );
-    let normal_reachable = graph.reachable(start, normal_end, words)?;
     ensure!(
         region
             .catches
@@ -4184,7 +6498,7 @@ fn render_try(
             &mut dry,
             depth,
             true,
-            None,
+            enclosing_loop,
             None,
         );
         // Probing must not leak generated handler identities into real output:
@@ -4218,7 +6532,32 @@ fn render_try(
         indent: out.indent + 1,
         ..Default::default()
     };
-    let (normal, normal_return) = render(
+    let escape_used = std::rc::Rc::new(std::cell::Cell::new(false));
+    let escape_label = format!("tryExit{}", body.sequence);
+    body.sequence += 1;
+    let invariant_continuation = normal_end == end
+        && graph
+            .written_in(method.code.as_ref().unwrap(), start, normal_end)
+            .is_some_and(|writes| {
+                writes
+                    .iter()
+                    .enumerate()
+                    .all(|(r, write)| !*write || !graph.live_at(normal_end, r))
+            });
+    let previous_escape = graph
+        .protected_loop_escape
+        .replace(invariant_continuation.then(|| {
+            ProtectedLoopEscape {
+                start,
+                end: normal_end,
+                label: escape_label.clone(),
+                forbidden_writes: (0..initial.len())
+                    .map(|r| graph.live_at(normal_end, r) || slots[r].is_some())
+                    .collect(),
+                used: escape_used.clone(),
+            }
+        }));
+    let normal_result = render(
         class,
         method,
         graph,
@@ -4228,9 +6567,21 @@ fn render_try(
         &mut body,
         depth,
         true,
-        None,
+        enclosing_loop,
         Some(&slots),
-    )?;
+    );
+    graph.protected_loop_escape.replace(previous_escape);
+    let (mut normal, normal_return) = normal_result?;
+    if escape_used.get() {
+        // A labeled escape skips assignments at the end of the normal body.
+        // Whole-region write analysis proved these physical registers invariant;
+        // reuse their initialized outer values rather than loop-local aliases.
+        for r in 0..normal.len() {
+            if graph.live_at(normal_end, r) {
+                normal[r] = initial[r].clone();
+            }
+        }
+    }
     let mut visits = vec![0u16; words.len() + 1];
     let mut roots = Vec::new();
     if !normal_return {
@@ -4240,8 +6591,85 @@ fn render_try(
     // Duplicate handlers count as a single path when finding a common tail.
     roots.sort_unstable();
     roots.dedup();
+    // A handler may be physically after an enclosing branch's join. It is
+    // owned by this try, not by that branch's normal instruction interval.
+    // Permit only detached forward tails: no handler edge may re-enter the
+    // enclosing interval, and rendering below must prove termination.
+    let mut outside_handlers = std::collections::HashSet::new();
+    let mut loop_handlers = std::collections::HashSet::new();
+    let mut detached_forward_handlers = std::collections::HashSet::new();
+    let split_subregion = !method
+        .code
+        .as_ref()
+        .unwrap()
+        .try_regions
+        .iter()
+        .any(|original| {
+            original.start == region.start
+                && original.end == region.end
+                && original.catches == region.catches
+        });
+    for (_, handler) in region.catches.iter() {
+        let handler = *handler as usize;
+        if handler > stop {
+            if enclosing_loop.is_some_and(|context| handler < context.exit) {
+                // The catch is lexically inside the enclosing Java loop even
+                // when it lies beyond this branch's stop. Its renderer must
+                // prove a terminal continue/break/return below; it is not a
+                // normal join root and may serve another disjoint try arm.
+                outside_handlers.insert(handler);
+                loop_handlers.insert(handler);
+                continue;
+            }
+            // Shared cleanup/dispatch handlers need ownership across all of
+            // their protected ranges, not this enclosing branch alone.
+            ensure!(
+                method
+                    .code
+                    .as_ref()
+                    .unwrap()
+                    .try_regions
+                    .iter()
+                    .filter(|other| other
+                        .catches
+                        .iter()
+                        .any(|(_, target)| *target as usize == handler))
+                    .count()
+                    == 1
+                    || split_subregion,
+                "outside handler shared by multiple protected regions"
+            );
+            let seen = graph.reachable(handler, words.len(), words)?;
+            ensure!(
+                !seen[..=stop].iter().any(|seen| *seen)
+                    && graph.non_reentering_tail(handler, 0..stop + 1, words)?,
+                "outside handler re-enters enclosing region"
+            );
+            outside_handlers.insert(handler);
+        }
+        if handler < stop {
+            // A catch can jump past the normal continuation to its own
+            // cleanup+throw tail. Render that tail in the catch; it cannot
+            // re-enter instructions preceding its move-exception entry.
+            let seen = graph.reachable(handler, words.len(), words)?;
+            if seen.iter().enumerate().any(|(pc, live)| pc > stop && *live)
+                && !seen[..handler].iter().any(|live| *live)
+                && graph.non_reentering_tail(handler, 0..handler, words)?
+            {
+                detached_forward_handlers.insert(handler);
+            }
+        }
+    }
     for root in &roots {
-        let seen = graph.reachable(*root, stop, words)?;
+        if loop_handlers.contains(root) || detached_forward_handlers.contains(root) {
+            continue;
+        }
+        let limit = if outside_handlers.contains(root) {
+            words.len()
+        } else {
+            stop
+        };
+        let seen = graph.reachable(*root, limit, words)?;
         for (count, seen) in visits.iter_mut().zip(seen) {
             *count += u16::from(seen);
         }
@@ -4249,10 +6677,10 @@ fn render_try(
     // Terminating handlers with no path back to normal flow can stay in
     // their catch arms. Keep the effectful normal continuation outside try.
     let detached_handlers = !normal_return
-        && region
-            .catches
-            .iter()
-            .all(|(_, handler)| *handler as usize != normal_end && (*handler as usize) < stop)
+        && region.catches.iter().all(|(_, handler)| {
+            *handler as usize != normal_end
+                && ((*handler as usize) < stop || outside_handlers.contains(&(*handler as usize)))
+        })
         && (!graph
             .reachable(normal_end, stop, words)?
             .iter()
@@ -4261,15 +6689,57 @@ fn render_try(
             // A shared bare void return has no state or effects to merge.
             // Emit it directly in catch, leaving normal effects outside try.
             || region.catches.iter().all(|(_, handler)| words[*handler as usize] as u8 == 0x0e));
-    let join = if detached_handlers {
+    // A catch may enter the same downstream cleanup as the normal path. If
+    // the normal prefix up to that handler is entirely pure, stop this try at
+    // the handler entry. The caller renders the effectful cleanup in its own
+    // exception region, so it executes once with the original catch ownership.
+    let shared_handler_join = if !normal_return {
+        region
+            .catches
+            .iter()
+            .map(|(_, handler)| *handler as usize)
+            .max()
+            .filter(|&candidate| candidate > normal_end && candidate < stop)
+            .filter(|&candidate| words[candidate] as u8 != 0x0d)
+            .filter(|&candidate| {
+                graph
+                    .reachable(normal_end, candidate, words)
+                    .is_ok_and(|seen| {
+                        seen[candidate]
+                            && seen.iter().enumerate().all(|(pc, reachable)| {
+                                !*reachable
+                                    || pc == candidate
+                                    || matches!(words[pc] as u8,
+                            0x00..=0x09 | 0x0e..=0x19 | 0x28..=0x2a | 0x32..=0x3d)
+                            })
+                    })
+            })
+            .filter(|&candidate| {
+                region.catches.iter().all(|(_, handler)| {
+                    graph.reachable(*handler as usize, candidate, words).is_ok()
+                })
+            })
+    } else {
+        None
+    };
+    let join = if normal_return {
+        // No ordinary value reaches a join; handlers own their complete
+        // terminal tails even when a handler begins at the old normal end.
+        stop
+    } else if detached_handlers {
         normal_end
+    } else if let Some(candidate) = shared_handler_join {
+        candidate
     } else if roots.len() == 1 && !normal_return && roots[0] == normal_end {
         roots[0]
     } else {
+        let latest_entry = roots.iter().copied().max().unwrap_or(normal_end);
         visits
             .iter()
             .enumerate()
-            .find_map(|(pc, count)| (*count > 1).then_some(pc))
+            .find_map(|(pc, count)| {
+                (pc >= latest_entry && usize::from(*count) == roots.len()).then_some(pc)
+            })
             .unwrap_or(stop)
     };
     let mut paths = Vec::new();
@@ -4300,7 +6770,7 @@ fn render_try(
             &mut continuation,
             depth,
             true,
-            None,
+            enclosing_loop,
             None,
         )?;
         // Moving effects from outside the DEX try would change which throws
@@ -4312,6 +6782,17 @@ fn render_try(
         ensure!(
             continuation.text.is_empty()
                 || (normal_terminal && continuation.text.trim() == "return;")
+                || (normal_terminal
+                    && enclosing_loop.is_some_and(|context| {
+                        graph
+                            .targets
+                            .get(normal_end)
+                            .copied()
+                            .flatten()
+                            .is_some_and(|target| target == context.start || target == context.exit)
+                            && matches!(words[normal_end] as u8, 0x28..=0x2a)
+                    })
+                    && matches!(continuation.text.trim(), "continue;" | "break;"))
                 || normal_reachable.iter().enumerate().all(|(pc, reachable)| {
                     !reachable
                         || matches!(words[pc] as u8,
@@ -4333,7 +6814,27 @@ fn render_try(
     for (index, (ty, handler)) in region.catches.iter().enumerate() {
         let ty = ty.as_deref().unwrap_or("Ljava/lang/Throwable;");
         ensure!(types.insert(ty), "duplicate catch type");
-        let handler_stop = if detached_handlers { stop } else { join };
+        // A detached catch can reach the enclosing branch's shared bare
+        // return. Include only that terminal instruction: moving calls or
+        // other effects across this boundary would change catch ownership.
+        let handler_stop = if loop_handlers.contains(&(*handler as usize))
+            || detached_forward_handlers.contains(&(*handler as usize))
+        {
+            words.len()
+        } else if detached_handlers {
+            if outside_handlers.contains(&(*handler as usize)) {
+                words.len()
+            } else if stop < words.len()
+                && graph.widths[stop] != 0
+                && matches!(words[stop] as u8, 0x0e..=0x11)
+            {
+                stop + graph.widths[stop]
+            } else {
+                stop
+            }
+        } else {
+            join
+        };
         let mut entry = *handler as usize;
         ensure!(
             entry <= handler_stop,
@@ -4384,9 +6885,13 @@ fn render_try(
             &mut handler_body,
             depth,
             true,
-            None,
+            enclosing_loop,
             None,
         )?;
+        ensure!(
+            !detached_forward_handlers.contains(&(*handler as usize)) || terminal,
+            "detached forward handler does not terminate"
+        );
         ensure!(
             !detached_handlers || terminal,
             "detached handler does not terminate"
@@ -4399,10 +6904,19 @@ fn render_try(
             class_label(ty).context("invalid catch type")?,
         ));
     }
+    if escape_used.get() {
+        ensure!(
+            paths.iter().skip(1).all(|path| path.3),
+            "protected loop escape has nonterminal catch merge"
+        );
+    }
     out.sequence = sequence;
     let mut merged = initial;
     merge_path_registers(&mut merged, &mut paths, out, graph, join)?;
     let all_returned = paths.iter().all(|path| path.3);
+    if escape_used.get() {
+        out.line(&format!("{escape_label}:"), &[]);
+    }
     out.line("try {", &[]);
     let mut paths = paths.into_iter();
     out.append(paths.next().context("missing try body")?.1);
@@ -4632,13 +7146,13 @@ fn render_switch(
         .enumerate()
         .find_map(|(pos, count)| (*count > 1).then_some(pos))
         .unwrap_or(stop);
-    if starts.iter().any(|start| *start > join) {
+    {
         // String-switch lowering can send several failed equality tests back
         // to the default selector assignment. It is an acyclic shared prefix,
         // not the switch join. Find a closed region. Each generated case owns
         // its path through that region, so duplicating a shared tail in the
         // source does not duplicate its execution: exactly one case runs.
-        join = *starts.iter().max().unwrap();
+        join = join.max(*starts.iter().max().unwrap());
         loop {
             let mut next = join;
             for start in &starts {
@@ -4660,19 +7174,19 @@ fn render_switch(
         });
         if duplicates_effects {
             // Normal-flow closure alone cannot establish exception ownership.
-            // Keep protected regions and monitors out of this transformation;
+            // Keep duplicated protected effects and monitor operations out;
             // their specialized renderers must establish their own boundaries.
             let code = method.code.as_ref().unwrap();
             ensure!(
                 code.try_regions.iter().all(|region| {
                     !(region.start as usize..region.end as usize)
-                        .any(|pc| pc < join && visits.get(pc).is_some_and(|n| *n != 0))
+                        .any(|pc| pc < join && visits.get(pc).is_some_and(|n| *n > 1))
                 }),
                 "shared switch tail crosses protected region"
             );
             ensure!(
                 visits.iter().enumerate().all(|(pc, count)| {
-                    pc >= join || *count == 0 || !matches!(words[pc] as u8, 0x1d | 0x1e)
+                    pc >= join || *count <= 1 || !matches!(words[pc] as u8, 0x1d | 0x1e)
                 }),
                 "shared switch tail crosses monitor boundary"
             );
@@ -4817,34 +7331,129 @@ fn render(
             previous_exception_values.clone_from_slice(&regs);
             continue;
         }
-        if exception_slots.is_none()
-            && let Some((_, region)) = method
-                .code
-                .as_ref()
-                .unwrap()
-                .try_regions
-                .iter()
-                .enumerate()
-                .find(|(index, region)| {
-                    region.start as usize == pc
-                        && !graph
-                            .synchronized
-                            .iter()
-                            .any(|monitor| monitor.tries.contains(index))
-                })
-        {
-            ensure!(
-                initialized && allocation.is_none() && pending.is_none(),
-                "try interrupts instruction state"
-            );
-            let (values, next, terminal) =
-                render_try(class, method, graph, region, stop, regs, out, depth + 1)?;
-            regs = values;
-            if terminal {
-                return Ok((regs, true));
+        let candidate_try = method
+            .code
+            .as_ref()
+            .unwrap()
+            .try_regions
+            .iter()
+            .enumerate()
+            .find(|(index, region)| {
+                (region.start as usize..region.end as usize).contains(&pc)
+                    && !graph
+                        .synchronized
+                        .iter()
+                        .any(|monitor| monitor.tries.contains(index))
+            });
+        // An interleaved catch can occupy addresses inside its own protected
+        // interval. Its probe resumes after move-exception, so a plain range
+        // check would recursively treat the handler body as a new try suffix.
+        let handler_only_entry = if let Some((_, region)) = candidate_try {
+            let start = region.start as usize;
+            let end = region.end as usize;
+            if pc > start
+                && region
+                    .catches
+                    .iter()
+                    .any(|(_, handler)| (*handler as usize) < end)
+            {
+                let normal = graph.reachable(start, words.len(), words)?;
+                let mut handler_reaches_pc = false;
+                if !normal[pc] {
+                    for (_, handler) in region.catches.iter() {
+                        if (*handler as usize) < end
+                            && graph.reachable(*handler as usize, words.len(), words)?[pc]
+                        {
+                            handler_reaches_pc = true;
+                            break;
+                        }
+                    }
+                }
+                !normal[pc] && handler_reaches_pc
+            } else {
+                false
             }
-            pc = next;
-            continue;
+        } else {
+            false
+        };
+        if exception_slots.is_none()
+            && !handler_only_entry
+            && let Some((_, region)) = candidate_try
+        {
+            let split = protected_branch_split(
+                graph,
+                words,
+                pc,
+                region.start as usize,
+                region.end as usize,
+                suppressed_loop.map(|context| context.start),
+            )?;
+            if split != Some(pc) {
+                ensure!(
+                    initialized && allocation.is_none() && pending.is_none(),
+                    "try interrupts instruction state"
+                );
+                // A branch may enter a protected suffix after the region's first
+                // instruction. Render that suffix with the same DEX handler set.
+                // Earlier instructions belong to the other branch and are never
+                // replayed on this path.
+                let mut suffix = region.clone();
+                suffix.start = pc as u32;
+                if let Some(split) = split {
+                    ensure!(split > pc, "protected branch split at entry");
+                    suffix.end = split as u32;
+                }
+                let try_stop = if suffix.end as usize > stop {
+                    if let Some(context) = suppressed_loop {
+                        ensure!(
+                            suffix.end as usize <= context.exit,
+                            "inner try crosses loop exit"
+                        );
+                        context.exit
+                    } else {
+                        words.len()
+                    }
+                } else {
+                    stop
+                };
+                let (values, next, terminal) = render_try(
+                    class,
+                    method,
+                    graph,
+                    &suffix,
+                    try_stop,
+                    regs,
+                    out,
+                    depth + 1,
+                    suppressed_loop,
+                )?;
+                regs = values;
+                if terminal {
+                    return Ok((regs, true));
+                }
+                if next > stop {
+                    let (values, terminal) = render(
+                        class,
+                        method,
+                        graph,
+                        next,
+                        try_stop,
+                        regs,
+                        out,
+                        depth + 1,
+                        initialized,
+                        suppressed_loop,
+                        exception_slots,
+                    )?;
+                    ensure!(
+                        terminal,
+                        "inner try suffix does not terminate enclosing branch"
+                    );
+                    return Ok((values, true));
+                }
+                pc = next;
+                continue;
+            }
         }
         if Some(pc) != suppressed_loop.map(|context| context.start)
             && let Some(region) = graph.loops.iter().find(|l| l.start == pc)
@@ -4854,11 +7463,40 @@ fn render(
                 "loop interrupts instruction state"
             );
             ensure!(region.exit <= stop, "loop crosses region boundary");
-            ensure!(
-                exception_slots.is_none(),
-                "loop inside try not reconstructed"
-            );
-            regs = render_loop(class, method, graph, *region, regs, out, depth + 1)?;
+            // A wholly protected loop may use ordinary loop locals when no
+            // handler-visible register is written anywhere in its body. This
+            // also covers nested loops. Changing snapshots need a separate
+            // exceptional liveness proof and remain unsupported here.
+            if let Some(slots) = exception_slots {
+                let writes = graph
+                    .written_in(method.code.as_ref().unwrap(), region.start, region.exit)
+                    .context("unknown protected loop writes")?;
+                ensure!(
+                    slots
+                        .iter()
+                        .enumerate()
+                        .all(|(r, slot)| slot.is_none() || !writes[r]),
+                    "loop writes handler-visible register"
+                );
+            }
+            let before = regs.clone();
+            regs = render_loop(
+                class,
+                method,
+                graph,
+                *region,
+                regs,
+                out,
+                depth + 1,
+                exception_slots.is_some(),
+            )?;
+            if let Some(slots) = exception_slots {
+                for (r, slot) in slots.iter().enumerate() {
+                    if slot.is_some() {
+                        regs[r] = before[r].clone();
+                    }
+                }
+            }
             if region.exit == words.len() {
                 // The unconditional final backedge has no normal successor;
                 // a Java while(true) is terminal even if some paths return.
@@ -4870,12 +7508,50 @@ fn render(
         let w = words[pc];
         let instruction = graph.instruction(pc)?;
         let op = instruction.map_or(w as u8, |insn| insn.opcode);
+        // Only an immediate result transfer may separate a producer from its
+        // terminal return. Even instructions emitting no Java are barriers.
+        if !matches!(op, 0x0a..=0x0c | 0x0f..=0x11) {
+            out.last_local = None;
+        }
         let a = (w >> 8) as usize;
         ensure!(
             allocation.is_none() || matches!(op, 0x00..=0x09 | 0x12..=0x19 | 0x1c | 0x70 | 0x76),
             "effectful instruction between allocation and constructor"
         );
         let width = instruction.map_or(graph.widths[pc], |insn| insn.width);
+        if op == 0x22
+            && initialized
+            && pending.is_none()
+            && allocation.is_none()
+            && exception_slots.is_none()
+            && graph.front_end.is_none()
+            && graph.shared_cfg.is_none()
+            && graph.loops.is_empty()
+            && graph.protected.is_empty()
+            && graph.synchronized.is_empty()
+            && let Some(plan) = concat::plan_at(class, method, pc)
+            && plan.end <= stop
+            && let Some(value) = regs.get(plan.argument).and_then(Option::as_ref)
+            && reference(&value.ty)
+            && value.literal.is_none()
+            && value.text.strip_prefix('p').is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            })
+        {
+            let expression = format!("{} + {}", string_literal(&plan.prefix)?, value.text);
+            let text = out.local("Ljava/lang/String;", &expression, &[])?;
+            assign(&mut regs, plan.result, text)?;
+            pc = plan.end;
+            previous_exception_values.clone_from_slice(&regs);
+            continue;
+        }
+        if op == 0x1e && synchronized::dispatch_release(graph, pc, &regs, out)? {
+            ensure!(
+                allocation.is_none() && pending.is_none(),
+                "monitor dispatch interrupts instruction state"
+            );
+            return Ok((regs, true));
+        }
         if op == 0x1e
             && graph
                 .synchronized
@@ -4919,6 +7595,39 @@ fn render(
                 return Ok((regs, true));
             }
             if let Some(context) = suppressed_loop
+                && let Some(region) = graph
+                    .loops
+                    .iter()
+                    .find(|region| region.start == context.start)
+                && let Some(escape) = graph.protected_escape(
+                    target,
+                    region.start..region.body_end(&graph.widths),
+                    method.code.as_ref().unwrap(),
+                )?
+            {
+                ensure!(
+                    allocation.is_none(),
+                    "protected escape interrupts instruction state"
+                );
+                let (_, terminal) = render(
+                    class,
+                    method,
+                    graph,
+                    target,
+                    escape.end,
+                    regs.clone(),
+                    out,
+                    depth + 1,
+                    initialized,
+                    None,
+                    exception_slots,
+                )?;
+                ensure!(!terminal, "protected escape terminates before continuation");
+                escape.used.set(true);
+                out.line(&format!("break {};", escape.label), &[]);
+                return Ok((regs, true));
+            }
+            if let Some(context) = suppressed_loop
                 && graph
                     .loops
                     .iter()
@@ -4959,8 +7668,8 @@ fn render(
                 target > pc || graph.acyclic_backwards.contains(&pc),
                 "unstructured backward jump"
             );
+            ensure!(target <= stop, "goto crosses region boundary");
             pc = target;
-            ensure!(pc <= stop, "goto crosses region boundary");
             pending = None;
             continue;
         }
@@ -5014,6 +7723,38 @@ fn render(
                 continue;
             }
             if let Some(context) = suppressed_loop
+                && let Some(edge) = graph.shared_loop_edge(pc)
+                && edge.owner == context.start
+                && edge.kind == SharedLoopEdgeKind::Terminal
+            {
+                ensure!(
+                    allocation.is_none() && target == edge.taken,
+                    "invalid shared terminal escape"
+                );
+                let test = graph.test(words, pc, false, &regs)?;
+                out.line(&format!("if ({test}) {{"), &[]);
+                out.indent += 1;
+                let (_, terminal) = render(
+                    class,
+                    method,
+                    graph,
+                    target,
+                    target + 1,
+                    regs.clone(),
+                    out,
+                    depth + 1,
+                    initialized,
+                    None,
+                    exception_slots,
+                )?;
+                ensure!(terminal, "shared terminal escape does not return");
+                out.indent -= 1;
+                out.line("}", &[]);
+                pending = None;
+                pc = edge.fallthrough;
+                continue;
+            }
+            if let Some(context) = suppressed_loop
                 && target == context.exit
             {
                 ensure!(allocation.is_none(), "break interrupts instruction state");
@@ -5028,6 +7769,46 @@ fn render(
                 pc = graph
                     .shared_loop_edge(pc)
                     .map_or(pc + width, |edge| edge.fallthrough);
+                continue;
+            }
+            if let Some(context) = suppressed_loop
+                && let Some(region) = graph
+                    .loops
+                    .iter()
+                    .find(|region| region.start == context.start)
+                && let Some(escape) = graph.protected_escape(
+                    target,
+                    region.start..region.body_end(&graph.widths),
+                    method.code.as_ref().unwrap(),
+                )?
+            {
+                ensure!(
+                    allocation.is_none(),
+                    "protected escape interrupts instruction state"
+                );
+                let test = condition(op, a, &regs)?;
+                out.line(&format!("if ({test}) {{"), &[]);
+                out.indent += 1;
+                let (_, terminal) = render(
+                    class,
+                    method,
+                    graph,
+                    target,
+                    escape.end,
+                    regs.clone(),
+                    out,
+                    depth + 1,
+                    initialized,
+                    None,
+                    exception_slots,
+                )?;
+                ensure!(!terminal, "protected escape terminates before continuation");
+                escape.used.set(true);
+                out.line(&format!("break {};", escape.label), &[]);
+                out.indent -= 1;
+                out.line("}", &[]);
+                pending = None;
+                pc += width;
                 continue;
             }
             if let Some(context) = suppressed_loop
@@ -5076,7 +7857,7 @@ fn render(
             );
             ensure!(
                 (target > pc || graph.acyclic_backwards.contains(&pc)) && target <= stop,
-                "branch crosses region boundary at {pc:04x}: target {target:04x}, stop {stop:04x}"
+                "branch crosses region boundary"
             );
             let mut branch_regs = regs.clone();
             if !initialized {
@@ -5485,7 +8266,29 @@ fn render(
                     "return opcode type mismatch"
                 );
                 let value = register(&regs, src)?;
-                let expr = argument(&value, &method.return_type)?;
+                let converted = argument_from_register(
+                    &value,
+                    &method.return_type,
+                    src,
+                    method.code.as_ref().unwrap(),
+                    graph,
+                );
+                let expr = match converted {
+                    Ok(expr) => expr,
+                    Err(original)
+                        if method.return_type.as_ref() == "Z"
+                            && value.ty == "I"
+                            && value.literal.is_none()
+                            && !value.raw_bits32 =>
+                    {
+                        if proven_boolean_return(class, method, graph, pc, src)? {
+                            format!("({} != 0)", value.text)
+                        } else {
+                            return Err(original);
+                        }
+                    }
+                    Err(original) => return Err(original),
+                };
                 if exception_slots.is_some()
                     && reference(&method.return_type)
                     && !method
@@ -5509,7 +8312,7 @@ fn render(
                         "return tail requires a potentially throwing conversion"
                     );
                 }
-                out.line(&format!("return {expr};"), &[]);
+                out.return_value(&value, &expr, &method.return_type);
                 returned = true;
             }
             0x12..=0x15 => {
@@ -5900,7 +8703,51 @@ fn render(
                         owner,
                     )?
                 };
-                let expr = format!("{target}.{display_name}");
+                // Own blank-final fields require a simple assignment name in
+                // Java. A field can also hide the class/package qualifier.
+                // Do not use a bare name that could bind a generated local.
+                let declared_field = class.fields.iter().find(|field| {
+                    field.is_static
+                        && field.declaring_type == class.descriptor
+                        && field.name.as_ref() == name.as_str()
+                        && field.field_type.as_ref() == ty.as_ref()
+                });
+                let initializer_needs_bare = is_static
+                    && put
+                    && method.name.as_ref() == "<clinit>"
+                    && owner == &class.descriptor
+                    && declared_field.is_some()
+                    && (declared_field.is_some_and(|field| field.access_flags & 0x10 != 0)
+                        || class.fields.iter().any(|field| {
+                            names::member(&field.name).is_ok_and(|field_name| {
+                                Some(field_name.as_str()) == target.split('.').next()
+                                    || Some(field_name.as_str()) == target.rsplit('.').next()
+                            })
+                        }));
+                let generated_collision =
+                    ["v", "e", "caught", "monitorExit"].iter().any(|prefix| {
+                        if *prefix != "v"
+                            && method
+                                .code
+                                .as_ref()
+                                .is_some_and(|code| code.try_regions.is_empty())
+                        {
+                            return false;
+                        }
+                        display_name.strip_prefix(prefix).is_some_and(|suffix| {
+                            !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+                        })
+                    });
+                ensure!(
+                    !initializer_needs_bare || !generated_collision,
+                    "initializer field collides with generated local namespace"
+                );
+                let bare_initializer_field = initializer_needs_bare;
+                let expr = if bare_initializer_field {
+                    display_name.clone()
+                } else {
+                    format!("{target}.{display_name}")
+                };
                 let label = format!(
                     "{}.{}:{}",
                     owner
@@ -5911,11 +8758,15 @@ fn render(
                     ty
                 );
                 let mut refs = vec![(
-                    target.chars().count() + 1,
+                    if bare_initializer_field {
+                        0
+                    } else {
+                        target.chars().count() + 1
+                    },
                     display_name.chars().count(),
                     label,
                 )];
-                if is_static {
+                if is_static && !bare_initializer_field {
                     refs.push((
                         0,
                         target.chars().count(),
@@ -5923,7 +8774,13 @@ fn render(
                     ));
                 }
                 if put {
-                    let value = argument(&register(&regs, reg)?, ty)?;
+                    let value = argument_from_register(
+                        &register(&regs, reg)?,
+                        ty,
+                        reg,
+                        method.code.as_ref().unwrap(),
+                        graph,
+                    )?;
                     out.line(&format!("{expr} = {value};"), &refs);
                 } else {
                     let value = out.local(ty, &expr, &refs)?;
@@ -5997,7 +8854,27 @@ fn render(
                                 .register,
                         ),
                     )?;
-                    receiver(&value, owner)?
+                    if receiver_cleanup::sdk_number_conversion_receiver(
+                        &value,
+                        owner,
+                        name,
+                        args,
+                        ret,
+                        op,
+                        class.symbols.hierarchy.get().map(AsRef::as_ref),
+                    ) || receiver_cleanup::proven_void_receiver(
+                        &value,
+                        owner,
+                        name,
+                        args,
+                        ret,
+                        op,
+                        class.symbols.hierarchy.get().map(AsRef::as_ref),
+                    ) {
+                        value.text.clone()
+                    } else {
+                        receiver(&value, owner)?
+                    }
                 };
                 let label = format!(
                     "{}.{}({}){}",
@@ -6019,7 +8896,7 @@ fn render(
                 let mut actual = Vec::new();
                 let mut capture_count = 0;
                 let mut capture_refs = Vec::new();
-                for input in &call.arguments {
+                for (argument_index, input) in call.arguments.iter().enumerate() {
                     let ty = &input.descriptor;
                     let reg = usize::from(input.register);
                     let mut value = register(&regs, reg)?;
@@ -6067,17 +8944,38 @@ fn render(
                     );
                     // Typed null preserves the DEX descriptor when Java has
                     // overloads (including constructors and varargs arrays).
+                    let omit_cast = receiver_cleanup::proven_call_argument(
+                        &value,
+                        owner,
+                        name,
+                        args,
+                        ret,
+                        op,
+                        argument_index,
+                        class.symbols.hierarchy.get().map(AsRef::as_ref),
+                    );
                     actual.push(if value.literal == Some(0) && reference(ty) {
-                        format!("(({}) null)", java_type(ty)?)
-                    } else if unambiguous_object_call
-                        && ty.as_ref() == "Ljava/lang/Object;"
-                        && reference(&value.ty)
+                        if omit_cast {
+                            "null".into()
+                        } else {
+                            format!("(({}) null)", java_type(ty)?)
+                        }
+                    } else if omit_cast
+                        || (unambiguous_object_call
+                            && ty.as_ref() == "Ljava/lang/Object;"
+                            && reference(&value.ty))
                     {
                         value.text.clone()
                     } else if ty.as_ref() == "I" && matches!(value.ty.as_str(), "B" | "S" | "C") {
                         format!("((int) {})", value.text)
                     } else {
-                        argument(&value, ty)?
+                        argument_from_register(
+                            &value,
+                            ty,
+                            reg,
+                            method.code.as_ref().unwrap(),
+                            graph,
+                        )?
                     });
                 }
                 ensure!(name != "<clinit>", "static initializer invocation");
@@ -6462,6 +9360,82 @@ mod tests {
         (class, method)
     }
     #[test]
+    fn selected_loop_literal_uses_decoded_null_and_rejects_poison() {
+        let words = vec![
+            0x0012, 0x0338, 9, 0x0071, 0, 0, 0x000c, 0x03d8, 0xff03, 0xf828, 0x0011,
+        ];
+        let (mut class, mut method) =
+            fixture(words.clone(), 4, 1, vec!["I".into()], "Ljava/lang/String;");
+        class.symbols = Arc::new(DexSymbols {
+            types: vec!["Lsample/Example;".into()],
+            strings: vec!["next".into()],
+            protos: vec![("Ljava/lang/String;".into(), vec![])],
+            methods: vec![(0, 0, 0)],
+            ..Default::default()
+        });
+        let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert_eq!(graph.shared_loops.len(), 1);
+        let regs = vec![
+            Some(Value {
+                text: "0".into(),
+                ty: "I".into(),
+                literal: Some(0),
+                wide_literal: None,
+                raw_bits32: false,
+            }),
+            None,
+            None,
+            Some(Value {
+                text: "p0".into(),
+                ty: "I".into(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: false,
+            }),
+        ];
+        let region = graph.loops[0];
+        let written = graph
+            .written_in(method.code.as_ref().unwrap(), region.start, region.exit)
+            .unwrap();
+        let mut baseline = regs.clone();
+        promote_loop_entry_literals(
+            &class,
+            &method,
+            &graph,
+            region,
+            &mut baseline,
+            Some(&written),
+        )
+        .unwrap();
+        assert_eq!(baseline[0].as_ref().unwrap().ty, "Ljava/lang/String;");
+        method.code.as_mut().unwrap().instructions[0] = 0x1012;
+        let mut raw_poisoned = regs.clone();
+        promote_loop_entry_literals(
+            &class,
+            &method,
+            &graph,
+            region,
+            &mut raw_poisoned,
+            Some(&written),
+        )
+        .unwrap();
+        assert_eq!(
+            raw_poisoned[0].as_ref().unwrap().ty,
+            baseline[0].as_ref().unwrap().ty
+        );
+        graph.front_end.as_mut().unwrap().ir.instructions[0].literal = None;
+        let mut decoded_poisoned = regs;
+        let result = promote_loop_entry_literals(
+            &class,
+            &method,
+            &graph,
+            region,
+            &mut decoded_poisoned,
+            Some(&written),
+        );
+        assert!(result.is_err() || decoded_poisoned[0].as_ref().unwrap().ty == "I");
+    }
+    #[test]
     fn shared_straight_line_consumes_decoded_layout_and_bound_calls() {
         let (mut class, mut method) =
             fixture(vec![0x0071, 0, 0, 0x000a, 0x000f], 1, 0, vec![], "I");
@@ -6596,6 +9570,251 @@ mod tests {
             0x0012, 0x1071, 0, 0, value, 0x00d8, 0x0100, 0x3034, 0xfffa, returned,
         ];
         (class, method, regs)
+    }
+    fn shared_dual_backedge_fixture() -> (DexClass, DexMethod, Vec<Option<Value>>) {
+        let words = vec![
+            0x0012, 0x0112, 0x01d8, 0x0101, 0x2032, 19, 0x01d8, 0x0201, 0x3032, 15, 0x01d8, 0x0301,
+            0x4032, 10, 0x00d8, 0x0100, 0x5034, 0xfff2, 0x01d8, 0x0401, 0x6034, 0xffee, 0x010f,
+            0x010f,
+        ];
+        let (class, method) = fixture(words, 7, 5, vec!["I".into(); 5], "I");
+        let mut regs = vec![None; 7];
+        for (index, register) in (2..7).enumerate() {
+            assign(
+                &mut regs,
+                register,
+                Value {
+                    text: format!("p{index}"),
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                },
+            )
+            .unwrap();
+        }
+        (class, method, regs)
+    }
+    #[test]
+    fn shared_dual_backedges_revalidate_canonical_region_edges_and_operands() {
+        let (class, method, regs) = shared_dual_backedge_fixture();
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert_eq!(graph.shared_loops.len(), 1);
+        assert_eq!(graph.shared_loops[0].start, 2);
+        assert_eq!(graph.shared_loops[0].tail, Some(22));
+        assert_eq!(
+            graph
+                .shared_loop_edges
+                .iter()
+                .filter(|e| e.kind == SharedLoopEdgeKind::Break)
+                .count(),
+            2
+        );
+        assert_eq!(
+            graph
+                .shared_loop_edges
+                .iter()
+                .filter(|e| e.kind == SharedLoopEdgeKind::Continue)
+                .count(),
+            1
+        );
+        let mut expected = Output::default();
+        render(
+            &class,
+            &method,
+            &graph,
+            0,
+            24,
+            regs.clone(),
+            &mut expected,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        // Once selected, emission consumes the canonical decoded operands and
+        // does not silently retry altered raw branch words.
+        let (_, mut raw, _) = shared_dual_backedge_fixture();
+        for pc in [5, 9, 13, 17, 21] {
+            raw.code.as_mut().unwrap().instructions[pc] = 0x7fff;
+        }
+        let mut actual = Output::default();
+        render(
+            &class,
+            &raw,
+            &graph,
+            0,
+            24,
+            regs.clone(),
+            &mut actual,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(actual.text, expected.text);
+        for mutation in 0..7 {
+            let mut poisoned = Graph::straight_line(&class, &method).unwrap().unwrap();
+            match mutation {
+                0 => poisoned.shared_loops[0].exit = 22,
+                1 => poisoned.shared_loops[0].tail = None,
+                2 => poisoned.shared_loop_edges[0].kind = SharedLoopEdgeKind::Continue,
+                3 => poisoned.shared_loop_edges.swap(0, 1),
+                4 => {
+                    let index = poisoned.shared_cfg.as_ref().unwrap().block_at[&16];
+                    poisoned.shared_cfg.as_mut().unwrap().blocks[index]
+                        .successors
+                        .swap(0, 1);
+                }
+                5 => {
+                    poisoned
+                        .front_end
+                        .as_mut()
+                        .unwrap()
+                        .ir
+                        .instructions
+                        .iter_mut()
+                        .find(|i| i.pc == 16)
+                        .unwrap()
+                        .branch_target = Some(23)
+                }
+                _ => {
+                    poisoned.shared_loop_edges.pop();
+                }
+            }
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &poisoned,
+                    0,
+                    24,
+                    regs.clone(),
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
+    #[test]
+    fn shared_dual_backedges_reject_extra_exit_and_interior_entry() {
+        let (class, mut method, _) = shared_dual_backedge_fixture();
+        // Three guards to the common exit exceed the bounded shape.
+        method.code.as_mut().unwrap().instructions[13] = 11; // terminal guard -> exit
+        assert!(Graph::straight_line(&class, &method).unwrap().is_none());
+        let (class, mut method, _) = shared_dual_backedge_fixture();
+        // Redirect one preheader branch into the loop interior while keeping
+        // both backedges and the terminal return. Canonical ownership rejects.
+        let words = &mut method.code.as_mut().unwrap().instructions;
+        words.splice(0..0, [0x0238, 6]); // if-eqz p0, @0006 (inside body)
+        assert!(Graph::straight_line(&class, &method).unwrap().is_none());
+    }
+    #[test]
+    fn dual_backedge_selector_preserves_prefix_and_terminal_body_routes() {
+        for arms in 1..=3 {
+            let (class, mut method, _) = shared_dual_backedge_fixture();
+            let words = &mut method.code.as_mut().unwrap().instructions;
+            for _ in 0..arms {
+                words.splice(2..2, [0x0038, 3, 0x010f]);
+            }
+            let selected = Graph::straight_line(&class, &method).unwrap();
+            if arms == 1 {
+                assert!(
+                    selected.is_none(),
+                    "single prefix return stays on legacy route"
+                );
+            } else {
+                assert!(
+                    selected.is_some(),
+                    "closed prefix chain {arms} should be selected"
+                );
+            }
+        }
+        let (class, mut method, _) = shared_dual_backedge_fixture();
+        method.code.as_mut().unwrap().instructions[2..4].copy_from_slice(&[0x010f, 0x0000]);
+        assert!(
+            Graph::straight_line(&class, &method).unwrap().is_none(),
+            "terminal instruction inside loop body remains on legacy route"
+        );
+        let (class, mut method, _) = shared_dual_backedge_fixture();
+        method.code.as_mut().unwrap().instructions[2] = 0x0113; // const/16 v1
+        method.code.as_mut().unwrap().instructions[3] = 0x000f;
+        assert!(
+            Graph::straight_line(&class, &method).unwrap().is_some(),
+            "operand low byte must not be mistaken for a return opcode"
+        );
+    }
+    #[test]
+    fn distinct_conditional_backedges_keep_their_existing_route() {
+        let words = vec![
+            0x0012, 0x00d8, 0x0100, 0x1034, 0xfffe, 0x00d8, 0x0100, 0x2034, 0xfffe, 0x000f,
+        ];
+        let (class, method) = fixture(words, 3, 2, vec!["I".into(); 2], "I");
+        assert!(Graph::straight_line(&class, &method).unwrap().is_none());
+        let graph = Graph::new(&method.code.as_ref().unwrap().instructions).unwrap();
+        let regs = vec![
+            None,
+            Some(Value {
+                text: "p0".into(),
+                ty: "I".into(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: false,
+            }),
+            Some(Value {
+                text: "p1".into(),
+                ty: "I".into(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: false,
+            }),
+        ];
+        let mut out = Output::default();
+        render(
+            &class, &method, &graph, 0, 10, regs, &mut out, 0, true, None, None,
+        )
+        .unwrap();
+        assert_eq!(out.text.matches("while (").count(), 2, "{}", out.text);
+    }
+    #[test]
+    fn early_continue_skips_late_only_latch_operand() {
+        let words = vec![
+            0x0012, 0x0112, 0x01d8, 0x0101, 0x3032, 0x0014, 0x01d8, 0x0201, 0x4032, 0x0010, 0x01d8,
+            0x0301, 0x5032, 0x000b, 0x00d8, 0x0100, 0x6034, 0xfff2, 0x4212, 0x01d8, 0x0401, 0x2034,
+            0xffed, 0x010f, 0x010f,
+        ];
+        let (class, method) = fixture(words, 8, 5, vec!["I".into(); 5], "I");
+        let mut regs = vec![None; 8];
+        for (index, register) in (3..8).enumerate() {
+            assign(
+                &mut regs,
+                register,
+                Value {
+                    text: format!("p{index}"),
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                },
+            )
+            .unwrap();
+        }
+        // v2 is undefined on the early backedge and assigned only after it.
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert!(!graph.live_at(graph.shared_loops[0].start, 2));
+        let mut out = Output::default();
+        render(
+            &class, &method, &graph, 0, 25, regs, &mut out, 0, true, None, None,
+        )
+        .unwrap();
+        assert_eq!(out.text.matches("continue;").count(), 2, "{}", out.text);
     }
     #[test]
     fn shared_posttest_body_diamond_preserves_canonical_ownership() {
@@ -6915,6 +10134,441 @@ mod tests {
             let (class, method) = fixture(words, 1, 0, vec![], "V");
             assert!(Graph::straight_line(&class, &method).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn shared_posttest_break_revalidates_exit_edge_and_keeps_decoded_ownership() {
+        // sum += 2; if (selector == 0) break; sum += 3; i++;
+        // if (i < limit) repeat; return sum.
+        let words = vec![
+            0x0012, 0x0112, 0x01d8, 0x0201, 0x0338, 8, 0x01d8, 0x0301, 0x00d8, 0x0100, 0x2034,
+            0xfff8, 0x010f,
+        ];
+        let (class, method) = fixture(words.clone(), 4, 2, vec!["I".into(), "I".into()], "I");
+        let regs = [None, None, Some("p0"), Some("p1")]
+            .into_iter()
+            .map(|value| {
+                value.map(|text| Value {
+                    text: text.into(),
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                })
+            })
+            .collect::<Vec<_>>();
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert_eq!(graph.shared_loops[0].start, 2);
+        assert_eq!(
+            graph.shared_loop_edges,
+            vec![SharedLoopEdge {
+                owner: 2,
+                branch: 4,
+                taken: 12,
+                fallthrough: 6,
+                kind: SharedLoopEdgeKind::Break,
+            }]
+        );
+        let mut expected = Output::default();
+        let result = render(
+            &class,
+            &method,
+            &graph,
+            0,
+            13,
+            regs.clone(),
+            &mut expected,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(expected.text.contains("break;"));
+
+        for mutation in 0..4 {
+            let mut broken = Graph::straight_line(&class, &method).unwrap().unwrap();
+            match mutation {
+                0 => broken.shared_loop_edges[0].taken = 10,
+                1 => broken.shared_loop_edges[0].fallthrough = 8,
+                2 => broken.shared_loop_edges[0].owner = 0,
+                _ => {
+                    let cfg = broken.shared_cfg.as_mut().unwrap();
+                    cfg.blocks[cfg.block_at[&4]].successors.swap(0, 1);
+                }
+            }
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &broken,
+                    0,
+                    13,
+                    regs.clone(),
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let (_, mut raw) = fixture(words, 4, 2, vec!["I".into(), "I".into()], "I");
+        let mut poisoned = Graph::straight_line(&class, &method).unwrap().unwrap();
+        poisoned.targets.fill(Some(usize::MAX));
+        raw.code.as_mut().unwrap().instructions.fill(u16::MAX);
+        let mut actual = Output::default();
+        let decoded = render(
+            &class,
+            &raw,
+            &poisoned,
+            0,
+            13,
+            regs,
+            &mut actual,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(decoded == result);
+        assert_eq!(actual.text, expected.text);
+    }
+
+    #[test]
+    fn shared_posttest_break_rejects_extra_exit_and_interior_entry() {
+        let cases = [
+            // Two conditional body edges leave through distinct exits.
+            vec![
+                0x0012, 0x0112, 0x01d8, 0x0201, 0x0338, 10, 0x0338, 9, 0x01d8, 0x0301, 0x00d8,
+                0x0100, 0x2034, 0xfff6, 0x010f, 0x000f,
+            ],
+            // A prefix branch bypasses the posttest header into its interior.
+            vec![
+                0x0338, 6, 0x0012, 0x0112, 0x01d8, 0x0201, 0x0338, 6, 0x00d8, 0x0100, 0x2034,
+                0xfff8, 0x010f,
+            ],
+        ];
+        for words in cases {
+            let (class, method) = fixture(words.clone(), 4, 2, vec!["I".into(), "I".into()], "I");
+            let front = crate::native_method::MethodFrontEnd::build(&class, &method).unwrap();
+            let cfg =
+                crate::native_cfg::ControlFlowGraph::from_decoded_loop(&front.ir, words.len())
+                    .unwrap();
+            assert!(decoded_posttest_loop(&front.ir, &cfg, &mut 16_000_000).is_err());
+        }
+    }
+
+    #[test]
+    fn shared_posttest_multiple_breaks_revalidate_order_and_decoded_operands() {
+        // sum += 1; if (i == first) break; sum += 2;
+        // if (i == second) break; sum += 3; i++; if (i < limit) repeat.
+        let words = vec![
+            0x0012, 0x0112, 0x01d8, 0x0101, 0x3032, 12, 0x01d8, 0x0201, 0x4032, 8, 0x01d8, 0x0301,
+            0x00d8, 0x0100, 0x2034, 0xfff4, 0x010f,
+        ];
+        let (class, method) = fixture(
+            words.clone(),
+            5,
+            3,
+            vec!["I".into(), "I".into(), "I".into()],
+            "I",
+        );
+        let regs = [None, None, Some("limit"), Some("first"), Some("second")]
+            .into_iter()
+            .map(|value| {
+                value.map(|text| Value {
+                    text: text.into(),
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                })
+            })
+            .collect::<Vec<_>>();
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert_eq!(
+            graph.shared_loop_edges,
+            vec![
+                SharedLoopEdge {
+                    owner: 2,
+                    branch: 4,
+                    taken: 16,
+                    fallthrough: 6,
+                    kind: SharedLoopEdgeKind::Break
+                },
+                SharedLoopEdge {
+                    owner: 2,
+                    branch: 8,
+                    taken: 16,
+                    fallthrough: 10,
+                    kind: SharedLoopEdgeKind::Break
+                },
+            ]
+        );
+        let mut expected = Output::default();
+        let result = render(
+            &class,
+            &method,
+            &graph,
+            0,
+            words.len(),
+            regs.clone(),
+            &mut expected,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(expected.text.matches("break;").count(), 3);
+        for mutation in 0..5 {
+            let mut broken = Graph::straight_line(&class, &method).unwrap().unwrap();
+            match mutation {
+                0 => broken.shared_loop_edges.swap(0, 1),
+                1 => broken.shared_loop_edges[1].taken = 15,
+                2 => broken.shared_loop_edges[1].fallthrough = 12,
+                3 => broken.shared_loop_edges[1].owner = 0,
+                _ => {
+                    let cfg = broken.shared_cfg.as_mut().unwrap();
+                    cfg.blocks[cfg.block_at[&8]].successors.swap(0, 1);
+                }
+            }
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &broken,
+                    0,
+                    words.len(),
+                    regs.clone(),
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let (_, mut raw) = fixture(words, 5, 3, vec!["I".into(), "I".into(), "I".into()], "I");
+        let mut poisoned = Graph::straight_line(&class, &method).unwrap().unwrap();
+        poisoned.targets.fill(Some(usize::MAX));
+        raw.code.as_mut().unwrap().instructions.fill(u16::MAX);
+        let mut actual = Output::default();
+        let decoded = render(
+            &class,
+            &raw,
+            &poisoned,
+            0,
+            17,
+            regs,
+            &mut actual,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(decoded == result);
+        assert_eq!(actual.text, expected.text);
+    }
+
+    #[test]
+    fn shared_posttest_multiple_break_budget_and_extra_backedge() {
+        let build = |breaks: usize| {
+            let mut words = vec![0x0012, 0x0112];
+            let mut branches = Vec::new();
+            for _ in 0..breaks {
+                branches.push(words.len());
+                words.extend([0x0338, 0]);
+            }
+            words.extend([0x01d8, 0x0101, 0x00d8, 0x0100]);
+            let latch = words.len();
+            words.extend([0x2034, (2isize - latch as isize) as i16 as u16]);
+            let exit = words.len();
+            words.push(0x010f);
+            for pc in branches {
+                words[pc + 1] = (exit as isize - pc as isize) as i16 as u16;
+            }
+            words
+        };
+        let words = build(8);
+        let (class, method) = fixture(words.clone(), 4, 2, vec!["I".into(), "I".into()], "I");
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert_eq!(graph.shared_loop_edges.len(), 8);
+        let regs = [None, None, Some("limit"), Some("selector")]
+            .into_iter()
+            .map(|value| {
+                value.map(|text| Value {
+                    text: text.into(),
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                })
+            })
+            .collect();
+        render(
+            &class,
+            &method,
+            &graph,
+            0,
+            words.len(),
+            regs,
+            &mut Output::default(),
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let words = build(9);
+        let (class, method) = fixture(words.clone(), 4, 2, vec!["I".into(), "I".into()], "I");
+        let front = crate::native_method::MethodFrontEnd::build(&class, &method).unwrap();
+        let cfg =
+            crate::native_cfg::ControlFlowGraph::from_decoded_loop(&front.ir, words.len()).unwrap();
+        assert!(
+            decoded_posttest_loop(&front.ir, &cfg, &mut 16_000_000)
+                .unwrap_err()
+                .to_string()
+                .contains("break budget")
+        );
+        assert!(Graph::straight_line(&class, &method).unwrap().is_none());
+
+        let mut words = build(2);
+        let second = 4;
+        words[second + 1] = (2isize - second as isize) as i16 as u16;
+        let (class, method) = fixture(words.clone(), 4, 2, vec!["I".into(), "I".into()], "I");
+        let front = crate::native_method::MethodFrontEnd::build(&class, &method).unwrap();
+        let cfg =
+            crate::native_cfg::ControlFlowGraph::from_decoded_loop(&front.ir, words.len()).unwrap();
+        assert!(decoded_posttest_loop(&front.ir, &cfg, &mut 16_000_000).is_err());
+    }
+
+    #[test]
+    fn shared_pretest_terminal_exits_revalidate_metadata_and_decoded_operands() {
+        let words = vec![
+            0x0012, 0xf112, 0x1071, 0, 0, 0x2035, 12, 0x1071, 1, 0, 0x3032, 6, 0x00d8, 0x0100,
+            0x2034, 0xfff4, 0x000f, 0x010f,
+        ];
+        let (mut class, method) = fixture(words.clone(), 4, 2, vec!["I".into(), "I".into()], "I");
+        class.symbols = Arc::new(DexSymbols {
+            strings: vec!["header".into(), "body".into()],
+            types: vec!["Lsample/Hook;".into()],
+            protos: vec![("V".into(), vec!["I".into()])],
+            methods: vec![(0, 0, 0), (0, 0, 1)],
+            ..Default::default()
+        });
+        let mut method = method;
+        method.code.as_mut().unwrap().outs = 1;
+        let regs = [None, None, Some("p0"), Some("p1")]
+            .into_iter()
+            .map(|value| {
+                value.map(|text| Value {
+                    text: text.into(),
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                })
+            })
+            .collect::<Vec<_>>();
+        let graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert_eq!(
+            graph.shared_loops,
+            vec![Loop {
+                parent: None,
+                start: 2,
+                latch: 14,
+                guard: Some(5),
+                exit: 18,
+                tail: None,
+            }]
+        );
+        assert_eq!(graph.loops, graph.shared_loops);
+        assert_eq!(
+            graph.shared_loop_edges,
+            vec![SharedLoopEdge {
+                owner: 2,
+                branch: 10,
+                taken: 16,
+                fallthrough: 12,
+                kind: SharedLoopEdgeKind::Terminal,
+            }]
+        );
+        assert!(graph.non_reentering_tail(16, 2..16, &words).unwrap());
+        let mut expected = Output::default();
+        let result = render(
+            &class,
+            &method,
+            &graph,
+            0,
+            18,
+            regs.clone(),
+            &mut expected,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        for mutation in 0..5 {
+            let mut broken = Graph::straight_line(&class, &method).unwrap().unwrap();
+            match mutation {
+                0 => broken.shared_loops[0].exit = 17,
+                1 => broken.shared_loops[0].guard = Some(7),
+                2 => broken.shared_loop_edges[0].taken = 17,
+                3 => broken.shared_loop_edges[0].kind = SharedLoopEdgeKind::Break,
+                _ => {
+                    let cfg = broken.shared_cfg.as_mut().unwrap();
+                    cfg.blocks[cfg.block_at[&14]].successors.swap(0, 1);
+                }
+            }
+            assert!(
+                render(
+                    &class,
+                    &method,
+                    &broken,
+                    0,
+                    18,
+                    regs.clone(),
+                    &mut Output::default(),
+                    0,
+                    true,
+                    None,
+                    None
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let (_, mut raw) = fixture(words, 4, 2, vec!["I".into(), "I".into()], "I");
+        raw.code.as_mut().unwrap().outs = 1;
+        raw.code.as_mut().unwrap().instructions.fill(u16::MAX);
+        let mut poisoned = Graph::straight_line(&class, &method).unwrap().unwrap();
+        poisoned.targets.fill(Some(usize::MAX));
+        let mut actual = Output::default();
+        let decoded = render(
+            &class,
+            &raw,
+            &poisoned,
+            0,
+            18,
+            regs,
+            &mut actual,
+            0,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(decoded == result);
+        assert_eq!(actual.text, expected.text);
     }
 
     fn shared_loop_body_fixture(empty: bool) -> (DexClass, DexMethod, Vec<Option<Value>>) {
@@ -11542,7 +15196,8 @@ mod tests {
             )
             .unwrap();
             assert_eq!(actual.text, expected.text, "boolean opcode {op:02x}");
-            assert!(actual.text.contains("boolean"));
+            assert!(actual.text.contains("return "));
+            assert!(!actual.text.contains("int "));
         }
     }
 
@@ -12235,7 +15890,11 @@ mod tests {
                 .lines()
                 .find(|line| line.contains(".value()"))
                 .unwrap();
-            let (_, rhs) = line.trim().trim_end_matches(';').split_once(" = ").unwrap();
+            let statement = line.trim().trim_end_matches(';');
+            let rhs = statement
+                .strip_prefix("return ")
+                .or_else(|| statement.split_once(" = ").map(|(_, rhs)| rhs))
+                .unwrap();
             match rhs {
                 "super.value()" => (7, "Base.value"),
                 "this.value()" => (99, "Example.value"),
@@ -12544,7 +16203,7 @@ mod tests {
         ];
         let graph = Graph::new(&[0x000e]).unwrap();
         let mut out = Output::default();
-        let slots = loop_slots(&regs, &graph, 0, &mut out, None).unwrap();
+        let slots = loop_slots(&regs, &graph, 0, &mut out, None, None).unwrap();
         assert_eq!(slots[0].as_ref().unwrap().ty, "J");
         assert_eq!(slots[1].as_ref().unwrap().ty, "<wide-tail>");
         assert_eq!(slots[1].as_ref().unwrap().text, "0");
@@ -12561,7 +16220,7 @@ mod tests {
             raw_bits32: false,
         })];
         let graph = Graph::new(&[0x000e]).unwrap();
-        assert!(loop_slots(&regs, &graph, 0, &mut Output::default(), None).is_err());
+        assert!(loop_slots(&regs, &graph, 0, &mut Output::default(), None, None).is_err());
     }
     #[test]
     fn wide_diamond_merges_a_single_long_head() {
@@ -13171,18 +16830,36 @@ mod tests {
     }
 
     #[test]
-    fn guarded_loop_rejects_tail_entry_and_tail_backedge() {
+    fn guarded_loop_separates_shared_tail_but_rejects_body_entry_and_tail_backedge() {
         // A branch outside the loop enters its one-time exit tail.
         let entry = [
             0x0138, 8, 0x003d, 10, 0x00d8, 0xff00, 0x003c, 0xfffc, 0x0113, 99, 0x01d8, 0x0101,
             0x010f,
         ];
-        let error = Graph::new(&entry).err().unwrap().to_string();
+        let graph = Graph::new(&entry).unwrap();
+        assert_eq!(graph.loops[0].tail, None);
+        assert_eq!(graph.loops[0].exit, 8);
+        let mut interior = entry;
+        interior[1] = 4;
+        let error = Graph::new(&interior).err().unwrap().to_string();
         assert!(error.contains("interior entry"), "{error}");
         let backedge = [
             0x003d, 10, 0x00d8, 0xff00, 0x003c, 0xfffc, 0x0113, 99, 0x0139, 0xfffa, 0x010f,
         ];
         assert!(Graph::new(&backedge).is_err());
+    }
+
+    #[test]
+    fn branches_within_owned_exit_tail_do_not_make_it_externally_shared() {
+        let words = vec![
+            0x003d, 13, 0x00d8, 0xff00, 0x003c, 0xfffc, 0x0138, 4, 0x1112, 0x0228, 0x2112, 0x01d8,
+            0x0101, 0x010f,
+        ];
+        let graph = Graph::new(&words).unwrap();
+        assert_eq!(graph.loops[0].tail, Some(6));
+        assert_eq!(graph.loops[0].exit, 13);
+        let (class, method) = fixture(words, 2, 2, vec!["I".into(), "I".into()], "I");
+        reconstruct("sample.Example", &class, &method).unwrap();
     }
 
     #[test]
@@ -13459,6 +17136,301 @@ mod boolean_numeric_arguments {
         };
         for target in ["B", "S", "C", "Z"] {
             assert!(argument(&value, target).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod boolean_register_arguments {
+    use super::*;
+    use crate::native_dex::{DexCode, DexSymbols};
+    use std::sync::Arc;
+
+    fn code(words: Vec<u16>, registers: u16, ins: u16) -> DexCode {
+        DexCode {
+            registers,
+            ins,
+            outs: 0,
+            tries: 0,
+            try_regions: vec![],
+            instructions: words,
+            offset: 0,
+        }
+    }
+
+    fn integer_value() -> Value {
+        Value {
+            text: "slot".into(),
+            ty: "I".into(),
+            literal: None,
+            wide_literal: None,
+            raw_bits32: false,
+        }
+    }
+
+    #[test]
+    fn all_narrow_constant_encodings_prove_boolean_register() {
+        for words in [
+            vec![0x1012, 0x000e],
+            vec![0x0013, 1, 0x000e],
+            vec![0x0014, 1, 0, 0x000e],
+            vec![0x0015, 0, 0x000e],
+        ] {
+            let code = code(words, 1, 0);
+            let graph = Graph::new(&code.instructions).unwrap();
+            assert_eq!(
+                argument_from_register(&integer_value(), "Z", 0, &code, &graph).unwrap(),
+                "(slot != 0)"
+            );
+        }
+    }
+
+    #[test]
+    fn arbitrary_parameter_and_later_backward_write_are_not_boolean() {
+        let parameter = code(vec![0x000e], 1, 1);
+        let graph = Graph::new(&parameter.instructions).unwrap();
+        assert!(argument_from_register(&integer_value(), "Z", 0, &parameter, &graph).is_err());
+
+        // The write lies after the sink in code order but can run before its
+        // next execution through the backward goto.
+        let looped = code(
+            vec![0x0012, 0x0138, 7, 0x1071, 0, 0, 0x2012, 0xfa28, 0x000e],
+            2,
+            0,
+        );
+        let graph = Graph::new(&looped.instructions).unwrap();
+        assert_eq!(graph.targets[7], Some(1));
+        assert!(argument_from_register(&integer_value(), "Z", 0, &looped, &graph).is_err());
+    }
+
+    #[test]
+    fn selected_constant_proof_uses_decoded_identity_and_rejects_poison() {
+        let class = DexClass {
+            symbols: Arc::new(DexSymbols::default()),
+            descriptor: "Lsample/ConstProof;".into(),
+            superclass: Some("Ljava/lang/Object;".into()),
+            interfaces: vec![],
+            access_flags: 1,
+            annotations_offset: 0,
+            static_values_offset: 0,
+            static_values: vec![],
+            fields: vec![],
+            methods: vec![],
+        };
+        let method = DexMethod {
+            declaring_type: class.descriptor.clone(),
+            name: "test".into(),
+            return_type: "V".into(),
+            parameters: vec![],
+            thrown_types: vec![],
+            access_flags: 9,
+            code: Some(code(vec![0x1012, 0x000e], 1, 0)),
+        };
+        let source = method.code.as_ref().unwrap();
+        let mut graph = Graph::straight_line(&class, &method).unwrap().unwrap();
+        let selected = &mut graph.front_end.as_mut().unwrap().ir.instructions[0];
+        selected.literal = Some(2);
+        assert!(!constant_register_domain(source, &graph, 0, ConstantDomain::Boolean).unwrap());
+        graph.front_end.as_mut().unwrap().ir.instructions[0].literal = None;
+        assert!(constant_register_domain(source, &graph, 0, ConstantDomain::Boolean).is_err());
+    }
+
+    #[test]
+    fn boolean_return_proof_rejects_selected_call_and_cfg_poison() {
+        let class = DexClass {
+            symbols: Arc::new(DexSymbols {
+                strings: vec!["tick".into()],
+                types: vec!["Lsample/ReturnProof;".into()],
+                protos: vec![("Z".into(), vec![])],
+                methods: vec![(0, 0, 0)],
+                ..Default::default()
+            }),
+            descriptor: "Lsample/ReturnProof;".into(),
+            superclass: Some("Ljava/lang/Object;".into()),
+            interfaces: vec![],
+            access_flags: 1,
+            annotations_offset: 0,
+            static_values_offset: 0,
+            static_values: vec![],
+            fields: vec![],
+            methods: vec![],
+        };
+        let method = DexMethod {
+            declaring_type: class.descriptor.clone(),
+            name: "test".into(),
+            return_type: "Z".into(),
+            parameters: vec![],
+            thrown_types: vec![],
+            access_flags: 9,
+            code: Some(code(vec![0x0012, 0x0071, 0, 0, 0x000a, 0x000f], 1, 0)),
+        };
+        let clean = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert!(proven_boolean_return(&class, &method, &clean, 5, 0).unwrap());
+
+        let mut poisoned_call = Graph::straight_line(&class, &method).unwrap().unwrap();
+        poisoned_call.front_end.as_mut().unwrap().bound.calls[0].return_type = "I".into();
+        assert!(proven_boolean_return(&class, &method, &poisoned_call, 5, 0).is_err());
+
+        let mut poisoned_cfg = Graph::straight_line(&class, &method).unwrap().unwrap();
+        poisoned_cfg.shared_cfg = Some(
+            crate::native_cfg::ControlFlowGraph::from_decoded(
+                &poisoned_cfg.front_end.as_ref().unwrap().ir,
+                method.code.as_ref().unwrap().instructions.len(),
+            )
+            .unwrap(),
+        );
+        poisoned_cfg.shared_cfg.as_mut().unwrap().blocks[0].start += 1;
+        assert!(proven_boolean_return(&class, &method, &poisoned_cfg, 5, 0).is_err());
+
+        let literal_method = DexMethod {
+            code: Some(code(vec![0x2012, 0x000f], 1, 0)),
+            ..method
+        };
+        let mut poisoned_literal = Graph::straight_line(&class, &literal_method)
+            .unwrap()
+            .unwrap();
+        poisoned_literal.front_end.as_mut().unwrap().ir.instructions[0].literal = Some(1);
+        assert!(proven_boolean_return(&class, &literal_method, &poisoned_literal, 1, 0).is_err());
+
+        let moved_method = DexMethod {
+            code: Some(code(vec![0x0012, 0x0101, 0x010f], 2, 0)),
+            ..literal_method
+        };
+        let mut poisoned_move = Graph::straight_line(&class, &moved_method)
+            .unwrap()
+            .unwrap();
+        poisoned_move.front_end.as_mut().unwrap().ir.instructions[1].reads[0].register = 1;
+        assert!(proven_boolean_return(&class, &moved_method, &poisoned_move, 2, 1).is_err());
+    }
+
+    #[test]
+    fn boolean_or_loop_rejects_selected_poison_and_unanchored_dependency_cycle() {
+        let class = DexClass {
+            symbols: Arc::new(DexSymbols {
+                strings: vec!["tick".into()],
+                types: vec!["Lsample/ReturnOrProof;".into()],
+                protos: vec![("Z".into(), vec![])],
+                methods: vec![(0, 0, 0)],
+                ..Default::default()
+            }),
+            descriptor: "Lsample/ReturnOrProof;".into(),
+            superclass: Some("Ljava/lang/Object;".into()),
+            interfaces: vec![],
+            access_flags: 1,
+            annotations_offset: 0,
+            static_values_offset: 0,
+            static_values: vec![],
+            fields: vec![],
+            methods: vec![],
+        };
+        let method = DexMethod {
+            declaring_type: class.descriptor.clone(),
+            name: "test".into(),
+            return_type: "Z".into(),
+            parameters: vec!["I".into()],
+            thrown_types: vec![],
+            access_flags: 9,
+            code: Some(code(
+                vec![
+                    0x0012, 0x0238, 10, 0x0071, 0, 0, 0x010a, 0x10b6, 0x02d8, 0xff02, 0xf728,
+                    0x000f,
+                ],
+                3,
+                1,
+            )),
+        };
+        let mut selected = Graph::straight_line(&class, &method).unwrap().unwrap();
+        assert!(proven_boolean_return(&class, &method, &selected, 11, 0).unwrap());
+        selected.front_end.as_mut().unwrap().ir.instructions[0].literal = Some(2);
+        assert!(proven_boolean_return(&class, &method, &selected, 11, 0).is_err());
+
+        let code = method.code.as_ref().unwrap();
+        let ir = crate::native_ir::DecodedMethod::decode(code).unwrap();
+        let cfg = crate::native_cfg::ControlFlowGraph::build(code).unwrap();
+        let mut ssa = crate::native_ssa::SsaMethod::build(code, &ir, &cfg).unwrap();
+        let bound = crate::native_calls::BoundCalls::bind(code, &ir, &class.symbols).unwrap();
+        let calls = crate::native_call_values::SsaCalls::bind(&bound, &ssa).unwrap();
+        assert!(boolean_return_or_proven(&method, &ir, &ssa, &calls, 11, 0));
+
+        // The return phi still has a valid zero anchor. Its loop-back value
+        // now depends on a separate closed phi cycle with no finite value.
+        // Joining Bottom away at the return phi would accept it unsoundly.
+        let header = ssa
+            .phis
+            .iter()
+            .find(|phi| phi.register == 0)
+            .unwrap()
+            .clone();
+        let phantom = ssa.definitions.len();
+        ssa.definitions.push(crate::native_ssa::Definition {
+            register: 1,
+            kind: crate::native_ssa::DefinitionKind::Phi {
+                block: header.block,
+            },
+        });
+        ssa.phis.push(crate::native_ssa::Phi {
+            block: header.block,
+            register: 1,
+            result: phantom,
+            incoming: header
+                .incoming
+                .iter()
+                .map(|(pred, _)| (*pred, phantom))
+                .collect(),
+        });
+        ssa.instructions
+            .iter_mut()
+            .find(|instruction| instruction.pc == 7)
+            .unwrap()
+            .reads[1]
+            .words[0] = phantom;
+        assert!(!boolean_return_or_proven(&method, &ir, &ssa, &calls, 11, 0));
+    }
+}
+
+#[cfg(test)]
+mod terminal_local_tests {
+    use super::*;
+
+    #[test]
+    fn adjacent_return_uses_recorded_expression_and_unicode_spans() {
+        let mut out = Output::default();
+        out.line("// λ", &[]);
+        let value = out
+            .local("I", "Source.read()", &[(7, 4, "Source.read()I".into())])
+            .unwrap();
+        out.return_value(&value, &value.text, "I");
+        assert!(out.text.contains("return Source.read();"));
+        assert!(!out.text.contains("int v0"));
+        let link = &out.links[0];
+        assert_eq!(
+            out.text
+                .chars()
+                .skip(link.start)
+                .take(link.end - link.start)
+                .collect::<String>(),
+            "read"
+        );
+    }
+
+    #[test]
+    fn statements_blocks_conversions_and_appends_prevent_terminal_shrinking() {
+        for barrier in 0..4 {
+            let mut out = Output::default();
+            let value = out.local("I", "Source.read()", &[]).unwrap();
+            match barrier {
+                0 => out.line("Source.effect();", &[]),
+                1 => out.indent += 1,
+                2 => out.append(Output::default()),
+                _ => (),
+            }
+            let converted = if barrier == 3 {
+                "((long) v0)"
+            } else {
+                &value.text
+            };
+            out.return_value(&value, converted, if barrier == 3 { "J" } else { "I" });
+            assert!(out.text.contains("int v0 = Source.read();"), "{}", out.text);
         }
     }
 }

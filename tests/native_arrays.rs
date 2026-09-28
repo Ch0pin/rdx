@@ -176,7 +176,7 @@ fn filled_arrays_preserve_element_order_and_result_register() {
         let class = fixture(&words, &["I", "I"], "[I", 2, &["[I"]);
         let s = source(&class);
         assert!(s.contains("new int[] {p0, p1}"), "{s}");
-        assert!(s.contains("return v0;"));
+        assert!(s.contains("return new int[] {p0, p1};"), "{s}");
     }
     let class = fixture(
         &[0x2024, 0, 0x0010, 0x000c, 0x0011],
@@ -206,7 +206,6 @@ fn narrowing_conversions_have_java_signed_and_unsigned_semantics() {
     ] {
         let class = fixture(&[op, 0x000f], &["I"], ty, 1, &[]);
         let s = source(&class);
-        assert!(s.contains(&format!("{cast} v0 = ({cast}) (p0);")), "{s}");
-        assert!(s.contains("return v0;"));
+        assert!(s.contains(&format!("return ({cast}) (p0);")), "{s}");
     }
 }

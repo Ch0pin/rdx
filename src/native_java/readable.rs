@@ -139,7 +139,10 @@ fn remap(position: usize, edits: &[(usize, usize, String)], deltas: &[isize]) ->
     (position as isize + deltas[count - 1]) as usize
 }
 
-fn apply(mut code: DecompiledCode, mut edits: Vec<(usize, usize, String)>) -> DecompiledCode {
+pub(super) fn apply(
+    mut code: DecompiledCode,
+    mut edits: Vec<(usize, usize, String)>,
+) -> DecompiledCode {
     if edits.is_empty() {
         return code;
     }

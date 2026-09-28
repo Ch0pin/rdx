@@ -1,5 +1,6 @@
 //! Conservative native Java reconstruction with exact emitted-source mappings.
 mod annotations;
+pub(crate) mod anonymous;
 mod condition_cleanup;
 mod display_names;
 mod enums;
@@ -13,7 +14,7 @@ use crate::{
     engine::{CodeDefinition, CodeLink, DecompiledCode},
     native_dex::{DexClass, DexField, DexMethod, DexValue},
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 pub(crate) fn java_type(descriptor: &str) -> Result<String> {
     let dimensions = descriptor.bytes().take_while(|b| *b == b'[').count();
@@ -133,7 +134,10 @@ fn render_initializer(name: &str, class: &DexClass, method: &DexMethod) -> Resul
             && method.parameters.is_empty()
             && method.thrown_types.is_empty()
             && method.access_flags & 8 != 0
-            && method.access_flags & !(8 | 0x1000 | 0x10000) == 0
+            // DEX permits visibility metadata on <clinit>; Java represents
+            // the same VM-triggered initialization with an unqualified block.
+            && (method.access_flags & 7).count_ones() <= 1
+            && method.access_flags & !(7 | 8 | 0x1000 | 0x10000) == 0
             && method.code.is_some(),
         "Invalid static initializer"
     );
@@ -176,8 +180,9 @@ fn render_initializer(name: &str, class: &DexClass, method: &DexMethod) -> Resul
 }
 
 // Exact inherited framework contracts, used identically by throw validation and
-// declaration emission. Only a direct framework parent is accepted: an unknown
-// intervening override may have narrowed its checked exception declaration.
+// declaration emission. Backup contracts require a direct framework parent.
+// ContentProvider file contracts also accept loaded intermediate parents only
+// when the hierarchy proves no intervening override narrows the declaration.
 // AOSP android-15.0.0_r1 BackupAgent.java:346-347,380-381 and
 // BackupAgentHelper.java:64-75 declare these public instance contracts.
 // https://android.googlesource.com/platform/frameworks/base/+/refs/tags/android-15.0.0_r1/core/java/android/app/backup/BackupAgent.java
@@ -185,6 +190,68 @@ pub(super) fn inherited_override_exception(
     class: &DexClass,
     method: &DexMethod,
 ) -> Option<&'static str> {
+    if method.thrown_types.is_empty()
+        && method.declaring_type == class.descriptor
+        && method.access_flags & 7 == 1
+        && method.access_flags & 8 == 0
+        && class
+            .symbols
+            .hierarchy
+            .get()
+            .is_some_and(|hierarchy| hierarchy.inherited_io_exception(class, method))
+    {
+        return Some("Ljava/io/IOException;");
+    }
+    if method.thrown_types.is_empty()
+        && method.declaring_type == class.descriptor
+        && method.access_flags & 7 == 1
+        && method.access_flags & 8 == 0
+        && class.superclass.as_deref().is_some_and(|parent| {
+            class.symbols.hierarchy.get().map_or_else(
+                || {
+                    parent == "Landroid/provider/DocumentsProvider;"
+                        && crate::native_hierarchy::pinned_document_exception_contract(
+                            method,
+                            "Ljava/io/FileNotFoundException;",
+                        )
+                },
+                |hierarchy| {
+                    hierarchy.inherited_document_exception_contract(
+                        parent,
+                        method,
+                        "Ljava/io/FileNotFoundException;",
+                    )
+                },
+            )
+        })
+    {
+        return Some("Ljava/io/FileNotFoundException;");
+    }
+    if method.thrown_types.is_empty()
+        && method.declaring_type == class.descriptor
+        && method.access_flags & 15 == 1
+        && method.name.as_ref() == "openFile"
+        && method.return_type.as_ref() == "Landroid/os/ParcelFileDescriptor;"
+        && method
+            .parameters
+            .iter()
+            .map(AsRef::as_ref)
+            .eq(["Landroid/net/Uri;", "Ljava/lang/String;"])
+        && class.superclass.as_deref().is_some_and(|parent| {
+            class.symbols.hierarchy.get().map_or_else(
+                || parent == "Landroid/content/ContentProvider;",
+                |hierarchy| {
+                    hierarchy.inherited_file_exception_contract(
+                        parent,
+                        method,
+                        "Ljava/io/FileNotFoundException;",
+                    )
+                },
+            )
+        })
+    {
+        return Some("Ljava/io/FileNotFoundException;");
+    }
     if !method.thrown_types.is_empty()
         || method.declaring_type != class.descriptor
         || method.access_flags & 7 != 1
@@ -309,7 +376,15 @@ pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result
         out.push("synchronized ");
     }
     if !constructor {
-        out.push(&java_type(&method.return_type)?);
+        let display = java_type(&method.return_type)?;
+        if method.return_type.starts_with('L') && method.return_type.ends_with(';') {
+            out.reference(
+                &display,
+                &names::label(&method.return_type).context("Method return type label")?,
+            );
+        } else {
+            out.push(&display);
+        }
         out.push(" ");
     }
     let display_name = if constructor {
@@ -339,10 +414,18 @@ pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result
         } else {
             java_type(ty)?
         };
-        out.push(&format!("{display} p{index}"));
+        if ty.starts_with('L') && ty.ends_with(';') {
+            out.reference(
+                &display,
+                &names::label(ty).context("Method parameter type label")?,
+            );
+        } else {
+            out.push(&display);
+        }
+        out.push(&format!(" p{index}"));
     }
     out.push(")");
-    let declared_throws: Vec<&str> = method
+    let mut declared_throws: Vec<&str> = method
         .thrown_types
         .iter()
         .map(AsRef::as_ref)
@@ -353,6 +436,8 @@ pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result
                 .flat_map(|body| body.inferred_throws.iter().map(String::as_str)),
         )
         .collect();
+    let mut seen_throws = std::collections::HashSet::new();
+    declared_throws.retain(|ty| seen_throws.insert(*ty));
     if !declared_throws.is_empty() {
         out.push(" throws ");
         for (index, ty) in declared_throws.iter().enumerate() {
@@ -425,7 +510,103 @@ fn static_initializer_writes(class: &DexClass, field: &DexField) -> Result<bool>
     Ok(false)
 }
 
-/// Reconstruct a declaration only when its actual encoded initializer is known.
+fn resolved_static_value(class: &DexClass, field: &DexField, value: &DexValue) -> bool {
+    match (field.field_type.as_ref(), value) {
+        ("B", DexValue::Byte(_))
+        | ("S", DexValue::Short(_))
+        | ("C", DexValue::Char(_))
+        | ("I", DexValue::Int(_))
+        | ("J", DexValue::Long(_))
+        | ("Z", DexValue::Boolean(_)) => true,
+        ("F", DexValue::Float(bits)) => !f32::from_bits(*bits).is_nan(),
+        ("D", DexValue::Double(bits)) => !f64::from_bits(*bits).is_nan(),
+        (ty, DexValue::Null) => ty.starts_with('L') || ty.starts_with('['),
+        ("Ljava/lang/String;", DexValue::String(index)) => {
+            class.symbols.strings.get(*index as usize).is_some()
+        }
+        ("Ljava/lang/Class;", DexValue::Type(index)) => class
+            .symbols
+            .types
+            .get(*index as usize)
+            .is_some_and(|ty| java_type(ty).is_ok()),
+        _ => false,
+    }
+}
+
+fn omitted_static_default(
+    class: &DexClass,
+    field: &DexField,
+    index: Option<usize>,
+) -> Result<&'static str> {
+    let index = index.ok_or_else(|| anyhow::anyhow!("Static field declaration not indexed"))?;
+    let static_fields: Vec<_> = class
+        .fields
+        .iter()
+        .filter(|field| field.is_static)
+        .collect();
+    ensure!(
+        class.static_values.len() <= static_fields.len()
+            && (class.static_values_offset == 0) == class.static_values.is_empty(),
+        "Static value array is unresolved"
+    );
+    ensure!(
+        index >= class.static_values.len()
+            && class
+                .static_values
+                .iter()
+                .enumerate()
+                .all(|(i, value)| { resolved_static_value(class, static_fields[i], value) }),
+        "Static value prefix is unresolved"
+    );
+    for initializer in class
+        .methods
+        .iter()
+        .filter(|method| method.name.as_ref() == "<clinit>")
+    {
+        let code = initializer
+            .code
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Missing static initializer code"))?;
+        let decoded = crate::native_ir::DecodedMethod::decode(code)?;
+        for instruction in decoded.instructions {
+            if !matches!(instruction.opcode, 0x67..=0x6d) {
+                continue;
+            }
+            let field_index = *code
+                .instructions
+                .get(instruction.pc + 1)
+                .ok_or_else(|| anyhow::anyhow!("Invalid static initializer field operand"))?;
+            let &(owner, ty, name) = class
+                .symbols
+                .fields
+                .get(field_index as usize)
+                .ok_or_else(|| anyhow::anyhow!("Invalid static initializer field"))?;
+            ensure!(
+                class.symbols.types.get(owner as usize).is_some()
+                    && class.symbols.types.get(ty as usize).is_some()
+                    && class.symbols.strings.get(name as usize).is_some(),
+                "Unresolved static initializer field"
+            );
+            ensure!(
+                class.symbols.types[ty as usize] != field.field_type
+                    || class.symbols.strings[name as usize].as_str() != field.name.as_ref(),
+                "Possible static initializer field alias write"
+            );
+        }
+    }
+    match field.field_type.as_ref() {
+        "Z" => Ok("false"),
+        "B" | "S" | "I" => Ok("0"),
+        "C" => Ok("(char) 0"),
+        "J" => Ok("0L"),
+        "F" => Ok("0.0f"),
+        "D" => Ok("0.0d"),
+        ty if ty.starts_with('L') || ty.starts_with('[') => Ok("null"),
+        _ => bail!("Unsupported implicit static default type"),
+    }
+}
+
+/// Reconstruct a declaration from an encoded value or a proven omitted DEX default.
 pub fn render_field(name: &str, class: &DexClass, field: &DexField) -> Result<DecompiledCode> {
     ensure!(field.field_type.as_ref() != "V", "Unsupported field type");
     ensure!(
@@ -447,8 +628,16 @@ pub fn render_field(name: &str, class: &DexClass, field: &DexField) -> Result<De
         .filter(|f| f.is_static)
         .position(|f| std::ptr::eq(f, field));
     let value = index.and_then(|i| class.static_values.get(i));
+    let implicit_default = if field.is_static && field.access_flags & 0x10 != 0 && value.is_none() {
+        Some(omitted_static_default(class, field, index)?)
+    } else {
+        None
+    };
     if field.access_flags & 0x10 != 0 {
-        ensure!(value.is_some(), "Final field initializer not reconstructed");
+        ensure!(
+            value.is_some() || implicit_default.is_some(),
+            "Final field initializer not reconstructed"
+        );
         ensure!(
             !static_initializer_writes(class, field)?,
             "Final field also assigned in static initializer"
@@ -577,6 +766,9 @@ pub fn render_field(name: &str, class: &DexClass, field: &DexField) -> Result<De
             }
             _ => bail!("Encoded field initializer not reconstructed"),
         }
+    } else if let Some(default) = implicit_default {
+        out.push(" = ");
+        out.push(default);
     }
     out.push(";\n");
     ensure!(
@@ -899,13 +1091,22 @@ fn append_presented_method(
     out.append(code);
     Ok(())
 }
-fn finish_class(name: &str, class: &DexClass, mut out: Output) -> DecompiledCode {
+fn finish_class(name: &str, class: &DexClass, out: Output) -> DecompiledCode {
+    finish_class_nested(name, class, out, &[])
+}
+fn finish_class_nested(
+    name: &str,
+    class: &DexClass,
+    mut out: Output,
+    nested_names: &[(String, String)],
+) -> DecompiledCode {
     out.push("}\n");
     let shortened = readable::shorten(name, class, vec![out.finish()]);
-    readable::add_imports(
+    let code = readable::add_imports(
         shortened.codes.into_iter().next().unwrap(),
         &shortened.imports,
-    )
+    );
+    anonymous::shorten_bound_types(code, nested_names)
 }
 
 pub fn render(name: &str, class: &DexClass) -> Result<DecompiledCode> {
@@ -921,27 +1122,49 @@ pub fn render(name: &str, class: &DexClass) -> Result<DecompiledCode> {
 
 /// A failing class keeps its completed member work. Neither successful methods
 /// before the failure nor the failed method itself are decompiled a second time.
+#[cfg(test)]
 pub(crate) fn render_mixed(name: &str, class: &DexClass) -> DecompiledCode {
     render_mixed_with(name, class, |method| render_method(name, class, method))
 }
+pub(crate) fn render_mixed_with_nested(
+    name: &str,
+    class: &DexClass,
+    children: &[&DexClass],
+    world: Option<&std::collections::BTreeMap<String, DexClass>>,
+) -> DecompiledCode {
+    render_mixed_controlled(
+        name,
+        class,
+        |method| render_method(name, class, method),
+        children,
+        world,
+        &|| false,
+    )
+    .expect("non-cancellable class rendering")
+}
+#[cfg(test)]
 fn render_mixed_with(
     name: &str,
     class: &DexClass,
     render_member: impl FnMut(&DexMethod) -> Result<DecompiledCode>,
 ) -> DecompiledCode {
-    render_mixed_controlled(name, class, render_member, &|| false)
+    render_mixed_controlled(name, class, render_member, &[], None, &|| false)
         .expect("non-cancellable class rendering")
 }
 
-pub(crate) fn render_mixed_cancellable(
+pub(crate) fn render_mixed_cancellable_with_nested(
     name: &str,
     class: &DexClass,
+    children: &[&DexClass],
+    world: Option<&std::collections::BTreeMap<String, DexClass>>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<DecompiledCode> {
     render_mixed_controlled(
         name,
         class,
         |method| render_method(name, class, method),
+        children,
+        world,
         cancelled,
     )
 }
@@ -950,6 +1173,8 @@ fn render_mixed_controlled(
     name: &str,
     class: &DexClass,
     mut render_member: impl FnMut(&DexMethod) -> Result<DecompiledCode>,
+    children: &[&DexClass],
+    world: Option<&std::collections::BTreeMap<String, DexClass>>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<DecompiledCode> {
     ensure!(!cancelled(), "decompilation cancelled");
@@ -981,7 +1206,9 @@ fn render_mixed_controlled(
                     .expect("validated interface method");
             }
             ensure!(!cancelled(), "decompilation cancelled");
-            return Ok(finish_class(name, class, out));
+            let nested_names =
+                anonymous::append_proven(&mut out, class, children, world, cancelled)?;
+            return Ok(finish_class_nested(name, class, out, &nested_names));
         }
     }
     ensure!(!cancelled(), "decompilation cancelled");
@@ -990,6 +1217,8 @@ fn render_mixed_controlled(
         name,
         class,
         raw,
+        children,
+        world,
         |index, method| {
             attempted
                 .get_mut(index)
@@ -1015,7 +1244,7 @@ fn upgrade_methods_with(
     raw: DecompiledCode,
     render_member: impl FnMut(usize, &DexMethod) -> Result<DecompiledCode>,
 ) -> DecompiledCode {
-    upgrade_methods_controlled(name, class, raw, render_member, &|| false)
+    upgrade_methods_controlled(name, class, raw, &[], None, render_member, &|| false)
         .expect("non-cancellable member rendering")
 }
 
@@ -1023,6 +1252,8 @@ fn upgrade_methods_controlled(
     name: &str,
     class: &DexClass,
     raw: DecompiledCode,
+    children: &[&DexClass],
+    world: Option<&std::collections::BTreeMap<String, DexClass>>,
     mut render_member: impl FnMut(usize, &DexMethod) -> Result<DecompiledCode>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<DecompiledCode> {
@@ -1184,11 +1415,17 @@ fn upgrade_methods_controlled(
         cursor = end;
     }
     copy(&mut out, cursor, boundaries.len() - 1);
+    let nested_names = if java_header {
+        anonymous::append_proven(&mut out, class, children, world, cancelled)?
+    } else {
+        Vec::new()
+    };
     if java_header {
         out.push("}\n");
     }
     ensure!(!cancelled(), "decompilation cancelled");
-    Ok(readable::add_imports(out.finish(), &imports))
+    let code = readable::add_imports(out.finish(), &imports);
+    Ok(anonymous::shorten_bound_types(code, &nested_names))
 }
 
 pub(crate) fn identifier(name: &str) -> bool {
@@ -1671,6 +1908,8 @@ mod single_pass_tests {
                         calls.set(calls.get() + 1);
                         render_method("sample.Hello", &class, method)
                     },
+                    &[],
+                    None,
                     &|| calls.get() >= 1,
                 );
                 assert!(

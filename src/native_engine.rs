@@ -39,9 +39,18 @@ fn unsupported<T>(reason: impl Into<String>) -> Result<T> {
 #[derive(Default)]
 pub struct NativeDexEngine {
     classes: BTreeMap<String, DexClass>,
+    nested_children: BTreeMap<String, Vec<String>>,
     opened: bool,
 }
 impl NativeDexEngine {
+    fn nested_children(&self, name: &str) -> Vec<&DexClass> {
+        self.nested_children
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|child| self.classes.get(child))
+            .collect()
+    }
     pub(crate) fn graph_classes(&self) -> impl Iterator<Item = &DexClass> {
         self.classes.values()
     }
@@ -61,10 +70,21 @@ impl NativeDexEngine {
             .classes
             .get(name)
             .with_context(|| format!("Unknown class: {name}"))?;
-        crate::native_java::render_mixed_cancellable(name, class, cancelled)
+        crate::native_java::render_mixed_cancellable_with_nested(
+            name,
+            class,
+            &self.nested_children(name),
+            Some(&self.classes),
+            cancelled,
+        )
     }
     fn render_class(&self, name: &str, class: &DexClass) -> Result<DecompiledCode> {
-        Ok(crate::native_java::render_mixed(name, class))
+        Ok(crate::native_java::render_mixed_with_nested(
+            name,
+            class,
+            &self.nested_children(name),
+            Some(&self.classes),
+        ))
     }
 
     pub fn definition_names(&self, names: &[String]) -> Result<DefinitionNameIndex> {
@@ -185,6 +205,7 @@ impl DecompilerEngine for NativeDexEngine {
     fn open(&mut self, path: &Path) -> Result<Project> {
         // Clear stale state even if the replacement input fails.
         self.classes.clear();
+        self.nested_children.clear();
         self.opened = false;
         let mut classes = BTreeMap::new();
         let mut resources = Vec::new();
@@ -278,6 +299,7 @@ impl DecompilerEngine for NativeDexEngine {
             classes: classes.keys().cloned().collect(),
             resources,
         };
+        self.nested_children = crate::native_java::anonymous::index(&classes);
         self.classes = classes;
         self.opened = true;
         Ok(project)

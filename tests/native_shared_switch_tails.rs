@@ -166,3 +166,19 @@ fn shared_switch_tails_jvm_preserve_effect_counts_and_exception_identity() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn default_arm_can_bypass_an_earlier_shared_case_return() {
+    let (mut class, _) = fixture(false);
+    let method = &mut class.methods[0];
+    method.return_type = "I".into();
+    method.code.as_mut().unwrap().instructions = vec![
+        0x0012, 0x012b, 13, 0, 0x0528, 0x1012, 0x0228, 0x2012, 0x000f, 0x0071, 0, 0, 0xf012,
+        0x000f, 0x0100, 2, 0, 0, 4, 0, 6, 0,
+    ];
+    let java = source(&class).unwrap();
+    assert!(java.contains("return 1;"), "{java}");
+    assert!(java.contains("return 2;"), "{java}");
+    assert!(java.contains("return -1;"), "{java}");
+    assert_eq!(java.matches("sample.Effects.first()").count(), 1, "{java}");
+}

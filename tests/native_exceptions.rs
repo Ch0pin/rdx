@@ -1,6 +1,7 @@
 //! Independent small DEX/Java evaluators for exception-visible register state.
 use rdx::{
     native_dex::{DexClass, DexCode, DexMethod, DexSymbols, DexTryRegion},
+    native_hierarchy::TypeHierarchy,
     native_java,
 };
 use std::{collections::HashMap, sync::Arc};
@@ -870,6 +871,12 @@ fn unchanged_caught_throwable_can_be_rethrown_after_cleanup() {
     Arc::get_mut(&mut class.symbols).unwrap().protos[0].0 = "Ljava/lang/Throwable;".into();
     class.methods[0].code.as_mut().unwrap().instructions =
         vec![0x0071, 2, 0, 0x000e, 0x000d, 0x0071, 0, 0, 0x000c, 0x0027];
+    class.access_flags |= 0x10;
+    class
+        .symbols
+        .hierarchy
+        .set(Arc::new(TypeHierarchy::from_classes([&class]).unwrap()))
+        .unwrap();
     let code = native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
     assert!(
         code.source.contains("throws java.lang.Throwable"),

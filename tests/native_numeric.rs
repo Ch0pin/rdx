@@ -173,6 +173,30 @@ fn compare_expression(source: &str, left: f64, right: f64) -> i32 {
         right,
     )
 }
+
+// The renderer may keep a typed temporary or put the same expression directly
+// at the return. Resolve only the final generated local, then inspect the
+// actual expression in either shape.
+fn returned_expression(source: &str) -> &str {
+    let returned = source
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("return "))
+        .expect("numeric method return")
+        .trim_end_matches(';');
+    if returned.starts_with('v') && returned[1..].bytes().all(|b| b.is_ascii_digit()) {
+        source
+            .lines()
+            .map(str::trim)
+            .find_map(|line| {
+                let (declared, value) = line.trim_end_matches(';').split_once(" = ")?;
+                (declared.split_whitespace().last() == Some(returned)).then_some(value)
+            })
+            .expect("generated numeric return local")
+    } else {
+        returned
+    }
+}
 #[test]
 fn floating_comparisons_match_dex_nan_bias_and_signed_zero() {
     let cases = [
@@ -388,14 +412,15 @@ fn actual_wide_parameters_returns_arithmetic_and_raw_constants_reconstruct() {
     }
     for (ty, op, text) in [("J", 0x9b, "long"), ("D", 0xab, "double")] {
         let code = render_numeric(&[op, 0x0200, 0x0010], &[ty, ty], ty, 4).unwrap();
-        assert!(
-            code.source.contains(&format!("{text} v0 = (p0) + (p1);")),
-            "{}",
+        assert_eq!(
+            returned_expression(&code.source),
+            "(p0) + (p1)",
+            "{text}: {}",
             code.source
         );
     }
     let code = render_numeric(&[0x00a6, 0x0100, 0x000f], &["F", "F"], "F", 2).unwrap();
-    assert!(code.source.contains("float v0 = (p0) + (p1);"));
+    assert_eq!(returned_expression(&code.source), "(p0) + (p1)");
     for (ty, expected) in [("J", "4607182418800017408L"), ("D", "1.0d")] {
         let code = render_numeric(&[0x0018, 0, 0, 0, 0x3ff0, 0x0010], &[], ty, 2).unwrap();
         assert!(
@@ -473,17 +498,7 @@ fn actual_numeric_comparisons_conversions_and_control_flow_limits() {
         assert!(code.source.contains("?"));
         if ty != "J" {
             assert_eq!(
-                compare_expression(
-                    code.source
-                        .split(" = ")
-                        .nth(1)
-                        .unwrap()
-                        .split(';')
-                        .next()
-                        .unwrap(),
-                    f64::NAN,
-                    1.0
-                ),
+                compare_expression(returned_expression(&code.source), f64::NAN, 1.0),
                 if matches!(op, 0x2d | 0x2f) { -1 } else { 1 }
             );
         }
@@ -639,14 +654,7 @@ fn actual_float_to_integer_casts_cover_nan_saturation_and_truncation() {
         let instruction = if src == "F" { 0x1000 | op } else { op };
         let ret = if dst == "J" { 0x0010 } else { 0x000f };
         let code = render_numeric(&[instruction, ret], &[src], dst, 2).unwrap();
-        let expression = code
-            .source
-            .split(" = ")
-            .nth(1)
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap();
+        let expression = returned_expression(&code.source);
         let cast = expression.split_whitespace().next().unwrap();
         assert_eq!(cast, if dst == "J" { "(long)" } else { "(int)" });
         for input in [

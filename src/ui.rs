@@ -261,7 +261,7 @@ pub struct App {
     tabs: Vec<Tab>,
     selected: usize,
     revealed_tab: Option<Target>,
-    tabs_keep_open: bool,
+    tabs_auto_hide: bool,
     menu_auto_hide: bool,
     menu_hovered: bool,
     tabs_hovered: bool,
@@ -331,7 +331,7 @@ impl App {
             search.preferences(),
             usages.keep_open,
         );
-        last_preferences.tabs_keep_open = preferences.tabs_keep_open;
+        last_preferences.tabs_auto_hide = preferences.tabs_auto_hide;
         last_preferences.menu_auto_hide = preferences.menu_auto_hide;
         crate::ui_style::install(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
@@ -376,7 +376,7 @@ impl App {
             tabs: Vec::new(),
             selected: 0,
             revealed_tab: None,
-            tabs_keep_open: preferences.tabs_keep_open,
+            tabs_auto_hide: preferences.tabs_auto_hide,
             menu_auto_hide: preferences.menu_auto_hide,
             menu_hovered: false,
             tabs_hovered: false,
@@ -462,7 +462,7 @@ impl App {
             self.search.preferences(),
             self.usages.keep_open,
         );
-        preferences.tabs_keep_open = self.tabs_keep_open;
+        preferences.tabs_auto_hide = self.tabs_auto_hide;
         preferences.menu_auto_hide = self.menu_auto_hide;
         if preferences == self.last_preferences {
             return;
@@ -1362,8 +1362,10 @@ impl App {
                 self.tab_ui_controls.push(("views".into(), views.rect));
                 #[cfg(not(test))]
                 let _ = views;
-                ui.checkbox(&mut self.tabs_keep_open, "Keep open")
-                    .on_hover_text("Keep the tab bar visible");
+                ui.checkbox(&mut self.tabs_auto_hide, "Autohide")
+                    .on_hover_text(
+                        "Hide the tab bar until the pointer reaches the top of the viewer",
+                    );
                 if let Some(text) = self.tabs.get(self.selected).and_then(Tab::text)
                     && icons::button(ui, Icon::Copy, "Copy source", true).clicked()
                 {
@@ -2268,8 +2270,8 @@ impl eframe::App for App {
                             }
                         });
                         ui.menu_button("View", |ui| {
-                            ui.checkbox(&mut self.tabs_keep_open, "Keep tabs open");
-                            ui.checkbox(&mut self.menu_auto_hide, "Autohide");
+                            ui.checkbox(&mut self.tabs_auto_hide, "Autohide tabs");
+                            ui.checkbox(&mut self.menu_auto_hide, "Autohide menu");
                             if ui.checkbox(&mut self.word_wrap, "Word wrap").clicked() {
                                 ui.close_menu();
                             }
@@ -2598,7 +2600,6 @@ impl eframe::App for App {
             self.choose_target(target, ctx);
         }
         let mut export = tree_actions.export;
-        let mut decode = None;
         let mut jump = None;
         let mut manifest_jump = None;
         let mut usage_request = None;
@@ -2623,7 +2624,7 @@ impl eframe::App for App {
                         .is_some_and(|p| reveal_rect.contains(p))
                 });
                 let show_tabs =
-                    self.tabs_keep_open || pointer_inside || ui.memory(|m| m.any_popup_open());
+                    !self.tabs_auto_hide || pointer_inside || ui.memory(|m| m.any_popup_open());
                 self.tabs_hovered = show_tabs;
                 if show_tabs {
                     if let Some(target) = self.tab_bar(ui) {
@@ -2639,29 +2640,6 @@ impl eframe::App for App {
                     );
                 }
                 if let Some(tab) = self.tabs.get_mut(self.selected) {
-                    if matches!(tab.target, Target::File(_)) {
-                        ui.horizontal_wrapped(|ui| {
-                            if let Target::File(index) = tab.target {
-                                if let Some(entry) = self
-                                    .archive
-                                    .as_ref()
-                                    .and_then(|a| a.entries.iter().find(|e| e.index == index))
-                                {
-                                    ui.weak(format!("{} bytes", entry.size));
-                                }
-                                if is_android_xml(&tab.name)
-                                    && ui
-                                        .add_enabled(
-                                            self.engine.is_some() && !self.busy,
-                                            egui::Button::new("Decode Android XML"),
-                                        )
-                                        .clicked()
-                                {
-                                    decode = Some(index);
-                                }
-                            }
-                        });
-                    }
                     if let Some(owner) = tab.name.strip_prefix("dex://") {
                         ui.horizontal_wrapped(|ui| {
                             ui.label("X-Refs: exact DEX call-site view, not Java source.");
@@ -2687,7 +2665,9 @@ impl eframe::App for App {
                             }
                         });
                     }
-                    if let Some(note) = &tab.note {
+                    if let Some(note) = &tab.note
+                        && note != "Android XML decoded natively"
+                    {
                         ui.label(note);
                     }
                     ui.separator();
@@ -2834,9 +2814,6 @@ impl eframe::App for App {
         if let Some((class, position, hash)) = jump {
             self.navigate(class, position, hash, ctx);
         }
-        if let Some(index) = decode {
-            self.decode_resource(index, ctx);
-        }
         // Layout caches are created lazily; include them when enforcing tab eviction.
         while self.tabs.len() > 1
             && self.tabs.iter().map(Tab::retained_bytes).sum::<usize>() > 64 * 1024 * 1024
@@ -2940,7 +2917,7 @@ fn snapshot_preferences(
         code_font: code_font.preference_key().into(),
         word_wrap,
         usages_keep_open,
-        tabs_keep_open: false,
+        tabs_auto_hide: false,
         menu_auto_hide: false,
         search_keep_open: search.keep_open,
         search,
@@ -3114,7 +3091,7 @@ mod settings_tests {
             tabs: Vec::new(),
             selected: 0,
             revealed_tab: None,
-            tabs_keep_open: false,
+            tabs_auto_hide: false,
             menu_auto_hide: false,
             menu_hovered: false,
             tabs_hovered: false,
@@ -3635,6 +3612,104 @@ mod settings_tests {
             SearchTarget::Class("sample.Other".into());
         assert!(!tab.reuse_search_hit(&hit).unwrap());
         assert_eq!(tab.text(), Some(source));
+    }
+
+    #[test]
+    fn search_results_open_exact_match_and_paint_destination_for_each_route() {
+        fn has_red_line_marker(output: &egui::FullOutput) -> bool {
+            fn contains(shape: &egui::Shape) -> bool {
+                match shape {
+                    egui::Shape::Rect(rect) => {
+                        rect.fill == egui::Color32::from_rgba_unmultiplied(255, 135, 135, 55)
+                    }
+                    egui::Shape::Vec(shapes) => shapes.iter().any(contains),
+                    _ => false,
+                }
+            }
+            output.shapes.iter().any(|shape| contains(&shape.shape))
+        }
+
+        let mut app = navigation_test_app();
+        let context = egui::Context::default();
+        let class_source = "class Target {}\nvoid target() {}\nreturn target;\n";
+        let class = Arc::new(search::SearchDocument {
+            target: SearchTarget::Class("sample.Target".into()),
+            name: "sample.Target".into(),
+            source: class_source.into(),
+            syntax: "java".into(),
+            links: vec![rdx::engine::CodeLink {
+                start: 6,
+                end: 12,
+                label: "sample.Target".into(),
+            }],
+            source_hash: Some("class-hash".into()),
+            metadata_complete: true,
+        });
+        let resource_source = "<root>target</root>\n";
+        let resource = Arc::new(search::SearchDocument {
+            target: SearchTarget::Resource(7),
+            name: "res/layout/main.xml".into(),
+            source: resource_source.into(),
+            syntax: "xml".into(),
+            links: vec![],
+            source_hash: None,
+            metadata_complete: true,
+        });
+        for (document, needle, kind, line, target) in [
+            (
+                class.clone(),
+                "Target",
+                "class",
+                1,
+                Target::Class("sample.Target".into()),
+            ),
+            (
+                class.clone(),
+                "target()",
+                "method",
+                2,
+                Target::Class("sample.Target".into()),
+            ),
+            (
+                class.clone(),
+                "target;",
+                "code",
+                3,
+                Target::Class("sample.Target".into()),
+            ),
+            (resource, "target", "resource", 1, Target::File(7)),
+        ] {
+            let start = document.source.find(needle).unwrap();
+            let end = start + needle.len();
+            app.open_search_hit(SearchHit {
+                document,
+                start,
+                end,
+                line,
+                kind: kind.into(),
+                preview: needle.into(),
+                preview_match: 0..needle.len(),
+            });
+            assert!(
+                app.status.ends_with(&format!(":{line}")),
+                "{kind} line status"
+            );
+            let tab = &mut app.tabs[app.selected];
+            assert_eq!(tab.target, target, "{kind} destination");
+            let Content::Text(document) = &mut tab.content else {
+                panic!("{kind} did not open a source document");
+            };
+            assert_eq!(document.navigation_position(), start, "{kind} match");
+            let output = context.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    document.show(ui, CodeTheme::Ocean, 14.0);
+                });
+            });
+            assert!(
+                has_red_line_marker(&output),
+                "{kind} destination line is not painted"
+            );
+        }
     }
     #[test]
     fn deferred_search_metadata_refreshes_changed_source_and_rejects_stale_requests() {

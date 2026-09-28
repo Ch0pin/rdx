@@ -113,7 +113,7 @@ fn initializer_rejects_early_return_regions_and_invalid_signatures() {
             2 => method.parameters.push("I".into()),
             3 => method.code = None,
             4 => method.access_flags |= 0x100,
-            5 => method.access_flags |= 1,
+            5 => method.access_flags |= 3,
             _ => method.declaring_type = "Lother/Class;".into(),
         }
         assert!(
@@ -128,4 +128,219 @@ fn empty_static_initializer_is_an_empty_java_block() {
     let class = fixture(vec![0x000e]);
     let code = native_java::render_method("sample.Init", &class, &class.methods[0]).unwrap();
     assert_eq!(code.source, "    static {\n    }\n");
+}
+
+#[test]
+fn initializer_visibility_metadata_does_not_change_body_or_links() {
+    let class = fixture(vec![0x1012, 0x0067, 0, 0x000e]);
+    let expected = native_java::render_method("sample.Init", &class, &class.methods[0]).unwrap();
+    for visibility in [1, 2, 4] {
+        let mut visible = fixture(vec![0x1012, 0x0067, 0, 0x000e]);
+        visible.methods[0].access_flags |= visibility;
+        let actual =
+            native_java::render_method("sample.Init", &visible, &visible.methods[0]).unwrap();
+        assert_eq!(actual.source, expected.source);
+        assert_eq!(actual.source_hash, expected.source_hash);
+        let links = |code: &rdx::engine::DecompiledCode| {
+            code.links
+                .iter()
+                .map(|link| (link.start, link.end, link.label.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(links(&actual), links(&expected));
+        assert!(actual.source.contains("sample.Init.count = 1;"));
+    }
+}
+
+#[test]
+fn initializer_own_field_does_not_shadow_class_qualifier() {
+    let mut class = fixture(vec![0x1012, 0x0067, 0, 0x000e]);
+    Arc::get_mut(&mut class.symbols).unwrap().strings[0] = "Init".into();
+    class.fields[0].name = "Init".into();
+    class.methods[0].access_flags |= 1;
+    let code = native_java::render("sample.Init", &class).unwrap();
+    assert!(code.source.contains("        Init = 1;"), "{}", code.source);
+    assert!(!code.source.contains("Init.Init ="));
+    let link = code.links.iter().find(|link| {
+        link.label == "sample.Init.Init:I"
+            && code
+                .source
+                .chars()
+                .skip(link.start)
+                .take(link.end - link.start)
+                .collect::<String>()
+                == "Init"
+    });
+    assert!(link.is_some());
+}
+
+#[test]
+#[ignore = "requires javac and java on PATH"]
+fn initializer_shadowed_class_field_compiles_and_initializes_once() {
+    use std::{fs, process::Command};
+    let mut class = fixture(vec![0x1012, 0x0067, 0, 0x000e]);
+    Arc::get_mut(&mut class.symbols).unwrap().strings[0] = "Init".into();
+    class.fields[0].name = "Init".into();
+    class.methods[0].access_flags |= 1;
+    let source = native_java::render("sample.Init", &class).unwrap().source;
+    let dir = std::env::temp_dir().join(format!("rdx-clinit-visibility-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    fs::write(dir.join("sample/Init.java"), source).unwrap();
+    fs::write(
+        dir.join("sample/Check.java"),
+        r#"package sample;
+public class Check {
+ public static void main(String[] args) throws Exception {
+  Class<?> first = Class.forName("sample.Init");
+  Class<?> second = Class.forName("sample.Init");
+  if (first != second || first.getField("Init").getInt(null) != 1) throw new AssertionError();
+ }
+}"#,
+    )
+    .unwrap();
+    for (program, args) in [
+        ("javac", vec!["sample/Init.java", "sample/Check.java"]),
+        ("java", vec!["sample.Check"]),
+    ] {
+        let output = Command::new(program)
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires javac and java on PATH"]
+fn initializer_package_prefix_collision_compiles() {
+    use std::{fs, process::Command};
+    let mut class = fixture(vec![0x1012, 0x0067, 0, 0x000e]);
+    Arc::get_mut(&mut class.symbols).unwrap().strings[0] = "sample".into();
+    class.fields[0].name = "sample".into();
+    let code = native_java::render("sample.Init", &class).unwrap();
+    assert!(
+        code.source.contains("        sample = 1;"),
+        "{}",
+        code.source
+    );
+    let dir = std::env::temp_dir().join(format!("rdx-clinit-package-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    fs::write(dir.join("sample/Init.java"), code.source).unwrap();
+    let output = Command::new("javac")
+        .arg("sample/Init.java")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires javac on PATH"]
+fn initializer_blank_final_write_compiles_with_simple_name() {
+    use std::{fs, process::Command};
+    let mut class = fixture(vec![0x1012, 0x0067, 0, 0x000e]);
+    class.fields[0].access_flags = 0x19;
+    let body = native_java::render_method("sample.Init", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    assert!(body.contains("        count = 1;"), "{body}");
+    assert!(!body.contains("Init.count ="));
+
+    // A blank final has no encoded DEX initializer. Compile the reconstructed
+    // method inside its equivalent Java declaration to check assignment rules.
+    let source = format!(
+        "package sample;\npublic class Init {{\n    public static final int count;\n{body}}}\n"
+    );
+    let dir = std::env::temp_dir().join(format!("rdx-clinit-blank-final-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    fs::write(dir.join("sample/Init.java"), source).unwrap();
+    let output = Command::new("javac")
+        .arg("sample/Init.java")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires javac on PATH"]
+fn initializer_digit_field_without_try_compiles_when_class_name_collides() {
+    use std::{fs, process::Command};
+    let mut class = fixture(vec![0x1012, 0x0067, 0, 0x000e]);
+    class.descriptor = "Lsample/e0;".into();
+    class.fields[0].declaring_type = class.descriptor.clone();
+    class.fields[0].name = "e0".into();
+    class.methods[0].declaring_type = class.descriptor.clone();
+    Arc::get_mut(&mut class.symbols).unwrap().types[0] = class.descriptor.clone();
+    Arc::get_mut(&mut class.symbols).unwrap().strings[0] = "e0".into();
+    assert!(
+        class.methods[0]
+            .code
+            .as_ref()
+            .unwrap()
+            .try_regions
+            .is_empty()
+    );
+    let body = native_java::render_method("sample.e0", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    assert!(body.contains("        e0 = 1;"), "{body}");
+    assert!(!body.contains("e0.e0 ="));
+
+    let source =
+        format!("package sample;\npublic class e0 {{\n    public static int e0;\n{body}}}\n");
+    let dir = std::env::temp_dir().join(format!("rdx-clinit-digit-field-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    fs::write(dir.join("sample/e0.java"), source).unwrap();
+    let output = Command::new("javac")
+        .arg("sample/e0.java")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn initializer_field_matching_generated_local_rejects_bare_write() {
+    // sget creates local v0, then sput would use the same bare name for the
+    // field because the separate Init field shadows the class qualifier.
+    let mut class = fixture(vec![0x0060, 0, 0x0067, 0, 0x000e]);
+    Arc::get_mut(&mut class.symbols).unwrap().strings = vec!["v0".into(), "Init".into()];
+    Arc::get_mut(&mut class.symbols).unwrap().fields = vec![(0, 1, 0), (0, 1, 1)];
+    class.fields[0].name = "v0".into();
+    class.fields.push(DexField {
+        declaring_type: class.descriptor.clone(),
+        name: "Init".into(),
+        field_type: "I".into(),
+        access_flags: 9,
+        is_static: true,
+    });
+    let error = native_java::render_method("sample.Init", &class, &class.methods[0])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("initializer field collides with generated local namespace"),
+        "{error}"
+    );
 }

@@ -105,6 +105,63 @@ fn allocation_precedes_static_field_effect_and_keeps_exact_links() {
 }
 
 #[test]
+fn live_capture_after_constructor_keeps_its_declaration() {
+    // The constructor consumes v1, and the same value is returned afterward.
+    let mut class = class(
+        vec![0x0022, 0, 0x0160, 0, 0x2070, 0, 0x0010, 0x010f],
+        vec!["number", "<init>"],
+        vec![(0, 1, 1)],
+    );
+    class.methods[0].return_type = "I".into();
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("int v0;"), "{}", code.source);
+    assert!(
+        code.source.contains("(v0 = sample.Source.number)"),
+        "{}",
+        code.source
+    );
+    assert!(code.source.contains("return v0;"), "{}", code.source);
+}
+
+#[test]
+fn live_alias_preserves_capture_and_original_high_index_name_is_reserved() {
+    // v2 aliases the captured v1 across the constructor. Both physical
+    // registers are checked before eliminating the capture declaration.
+    let mut alias_class = class(
+        vec![0x0022, 0, 0x0160, 0, 0x1201, 0x2070, 0, 0x0010, 0x020f],
+        vec!["number", "<init>"],
+        vec![(0, 1, 1)],
+    );
+    alias_class.methods[0].return_type = "I".into();
+    let code =
+        native_java::render_method("sample.Test", &alias_class, &alias_class.methods[0]).unwrap();
+    assert!(code.source.contains("int v0;"), "{}", code.source);
+    assert!(code.source.contains("return v0;"), "{}", code.source);
+
+    // Capture 0 can shrink, but capture 1 remains live and keeps its original
+    // v1 name. The allocation result must be v2, not a duplicate v1 declaration.
+    let mut class = class(
+        vec![0x0022, 0, 0x0160, 0, 0x0260, 0, 0x3070, 0, 0x0210, 0x020f],
+        vec!["number", "<init>"],
+        vec![(0, 5, 1)],
+    );
+    Arc::get_mut(&mut class.symbols)
+        .unwrap()
+        .protos
+        .push(("V".into(), vec!["I".into(), "I".into()]));
+    class.methods[0].return_type = "I".into();
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("int v1;"), "{}", code.source);
+    assert!(
+        code.source.contains("sample.A v2 = new sample.A("),
+        "{}",
+        code.source
+    );
+    assert!(code.source.contains("return v1;"), "{}", code.source);
+    assert!(!code.source.contains("sample.A v1 ="), "{}", code.source);
+}
+
+#[test]
 fn allocation_precedes_call_and_move_alias_reuses_one_object_local() {
     // new v0; move-object v2,v0; invoke-static {}; move-result v1;
     // invoke-direct {v2,v1}; return-object v0
@@ -118,10 +175,11 @@ fn allocation_precedes_call_and_move_alias_reuses_one_object_local() {
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
     assert!(
         code.source
-            .contains("int v0;\n        sample.A v1 = new sample.A((v0 = sample.Source.f()));"),
+            .contains("sample.A v1 = new sample.A(sample.Source.f());"),
         "{}",
         code.source
     );
+    assert!(!code.source.contains("int v0;"), "{}", code.source);
     assert_eq!(code.source.matches("new sample.A").count(), 1);
     assert!(code.source.contains("return v1;"), "{}", code.source);
 }
@@ -226,7 +284,12 @@ fn jumbo_string_is_supported_and_bad_string_index_fails_closed() {
         vec![(0, 2, 1)],
     );
     let code = native_java::render_method("sample.Test", &jumbo, &jumbo.methods[0]).unwrap();
-    assert!(code.source.contains("(v0 = \"jumbo\")"), "{}", code.source);
+    assert!(
+        code.source
+            .contains("new java.lang.UnsupportedOperationException(\"jumbo\")"),
+        "{}",
+        code.source
+    );
 
     let malformed = class(
         vec![0x0022, 0, 0x011a, 99, 0x2070, 0, 0x0010, 0x0027],
@@ -261,9 +324,12 @@ fn class_literal_resolution_is_ordered_once_and_reused_by_next_allocation() {
     );
     assert_eq!(code.source.matches("new sample.A").count(), 2);
     assert!(
-        code.source.contains(
-            "java.lang.Class v0;\n        java.lang.String v1;\n        java.lang.String v2;"
-        ),
+        code.source.contains("java.lang.Class v0;"),
+        "{}",
+        code.source
+    );
+    assert!(
+        !code.source.contains("java.lang.String v1;"),
         "{}",
         code.source
     );
@@ -386,7 +452,7 @@ fn captured_reference_widening_keeps_declared_overload_and_single_evaluation() {
     let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
     assert!(
         code.source
-            .contains("((java.lang.Object) (v0 = sample.Source.boxed()))"),
+            .contains("((java.lang.Object) sample.Source.boxed())"),
         "{}",
         code.source
     );
@@ -433,7 +499,7 @@ fn check_cast_argument_stays_after_allocation_and_preserves_link() {
     let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
     assert!(
         code.source
-            .contains("new sample.A(((java.lang.Object) (v0 = ((sample.Source) p0))))"),
+            .contains("new sample.A(((java.lang.Object) ((sample.Source) p0)))"),
         "{}",
         code.source
     );
@@ -470,7 +536,7 @@ fn unrelated_reference_check_cast_uses_nonthrowing_object_bridge() {
     let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
     assert!(
         code.source
-            .contains("new sample.A((v0 = ((sample.Source) ((java.lang.Object) p0))))"),
+            .contains("new sample.A(((sample.Source) ((java.lang.Object) p0)))"),
         "{}",
         code.source
     );
@@ -1187,4 +1253,81 @@ fn allocation_boolean_xor_keeps_boolean_constructor_argument() {
     let out = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
     assert!(out.source.contains("^ (true)"), "{}", out.source);
     assert!(out.source.contains("new sample.A"), "{}", out.source);
+}
+
+fn protected_branching_allocation() -> DexClass {
+    let mut c = branching_allocation();
+    let code = c.methods[0].code.as_mut().unwrap();
+    code.instructions.extend([0x010d, 0x0012, 0x0011]);
+    code.tries = 1;
+    code.try_regions = vec![rdx::native_dex::DexTryRegion {
+        start: 0,
+        end: 13,
+        catches: vec![(Some(Arc::from("Ljava/lang/IllegalStateException;")), 14)].into(),
+    }];
+    c
+}
+
+#[test]
+fn protected_argument_staging_keeps_the_enclosing_handler() {
+    let c = protected_branching_allocation();
+    let rendered = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    assert_eq!(
+        rendered.source.matches("catch (").count(),
+        1,
+        "{}",
+        rendered.source
+    );
+    assert_eq!(rendered.source.matches("sample.Source.value()").count(), 1);
+    let mut invalid = protected_branching_allocation();
+    invalid.methods[0].code.as_mut().unwrap().try_regions[0].end = 9;
+    assert!(native_java::render_method("sample.Test", &invalid, &invalid.methods[0]).is_err());
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn protected_argument_staging_preserves_catch_and_effects_in_java() {
+    use std::{fs, process::Command};
+    let c = protected_branching_allocation();
+    let rendered = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    let dir = std::env::temp_dir().join(format!("rdx-protected-allocation-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    fs::write(dir.join("sample/Test.java"), format!(r#"package sample;
+public class Test {{ {}
+ public static void main(String[] args) {{
+  if (make(false).value != 2 || Source.calls != 0 || A.calls != 1) throw new AssertionError();
+  if (make(true).value != 42 || Source.calls != 1 || A.calls != 2) throw new AssertionError();
+  Source.fail = new IllegalStateException();
+  if (make(true) != null || Source.calls != 2 || A.calls != 2) throw new AssertionError();
+  Source.fail = new IllegalArgumentException();
+  try {{ make(true); throw new AssertionError(); }} catch (IllegalArgumentException e) {{ if (e != Source.fail) throw new AssertionError(); }}
+  Source.fail = null; A.fail = true;
+  if (make(false) != null || A.calls != 3) throw new AssertionError();
+ }}
+}}
+class Source {{ static int calls; static RuntimeException fail; static int value() {{ calls++; if (fail != null) throw fail; return 42; }} }}
+class A {{ static int calls; static boolean fail; final int value; A(int n) {{ calls++; if(fail) throw new IllegalStateException(); value=n; }} }}
+"#, rendered.source)).unwrap();
+    let compiled = Command::new("javac")
+        .arg(dir.join("sample/Test.java"))
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&compiled.stderr),
+        rendered.source
+    );
+    let ran = Command::new("java")
+        .arg("-cp")
+        .arg(&dir)
+        .arg("sample.Test")
+        .output()
+        .unwrap();
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    fs::remove_dir_all(dir).unwrap();
 }

@@ -753,6 +753,7 @@ impl CodeDocument {
                         (target.center().y - ui.available_height() * 0.5).max(0.0),
                     );
                 }
+                let prior_navigation_cursor = self.last_navigation_cursor;
                 scroll.show(ui, |ui| {
                     ui.horizontal_top(|ui| {
                         // Paint numbers at the actual laid-out row positions, avoiding font drift.
@@ -1057,13 +1058,28 @@ impl CodeDocument {
                                 .zip(caret)
                                 .map(|(range, position)| (position, range));
                         }
-                        let moved_focus = output.response.has_focus()
-                            && ui.input(|input| {
-                                input.pointer.primary_down()
-                                    || input.events.iter().any(|event| {
-                                        matches!(event, egui::Event::Key { pressed: true, .. })
+                        let moved_focus = output.response.clicked_by(egui::PointerButton::Primary)
+                            || output.response.dragged_by(egui::PointerButton::Primary)
+                            || (output.response.has_focus()
+                                && caret.is_some_and(|position| {
+                                    prior_navigation_cursor != Some(self.char_start + position)
+                                })
+                                && ui.input(|input| {
+                                    input.events.iter().any(|event| {
+                                        matches!(event, egui::Event::Key {
+                                            key: egui::Key::ArrowUp
+                                                | egui::Key::ArrowDown
+                                                | egui::Key::ArrowLeft
+                                                | egui::Key::ArrowRight
+                                                | egui::Key::Home
+                                                | egui::Key::End
+                                                | egui::Key::PageUp
+                                                | egui::Key::PageDown,
+                                            pressed: true,
+                                            ..
+                                        })
                                     })
-                            });
+                                }));
                         if self.jump.is_none()
                             && moved_focus
                             && let (Some(caret), Some(target)) = (caret, &self.highlight)
@@ -1370,6 +1386,135 @@ mod tests {
                     || rect.fill == super::jump_tint(theme)))
             );
         }
+    }
+
+    #[test]
+    fn search_jump_survives_pointer_held_outside_editor_until_local_navigation() {
+        let context = egui::Context::default();
+        let source = "first line\nsecond target\nthird line\n";
+        let mut doc = CodeDocument::new(source.into(), "java");
+        let target = source.find("target").unwrap();
+        let render = |doc: &mut CodeDocument, events| {
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 400.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        doc.show(ui, CodeTheme::Ocean, 14.0);
+                    });
+                },
+            )
+        };
+        render(&mut doc, vec![]);
+        let id = doc.last_editor_id.unwrap();
+        let mut state = egui::text_edit::TextEditState::load(&context, id).unwrap();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(0),
+            )));
+        state.store(&context, id);
+        context.memory_mut(|memory| memory.request_focus(id));
+        doc.jump_to_range(target, target + "target".len()).unwrap();
+
+        let outside = egui::pos2(2.0, 2.0);
+        let press = egui::Event::PointerButton {
+            pos: outside,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        render(&mut doc, vec![egui::Event::PointerMoved(outside), press]);
+        context.memory_mut(|memory| memory.request_focus(id));
+        let output = render(&mut doc, vec![]);
+        assert_eq!(doc.highlight, Some(target..target + 6));
+        assert!(
+            painted_shapes(&output)
+                .iter()
+                .any(|shape| matches!(&shape.shape,
+            egui::Shape::Rect(rect) if rect.fill == super::jump_gutter_tint(CodeTheme::Ocean)))
+        );
+
+        render(
+            &mut doc,
+            vec![egui::Event::PointerButton {
+                pos: outside,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let third = source.find("third").unwrap();
+        let glyph = doc
+            .cache
+            .as_ref()
+            .unwrap()
+            .galley
+            .pos_from_ccursor(egui::text::CCursor::new(third));
+        let point = doc.last_galley_pos.unwrap() + glyph.center().to_vec2();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        render(
+            &mut doc,
+            vec![egui::Event::PointerMoved(point), button(true)],
+        );
+        render(&mut doc, vec![button(false)]);
+        assert!(
+            doc.highlight.is_none(),
+            "clicking another editor line clears the jump"
+        );
+    }
+
+    #[test]
+    fn fresh_search_result_keeps_jump_through_enter_and_copy_shortcuts() {
+        let context = egui::Context::default();
+        let render = |doc: &mut CodeDocument, events| {
+            context.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        doc.show(ui, CodeTheme::QuietLight, 14.0);
+                    });
+                },
+            )
+        };
+        let mut previous = CodeDocument::new("old cursor\nother line\n".into(), "java");
+        render(&mut previous, vec![]);
+        let old_editor = previous.last_editor_id.unwrap();
+        context.memory_mut(|memory| memory.request_focus(old_editor));
+
+        let mut result = CodeDocument::new("first line\nsearch target\n".into(), "java");
+        assert_eq!(result.last_navigation_cursor, None);
+        result.jump_to_range(18, 24).unwrap();
+        let key = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        render(
+            &mut result,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        context.memory_mut(|memory| memory.request_focus(old_editor));
+        let output = render(&mut result, vec![key(egui::Key::C, egui::Modifiers::CTRL)]);
+        assert_eq!(result.highlight, Some(18..24));
+        assert!(painted_shapes(&output).iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Rect(rect) if rect.fill == super::jump_gutter_tint(CodeTheme::QuietLight))));
     }
 
     #[test]

@@ -94,7 +94,7 @@ fn primitive_encoded_values_preserve_signedness_width_and_float_bits() {
     }
 }
 #[test]
-fn default_and_unsupported_final_initializers_are_never_fabricated() {
+fn proven_static_defaults_render_but_unsupported_initializers_are_rejected() {
     let mut class = fixture();
     field(&mut class, "value", "I", 0x9);
     assert!(
@@ -104,7 +104,12 @@ fn default_and_unsupported_final_initializers_are_never_fabricated() {
             .contains("static int value;")
     );
     class.fields[0].access_flags |= 0x10;
-    assert!(native_java::render_field("sample.Hello", &class, &class.fields[0]).is_err());
+    assert!(
+        native_java::render_field("sample.Hello", &class, &class.fields[0])
+            .unwrap()
+            .source
+            .contains("static final int value = 0;")
+    );
     class.static_values = vec![DexValue::String(0)];
     assert!(native_java::render_field("sample.Hello", &class, &class.fields[0]).is_err());
     class.static_values = vec![DexValue::Array(vec![])];

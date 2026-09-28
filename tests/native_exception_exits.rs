@@ -135,3 +135,89 @@ public class Effects {{
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+fn shared_return_fixture() -> DexClass {
+    let mut class = fixture(
+        vec![
+            0x0012, 0x0238, 16, 0x0071, 0, 0, 0x010a, 0x0071, 1, 0, 0x010a, 0x010f, 0x010d, 0x0071,
+            2, 0, 0x0000, 0x000f,
+        ],
+        vec![(Some("Ljava/lang/RuntimeException;"), 12)],
+        3,
+        7,
+        "I",
+    );
+    class.methods[0].parameters = vec!["Z".into()];
+    class.methods[0].code.as_mut().unwrap().ins = 1;
+    class
+}
+
+#[test]
+fn detached_catch_can_end_at_enclosing_branchs_shared_return() {
+    let class = shared_return_fixture();
+    let source = native_java::render_method("sample.Effects", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    assert_eq!(source.matches(".first()").count(), 1, "{source}");
+    assert_eq!(source.matches(".second()").count(), 1, "{source}");
+    assert_eq!(source.matches(".touch()").count(), 1, "{source}");
+    let catch = source.find("catch (").unwrap();
+    let touch = source.find(".touch()").unwrap();
+    assert!(catch < touch, "{source}");
+    assert!(source[touch..].contains("return "), "{source}");
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn shared_return_catch_preserves_effects_results_and_exception_identity() {
+    let class = shared_return_fixture();
+    let source = native_java::render_method("sample.Effects", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    let dir = std::env::temp_dir().join(format!("rdx-shared-catch-return-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("sample")).unwrap();
+    std::fs::write(
+        dir.join("sample/Effects.java"),
+        format!(
+            r#"package sample;
+public class Effects {{
+ static int mode; static String trace;
+ static final RuntimeException failure = new IllegalStateException("sentinel");
+ static int first(){{trace+="F"; if(mode==1||mode==3)throw failure; return 1;}}
+ static int second(){{trace+="S"; if(mode==2)throw failure; return 42;}}
+ static void touch(){{trace+="T"; if(mode==3)throw failure;}}
+ {source}
+ public static void main(String[] args) {{
+  for (mode=0;mode<4;mode++) {{
+   trace=""; if(test(false)!=0 || !trace.isEmpty())throw new AssertionError("guard");
+   trace="";
+   try {{
+    int actual=test(true);
+    if(mode==2||mode==3 || actual!=(mode==1?0:42))throw new AssertionError("result");
+   }} catch(RuntimeException actual) {{
+    if((mode!=2&&mode!=3) || actual!=failure)throw new AssertionError("exception",actual);
+   }}
+   if(!trace.equals((mode==1||mode==3)?"FT":"FS"))throw new AssertionError("trace "+trace);
+  }}
+ }}
+}}"#
+        ),
+    )
+    .unwrap();
+    for (command, args) in [
+        ("javac", vec!["sample/Effects.java"]),
+        ("java", vec!["-cp", ".", "sample.Effects"]),
+    ] {
+        let result = std::process::Command::new(command)
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

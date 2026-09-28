@@ -473,7 +473,20 @@ fn try_region_staging(
             ins: code.ins,
             outs: code.outs,
             tries: code.tries,
-            try_regions: code.try_regions.clone(),
+            // The caller owns any try containing this entire allocation.
+            // Argument staging is a subregion of that already protected body;
+            // reopening its catch here would incorrectly include the handler
+            // in the constructor arguments. The boundary proof above rejects
+            // partially overlapping regions before reaching this point.
+            try_regions: code
+                .try_regions
+                .iter()
+                .filter(|region| {
+                    !(region.start as usize <= pc
+                        && constructor_pc + graph.widths[constructor_pc] <= region.end as usize)
+                })
+                .cloned()
+                .collect(),
             instructions: staged_words,
             offset: code.offset,
         }),
@@ -1425,7 +1438,7 @@ pub(super) fn try_lower(
                         )?
                     };
                     let mut actual = Vec::new();
-                    for arg_ty in args {
+                    for (argument_index, arg_ty) in args.iter().enumerate() {
                         let r = *inputs
                             .get(input_cursor)
                             .context("missing invoke argument")?;
@@ -1435,7 +1448,32 @@ pub(super) fn try_lower(
                                 "nonadjacent allocation wide argument"
                             );
                         }
-                        actual.push(expression(atom(&regs, r)?, arg_ty, class)?);
+                        let argument_atom = atom(&regs, r)?;
+                        let simplified = match &argument_atom {
+                            Atom::Input(value)
+                                if super::receiver_cleanup::proven_call_argument(
+                                    value,
+                                    owner,
+                                    raw_name,
+                                    args,
+                                    ret,
+                                    op,
+                                    argument_index,
+                                    class.symbols.hierarchy.get().map(AsRef::as_ref),
+                                ) =>
+                            {
+                                Some(if value.literal == Some(0) {
+                                    Expr::Null
+                                } else {
+                                    Expr::Local(value.text.clone())
+                                })
+                            }
+                            _ => None,
+                        };
+                        actual.push(match simplified {
+                            Some(expression) => expression,
+                            None => expression(argument_atom, arg_ty, class)?,
+                        });
                         input_cursor += if matches!(arg_ty.as_ref(), "J" | "D") {
                             2
                         } else {
@@ -1536,7 +1574,32 @@ pub(super) fn try_lower(
                         };
                         let local_refs: Vec<&str> =
                             local_names.iter().map(String::as_str).collect();
-                        let mut rendered = match allocation.render_checked(&events, &local_refs) {
+                        let next_pc = cursor + graph.widths[cursor];
+                        let code = method.code.as_ref().context("method code")?;
+                        let liveness = (code.instructions.len() <= 1024
+                            && code.registers <= 128
+                            && allocation.captures.len() <= 16)
+                            .then(|| super::super::liveness::analyze(code))
+                            .flatten();
+                        let mut live_after = vec![false; allocation.captures.len()];
+                        for (register, staged) in regs.iter().enumerate() {
+                            if let Some(Atom::Expr {
+                                expression: Expr::Capture(index),
+                                ..
+                            }) = staged
+                                && liveness
+                                    .as_ref()
+                                    .is_none_or(|live| live.contains(next_pc, register))
+                            {
+                                live_after[*index] = true;
+                            }
+                        }
+                        let mut rendered = match super::shrink::render_checked(
+                            &allocation,
+                            &events,
+                            &local_refs,
+                            &live_after,
+                        ) {
                             Ok(rendered) => rendered,
                             Err(_) => allocation.render_staged_with_discarded(
                                 &events,
@@ -1563,7 +1626,9 @@ pub(super) fn try_lower(
                                 .collect();
                             out.line(declaration, &refs);
                         }
-                        out.sequence += rendered.declarations.len();
+                        // Names retain their original capture indices after
+                        // shrinking; reserve every original name before local().
+                        out.sequence += rendered.declarations.len().max(allocation.captures.len());
                         let refs: Vec<_> = rendered
                             .links
                             .iter()

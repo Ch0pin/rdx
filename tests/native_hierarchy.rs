@@ -10,6 +10,23 @@ use native_dex::{DexClass, DexSymbols};
 use native_hierarchy::{Relation, TypeHierarchy};
 use std::sync::Arc;
 
+#[test]
+fn sdk_readability_facts_require_unshadowed_exact_platform_types() {
+    let hierarchy = TypeHierarchy::from_classes([]).unwrap();
+    assert!(hierarchy.unshadowed_sdk_type("Ljava/lang/StringBuilder;"));
+    assert!(hierarchy.sdk_numeric_wrapper_to_number("Ljava/lang/Integer;"));
+    assert!(!hierarchy.unshadowed_sdk_type("Lsample/Unknown;"));
+    assert!(!hierarchy.sdk_numeric_wrapper_to_number("Ljava/lang/Character;"));
+
+    let replacement = class("Ljava/lang/Integer;", Some("Ljava/lang/Number;"), &[]);
+    let shadowed = TypeHierarchy::from_classes([&replacement]).unwrap();
+    assert!(!shadowed.unshadowed_sdk_type("Ljava/lang/Integer;"));
+    assert!(!shadowed.sdk_numeric_wrapper_to_number("Ljava/lang/Integer;"));
+    let duplicate = class("Ljava/lang/Integer;", Some("Ljava/lang/Object;"), &[]);
+    let ambiguous = TypeHierarchy::from_classes([&replacement, &duplicate]).unwrap();
+    assert!(!ambiguous.sdk_numeric_wrapper_to_number("Ljava/lang/Integer;"));
+}
+
 fn class(descriptor: &str, superclass: Option<&str>, interfaces: &[&str]) -> DexClass {
     DexClass {
         symbols: Arc::new(DexSymbols::default()),
@@ -121,6 +138,168 @@ fn resolves_custom_checked_exception_through_platform_ancestry() {
         hierarchy.assignable("Lapp/DiskFailure;", "Ljava/io/IOException;"),
         Relation::Proven
     );
+}
+
+#[test]
+fn inferred_checked_throw_obeys_loaded_override_contract() {
+    use native_dex::{DexCode, DexMethod};
+    let mut parent = class("Lapp/Parent;", Some("Ljava/lang/Object;"), &[]);
+    parent.methods.push(DexMethod {
+        declaring_type: parent.descriptor.clone(),
+        name: "run".into(),
+        return_type: "V".into(),
+        parameters: vec!["Ljava/io/IOException;".into()],
+        thrown_types: vec!["Ljava/io/IOException;".into()],
+        access_flags: 1,
+        code: None,
+    });
+    let mut child = class("Lapp/Child;", Some("Lapp/Parent;"), &[]);
+    child.access_flags |= 0x10;
+    child.methods.push(DexMethod {
+        declaring_type: child.descriptor.clone(),
+        name: "run".into(),
+        return_type: "V".into(),
+        parameters: vec!["Ljava/io/IOException;".into()],
+        thrown_types: vec![],
+        access_flags: 1,
+        code: Some(DexCode {
+            registers: 2,
+            ins: 2,
+            outs: 0,
+            tries: 0,
+            try_regions: vec![],
+            instructions: vec![0x0127], // throw p1
+            offset: 0,
+        }),
+    });
+    let check = |parent: &DexClass, child: &DexClass, exception: &str| {
+        TypeHierarchy::from_classes([parent, child])
+            .unwrap()
+            .permits_inferred_checked_throw(child, &child.methods[0], exception)
+    };
+    assert!(check(&parent, &child, "Ljava/io/EOFException;"));
+    assert!(!check(&parent, &child, "Ljava/lang/Exception;"));
+
+    parent.methods[0].thrown_types.clear();
+    assert!(!check(&parent, &child, "Ljava/io/IOException;"));
+    parent.methods[0].access_flags = 2;
+    assert!(check(&parent, &child, "Ljava/io/IOException;"));
+}
+
+#[test]
+fn pinned_data_input_contract_proves_exact_throws_and_rejects_unknown_families() {
+    use native_dex::{DexCode, DexMethod};
+    let method = |owner: &str, name: &str, ret: &str| DexMethod {
+        declaring_type: owner.into(),
+        name: name.into(),
+        return_type: ret.into(),
+        parameters: vec![],
+        thrown_types: vec![],
+        access_flags: 1,
+        code: Some(DexCode {
+            registers: 2,
+            ins: 1,
+            outs: 0,
+            tries: 0,
+            try_regions: vec![],
+            instructions: vec![0x0012, 0x0027], // throw null; contract proof only
+            offset: 0,
+        }),
+    };
+    let make_reader = || {
+        let mut reader = class(
+            "Lsample/Reader;",
+            Some("Ljava/io/InputStream;"),
+            &["Ljava/io/DataInput;"],
+        );
+        reader.access_flags |= 0x10;
+        reader
+            .methods
+            .push(method("Lsample/Reader;", "readByte", "B"));
+        reader
+            .methods
+            .push(method("Lsample/Reader;", "readFloat", "F"));
+        reader
+    };
+    let reader = make_reader();
+    let h = TypeHierarchy::from_classes([&reader]).unwrap();
+    assert!(h.permits_inferred_checked_throw(
+        &reader,
+        &reader.methods[0],
+        "Ljava/io/EOFException;"
+    ));
+    assert!(h.inherited_io_exception(&reader, &reader.methods[1]));
+    assert!(!h.permits_inferred_checked_throw(
+        &reader,
+        &reader.methods[0],
+        "Ljava/lang/Exception;"
+    ));
+
+    let mut wrong_return = make_reader();
+    wrong_return.methods[0].return_type = "I".into();
+    let h = TypeHierarchy::from_classes([&wrong_return]).unwrap();
+    assert!(!h.inherited_io_exception(&wrong_return, &wrong_return.methods[0]));
+    assert!(!h.permits_inferred_checked_throw(
+        &wrong_return,
+        &wrong_return.methods[0],
+        "Ljava/io/EOFException;"
+    ));
+
+    let mut unknown = make_reader();
+    unknown.interfaces.push("Lvendor/Unknown;".into());
+    let h = TypeHierarchy::from_classes([&unknown]).unwrap();
+    assert!(!h.inherited_io_exception(&unknown, &unknown.methods[0]));
+
+    let shadow = class("Ljava/io/DataInput;", Some("Ljava/lang/Object;"), &[]);
+    let h = TypeHierarchy::from_classes([&reader, &shadow]).unwrap();
+    assert!(!h.inherited_io_exception(&reader, &reader.methods[0]));
+
+    let mut unrelated = make_reader();
+    unrelated.methods.push(method("Lsample/Reader;", "e", "V"));
+    unrelated.methods[2].parameters = vec!["J".into()];
+    let h = TypeHierarchy::from_classes([&unrelated]).unwrap();
+    assert!(!h.inherited_io_exception(&unrelated, &unrelated.methods[2]));
+    assert!(!h.permits_inferred_checked_throw(
+        &unrelated,
+        &unrelated.methods[2],
+        "Ljava/io/IOException;"
+    ));
+}
+
+#[test]
+fn non_io_covariant_loaded_override_keeps_checked_contract() {
+    use native_dex::{DexCode, DexMethod};
+    let mut parent = class("Lsample/Base;", Some("Ljava/lang/Object;"), &[]);
+    parent.methods.push(DexMethod {
+        declaring_type: parent.descriptor.clone(),
+        name: "make".into(),
+        return_type: "Ljava/lang/Object;".into(),
+        parameters: vec![],
+        thrown_types: vec!["Ljava/io/IOException;".into()],
+        access_flags: 1,
+        code: None,
+    });
+    let mut child = class("Lsample/Child;", Some("Lsample/Base;"), &[]);
+    child.access_flags |= 0x10;
+    child.methods.push(DexMethod {
+        declaring_type: child.descriptor.clone(),
+        name: "make".into(),
+        return_type: "Ljava/lang/String;".into(),
+        parameters: vec![],
+        thrown_types: vec![],
+        access_flags: 1,
+        code: Some(DexCode {
+            registers: 2,
+            ins: 1,
+            outs: 0,
+            tries: 0,
+            try_regions: vec![],
+            instructions: vec![0x0012, 0x0027],
+            offset: 0,
+        }),
+    });
+    let h = TypeHierarchy::from_classes([&parent, &child]).unwrap();
+    assert!(h.permits_inferred_checked_throw(&child, &child.methods[0], "Ljava/io/EOFException;"));
 }
 
 #[test]
@@ -386,6 +565,82 @@ fn object_argument_cast_elision_requires_unique_static_target() {
         !TypeHierarchy::from_classes([&owner])
             .unwrap()
             .is_unambiguous_object_call(signature)
+    );
+}
+
+#[test]
+fn loaded_call_family_proof_distinguishes_static_arguments_from_receiver_paths() {
+    let mut calls = class("Lapp/Calls;", Some("Ljava/lang/Object;"), &[]);
+    calls.access_flags = 1;
+    calls.methods.push(native_dex::DexMethod {
+        declaring_type: "Lapp/Calls;".into(),
+        name: "accept".into(),
+        return_type: "V".into(),
+        parameters: vec!["Ljava/lang/Object;".into()],
+        thrown_types: vec![],
+        access_flags: 9,
+        code: None,
+    });
+    calls.methods.push(native_dex::DexMethod {
+        declaring_type: "Lapp/Calls;".into(),
+        name: "consume".into(),
+        return_type: "V".into(),
+        parameters: vec!["Ljava/lang/Object;".into()],
+        thrown_types: vec![],
+        access_flags: 1,
+        code: None,
+    });
+    calls.methods.push(native_dex::DexMethod {
+        declaring_type: "Lapp/Calls;".into(),
+        name: "<init>".into(),
+        return_type: "V".into(),
+        parameters: vec!["Ljava/lang/Object;".into()],
+        thrown_types: vec![],
+        access_flags: 1,
+        code: None,
+    });
+    let mut child = class("Lapp/Child;", Some("Lapp/Calls;"), &[]);
+    child.access_flags = 1;
+    child.methods.push(native_dex::DexMethod {
+        declaring_type: "Lapp/Child;".into(),
+        name: "accept".into(),
+        return_type: "V".into(),
+        parameters: vec![],
+        thrown_types: vec![],
+        access_flags: 2,
+        code: None,
+    });
+    let h = TypeHierarchy::from_classes([&calls, &child]).unwrap();
+    let args = [Arc::from("Ljava/lang/Object;")];
+    assert!(h.unambiguous_loaded_call("Lapp/Calls;", "accept", &args, "V", 0x71));
+    assert!(h.unambiguous_loaded_argument_call("Lapp/Calls;", "accept", &args, "V", 0x71,));
+    assert!(h.unambiguous_loaded_argument_call("Lapp/Calls;", "consume", &args, "V", 0x6e));
+    assert!(h.unambiguous_loaded_argument_call("Lapp/Calls;", "<init>", &args, "V", 0x70));
+    assert!(h.noarg_void_upcast_path("Lapp/Child;", "Lapp/Calls;", "finish"));
+    assert!(!h.noarg_void_upcast_path("Lapp/Child;", "Lapp/Calls;", "accept"));
+
+    let object_shadow = class("Ljava/lang/Object;", None, &[]);
+    let shadowed = TypeHierarchy::from_classes([&calls, &child, &object_shadow]).unwrap();
+    assert!(!shadowed.unshadowed_sdk_type("Ljava/lang/Object;"));
+    assert!(!shadowed.unambiguous_loaded_argument_call("Lapp/Calls;", "accept", &args, "V", 0x71,));
+    assert!(
+        !shadowed.unambiguous_loaded_argument_call("Lapp/Calls;", "consume", &args, "V", 0x6e,)
+    );
+    assert!(shadowed.unambiguous_loaded_argument_call("Lapp/Calls;", "<init>", &args, "V", 0x70,));
+
+    calls.methods.push(native_dex::DexMethod {
+        declaring_type: "Lapp/Calls;".into(),
+        name: "accept".into(),
+        return_type: "V".into(),
+        parameters: vec!["Ljava/lang/String;".into()],
+        thrown_types: vec![],
+        access_flags: 9,
+        code: None,
+    });
+    let ambiguous = TypeHierarchy::from_classes([&calls, &child]).unwrap();
+    assert!(!ambiguous.unambiguous_loaded_call("Lapp/Calls;", "accept", &args, "V", 0x71,));
+    assert!(
+        !ambiguous.unambiguous_loaded_argument_call("Lapp/Calls;", "accept", &args, "V", 0x71,)
     );
 }
 
@@ -768,5 +1023,82 @@ fn checked_catch_can_narrow_a_declared_exception() {
         "I",
         "Ljava/sql/SQLException;",
         false
+    ));
+}
+
+#[test]
+fn inherited_file_contract_rejects_duplicate_parent_definitions() {
+    let base = class(
+        "Lapp/BaseProvider;",
+        Some("Landroid/content/ContentProvider;"),
+        &[],
+    );
+    let method = native_dex::DexMethod {
+        declaring_type: "Lapp/Provider;".into(),
+        name: "openFile".into(),
+        return_type: "Landroid/os/ParcelFileDescriptor;".into(),
+        parameters: vec!["Landroid/net/Uri;".into(), "Ljava/lang/String;".into()],
+        thrown_types: vec![],
+        access_flags: 1,
+        code: None,
+    };
+    let hierarchy = TypeHierarchy::from_classes([&base]).unwrap();
+    assert!(hierarchy.inherited_file_exception_contract(
+        "Lapp/BaseProvider;",
+        &method,
+        "Ljava/io/FileNotFoundException;"
+    ));
+    let ambiguous = TypeHierarchy::from_classes([&base, &base]).unwrap();
+    assert!(!ambiguous.inherited_file_exception_contract(
+        "Lapp/BaseProvider;",
+        &method,
+        "Ljava/io/FileNotFoundException;"
+    ));
+}
+
+#[test]
+fn pinned_static_throws_and_document_contracts_require_exact_descriptors() {
+    let hierarchy = TypeHierarchy::from_classes(std::iter::empty()).unwrap();
+    let args = [
+        "Ljava/io/File;",
+        "I",
+        "Landroid/os/Handler;",
+        "Landroid/os/ParcelFileDescriptor$OnCloseListener;",
+    ]
+    .map(Arc::<str>::from);
+    let types = hierarchy
+        .exact_static_call_thrown_types(
+            "Landroid/os/ParcelFileDescriptor;",
+            "open",
+            &args,
+            "Landroid/os/ParcelFileDescriptor;",
+        )
+        .unwrap();
+    assert_eq!(
+        types.as_slice(),
+        &[Arc::<str>::from("Ljava/io/IOException;")]
+    );
+    assert!(hierarchy.exact_static_call_thrown_types(
+        "Landroid/os/ParcelFileDescriptor;", "open", &args, "V",
+    ).is_none());
+    let mut method = native_dex::DexMethod {
+        declaring_type: "Lapp/Provider;".into(),
+        name: "queryDocument".into(),
+        return_type: "Landroid/database/Cursor;".into(),
+        parameters: vec!["Ljava/lang/String;".into(), "[Ljava/lang/String;".into()],
+        thrown_types: vec![],
+        access_flags: 1,
+        code: None,
+    };
+    assert!(hierarchy.inherited_document_exception_contract(
+        "Landroid/provider/DocumentsProvider;",
+        &method,
+        "Ljava/io/FileNotFoundException;",
+    ));
+    method.parameters[1] = "Ljava/lang/Object;".into();
+    assert!(!hierarchy.inherited_document_exception_contract(
+        "Landroid/provider/DocumentsProvider;",
+        &method,
+        "Ljava/io/FileNotFoundException;",
     ));
 }

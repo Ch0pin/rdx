@@ -80,6 +80,10 @@ fn checked(ty: &str) -> bool {
     )
 }
 
+pub(super) fn inferable_checked_type(class: &DexClass, ty: &str) -> bool {
+    validate_type(class, ty).is_ok() && !unchecked_type(class, ty)
+}
+
 pub(super) fn validate_type(class: &DexClass, ty: &str) -> Result<()> {
     ensure!(
         unchecked_type(class, ty)
@@ -165,16 +169,57 @@ pub(super) fn known_call_throws(
             && args[0].as_ref() == "Ljava/lang/String;"
 }
 
-// Throws metadata is optional in DEX. Infer only a type that the renderer has
-// established at an actual explicit throw and only where Java declaration
-// constraints are known: private or static methods of root classes.
+// Throws metadata is optional in DEX. Infer an explicit checked throw only
+// when the hierarchy proves both its declaration contract and exact loaded
+// callers. Private methods retain their separate non-override rule; other
+// methods require a final owner, while constructors use exact direct calls.
 pub(super) fn may_infer_declaration(class: &DexClass, method: &DexMethod, value: &Value) -> bool {
+    let declaration_permitted = method.access_flags & 2 != 0
+        || class.symbols.hierarchy.get().is_some_and(|hierarchy| {
+            hierarchy.permits_inferred_checked_throw(class, method, &value.ty)
+        });
     method.name.as_ref() != "<clinit>"
         && method.thrown_types.is_empty()
-        && method.access_flags & (2 | 8) != 0
-        && class.superclass.as_deref() == Some("Ljava/lang/Object;")
+        && declaration_permitted
         && validate_type(class, &value.ty).is_ok()
         && !unchecked_type(class, &value.ty)
+}
+
+/// An exact one-instruction static helper that throws its sole checked
+/// parameter has an order-independent inferred contract. No other body shape
+/// is summarized here; calls with effects or control flow need full analysis.
+pub(super) fn simple_static_parameter_throw<'a>(
+    class: &DexClass,
+    method: &'a DexMethod,
+) -> Option<&'a str> {
+    if method.access_flags & 8 == 0
+        || !method.thrown_types.is_empty()
+        || method.parameters.len() != 1
+    {
+        return None;
+    }
+    let code = method.code.as_ref()?;
+    let parameter_register = code.registers.checked_sub(code.ins)?;
+    if code.ins != 1
+        || !code.try_regions.is_empty()
+        || code.instructions.as_slice() != [0x27 | (parameter_register << 8)]
+    {
+        return None;
+    }
+    let ty = method.parameters[0].as_ref();
+    (inferable_checked_type(class, ty)
+        && may_infer_declaration(
+            class,
+            method,
+            &Value {
+                text: String::new(),
+                ty: ty.to_string(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: false,
+            },
+        ))
+    .then_some(ty)
 }
 
 pub(super) fn locally_caught(

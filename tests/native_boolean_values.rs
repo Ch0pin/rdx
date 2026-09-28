@@ -146,8 +146,7 @@ fn boolean_invoke_result_xor_true_remains_boolean() {
         source.contains("boolean v0 = sample.Hello.userMethod();"),
         "{source}"
     );
-    assert!(source.contains("boolean v1 = !(v0);"), "{source}");
-    assert!(source.contains("return v1;"), "{source}");
+    assert!(source.contains("return !(v0);"), "{source}");
 
     let lowered = |user_method: bool| !user_method;
     assert!(!lowered(true));
@@ -158,12 +157,12 @@ fn boolean_invoke_result_xor_true_remains_boolean() {
 fn xor_literal_keeps_boolean_and_integer_semantics_distinct() {
     let boolean_identity = render(&boolean_failure_fixture(0)).unwrap();
     assert!(
-        boolean_identity.contains("boolean v1 = v0;"),
+        boolean_identity.contains("return v0;"),
         "{boolean_identity}"
     );
 
     let integer = fixture(&[0x00df, 0x0100, 0x000f], &["I"], "I", 1);
     let integer = render(&integer).unwrap();
-    assert!(integer.contains("int v0 = p0 ^ (1);"), "{integer}");
+    assert!(integer.contains("return p0 ^ (1);"), "{integer}");
     assert!(!integer.contains("boolean v0"), "{integer}");
 }

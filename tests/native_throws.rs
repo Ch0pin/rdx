@@ -1,8 +1,10 @@
 //! Throw reconstruction tests use only native DEX fixtures and Rust assertions.
 use rdx::{
     native_dex::{self, DexClass},
+    native_hierarchy::TypeHierarchy,
     native_java,
 };
+use std::sync::Arc;
 
 fn fixture(
     words: &[u16],
@@ -62,7 +64,16 @@ fn checked_throw_uses_exact_declared_or_body_inferred_type_and_preserves_link() 
         .take(link.end - link.start)
         .collect();
     assert_eq!(text, "java.io.IOException");
-    let inferred = render(&fixture(&[0x0027], &[ty], "V", 1, &[])).unwrap();
+    let mut inferred_class = fixture(&[0x0027], &[ty], "V", 1, &[]);
+    inferred_class.access_flags |= 0x10;
+    inferred_class
+        .symbols
+        .hierarchy
+        .set(Arc::new(
+            TypeHierarchy::from_classes([&inferred_class]).unwrap(),
+        ))
+        .unwrap();
+    let inferred = render(&inferred_class).unwrap();
     assert!(inferred.source.contains("throws java.io.IOException"));
     assert!(inferred.source.contains("throw p0;"));
     let link = inferred

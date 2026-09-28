@@ -93,10 +93,19 @@ fn child_arguments_capture_call_after_child_allocation() {
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
     assert!(
         code.source
-            .contains("new sample.A((v1 = new sample.B((v0 = sample.Source.f()))))"),
+            .contains("new sample.A((v1 = new sample.B(sample.Source.f())))"),
         "{}",
         code.source
     );
+    assert_eq!(code.source.matches("sample.Source.f()").count(), 1);
+    assert!(
+        code.source.find("new sample.A").unwrap() < code.source.find("new sample.B").unwrap()
+            && code.source.find("new sample.B").unwrap()
+                < code.source.find("sample.Source.f()").unwrap(),
+        "{}",
+        code.source
+    );
+    assert!(code.source.contains("sample.B v1;"), "{}", code.source);
     assert!(code.source.contains("return v1;"), "{}", code.source);
 }
 #[test]

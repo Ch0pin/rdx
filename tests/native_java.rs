@@ -182,33 +182,32 @@ fn evaluate_integer_method(source: &str, input: i32) -> i32 {
         word.parse()
             .unwrap_or_else(|_| *vars.get(word).expect("known Java variable"))
     }
+    fn eval_expression(source: &str, vars: &std::collections::HashMap<String, i32>) -> i32 {
+        let parts: Vec<_> = source.trim_end_matches(';').split_whitespace().collect();
+        let left = operand(parts[0], vars);
+        if parts.len() == 1 {
+            return left;
+        }
+        assert_eq!(parts.len(), 3, "unsupported Java expression: {source}");
+        let right = operand(parts[2], vars);
+        match parts[1] {
+            "+" => left.wrapping_add(right),
+            "-" => left.wrapping_sub(right),
+            "*" => left.wrapping_mul(right),
+            "<<" => left.wrapping_shl(right as u32),
+            ">>" => left.wrapping_shr(right as u32),
+            ">>>" => ((left as u32).wrapping_shr(right as u32)) as i32,
+            other => panic!("unhandled Java expression {other}"),
+        }
+    }
     for line in source.lines().map(str::trim) {
         if let Some(value) = line.strip_prefix("return ") {
-            return operand(value, &variables);
+            return eval_expression(value, &variables);
         }
         if let Some(declaration) = line.strip_prefix("int ")
             && let Some((name, expression)) = declaration.split_once(" = ")
         {
-            let parts: Vec<_> = expression
-                .trim_end_matches(';')
-                .split_whitespace()
-                .collect();
-            let left = operand(parts[0], &variables);
-            let value = if parts.len() == 1 {
-                left
-            } else {
-                let right = operand(parts[2], &variables);
-                match parts[1] {
-                    "+" => left.wrapping_add(right),
-                    "-" => left.wrapping_sub(right),
-                    "*" => left.wrapping_mul(right),
-                    "<<" => left.wrapping_shl(right as u32),
-                    ">>" => left.wrapping_shr(right as u32),
-                    ">>>" => ((left as u32).wrapping_shr(right as u32)) as i32,
-                    other => panic!("unhandled Java expression {other}"),
-                }
-            };
-            variables.insert(name.to_owned(), value);
+            variables.insert(name.to_owned(), eval_expression(expression, &variables));
         }
     }
     panic!("no Java return in {source}");

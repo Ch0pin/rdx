@@ -70,7 +70,7 @@ pub struct Settings {
     pub word_wrap: bool,
     pub search_keep_open: bool,
     pub usages_keep_open: bool,
-    pub tabs_keep_open: bool,
+    pub tabs_auto_hide: bool,
     pub menu_auto_hide: bool,
     pub search: SearchPreferences,
 }
@@ -85,7 +85,7 @@ impl Default for Settings {
             word_wrap: false,
             search_keep_open: false,
             usages_keep_open: true,
-            tabs_keep_open: false,
+            tabs_auto_hide: false,
             menu_auto_hide: false,
             search: SearchPreferences::default(),
         }
@@ -294,7 +294,7 @@ mod tests {
             word_wrap: true,
             search_keep_open: true,
             usages_keep_open: false,
-            tabs_keep_open: true,
+            tabs_auto_hide: true,
             menu_auto_hide: true,
             search: SearchPreferences {
                 classes: true,
@@ -332,16 +332,16 @@ mod tests {
     }
 
     #[test]
-    fn tab_bar_defaults_to_auto_hide_and_persists_both_choices() {
+    fn tab_bar_defaults_to_visible_and_persists_both_choices() {
         let store = TemporaryStore::new();
         store.0.save(&Settings::default()).unwrap();
         fs::write(store.0.path.as_ref().unwrap(), br#"{"font_size":18.0}"#).unwrap();
         let mut settings = store.0.load().unwrap();
-        assert!(!settings.tabs_keep_open);
+        assert!(!settings.tabs_auto_hide);
         for enabled in [true, false] {
-            settings.tabs_keep_open = enabled;
+            settings.tabs_auto_hide = enabled;
             store.0.save(&settings).unwrap();
-            assert_eq!(store.0.load().unwrap().tabs_keep_open, enabled);
+            assert_eq!(store.0.load().unwrap().tabs_auto_hide, enabled);
         }
     }
 

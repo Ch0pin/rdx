@@ -1,6 +1,7 @@
 //! G01-B-throw: public rendering and independent exception identity/effect proof.
 use rdx::{
     native_dex::{self, DexClass, DexSymbols},
+    native_hierarchy::TypeHierarchy,
     native_java,
 };
 use std::{fs, process::Command, sync::Arc};
@@ -38,6 +39,14 @@ fn fixture(case: &Case) -> DexClass {
             methods: vec![(0, 0, 0)],
             ..Default::default()
         });
+    }
+    if case.name == "inferredIo" {
+        class.access_flags |= 0x10;
+        class
+            .symbols
+            .hierarchy
+            .set(Arc::new(TypeHierarchy::from_classes([&class]).unwrap()))
+            .unwrap();
     }
     class
 }

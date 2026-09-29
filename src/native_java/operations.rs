@@ -3,6 +3,7 @@ use super::{
     Output, Value, argument, assign, class_label, integral, java_type, reference, register,
 };
 use crate::native_dex::DexClass;
+use crate::native_hierarchy::Relation;
 use anyhow::{Context, Result, bail, ensure};
 
 /// Register roles shared by decoded IR and the legacy operand reader.
@@ -92,7 +93,13 @@ pub(super) fn emit(
                     );
                     let input = if input.literal == Some(0) {
                         "null".into()
-                    } else if input.ty == "Ljava/lang/Object;" || input.ty == ty.as_ref() {
+                    } else if input.ty == "Ljava/lang/Object;"
+                        || input.ty == ty.as_ref()
+                        || class.symbols.hierarchy.get().is_some_and(|hierarchy| {
+                            hierarchy.assignable(&input.ty, ty) == Relation::Proven
+                                || hierarchy.assignable(ty, &input.ty) == Relation::Proven
+                        })
+                    {
                         input.text
                     } else {
                         format!("((java.lang.Object) {})", input.text)

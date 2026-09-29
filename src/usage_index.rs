@@ -43,12 +43,14 @@ impl SpillDir {
             std::process::id(),
             u128::from_le_bytes(nonce)
         ));
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
             builder.mode(0o700);
-        }
+            builder
+        };
         builder.create(&path)?;
         Ok(Self(path))
     }

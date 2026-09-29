@@ -63,6 +63,18 @@ Metadata-only definition search narrows candidates. Matching, Unicode offsets,
 regexes, comment classification, result delivery and indexing are Rust code.
 Code search over disassembly is not equivalent to searching reconstructed Java.
 
+Find usages has a separate project-wide DEX reference index. Symbol fingerprints
+and owner IDs form sorted postings, with an in-memory posting buffer capped at
+32 MiB (reduced when owner names consume the index's 64 MiB admission budget).
+Full buffers spill to private temporary files containing 12-byte records;
+lookups binary-search each run instead of decompiling an unindexed project tail.
+Fingerprint collisions only add candidates: source links are checked against the
+original symbol before results are returned. Unsupported owners remain conservative
+candidates, and storage errors fall back to scanning rather than losing references.
+Shared project ownership controls cancellation and temporary-file cleanup. Owner
+metadata, transient decoding allocations, and result source are additional memory;
+the posting buffer limit is not a total process memory ceiling.
+
 The project-session index is bounded to 1 GiB disk, 96 MiB conservative index
 metadata, and 64 MiB / 10,000 documents in its RAM tier. Records contain a small
 metadata frame and raw UTF-8 source. Results stop at 1,000 hits / 32 MiB retained

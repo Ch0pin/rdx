@@ -6302,6 +6302,37 @@ fn protected_branch_split(
         .or(Some(escape)))
 }
 
+fn stable_retry_argument(value: &Value) -> bool {
+    if value.literal.is_some() || value.wide_literal.is_some() || value.text == "this" {
+        return true;
+    }
+    if value
+        .text
+        .strip_prefix(['v', 'p'])
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return true;
+    }
+    let Some(inner) = value
+        .text
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+    else {
+        return false;
+    };
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if chars.next().is_none() {
+                return false;
+            }
+        } else if matches!(ch, '"' | '\n' | '\r') {
+            return false;
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_try(
     class: &DexClass,
@@ -6380,6 +6411,38 @@ fn render_try(
             .all(|(_, handler)| { *handler >= region.end || !normal_reachable[*handler as usize] }),
         "normal flow enters interleaved handler"
     );
+    // A single void call at the end of its own protected range can retry at
+    // the handler entry if it throws the caught type. The catch body below
+    // gets a small loop so that this DEX edge is not lost in Java.
+    let reentering_handler = region.catches.first().and_then(|(ty, handler)| {
+        let handler = *handler as usize;
+        (region.catches.len() == 1
+            && throwing::validate_catch_type(
+                class,
+                ty.as_deref().unwrap_or("Ljava/lang/Throwable;"),
+                false,
+            )
+            .is_ok()
+            && handler >= start
+            && handler < end
+            && !normal_reachable[handler]
+            && matches!(words[handler] as u8, 0x71 | 0x77)
+            && handler + graph.widths[handler] == end
+            && class
+                .symbols
+                .methods
+                .get(words[handler + 1] as usize)
+                .and_then(|(_, proto, name)| {
+                    Some((
+                        class.symbols.protos.get(*proto as usize)?,
+                        class.symbols.strings.get(*name as usize)?,
+                    ))
+                })
+                .is_some_and(|((ret, _), name)| {
+                    ret.as_ref() == "V" && !matches!(name.as_str(), "<init>" | "<clinit>")
+                }))
+        .then_some(handler)
+    });
     for (_, handler) in region
         .catches
         .iter()
@@ -6392,7 +6455,8 @@ fn render_try(
             // that edge. Pure move/constant/branch prefixes are safe.
             ensure!(
                 !handler_reachable[pc]
-                    || matches!(words[pc] as u8, 0x00..=0x19 | 0x28..=0x2a | 0x32..=0x3d),
+                    || matches!(words[pc] as u8, 0x00..=0x19 | 0x28..=0x2a | 0x32..=0x3d)
+                    || reentering_handler == Some(pc),
                 "throwing handler instruction inside protected region"
             );
         }
@@ -6870,9 +6934,38 @@ fn render_try(
             entry <= handler_stop,
             "move-exception intersects shared continuation"
         );
+        let retry = reentering_handler == Some(*handler as usize);
+        if retry {
+            let count = (words[entry] >> 8) as usize;
+            let inputs: Vec<usize> = if words[entry] as u8 == 0x77 {
+                (words[entry + 2] as usize..words[entry + 2] as usize + count).collect()
+            } else {
+                let count = count >> 4;
+                ensure!(count <= 5, "self-covered handler invoke register count");
+                let packed = words[entry + 2];
+                let all = [
+                    (packed & 15) as usize,
+                    ((packed >> 4) & 15) as usize,
+                    ((packed >> 8) & 15) as usize,
+                    ((packed >> 12) & 15) as usize,
+                    (words[entry] >> 8) as usize & 15,
+                ];
+                all[..count].to_vec()
+            };
+            ensure!(
+                inputs.iter().all(|&r| {
+                    values
+                        .get(r)
+                        .and_then(Option::as_ref)
+                        .is_some_and(stable_retry_argument)
+                }),
+                "self-covered handler has deferred invoke argument"
+            );
+        }
+        let catch_indent = out.indent + if guarded_dispatch { 2 } else { 1 };
         let mut handler_body = Output {
             sequence,
-            indent: out.indent + if guarded_dispatch { 2 } else { 1 },
+            indent: catch_indent + if retry { 2 } else { 0 },
             ..Default::default()
         };
         let (values, terminal) = render(
@@ -6889,6 +6982,14 @@ fn render_try(
             None,
         )?;
         ensure!(
+            !retry || (handler_stop == end && !terminal),
+            "self-covered handler has effectful continuation"
+        );
+        ensure!(
+            !retry || handler_body.text.lines().count() == 1,
+            "self-covered handler emitted more than one statement"
+        );
+        ensure!(
             !detached_forward_handlers.contains(&(*handler as usize)) || terminal,
             "detached forward handler does not terminate"
         );
@@ -6896,6 +6997,35 @@ fn render_try(
             !detached_handlers || terminal,
             "detached handler does not terminate"
         );
+        if retry {
+            let mut wrapped = Output {
+                sequence: handler_body.sequence,
+                indent: catch_indent,
+                ..Default::default()
+            };
+            wrapped.line("while (true) {", &[]);
+            wrapped.indent += 1;
+            wrapped.line("try {", &[]);
+            wrapped.indent += 1;
+            wrapped.append(handler_body);
+            wrapped.line("break;", &[]);
+            wrapped.indent -= 1;
+            let retry_name = format!("retry{}", wrapped.sequence);
+            wrapped.sequence += 1;
+            let display = java_type(ty)?;
+            wrapped.line(
+                &format!("}} catch ({display} {retry_name}) {{"),
+                &[(
+                    9,
+                    display.chars().count(),
+                    class_label(ty).context("invalid catch type")?,
+                )],
+            );
+            wrapped.line("}", &[]);
+            wrapped.indent -= 1;
+            wrapped.line("}", &[]);
+            handler_body = wrapped;
+        }
         sequence = handler_body.sequence;
         paths.push((index, handler_body, values, terminal));
         headers.push((
@@ -9293,6 +9423,22 @@ mod tests {
     use super::*;
     use crate::native_dex::{DexCode, DexSymbols};
     use std::sync::Arc;
+    #[test]
+    fn retry_argument_guard_rejects_deferred_expressions_and_compound_literals() {
+        let value = |text: &str| Value {
+            text: text.into(),
+            ty: "Ljava/lang/String;".into(),
+            literal: None,
+            wide_literal: None,
+            raw_bits32: false,
+        };
+        assert!(stable_retry_argument(&value("\"escaped \\\" quote\"")));
+        assert!(stable_retry_argument(&value("v12")));
+        assert!(!stable_retry_argument(&value(
+            "\"prefix\" + effect() + \"suffix\""
+        )));
+        assert!(!stable_retry_argument(&value("this.field")));
+    }
     #[test]
     fn terminal_loop_tail_proof_rejects_cycles_and_reentry() {
         let words = [0x0012, 0x0038, 3, 0xfe28, 0x000e];

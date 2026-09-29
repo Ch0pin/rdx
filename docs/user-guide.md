@@ -51,6 +51,14 @@ bundles must include these license notices alongside the embedded assets.
 
 The **▾ Open views** menu at the right edge of the tab strip lists every open view by full name, including offscreen tabs. Right-click a tab to copy its name, pin/unpin it, bookmark it, or close views. Pins protect tabs from automatic eviction and **Close Others / Close All**; explicit **Close** still works. Pins and bookmarks last for the current session. The 8-view / 64 MiB admission budget remains enforced; unpin or close a view when pinned tabs prevent opening another.
 
+**Find usages** reuses a reference index built in the background for the loaded
+project. Searching a different symbol does not rebuild that index. The results
+window distinguishes **Building reference index** from scanning **candidate
+classes** to locate exact source references. Large indexes use temporary disk
+storage; files are removed when the project is released or RDX closes normally.
+The index is not reused across launches. Unsupported bytecode or unavailable
+temporary storage can still require a conservative scan to preserve results.
+
 Right-click a class name in the code viewer and choose **Find direct subclasses**.
 Results use the Find Usages window layout; click a row to open its class declaration.
 The lookup checks immediate DEX superclass relationships across the loaded project,
@@ -72,6 +80,10 @@ Use the toolbar arrows or **Navigate → Back / Forward** (**Alt+Left / Alt+Righ
 Source tabs show the alpha native engine label. Links are enabled only where native metadata provides a target; unavailable symbol operations remain disabled or report an explicit unsupported operation. Full JADX navigation, usage-analysis, and Java reconstruction parity are still porting work.
 
 The code viewer displays the complete loaded text without a byte or line cutoff. **Copy source** includes the full loaded document. Up to eight tabs are retained against an estimated 64 MiB tab budget; this is not a total application memory ceiling.
+
+To select beyond the visible area, hold the left mouse button and drag toward or
+past the top or bottom edge of the viewer. It scrolls while extending the selection,
+including with word wrap enabled; release the button to stop.
 
 Right-click a project-tree file/class, an open tab, or a viewer and choose **Export…**, then choose a directory. Archive entries export original bytes. Class exports contain the current native representation, including labeled disassembly where Java reconstruction is unavailable. Existing files receive numbered alternatives. Individual exports are limited to 1 GiB.
 

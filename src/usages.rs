@@ -78,7 +78,7 @@ pub fn collect(
     let owners = match engine.usage_index_handle() {
         Some(index) => match index.candidates(&target.id, cancel, |scanned, total| {
             emit(UsageUpdate::Progress(format!(
-                "Indexing references: {scanned}/{total} classes"
+                "Building reference index: {scanned}/{total} classes"
             )));
         }) {
             Some(owners) => owners,
@@ -221,6 +221,11 @@ fn collect_owners(
     mut emit: impl FnMut(UsageUpdate),
 ) -> UsageSummary {
     let noun = mode.noun();
+    let owner_label = if mode == UsageMode::Usages {
+        "candidate classes"
+    } else {
+        "classes"
+    };
     let total = owners.len();
     let (mut scanned, mut count, mut retained) = (0, 0, 0);
     let mut limited = false;
@@ -289,7 +294,7 @@ fn collect_owners(
         }
         scanned += 1;
         emit(UsageUpdate::Progress(format!(
-            "Finding {noun}: {scanned}/{total} classes · {count} results"
+            "Finding {noun}: {scanned}/{total} {owner_label} · {count} results"
         )));
         if count >= 1000 {
             limited |= scanned < total;
@@ -317,7 +322,7 @@ fn collect_owners(
     };
     UsageSummary {
         status: format!(
-            "{state}: {count} {noun} · {scanned}/{total} classes · {:.2} s",
+            "{state}: {count} {noun} · {scanned}/{total} {owner_label} · {:.2} s",
             started.elapsed().as_secs_f64()
         ),
         errors,
@@ -402,6 +407,47 @@ fn hits(mut result: ClassUsages) -> Result<Vec<SearchHit>, String> {
 mod tests {
     use super::*;
     use rdx::engine::{DecompiledCode, DecompilerEngine, UsageOccurrence};
+
+    #[test]
+    fn distinct_symbols_reuse_ready_index_and_report_candidate_scanning() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let mut engine = NativeEngine::start().unwrap();
+        engine.open(&path).unwrap();
+        let code = engine.decompile_with_metadata("sample.Target").unwrap();
+        let cancel = AtomicBool::new(false);
+        let index = engine.usage_index_handle().unwrap();
+        index
+            .candidates("sample.Target", &cancel, |_, _| {})
+            .unwrap();
+        let mut targets = Vec::new();
+        for kind in ["field", "method"] {
+            let definition = code.definitions.iter().find(|d| d.kind == kind).unwrap();
+            let mut progress = Vec::new();
+            // The UI uses a clone per query; it must retain the shared project index.
+            let summary = collect(
+                &mut engine.clone(),
+                "sample.Target",
+                definition.start,
+                &code.source_hash,
+                &cancel,
+                |update| match update {
+                    UsageUpdate::Target(target) => targets.push(target),
+                    UsageUpdate::Progress(status) => progress.push(status),
+                    UsageUpdate::Batch(_) => {}
+                },
+            );
+            assert!(summary.complete, "{} {:?}", summary.status, summary.errors);
+            assert!(summary.status.contains("candidate classes"));
+            assert!(
+                progress
+                    .iter()
+                    .all(|status| !status.contains("Building reference index"))
+            );
+        }
+        assert_eq!(targets.len(), 2);
+        assert_ne!(targets[0], targets[1]);
+    }
 
     #[test]
     fn completed_find_usages_refines_repeat_candidates_and_cancel_does_not_publish() {

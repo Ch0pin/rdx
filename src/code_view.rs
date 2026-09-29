@@ -14,6 +14,44 @@ use syntect::{
     easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet, util::LinesWithEndings,
 };
 
+fn scroll_drag_selection(ui: &egui::Ui, output: &egui::text_edit::TextEditOutput) {
+    // TextEdit updates the selection while dragging, but its cursor-following
+    // scroll requests only cover keyboard edits. Drive the surrounding viewport
+    // while the pointer is held at an edge, including frames with no mouse motion.
+    if !output.response.dragged_by(egui::PointerButton::Primary) {
+        return;
+    }
+    let Some(pointer) = ui.ctx().pointer_interact_pos() else {
+        return;
+    };
+    let visible = output.text_clip_rect.intersect(ui.clip_rect());
+    if !visible.is_positive() {
+        return;
+    }
+    let edge = 24.0_f32.min(visible.height() / 4.0);
+    let distance = if pointer.y < visible.top() + edge {
+        pointer.y - (visible.top() + edge)
+    } else if pointer.y > visible.bottom() - edge {
+        pointer.y - (visible.bottom() - edge)
+    } else {
+        return;
+    };
+    let can_scroll = if distance < 0.0 {
+        output.galley_pos.y < visible.top() - 0.5
+    } else {
+        output.galley_pos.y + output.galley.size().y > visible.bottom() + 0.5
+    };
+    if can_scroll {
+        let dt = ui.input(|input| input.stable_dt).clamp(0.0, 0.05);
+        let delta = -(distance / edge).clamp(-4.0, 4.0) * 360.0 * dt;
+        ui.scroll_with_delta_animation(
+            egui::vec2(0.0, delta),
+            egui::style::ScrollAnimation::none(),
+        );
+        ui.ctx().request_repaint();
+    }
+}
+
 fn exported_component_tint(theme: CodeTheme) -> Color32 {
     if theme.is_light() {
         Color32::from_rgba_unmultiplied(130, 65, 195, 45)
@@ -234,6 +272,8 @@ pub struct CodeDocument {
     last_galley_pos: Option<egui::Pos2>,
     #[cfg(test)]
     last_editor_id: Option<egui::Id>,
+    #[cfg(test)]
+    last_editor_visible_rect: Option<egui::Rect>,
     cache: Option<Cache>,
 }
 impl CodeDocument {
@@ -274,6 +314,8 @@ impl CodeDocument {
             last_galley_pos: None,
             #[cfg(test)]
             last_editor_id: None,
+            #[cfg(test)]
+            last_editor_visible_rect: None,
             cache: None,
         }
     }
@@ -868,6 +910,7 @@ impl CodeDocument {
                             .min_size(egui::vec2(0.0, ui.clip_rect().height()))
                             .layouter(&mut layouter)
                             .show(ui);
+                        scroll_drag_selection(ui, &output);
                         let fold_click = fold_gutter_clicked || output.response.clicked_by(egui::PointerButton::Primary)
                             && output.response.interact_pointer_pos()
                                 .filter(|point| output.text_clip_rect.contains(*point))
@@ -1066,6 +1109,7 @@ impl CodeDocument {
                         {
                             self.last_galley_pos = Some(output.galley_pos);
                             self.last_editor_id = Some(editor_id);
+                            self.last_editor_visible_rect = Some(output.text_clip_rect.intersect(ui.clip_rect()));
                         }
                         if let Some(cursor) = output.state.cursor.char_range() {
                             let position = self.display_to_source(cursor.primary.index).unwrap_or_else(|| self.metadata_fold.as_ref().unwrap().chars.start);
@@ -1372,6 +1416,173 @@ impl CodeDocument {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dragging_selection_scrolls_both_edges_with_stationary_pointer_and_copies_hidden_text() {
+        use super::*;
+        for wrap in [false, true] {
+            for upwards in [false, true] {
+                let source: String = (0..160)
+                    .map(|line| {
+                        format!("line_{line:03} αβ a fairly long line of source text to wrap\n")
+                    })
+                    .collect();
+                let context = egui::Context::default();
+                let mut doc = CodeDocument::new(source.clone(), "java");
+                doc.set_word_wrap(wrap);
+                let mut frame = 0;
+                let mut render = |doc: &mut CodeDocument, events| {
+                    frame += 1;
+                    context.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(340.0, 240.0),
+                            )),
+                            time: Some(frame as f64 / 60.0),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                doc.show(ui, CodeTheme::Ocean, 14.0);
+                            });
+                        },
+                    )
+                };
+                render(&mut doc, vec![]);
+                if upwards {
+                    let target = source[..source.find("line_080").unwrap()].chars().count();
+                    doc.jump_to(target).unwrap();
+                    render(&mut doc, vec![]);
+                    render(&mut doc, vec![]);
+                }
+                let visible = doc.last_editor_visible_rect.unwrap();
+                let start = egui::pos2(visible.left() + 40.0, visible.center().y);
+                let button = |pos, pressed| egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                render(
+                    &mut doc,
+                    vec![egui::Event::PointerMoved(start), button(start, true)],
+                );
+                let id = doc.last_editor_id.unwrap();
+                let selection = || {
+                    egui::text_edit::TextEditState::load(&context, id)
+                        .unwrap()
+                        .cursor
+                        .char_range()
+                        .unwrap()
+                };
+                let anchor = selection().secondary.index;
+                let edge = egui::pos2(
+                    start.x,
+                    if upwards {
+                        visible.top() - 30.0
+                    } else {
+                        visible.bottom() + 30.0
+                    },
+                );
+                let original_y = doc.last_galley_pos.unwrap().y;
+                render(&mut doc, vec![egui::Event::PointerMoved(edge)]);
+                let first_endpoint = selection().primary.index;
+                for _ in 0..45 {
+                    render(&mut doc, vec![]);
+                }
+                let extended = selection();
+                assert_eq!(extended.secondary.index, anchor, "drag anchor changed");
+                if upwards {
+                    assert!(
+                        doc.last_galley_pos.unwrap().y > original_y + 100.0,
+                        "up scroll failed wrap={wrap}"
+                    );
+                    assert!(
+                        extended.primary.index < first_endpoint,
+                        "up selection stopped"
+                    );
+                } else {
+                    assert!(
+                        doc.last_galley_pos.unwrap().y < original_y - 100.0,
+                        "down scroll failed wrap={wrap}"
+                    );
+                    assert!(
+                        extended.primary.index > first_endpoint,
+                        "down selection stopped"
+                    );
+                }
+                render(&mut doc, vec![button(edge, false)]);
+                render(&mut doc, vec![]);
+                let stopped_y = doc.last_galley_pos.unwrap().y;
+                let stopped = selection();
+                for _ in 0..8 {
+                    render(&mut doc, vec![]);
+                }
+                assert_eq!(selection(), stopped, "selection moved after release");
+                assert!(
+                    (doc.last_galley_pos.unwrap().y - stopped_y).abs() < 0.1,
+                    "scroll continued after release"
+                );
+                let copied = render(&mut doc, vec![egui::Event::Copy]);
+                let [start, end] = stopped.sorted();
+                let expected: String = source
+                    .chars()
+                    .skip(start.index)
+                    .take(end.index - start.index)
+                    .collect();
+                assert!(expected.lines().count() > 10);
+                assert!(copied.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(text) if text == &expected)));
+            }
+        }
+    }
+
+    #[test]
+    fn pointer_held_outside_editor_does_not_start_autoscrolling() {
+        use super::*;
+        let context = egui::Context::default();
+        let mut doc = CodeDocument::new("line\n".repeat(120), "java");
+        let mut frame = 0;
+        let mut render = |doc: &mut CodeDocument, events| {
+            frame += 1;
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(340.0, 240.0),
+                    )),
+                    time: Some(frame as f64 / 60.0),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        doc.show(ui, CodeTheme::Ocean, 14.0);
+                    });
+                },
+            )
+        };
+        render(&mut doc, vec![]);
+        let original = doc.last_galley_pos.unwrap();
+        let outside = egui::pos2(2.0, 238.0);
+        render(
+            &mut doc,
+            vec![
+                egui::Event::PointerMoved(outside),
+                egui::Event::PointerButton {
+                    pos: outside,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        for _ in 0..45 {
+            render(&mut doc, vec![]);
+        }
+        assert_eq!(doc.last_galley_pos.unwrap(), original);
+    }
+
     #[test]
     fn kotlin_metadata_row_clicks_and_search_jump_preserve_full_source() {
         use super::*;

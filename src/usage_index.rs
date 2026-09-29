@@ -3,8 +3,12 @@ use crate::{
     native_dex::{DexAnnotation, DexClass, DexValue},
     native_engine::disassembly::{type_name, visit_instruction_symbols},
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fs::{self, File, OpenOptions},
+    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
+    path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -14,22 +18,164 @@ use std::{
 };
 
 const MAX_INDEX_BYTES: usize = 64 * 1024 * 1024;
+const MAX_POSTING_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+const POSTING_DISK_BYTES: u64 = 12;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct Posting {
+    fingerprint: u64,
+    owner: u32,
+}
+
+fn fingerprint(symbol: &str) -> u64 {
+    let digest = Sha256::digest(symbol.as_bytes());
+    u64::from_le_bytes(digest[..8].try_into().unwrap())
+}
+
+struct SpillDir(PathBuf);
+
+impl SpillDir {
+    fn new() -> io::Result<Self> {
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).map_err(|error| io::Error::other(error.to_string()))?;
+        let path = std::env::temp_dir().join(format!(
+            "rdx-usage-{}-{:032x}",
+            std::process::id(),
+            u128::from_le_bytes(nonce)
+        ));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for SpillDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct SpillRun {
+    path: PathBuf,
+    count: usize,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl SpillRun {
+    fn matching(
+        &self,
+        fingerprint: u64,
+        ids: &mut Vec<u32>,
+        cancel: &AtomicBool,
+        owner_count: usize,
+    ) -> io::Result<bool> {
+        let mut file = File::open(&self.path)?;
+        let metadata = file.metadata()?;
+        if metadata.len() != self.count as u64 * POSTING_DISK_BYTES
+            || metadata.modified().ok() != self.modified
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "spill run changed",
+            ));
+        }
+        let mut low = 0usize;
+        let mut high = self.count;
+        let mut record = [0u8; POSTING_DISK_BYTES as usize];
+        while low < high {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            let mid = low + (high - low) / 2;
+            file.seek(SeekFrom::Start(mid as u64 * POSTING_DISK_BYTES))?;
+            file.read_exact(&mut record)?;
+            if u64::from_le_bytes(record[..8].try_into().unwrap()) < fingerprint {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        file.seek(SeekFrom::Start(low as u64 * POSTING_DISK_BYTES))?;
+        while low < self.count {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            file.read_exact(&mut record)?;
+            if u64::from_le_bytes(record[..8].try_into().unwrap()) != fingerprint {
+                break;
+            }
+            let owner = u32::from_le_bytes(record[8..12].try_into().unwrap());
+            if owner as usize >= owner_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid spill owner",
+                ));
+            }
+            ids.push(owner);
+            low += 1;
+        }
+        Ok(true)
+    }
+}
+
+fn spill_postings(
+    postings: &mut Vec<Posting>,
+    directory: &SpillDir,
+    runs: &mut Vec<SpillRun>,
+) -> io::Result<()> {
+    postings.sort_unstable();
+    postings.dedup();
+    let path = directory.0.join(format!("run-{:06}.bin", runs.len()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut writer = BufWriter::new(options.open(&path)?);
+    for posting in postings.iter() {
+        let fingerprint = posting.fingerprint.to_le_bytes();
+        let owner = posting.owner.to_le_bytes();
+        writer.write_all(&fingerprint)?;
+        writer.write_all(&owner)?;
+    }
+    writer.flush()?;
+    drop(writer);
+    runs.push(SpillRun {
+        modified: fs::metadata(&path)?.modified().ok(),
+        path,
+        count: postings.len(),
+    });
+    postings.clear();
+    Ok(())
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct UsageIndexStats {
     pub owners: usize,
     pub indexed_owners: usize,
+    /// Class-symbol associations; repeated symbols in different classes count separately.
     pub symbols: usize,
     pub postings: usize,
     pub uncertain_owners: usize,
     pub estimated_bytes: usize,
     pub fallback: bool,
     pub partial: bool,
+    pub spill_runs: usize,
+    pub spill_bytes: u64,
 }
 
 struct Index {
     names: Vec<String>,
-    postings: HashMap<String, Vec<u32>>,
+    postings: Vec<Posting>,
+    runs: Vec<SpillRun>,
+    _spill_dir: Option<SpillDir>,
     uncertain: Vec<u32>,
     stats: UsageIndexStats,
 }
@@ -177,7 +323,11 @@ impl UsageIndexHandle {
         if target.starts_with(crate::resource_table::PREFIX) {
             return Some(index.names.clone());
         }
-        let mut ids = index.postings.get(target).cloned().unwrap_or_default();
+        let mut ids = match index.matches(target, query_cancel) {
+            Ok(Some(ids)) => ids,
+            Ok(None) => return None,
+            Err(_) => return Some(index.names.clone()),
+        };
         ids.extend_from_slice(&index.uncertain);
         ids.sort_unstable();
         ids.dedup();
@@ -216,14 +366,22 @@ impl UsageIndexHandle {
                 }
             }
         }
-        let mut postings: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut postings: Vec<Posting> = Vec::new();
+        let mut runs = Vec::new();
+        let mut spill_dir: Option<SpillDir> = None;
         let mut uncertain = Vec::new();
-        let mut bytes = names.iter().map(String::capacity).sum::<usize>()
+        let names_bytes = names.iter().map(String::capacity).sum::<usize>()
             + names.capacity() * std::mem::size_of::<String>();
+        let max_records = max_bytes
+            .saturating_sub(names_bytes + names.len() * 4)
+            .min(MAX_POSTING_BUFFER_BYTES)
+            .checked_div(std::mem::size_of::<Posting>())
+            .unwrap_or(0)
+            .max(1);
         let mut posting_count = 0usize;
+        let mut symbol_occurrences = 0usize;
         let mut indexed_owners = 0usize;
-        let mut partial = false;
-        let mut remaining_projection = names.len() + parents.values().map(Vec::len).sum::<usize>();
+        let mut last_progress = std::time::Instant::now();
         for (id, (name, class)) in classes.iter().enumerate() {
             if self.cancel.load(Ordering::Relaxed) {
                 return None;
@@ -239,70 +397,44 @@ impl UsageIndexHandle {
                     .map(|symbol| symbol.len() + 48)
                     .sum::<usize>()
                     <= 8 * 1024 * 1024;
-            let estimated_addition = symbols
-                .iter()
-                .map(|symbol| {
-                    (if postings.contains_key(symbol) {
-                        0
-                    } else {
-                        symbol.len() + 80
-                    }) + owner_ids.len() * 8
-                })
-                .sum::<usize>()
-                + owner_ids.len() * 8;
-            // Reserve space for at least one uncertain owner ID per unfinished class.
-            if bytes
-                .saturating_add(estimated_addition)
-                .saturating_add(remaining_projection * 8)
-                > max_bytes
-            {
-                partial = true;
-                for unfinished in names.iter().skip(id) {
-                    if let Some(&owner) = ids.get(unfinished.as_str()) {
-                        uncertain.push(owner);
-                    }
-                    uncertain.extend(
-                        parents
-                            .get(unfinished.as_str())
-                            .into_iter()
-                            .flatten()
-                            .copied(),
-                    );
-                }
-                break;
-            }
             if !complete {
                 symbols.clear();
-                bytes += owner_ids.len() * std::mem::size_of::<u32>();
                 uncertain.extend_from_slice(&owner_ids);
             }
+            symbol_occurrences += symbols.len();
             for symbol in symbols {
-                let key_cost = if postings.contains_key(&symbol) {
-                    0
-                } else {
-                    symbol.len() + 80
-                };
-                bytes += key_cost;
-                let entry = postings.entry(symbol).or_default();
+                let fingerprint = fingerprint(&symbol);
                 for &owner in &owner_ids {
-                    entry.push(owner);
+                    if postings.len() >= max_records {
+                        if spill_dir.is_none() {
+                            spill_dir = Some(SpillDir::new().ok()?);
+                        }
+                        spill_postings(&mut postings, spill_dir.as_ref()?, &mut runs).ok()?;
+                    }
+                    if postings.len() == postings.capacity() {
+                        postings.reserve_exact(
+                            postings.capacity().max(1).min(max_records - postings.len()),
+                        );
+                    }
+                    postings.push(Posting { fingerprint, owner });
                     posting_count += 1;
-                    bytes += 2 * std::mem::size_of::<u32>();
                 }
             }
             indexed_owners = id + 1;
-            remaining_projection = remaining_projection.saturating_sub(owner_ids.len());
-            let (lock, wake) = &*self.state;
-            if let Ok(mut state) = lock.lock() {
-                state.scanned = id + 1;
-                wake.notify_all();
+            if id + 1 == classes.len()
+                || (id + 1).is_multiple_of(256)
+                    && last_progress.elapsed() >= Duration::from_millis(100)
+            {
+                let (lock, wake) = &*self.state;
+                if let Ok(mut state) = lock.lock() {
+                    state.scanned = id + 1;
+                    wake.notify_all();
+                }
+                last_progress = std::time::Instant::now();
             }
         }
-        for owners in postings.values_mut() {
-            owners.sort_unstable();
-            owners.dedup();
-            owners.shrink_to_fit();
-        }
+        postings.sort_unstable();
+        postings.dedup();
         postings.shrink_to_fit();
         uncertain.sort_unstable();
         uncertain.dedup();
@@ -310,25 +442,32 @@ impl UsageIndexHandle {
         names.shrink_to_fit();
         let bytes = names.iter().map(String::capacity).sum::<usize>()
             + names.capacity() * std::mem::size_of::<String>()
-            + postings.capacity() * 48
-            + postings
-                .iter()
-                .map(|(key, owners)| key.capacity() + owners.capacity() * 4)
-                .sum::<usize>()
-            + uncertain.capacity() * 4;
+            + postings.capacity() * std::mem::size_of::<Posting>()
+            + uncertain.capacity() * 4
+            + runs.capacity() * std::mem::size_of::<SpillRun>()
+            + runs.iter().map(|run| run.path.capacity()).sum::<usize>()
+            + spill_dir.as_ref().map_or(0, |dir| dir.0.capacity());
+        let spill_bytes = runs
+            .iter()
+            .map(|run: &SpillRun| run.count as u64 * POSTING_DISK_BYTES)
+            .sum();
         let stats = UsageIndexStats {
             owners: names.len(),
             indexed_owners,
-            symbols: postings.len(),
+            symbols: symbol_occurrences,
             postings: posting_count,
             uncertain_owners: uncertain.len(),
             estimated_bytes: bytes,
             fallback: false,
-            partial,
+            partial: false,
+            spill_runs: runs.len(),
+            spill_bytes,
         };
         Some(Index {
             names,
             postings,
+            runs,
+            _spill_dir: spill_dir,
             uncertain,
             stats,
         })
@@ -336,6 +475,26 @@ impl UsageIndexHandle {
 }
 
 impl Index {
+    fn matches(&self, target: &str, cancel: &AtomicBool) -> io::Result<Option<Vec<u32>>> {
+        let fingerprint = fingerprint(target);
+        let start = self
+            .postings
+            .partition_point(|posting| posting.fingerprint < fingerprint);
+        let mut ids = Vec::new();
+        for posting in self.postings[start..]
+            .iter()
+            .take_while(|posting| posting.fingerprint == fingerprint)
+        {
+            ids.push(posting.owner);
+        }
+        for run in &self.runs {
+            if !run.matching(fingerprint, &mut ids, cancel, self.names.len())? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(ids))
+    }
+
     fn fallback(names: Vec<String>) -> Self {
         let owners = names.len();
         let estimated_bytes = names.iter().map(String::capacity).sum::<usize>()
@@ -343,7 +502,9 @@ impl Index {
             + owners * std::mem::size_of::<u32>();
         Self {
             names,
-            postings: HashMap::new(),
+            postings: Vec::new(),
+            runs: Vec::new(),
+            _spill_dir: None,
             uncertain: (0..owners as u32).collect(),
             stats: UsageIndexStats {
                 owners,
@@ -848,52 +1009,134 @@ mod tests {
     }
 
     #[test]
-    fn budget_limit_preserves_postings_and_only_unfinished_owners() {
+    fn forced_spill_keeps_all_owners_and_nested_projection() {
         let handle = UsageIndexHandle::start(Arc::new(BTreeMap::new()), Arc::new(BTreeMap::new()));
         let classes = handle_fixture_classes();
         let nested = BTreeMap::from([("b.Root".into(), vec!["c.Child".into()])]);
-        let full = handle
+        let names_bytes = classes.keys().map(String::len).sum::<usize>()
+            + classes.len() * std::mem::size_of::<String>();
+        let index = handle
+            .build_with_limit(&classes, &nested, names_bytes + classes.len() * 4 + 64)
+            .unwrap();
+        assert!(index.stats.spill_runs > 1);
+        assert_eq!(index.stats.indexed_owners, classes.len());
+        assert!(!index.stats.partial);
+        let cancel = AtomicBool::new(false);
+        let in_memory = handle
             .build_with_limit(&classes, &nested, usize::MAX)
             .unwrap();
-        let mut low = 0;
-        let mut high = full.stats.estimated_bytes + 4096;
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let indexed = handle
-                .build_with_limit(&classes, &nested, mid)
-                .unwrap()
-                .stats
-                .indexed_owners;
-            if indexed >= 2 {
-                high = mid;
-            } else {
-                low = mid + 1;
+        for target in [
+            "target.Unrelated",
+            "target.Root",
+            "target.Child",
+            "target.Other",
+        ] {
+            let mut spilled = index.matches(target, &cancel).unwrap().unwrap();
+            let mut memory = in_memory.matches(target, &cancel).unwrap().unwrap();
+            spilled.sort_unstable();
+            spilled.dedup();
+            memory.sort_unstable();
+            memory.dedup();
+            assert_eq!(spilled, memory, "{target}");
+        }
+        let child = index.matches("target.Child", &cancel).unwrap().unwrap();
+        let child_names: Vec<_> = child
+            .iter()
+            .map(|id| index.names[*id as usize].as_str())
+            .collect();
+        assert!(child_names.contains(&"b.Root"));
+        assert!(child_names.contains(&"c.Child"));
+        let other = index.matches("target.Other", &cancel).unwrap().unwrap();
+        assert!(
+            other
+                .iter()
+                .any(|id| index.names[*id as usize] == "z.Other")
+        );
+        cancel.store(true, Ordering::Relaxed);
+        assert!(index.matches("target.Child", &cancel).unwrap().is_none());
+        let spill_path = index._spill_dir.as_ref().unwrap().0.clone();
+        assert!(spill_path.exists());
+        drop(index);
+        assert!(!spill_path.exists());
+    }
+
+    #[test]
+    fn unreadable_spill_falls_back_to_all_owners() {
+        let handle = UsageIndexHandle::start(Arc::new(BTreeMap::new()), Arc::new(BTreeMap::new()));
+        let classes = handle_fixture_classes();
+        let names_bytes = classes.keys().map(String::len).sum::<usize>()
+            + classes.len() * std::mem::size_of::<String>();
+        let index = handle
+            .build_with_limit(
+                &classes,
+                &BTreeMap::new(),
+                names_bytes + classes.len() * 4 + 64,
+            )
+            .unwrap();
+        assert!(!index.runs.is_empty());
+        let run_path = index.runs[0].path.clone();
+        let file = OpenOptions::new().write(true).open(&run_path).unwrap();
+        file.set_len(0).unwrap();
+        assert!(
+            index
+                .matches("target.Child", &AtomicBool::new(false))
+                .is_err()
+        );
+        handle.candidates("unused", &AtomicBool::new(false), |_, _| {});
+        handle.state.0.lock().unwrap().ready = Some(Arc::new(index));
+        let owners = handle
+            .candidates("target.Child", &AtomicBool::new(false), |_, _| {})
+            .unwrap();
+        assert_eq!(owners.len(), classes.len());
+    }
+
+    #[test]
+    fn forced_spill_preserves_rendered_source_links() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.dex");
+        let mut engine = crate::native_engine::NativeDexEngine::default();
+        let project = engine.open(&path).unwrap();
+        let classes = engine.shared_classes();
+        let nested = engine.shared_nested_children();
+        let handle = UsageIndexHandle::start(Arc::new(BTreeMap::new()), Arc::new(BTreeMap::new()));
+        let index = handle.build_with_limit(&classes, &nested, 16).unwrap();
+        assert!(index.stats.spill_runs > 1);
+        let cancel = AtomicBool::new(false);
+        for owner in &project.classes {
+            let code = engine.render(owner).unwrap();
+            for link in &code.links {
+                if code
+                    .definitions
+                    .iter()
+                    .any(|definition| definition.start == link.start && definition.end == link.end)
+                {
+                    continue;
+                }
+                let mut ids = index.matches(&link.label, &cancel).unwrap().unwrap();
+                ids.extend_from_slice(&index.uncertain);
+                assert!(
+                    ids.iter().any(|id| index.names[*id as usize] == *owner),
+                    "missing source link {} in {owner}",
+                    link.label
+                );
             }
         }
-        let partial = handle.build_with_limit(&classes, &nested, low).unwrap();
-        assert!(partial.stats.partial);
-        assert!(!partial.stats.fallback);
-        assert_eq!(partial.stats.indexed_owners, 2);
-        let uncertain: Vec<_> = partial
-            .uncertain
-            .iter()
-            .map(|id| partial.names[*id as usize].as_str())
-            .collect();
-        assert_eq!(uncertain, vec!["b.Root", "c.Child", "z.Other"]);
-        assert!(!uncertain.contains(&"a.Unrelated"));
-        assert!(!partial.postings.is_empty());
     }
 
     fn handle_fixture_classes() -> BTreeMap<String, DexClass> {
         let mut classes = BTreeMap::new();
-        for name in ["a.Unrelated", "b.Root", "c.Child", "z.Other"] {
-            classes.insert(
-                name.to_owned(),
-                crate::native_dex::parse(include_bytes!("../tests/fixtures/hello.dex"))
-                    .unwrap()
-                    .classes
-                    .remove(0),
-            );
+        for (name, target) in [
+            ("a.Unrelated", "Unrelated"),
+            ("b.Root", "Root"),
+            ("c.Child", "Child"),
+            ("z.Other", "Other"),
+        ] {
+            let mut class = crate::native_dex::parse(include_bytes!("../tests/fixtures/hello.dex"))
+                .unwrap()
+                .classes
+                .remove(0);
+            class.superclass = Some(format!("Ltarget/{target};").into());
+            classes.insert(name.to_owned(), class);
         }
         classes
     }

@@ -19,7 +19,7 @@ pub fn method_id(method: &DexMethod) -> String {
         method.return_type
     )
 }
-fn symbol(s: &DexSymbols, kind: char, index: usize) -> Option<String> {
+pub(crate) fn symbol(s: &DexSymbols, kind: char, index: usize) -> Option<String> {
     match kind {
         's' => s.strings.get(index).map(|v| format!("{v:?}")),
         't' => s.types.get(index).map(|v| type_name(v)),
@@ -47,6 +47,47 @@ fn symbol(s: &DexSymbols, kind: char, index: usize) -> Option<String> {
             .map(|(ret, args)| format!("({}){ret}", args.join(""))),
         _ => None,
     }
+}
+/// Symbol links emitted from instruction operands, without constructing source.
+pub(crate) fn visit_instruction_symbols(
+    class: &DexClass,
+    cancelled: &impl Fn() -> bool,
+    mut visit: impl FnMut(String) -> bool,
+) -> bool {
+    for method in &class.methods {
+        let Some(code) = &method.code else { continue };
+        let words = &code.instructions;
+        let mut pc = 0;
+        let mut next_check_pc = 0;
+        while pc < words.len() {
+            if pc >= next_check_pc {
+                if cancelled() {
+                    return false;
+                }
+                next_check_pc = pc.saturating_add(256);
+            }
+            let Some(width) = width(words, pc) else {
+                return false;
+            };
+            let op = words[pc] as u8;
+            let reference = match op {
+                0x1c | 0x1f | 0x20 | 0x22..=0x25 => Some(('t', words[pc + 1] as usize)),
+                0x52..=0x6d => Some(('f', words[pc + 1] as usize)),
+                0x6e..=0x72 | 0x74..=0x78 | 0xfa | 0xfb => Some(('m', words[pc + 1] as usize)),
+                _ => None,
+            };
+            if let Some((kind, index)) = reference {
+                let Some(symbol) = symbol(&class.symbols, kind, index) else {
+                    return false;
+                };
+                if !visit(symbol) {
+                    return false;
+                }
+            }
+            pc += width;
+        }
+    }
+    true
 }
 #[derive(Default)]
 struct Output {

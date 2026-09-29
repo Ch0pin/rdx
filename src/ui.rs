@@ -234,6 +234,7 @@ pub struct App {
     usages: UsagesWindow,
     call_graph: crate::call_graph_window::CallGraphWindow,
     usages_cancel: Option<Arc<AtomicBool>>,
+    usage_index: Option<rdx::usage_index::UsageIndexHandle>,
     usages_id: u64,
     search_cache: Arc<Mutex<search::SearchCache>>,
     search_cancel: Option<Arc<AtomicBool>>,
@@ -345,6 +346,7 @@ impl App {
             usages,
             call_graph: crate::call_graph_window::CallGraphWindow::default(),
             usages_cancel: None,
+            usage_index: None,
             usages_id: 0,
             search_cache: Arc::new(Mutex::new(search::SearchCache::default())),
             search_cancel: None,
@@ -487,6 +489,9 @@ impl App {
         );
     }
     fn stop(&mut self) {
+        if let Some(index) = self.usage_index.take() {
+            index.cancel_project();
+        }
         self.pending_search_metadata.clear();
         self.interactive_requests = Arc::new(Mutex::new(Vec::new()));
         if let Some(cancel) = self.usages_cancel.take() {
@@ -689,13 +694,12 @@ impl App {
         mode: UsageMode,
         ctx: &egui::Context,
     ) {
-        let Some(mut engine) = self.engine.take() else {
+        let Some(mut engine) = self.engine.as_ref().cloned() else {
             self.usages.visible = true;
             self.usages
                 .error("Wait for the current engine operation".into());
             return;
         };
-        self.busy = true;
         match mode {
             UsageMode::Subclasses => self.usages.begin_subclasses(class.clone()),
             UsageMode::Implementations => self.usages.begin_implementations(class.clone()),
@@ -706,6 +710,9 @@ impl App {
         }
         self.status = self.usages.status.clone();
         self.usages_id += 1;
+        if let Some(previous) = self.usages_cancel.take() {
+            previous.store(true, Ordering::Relaxed);
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         self.usages_cancel = Some(cancel.clone());
         let (tx, generation, id, ctx) = (
@@ -1514,6 +1521,7 @@ impl App {
                     self.loading_progress = 1.0;
                     match result {
                         Ok((engine, project)) => {
+                            self.usage_index = engine.usage_index_handle();
                             self.status = format!(
                                 "{} top-level classes · {} archive files · Decompilation engine: RDX Native DEX (alpha)",
                                 project.classes.len(),
@@ -1812,11 +1820,9 @@ impl App {
                         UsageUpdate::Progress(status) => self.usages.status = status,
                     }
                 }
-                Event::UsagesDone(generation, id, engine, summary)
+                Event::UsagesDone(generation, id, _engine, summary)
                     if generation == self.generation && id == self.usages_id =>
                 {
-                    self.busy = false;
-                    self.engine = Some(engine);
                     self.usages_cancel = None;
                     self.usages.finish(summary.status, summary.errors);
                     self.status = self.usages.status.clone();
@@ -3064,6 +3070,7 @@ mod settings_tests {
             usages: UsagesWindow::default(),
             call_graph: crate::call_graph_window::CallGraphWindow::default(),
             usages_cancel: None,
+            usage_index: None,
             usages_id: 0,
             search_cache: Arc::new(Mutex::new(search::SearchCache::default())),
             search_cancel: None,
@@ -3421,6 +3428,40 @@ mod settings_tests {
             position: 10,
         });
         (app, index, fixture)
+    }
+    #[test]
+    fn usages_worker_keeps_interactive_engine_available() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let mut engine = NativeEngine::start().unwrap();
+        engine.open(&fixture).unwrap();
+        let code = engine.decompile_with_metadata("sample.Target").unwrap();
+        let link = code.links.first().expect("fixture reference");
+        let (mut app, ctx) = (navigation_test_app(), egui::Context::default());
+        app.usage_index = engine.usage_index_handle();
+        app.engine = Some(engine);
+        app.find_usages(
+            "sample.Target".into(),
+            link.start,
+            code.source_hash,
+            UsageMode::Usages,
+            &ctx,
+        );
+        assert!(app.engine.is_some());
+        assert!(!app.busy);
+        app.busy = true;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.usages.running && std::time::Instant::now() < deadline {
+            app.events(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!app.usages.running, "usage worker stalled");
+        assert!(app.engine.is_some());
+        assert!(
+            app.busy,
+            "usage completion reset an unrelated engine operation"
+        );
+        app.stop();
     }
     #[test]
     fn forward_restores_evicted_class_and_back_restores_asset_position() {

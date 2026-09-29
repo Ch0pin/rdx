@@ -14,6 +14,7 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::Path,
+    sync::Arc,
 };
 
 const MAX_DEX_BYTES: u64 = 256 * 1024 * 1024;
@@ -36,10 +37,10 @@ fn unsupported<T>(reason: impl Into<String>) -> Result<T> {
     Err(UnsupportedNative(reason.into()).into())
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct NativeDexEngine {
-    classes: BTreeMap<String, DexClass>,
-    nested_children: BTreeMap<String, Vec<String>>,
+    classes: Arc<BTreeMap<String, DexClass>>,
+    nested_children: Arc<BTreeMap<String, Vec<String>>>,
     opened: bool,
 }
 impl NativeDexEngine {
@@ -53,6 +54,12 @@ impl NativeDexEngine {
     }
     pub(crate) fn graph_classes(&self) -> impl Iterator<Item = &DexClass> {
         self.classes.values()
+    }
+    pub(crate) fn shared_classes(&self) -> Arc<BTreeMap<String, DexClass>> {
+        Arc::clone(&self.classes)
+    }
+    pub(crate) fn shared_nested_children(&self) -> Arc<BTreeMap<String, Vec<String>>> {
+        Arc::clone(&self.nested_children)
     }
     pub fn render(&self, name: &str) -> Result<DecompiledCode> {
         let class = self
@@ -204,8 +211,8 @@ fn check_zip_directory(file: &mut File) -> Result<()> {
 impl DecompilerEngine for NativeDexEngine {
     fn open(&mut self, path: &Path) -> Result<Project> {
         // Clear stale state even if the replacement input fails.
-        self.classes.clear();
-        self.nested_children.clear();
+        self.classes = Arc::default();
+        self.nested_children = Arc::default();
         self.opened = false;
         let mut classes = BTreeMap::new();
         let mut resources = Vec::new();
@@ -299,8 +306,8 @@ impl DecompilerEngine for NativeDexEngine {
             classes: classes.keys().cloned().collect(),
             resources,
         };
-        self.nested_children = crate::native_java::anonymous::index(&classes);
-        self.classes = classes;
+        self.nested_children = Arc::new(crate::native_java::anonymous::index(&classes));
+        self.classes = Arc::new(classes);
         self.opened = true;
         Ok(project)
     }
@@ -340,7 +347,9 @@ mod tests {
             class.superclass = Some(format!("L{};", parent.replace('.', "/")).into());
             class.interfaces = vec!["Lsample/Parent;".into()];
             class.access_flags = if interface { 0x601 } else { 1 };
-            engine.classes.insert(name.into(), class);
+            Arc::get_mut(&mut engine.classes)
+                .unwrap()
+                .insert(name.into(), class);
         }
         // Parent need not be defined in the APK; all DEX files share this catalog.
         assert_eq!(

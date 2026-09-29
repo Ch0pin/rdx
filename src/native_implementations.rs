@@ -43,7 +43,7 @@ impl NativeDexEngine {
         let mut reverse: HashMap<&str, Vec<&str>> = HashMap::new();
         let mut by_descriptor = HashMap::new();
         let mut work = 0usize;
-        for (name, class) in &self.classes {
+        for (name, class) in self.classes.iter() {
             ensure!(
                 !cancel.load(Ordering::Relaxed),
                 "Implementation search cancelled"
@@ -291,7 +291,9 @@ mod tests {
                     code: None,
                 })
                 .collect();
-            engine.classes.insert(name.into(), class);
+            Arc::get_mut(&mut engine.classes)
+                .unwrap()
+                .insert(name.into(), class);
         }
         let hierarchy = Arc::new(
             crate::native_hierarchy::TypeHierarchy::from_classes(engine.classes.values()).unwrap(),

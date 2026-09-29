@@ -23,6 +23,7 @@ pub mod native_method;
 pub mod resource_table;
 
 pub mod native_xrefs;
+pub mod usage_index;
 
 pub mod frida_snippet;
 pub mod mcp;

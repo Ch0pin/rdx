@@ -46,6 +46,7 @@ pub enum UsageUpdate {
 pub struct UsageSummary {
     pub status: String,
     pub errors: Vec<String>,
+    pub complete: bool,
 }
 
 pub fn collect(
@@ -69,18 +70,43 @@ pub fn collect(
             return UsageSummary {
                 status: "Find usages failed".into(),
                 errors: vec![format!("{error:#}")],
+                ..Default::default()
             };
         }
     };
     emit(UsageUpdate::Target(target.label));
-    collect_owners(
+    let owners = match engine.usage_index_handle() {
+        Some(index) => match index.candidates(&target.id, cancel, |scanned, total| {
+            emit(UsageUpdate::Progress(format!(
+                "Indexing references: {scanned}/{total} classes"
+            )));
+        }) {
+            Some(owners) => owners,
+            None => {
+                return UsageSummary {
+                    status: "Cancelled while indexing references".into(),
+                    ..Default::default()
+                };
+            }
+        },
+        None => target.classes,
+    };
+    let mut matched = Vec::new();
+    let summary = collect_owners(
         UsageMode::Usages,
-        target.classes,
+        owners,
         cancel,
         started,
         |owner| engine.usages_in_class(&target.id, owner),
+        Some(&mut matched),
         emit,
-    )
+    );
+    if summary.complete
+        && let Some(index) = engine.usage_index_handle()
+    {
+        index.record_completed(&target.id, matched);
+    }
+    summary
 }
 
 pub fn collect_subclasses(
@@ -96,6 +122,7 @@ pub fn collect_subclasses(
         return UsageSummary {
             status: "Subclass search cancelled".into(),
             errors: vec![],
+            ..Default::default()
         };
     }
     let (target, children) = match engine.direct_subclasses_at(class, offset, hash) {
@@ -104,6 +131,7 @@ pub fn collect_subclasses(
             return UsageSummary {
                 status: "Find direct subclasses failed".into(),
                 errors: vec![format!("{error:#}")],
+                ..Default::default()
             };
         }
     };
@@ -114,6 +142,7 @@ pub fn collect_subclasses(
         cancel,
         started,
         |child| engine.class_declaration_result(child),
+        None,
         emit,
     )
 }
@@ -133,6 +162,7 @@ pub fn collect_implementations(
             return UsageSummary {
                 status: "Find implementations stopped".into(),
                 errors: vec![format!("{error:#}")],
+                ..Default::default()
             };
         }
     };
@@ -143,6 +173,7 @@ pub fn collect_implementations(
         cancel,
         started,
         |symbol| engine.implementation_result(symbol),
+        None,
         emit,
     )
 }
@@ -164,6 +195,7 @@ pub fn collect_method_xrefs(
             return UsageSummary {
                 status: "Method references unavailable".into(),
                 errors: vec![format!("{error:#}")],
+                ..Default::default()
             };
         }
     };
@@ -174,6 +206,7 @@ pub fn collect_method_xrefs(
         cancel,
         started,
         |owner| engine.method_xrefs_in_class(&target.id, owner, callers, cancel),
+        None,
         emit,
     )
 }
@@ -184,6 +217,7 @@ fn collect_owners(
     cancel: &AtomicBool,
     started: Instant,
     mut fetch: impl FnMut(&str) -> anyhow::Result<ClassUsages>,
+    mut matched: Option<&mut Vec<String>>,
     mut emit: impl FnMut(UsageUpdate),
 ) -> UsageSummary {
     let noun = mode.noun();
@@ -234,6 +268,9 @@ fn collect_owners(
                         }
                         count += batch.len();
                         if !batch.is_empty() {
+                            if let Some(owners) = matched.as_deref_mut() {
+                                owners.push(owner.clone());
+                            }
                             emit(UsageUpdate::Batch(batch));
                         }
                     }
@@ -259,6 +296,8 @@ fn collect_owners(
             break;
         }
     }
+    let complete =
+        !cancel.load(Ordering::Relaxed) && !limited && errors.is_empty() && scanned == total;
     let state = if cancel.load(Ordering::Relaxed) {
         "Cancelled — partial results"
     } else if limited || !errors.is_empty() {
@@ -282,6 +321,7 @@ fn collect_owners(
             started.elapsed().as_secs_f64()
         ),
         errors,
+        complete,
     }
 }
 
@@ -361,7 +401,86 @@ fn hits(mut result: ClassUsages) -> Result<Vec<SearchHit>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rdx::engine::{DecompiledCode, UsageOccurrence};
+    use rdx::engine::{DecompiledCode, DecompilerEngine, UsageOccurrence};
+
+    #[test]
+    fn completed_find_usages_refines_repeat_candidates_and_cancel_does_not_publish() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let mut engine = NativeEngine::start().unwrap();
+        engine.open(&path).unwrap();
+        let code = engine.decompile_with_metadata("sample.Target").unwrap();
+        let offset = code
+            .definitions
+            .iter()
+            .find(|definition| definition.kind == "class")
+            .unwrap()
+            .start;
+        let index = engine.usage_index_handle().unwrap();
+        let cancel = AtomicBool::new(false);
+        let before = index
+            .candidates("sample.Target", &cancel, |_, _| {})
+            .unwrap();
+        let mut first = Vec::new();
+        let summary = collect(
+            &mut engine,
+            "sample.Target",
+            offset,
+            &code.source_hash,
+            &cancel,
+            |update| {
+                if let UsageUpdate::Batch(hits) = update {
+                    first.extend(hits.into_iter().map(|hit| hit.document.name.clone()));
+                }
+            },
+        );
+        assert!(summary.complete, "{}: {:?}", summary.status, summary.errors);
+        first.sort();
+        first.dedup();
+        let after = index
+            .candidates("sample.Target", &cancel, |_, _| {})
+            .unwrap();
+        assert_eq!(after, first);
+        assert!(after.len() <= before.len());
+        let mut second = Vec::new();
+        let repeat = collect(
+            &mut engine,
+            "sample.Target",
+            offset,
+            &code.source_hash,
+            &cancel,
+            |update| {
+                if let UsageUpdate::Batch(hits) = update {
+                    second.extend(hits.into_iter().map(|hit| hit.document.name.clone()));
+                }
+            },
+        );
+        assert!(repeat.complete);
+        second.sort();
+        second.dedup();
+        assert_eq!(second, first);
+
+        let mut another = NativeEngine::start().unwrap();
+        another.open(&path).unwrap();
+        let another_index = another.usage_index_handle().unwrap();
+        let original = another_index
+            .candidates("sample.Target", &cancel, |_, _| {})
+            .unwrap();
+        let cancelled = AtomicBool::new(true);
+        let stopped = collect(
+            &mut another,
+            "sample.Target",
+            offset,
+            &code.source_hash,
+            &cancelled,
+            |_| {},
+        );
+        assert!(!stopped.complete);
+        assert_eq!(
+            another_index.candidates("sample.Target", &cancel, |_, _| {}),
+            Some(original)
+        );
+    }
 
     fn source_result(owner: &str, bytes: usize, matched: bool) -> ClassUsages {
         ClassUsages {
@@ -401,6 +520,7 @@ mod tests {
                     owner == "40",
                 ))
             },
+            None,
             |update| {
                 if let UsageUpdate::Batch(batch) = update {
                     hits.extend(batch);
@@ -428,6 +548,7 @@ mod tests {
             &AtomicBool::new(false),
             Instant::now(),
             |owner| Ok(source_result(owner, 17 * 1024 * 1024, true)),
+            None,
             |update| {
                 if matches!(update, UsageUpdate::Batch(_)) {
                     batches += 1;
@@ -462,6 +583,7 @@ mod tests {
                 cancel.store(true, Ordering::Relaxed);
                 Ok(source_result(owner, 1, false))
             },
+            None,
             |_| {},
         );
         assert_eq!(fetched, 1);

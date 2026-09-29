@@ -111,13 +111,14 @@ pub trait DecompilerEngine: Send {
 }
 
 /// Native-only application boundary. No subprocess, JVM or fallback engine.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct NativeEngine {
     native: NativeDexEngine,
     input: Option<PathBuf>,
-    classes: Vec<String>,
-    resources: crate::resource_table::ResourceTable,
+    classes: std::sync::Arc<Vec<String>>,
+    resources: std::sync::Arc<crate::resource_table::ResourceTable>,
     resource_error: Option<String>,
+    usage_index: Option<crate::usage_index::UsageIndexHandle>,
 }
 
 /// A deterministic identity for locally generated source, not a security digest.
@@ -128,6 +129,22 @@ pub fn source_identity(source: &str) -> String {
 }
 
 impl NativeEngine {
+    pub fn usage_index_handle(&self) -> Option<crate::usage_index::UsageIndexHandle> {
+        self.usage_index.clone()
+    }
+    pub fn usage_index_stats(&self) -> Option<crate::usage_index::UsageIndexStats> {
+        self.usage_index.as_ref()?.stats()
+    }
+    pub fn usage_index_candidates(
+        &self,
+        target: &str,
+        query_cancel: &std::sync::atomic::AtomicBool,
+        progress: impl FnMut(usize, usize),
+    ) -> Option<Vec<String>> {
+        self.usage_index
+            .as_ref()?
+            .candidates(target, query_cancel, progress)
+    }
     pub fn dex_class(&self, name: &str) -> Option<&crate::native_dex::DexClass> {
         self.native.class(name)
     }
@@ -410,7 +427,7 @@ impl NativeEngine {
             id: symbol.clone(),
             label: symbol,
             kind: kind.into(),
-            classes: self.classes.clone(),
+            classes: self.classes.as_ref().clone(),
         })
     }
     pub fn usages_in_class(&mut self, target: &str, class: &str) -> Result<ClassUsages> {
@@ -735,9 +752,12 @@ impl NativeEngine {
 impl DecompilerEngine for NativeEngine {
     fn open(&mut self, path: &Path) -> Result<Project> {
         self.input = None;
-        self.classes.clear();
+        self.classes = Default::default();
         self.resources = Default::default();
         self.resource_error = None;
+        if let Some(index) = self.usage_index.take() {
+            index.cancel_project();
+        }
         let path = path.canonicalize()?;
         let project = self.native.open(&path)?;
         if project
@@ -761,14 +781,18 @@ impl DecompilerEngine for NativeEngine {
                 crate::resource_table::ResourceTable::parse(&bytes)
             })();
             match loaded {
-                Ok(resources) => self.resources = resources,
+                Ok(resources) => self.resources = std::sync::Arc::new(resources),
                 Err(error) => {
                     self.resource_error = Some(format!("Resource names unavailable: {error:#}"))
                 }
             }
         }
         self.input = Some(path);
-        self.classes = project.classes.clone();
+        self.usage_index = Some(crate::usage_index::UsageIndexHandle::start(
+            self.native.shared_classes(),
+            self.native.shared_nested_children(),
+        ));
+        self.classes = std::sync::Arc::new(project.classes.clone());
         Ok(project)
     }
     fn decompile(&mut self, class: &str) -> Result<String> {

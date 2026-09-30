@@ -222,6 +222,9 @@ struct Cache {
     theme: CodeTheme,
     size: f32,
     pixels_per_point: f32,
+    // Glyph meshes refer to coordinates in this specific atlas. A replacement
+    // atlas invalidates them even when font size and display scale are unchanged.
+    font_atlas: std::sync::Weak<egui::epaint::mutex::Mutex<egui::epaint::TextureAtlas>>,
     galley: Arc<egui::Galley>,
     retained_bytes: usize,
     wrap_width: f32,
@@ -767,10 +770,12 @@ impl CodeDocument {
             f32::INFINITY
         };
         let pixels_per_point = ui.ctx().pixels_per_point();
+        let font_atlas = ui.fonts(|fonts| Arc::downgrade(&fonts.texture_atlas()));
         if self.cache.as_ref().is_none_or(|cache| {
             cache.theme != theme
                 || cache.size != size
                 || cache.pixels_per_point != pixels_per_point
+                || !cache.font_atlas.ptr_eq(&font_atlas)
                 || cache.wrap_width != wrap_width
         }) {
             let mut job = self.job(theme, size);
@@ -793,6 +798,7 @@ impl CodeDocument {
                 theme,
                 size,
                 pixels_per_point,
+                font_atlas,
                 galley,
                 retained_bytes,
                 wrap_width,
@@ -1416,6 +1422,53 @@ impl CodeDocument {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cached_glyphs_follow_replaced_font_atlas_at_unchanged_scale() {
+        use super::*;
+        let context = egui::Context::default();
+        let source = "class Demo { String name = \"café\"; }\n";
+        let mut doc = CodeDocument::new(source.into(), "java");
+        let render = |doc: &mut CodeDocument, max_texture_side| {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 480.0),
+                    )),
+                    max_texture_side: Some(max_texture_side),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        doc.show(ui, CodeTheme::Ocean, 12.0);
+                    });
+                },
+            );
+        };
+        render(&mut doc, 2048);
+        let old_galley = doc.cache.as_ref().unwrap().galley.clone();
+        let old_atlas = doc.cache.as_ref().unwrap().font_atlas.clone();
+        let old_scale = doc.cache.as_ref().unwrap().pixels_per_point;
+        render(&mut doc, 2048);
+        assert!(Arc::ptr_eq(
+            &old_galley,
+            &doc.cache.as_ref().unwrap().galley
+        ));
+
+        // egui replaces its atlas when the backend's texture limit changes.
+        // Theme, point size, scale, content and wrapping remain identical.
+        render(&mut doc, 4096);
+        let cache = doc.cache.as_ref().unwrap();
+        let current_atlas = context.fonts(|fonts| Arc::downgrade(&fonts.texture_atlas()));
+        assert!(!old_atlas.ptr_eq(&current_atlas));
+        assert!(cache.font_atlas.ptr_eq(&current_atlas));
+        assert_eq!(cache.pixels_per_point, old_scale);
+        assert!(!Arc::ptr_eq(&old_galley, &cache.galley));
+        let fresh = context.fonts(|fonts| fonts.layout_job((*cache.galley.job).clone()));
+        assert!(Arc::ptr_eq(&fresh, &cache.galley));
+        assert_eq!(cache.galley.job.text, source);
+    }
+
     #[test]
     fn dragging_selection_scrolls_both_edges_with_stationary_pointer_and_copies_hidden_text() {
         use super::*;

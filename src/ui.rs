@@ -225,6 +225,7 @@ impl Tab {
 }
 
 pub struct App {
+    render_recovery: crate::render_recovery::RenderRecovery,
     toolbar_icon: Option<egui::TextureHandle>,
     mcp_server: Option<rdx::mcp::Server>,
     show_mcp: bool,
@@ -337,6 +338,7 @@ impl App {
         crate::ui_style::install(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
         Self {
+            render_recovery: Default::default(),
             toolbar_icon: None,
             mcp_server: None,
             show_mcp: false,
@@ -2175,6 +2177,7 @@ fn plain_menu_bar(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.render_recovery.update(ctx);
         self.events(ctx);
         if self.mcp_auto_start && self.project.is_some() && !self.loading_project {
             self.mcp_auto_start = false;
@@ -3061,6 +3064,7 @@ mod settings_tests {
     fn navigation_test_app() -> App {
         let (tx, rx) = mpsc::channel();
         App {
+            render_recovery: Default::default(),
             toolbar_icon: None,
             mcp_server: None,
             show_mcp: false,

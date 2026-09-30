@@ -5,6 +5,7 @@ mod icons;
 mod manifest_links;
 mod native_coverage;
 mod navigation;
+mod render_recovery;
 mod search;
 mod search_benchmark;
 mod search_index;

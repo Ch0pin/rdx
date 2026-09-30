@@ -56,6 +56,35 @@ pub(crate) fn write_stream(
     mut reader: impl Read,
     expected_size: u64,
 ) -> Result<PathBuf> {
+    write_with(directory, name, expected_size, |file| {
+        let mut buffer = [0; 64 * 1024];
+        let mut total = 0u64;
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .context("Cannot read export contents")?;
+            if count == 0 {
+                break;
+            }
+            total += count as u64;
+            ensure!(
+                total <= MAX_EXPORT_BYTES && total <= expected_size,
+                "Export contents exceed expected size or 1 GiB limit"
+            );
+            file.write_all(&buffer[..count])
+                .context("Cannot write export contents")?;
+        }
+        Ok(total)
+    })
+}
+
+/// Create a collision-safe export, verify its length, and remove partial output on failure.
+pub(crate) fn write_with(
+    directory: &Path,
+    name: &str,
+    expected_size: u64,
+    write: impl FnOnce(&mut fs::File) -> Result<u64>,
+) -> Result<PathBuf> {
     ensure!(
         expected_size <= MAX_EXPORT_BYTES,
         "Export exceeds the 1 GiB per-file limit"
@@ -92,23 +121,11 @@ pub(crate) fn write_stream(
         bail!("Too many files with this export name");
     };
     let result = (|| -> Result<()> {
-        let mut buffer = [0; 64 * 1024];
-        let mut total = 0u64;
-        loop {
-            let count = reader
-                .read(&mut buffer)
-                .context("Cannot read export contents")?;
-            if count == 0 {
-                break;
-            }
-            total += count as u64;
-            ensure!(
-                total <= MAX_EXPORT_BYTES && total <= expected_size,
-                "Export contents exceed expected size or 1 GiB limit"
-            );
-            file.write_all(&buffer[..count])
-                .context("Cannot write export contents")?;
-        }
+        let total = write(&mut file)?;
+        ensure!(
+            total <= MAX_EXPORT_BYTES,
+            "Export exceeds the 1 GiB per-file limit"
+        );
         ensure!(
             total == expected_size,
             "Export contents have an unexpected size"

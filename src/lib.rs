@@ -19,6 +19,7 @@ pub mod plugin;
 pub mod transport;
 
 pub mod native_method;
+pub mod package_container;
 
 pub mod resource_table;
 

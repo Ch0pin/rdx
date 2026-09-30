@@ -1,6 +1,6 @@
 # RDX user guide
 
-A native Rust desktop application for APK/DEX inspection. The GUI and CLI both use the RDX Native DEX engine. There is no Java worker, JVM dependency, or Java fallback.
+A native Rust desktop application for APK, XAPK, APKS, and DEX inspection. The GUI and CLI both use the RDX Native DEX engine. There is no Java worker, JVM dependency, or Java fallback.
 
 RDX is alpha software. Unsupported methods remain explicitly labelled DEX disassembly. See [native engine scope](native-engine.md) for reconstruction details.
 
@@ -32,11 +32,17 @@ cargo run --release -- --engine native --decompile tests/fixtures/hello.dex samp
 cargo run --release -- --native-coverage tests/fixtures/hello.apk
 ```
 
+## Package formats
+
+Open APK, XAPK, APKS, or DEX files through the GUI, drag and drop, or the CLI. AAB files are not supported. Java is not required. For XAPK and APKS, RDX keeps the base APK and split files under separate paths in the project tree. It requires one base APK and matching package/version identities across selected splits.
+
+For bundletool APKS with `toc.pb`, RDX chooses the highest numbered persistent variant and validates its APK set. APKS exports without `toc.pb` are also supported when they contain one validated base and matching splits. RDX displays an analysis union, including configuration splits; it does not select a device profile or claim that all splits are installed together. XAPK selection validates the manifests inside its APKs; an outer manifest is optional. Preparing either format writes selected inner APKs to temporary disk files, bounded to 2 GiB per APK and 4 GiB total, and releases them with the project. Previews and exports read the selected members on demand.
+
 The default engine is native. `--engine jadx` and `--engine auto` are no longer accepted. Java heap settings and Java runtime environment variables no longer affect RDX. Old saved appearance/search settings remain readable; obsolete heap preferences are ignored.
 
 ## Interface
 
-The desktop has project navigation on the left, source and asset tabs in the center, and status/error information below. **File → Open APK / DEX** opens a project; **File → Reload** refreshes it. Cmd+O / Ctrl+O and drag-and-drop are supported. The project tree groups classes, manifest, assets, resources, libraries, DEX bytecode, signatures/metadata, and other files.
+The desktop has project navigation on the left, source and asset tabs in the center, and status/error information below. **File → Open…** opens a project; **File → Reload** refreshes it. Cmd+O / Ctrl+O and drag-and-drop are supported. The project tree groups classes, manifest, assets, resources, libraries, DEX bytecode, signatures/metadata, split APKs, and container files.
 
 **View → Settings** contains interface theme (System, Light, Dark), code theme (Atom One Light, Quiet Light, Solarized light; Ocean, Eighties, Solarized dark, One Dark, Dracula), and font size (10–28 px). Code themes are grouped into Light and Dark; all palettes are bundled for offline use. Changes save automatically across sessions. Settings live at `~/Library/Application Support/rdx/settings.json` on macOS, `%APPDATA%/rdx/settings.json` on Windows, or `$XDG_CONFIG_HOME/rdx/settings.json` (default `~/.config/rdx/settings.json`) on Linux.
 
@@ -99,7 +105,7 @@ It describes the exported flag, independently of enabled state or permissions.
 
 Compiled Android XML, including the manifest, is detected by its binary header and decoded in native Rust directly from the archive. Previews work while class loading is running or if it fails. The native `resources.arsc` index resolves numeric IDs in Java views: the original number stays visible with its resource name and default-value preview. Hover shows the package, configuration and variant count; double-click (or **Go to declaration**) opens all values. Layout/XML paths in that view open decoded files, whose compiled resource references link onward. Back/Forward works across these views. Dense, sparse, 16-bit-offset and compact table entries are supported. Locale/configuration variants are preserved; the viewer does not guess a device-specific selection. Names are shown exactly as stored in the APK, including obfuscated names. IDs absent from the APK, including unavailable framework/split resources, remain numeric. A malformed or unsupported table reports a diagnostic and leaves code navigation available. Other binary data is accessible through hexadecimal previews and original-byte export. Unsupported decoding reports a clear error while preserving the raw preview.
 
-Asset decompression is limited to 8 MiB per preview. Larger entries show their first 4 KiB as hexadecimal. Text retains at most 2 MiB with a truncation notice. Images are limited to 4096 × 4096 pixels and a 64 MiB decoder allocation budget. Archive browsing does not extract files.
+Asset decompression is limited to 8 MiB per preview. Larger entries show their first 4 KiB as hexadecimal. Text retains at most 2 MiB with a truncation notice. Images are limited to 4096 × 4096 pixels and a 64 MiB decoder allocation budget. Previewing a member does not extract it; XAPK/APKS preparation uses bounded temporary files for the selected inner APKs.
 
 ## Search
 

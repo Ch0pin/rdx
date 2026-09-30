@@ -4,7 +4,6 @@ use serde::Deserialize;
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
-    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -115,6 +114,7 @@ pub trait DecompilerEngine: Send {
 pub struct NativeEngine {
     native: NativeDexEngine,
     input: Option<PathBuf>,
+    prepared: Option<std::sync::Arc<crate::package_container::PackageContainer>>,
     classes: std::sync::Arc<Vec<String>>,
     resources: std::sync::Arc<crate::resource_table::ResourceTable>,
     resource_error: Option<String>,
@@ -129,6 +129,98 @@ pub fn source_identity(source: &str) -> String {
 }
 
 impl NativeEngine {
+    pub fn open_prepared(
+        &mut self,
+        container: std::sync::Arc<crate::package_container::PackageContainer>,
+    ) -> Result<Project> {
+        let path = container.source_path().to_path_buf();
+        self.open_internal(&path, Some(container))
+    }
+    fn open_internal(
+        &mut self,
+        path: &Path,
+        supplied: Option<std::sync::Arc<crate::package_container::PackageContainer>>,
+    ) -> Result<Project> {
+        self.input = None;
+        self.prepared = None;
+        self.native = NativeDexEngine::default();
+        self.classes = Default::default();
+        self.resources = Default::default();
+        self.resource_error = None;
+        if let Some(index) = self.usage_index.take() {
+            index.cancel_project();
+        }
+        let path = path.canonicalize()?;
+        let prepared = match supplied {
+            Some(container) => Some(container),
+            None if path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("dex")) =>
+            {
+                None
+            }
+            None => Some(crate::package_container::PackageContainer::open(&path)?),
+        };
+        let project = if let Some(container) = &prepared {
+            self.native.open_prepared(container.clone())?
+        } else {
+            self.native.open(&path)?
+        };
+        if let Some(container) = &prepared {
+            let mut merged = crate::resource_table::ResourceTable::default();
+            let mut total_bytes = 0u64;
+            for entry in container
+                .entries()
+                .iter()
+                .filter(|entry| entry.is_apk_member && entry.member_path == "resources.arsc")
+            {
+                let loaded = (|| -> Result<()> {
+                    total_bytes = total_bytes
+                        .checked_add(entry.size)
+                        .context("Resource table size overflow")?;
+                    ensure!(
+                        total_bytes <= 256 * 1024 * 1024,
+                        "Combined resource tables exceed 256 MiB"
+                    );
+                    let bytes = container.read_member(entry.index, 64 * 1024 * 1024)?;
+                    let table = crate::resource_table::ResourceTable::parse(&bytes)?;
+                    let prefix = entry.path.strip_suffix("resources.arsc").unwrap_or("");
+                    merged.merge_split(table, prefix)?;
+                    Ok(())
+                })();
+                if let Err(error) = loaded {
+                    let warning =
+                        format!("Resource names unavailable for {}: {error:#}", entry.path);
+                    if let Some(existing) = &mut self.resource_error {
+                        if existing.len() < 4096 {
+                            existing.push_str("; ");
+                            existing.push_str(&warning);
+                        }
+                    } else {
+                        self.resource_error = Some(warning);
+                    }
+                    if total_bytes > 256 * 1024 * 1024 {
+                        break;
+                    }
+                }
+            }
+            self.resources = std::sync::Arc::new(merged);
+        }
+        self.input = Some(path);
+        self.prepared = prepared;
+        self.usage_index = Some(crate::usage_index::UsageIndexHandle::start(
+            self.native.shared_classes(),
+            self.native.shared_nested_children(),
+        ));
+        self.classes = std::sync::Arc::new(project.classes.clone());
+        Ok(project)
+    }
+    pub fn prepared_container(
+        &self,
+    ) -> Option<std::sync::Arc<crate::package_container::PackageContainer>> {
+        self.prepared.clone()
+    }
     pub fn usage_index_handle(&self) -> Option<crate::usage_index::UsageIndexHandle> {
         self.usage_index.clone()
     }
@@ -153,20 +245,10 @@ impl NativeEngine {
         self.native.direct_subclasses(name)
     }
     fn resource_bytes(&self, name: &str) -> Result<Vec<u8>> {
-        let path = self.input.as_ref().context("Open an APK first")?;
-        let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
-        let entry = zip.by_name(name)?;
-        ensure!(
-            entry.size() <= 2 * 1024 * 1024,
-            "Resource exceeds 2 MiB decoding limit"
-        );
-        let mut bytes = Vec::new();
-        entry.take(2 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() <= 2 * 1024 * 1024,
-            "Resource exceeds decoding limit"
-        );
-        Ok(bytes)
+        self.prepared
+            .as_ref()
+            .context("Open an APK first")?
+            .read_path(name, 2 * 1024 * 1024)
     }
     pub fn resource_error(&self) -> Option<&str> {
         self.resource_error.as_deref()
@@ -751,49 +833,7 @@ impl NativeEngine {
 }
 impl DecompilerEngine for NativeEngine {
     fn open(&mut self, path: &Path) -> Result<Project> {
-        self.input = None;
-        self.classes = Default::default();
-        self.resources = Default::default();
-        self.resource_error = None;
-        if let Some(index) = self.usage_index.take() {
-            index.cancel_project();
-        }
-        let path = path.canonicalize()?;
-        let project = self.native.open(&path)?;
-        if project
-            .resources
-            .iter()
-            .any(|name| name == "resources.arsc")
-        {
-            let loaded = (|| -> Result<crate::resource_table::ResourceTable> {
-                let mut zip = zip::ZipArchive::new(std::fs::File::open(&path)?)?;
-                let entry = match zip.by_name("resources.arsc") {
-                    Ok(entry) => entry,
-                    Err(zip::result::ZipError::FileNotFound) => return Ok(Default::default()),
-                    Err(error) => return Err(error.into()),
-                };
-                ensure!(
-                    entry.size() <= 64 * 1024 * 1024,
-                    "Resource table exceeds 64 MiB"
-                );
-                let mut bytes = Vec::new();
-                entry.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-                crate::resource_table::ResourceTable::parse(&bytes)
-            })();
-            match loaded {
-                Ok(resources) => self.resources = std::sync::Arc::new(resources),
-                Err(error) => {
-                    self.resource_error = Some(format!("Resource names unavailable: {error:#}"))
-                }
-            }
-        }
-        self.input = Some(path);
-        self.usage_index = Some(crate::usage_index::UsageIndexHandle::start(
-            self.native.shared_classes(),
-            self.native.shared_nested_children(),
-        ));
-        self.classes = std::sync::Arc::new(project.classes.clone());
-        Ok(project)
+        self.open_internal(path, None)
     }
     fn decompile(&mut self, class: &str) -> Result<String> {
         Ok(self.decompile_with_metadata(class)?.source)

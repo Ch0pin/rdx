@@ -77,6 +77,7 @@ pub struct Status {
     pub state: String,
     pub project_id: String,
     pub apk_sha256: String,
+    pub package_selection: String,
     pub requests: u64,
     pub active: String,
     pub last_error: String,
@@ -140,6 +141,11 @@ impl Server {
                             s.state = "Running".into();
                             s.project_id = data.4.clone();
                             s.apk_sha256 = data.3.clone();
+                            s.package_selection = data
+                                .0
+                                .prepared_container()
+                                .and_then(|source| source.selection_summary().map(str::to_owned))
+                                .unwrap_or_default();
                             loaded = Some(data);
                         }
                         Err(e) => {
@@ -176,7 +182,7 @@ impl Server {
                     if name == "get_instance_info" {
                         let s = shared.lock().unwrap();
                         return Ok(
-                            json!({"instance_id":entry.instance_id,"project_id":s.project_id,"state":s.state,"apk_path":path,"apk_sha256":s.apk_sha256,"error":s.last_error}),
+                            json!({"instance_id":entry.instance_id,"project_id":s.project_id,"state":s.state,"apk_path":path,"apk_sha256":s.apk_sha256,"package_selection":s.package_selection,"error":s.last_error}),
                         );
                     }
                     let (engine, project, path, hash, project_id, metadata) =
@@ -206,7 +212,7 @@ impl Server {
                         "CANCELLED"
                     );
                     Ok(
-                        json!({"identity":{"instance_id":entry.instance_id,"project_id":project_id,"apk_path":path,"apk_sha256":hash},"data":data}),
+                        json!({"identity":{"instance_id":entry.instance_id,"project_id":project_id,"apk_path":path,"apk_sha256":hash,"package_selection":engine.prepared_container().and_then(|source| source.selection_summary().map(str::to_owned))},"data":data}),
                     )
                 })();
                 {
@@ -425,7 +431,7 @@ fn tools_list() -> Value {
         ),
         (
             "open_apk",
-            "Open a local APK in a new RDX GUI instance with MCP enabled.",
+            "Open a local APK, XAPK, or APKS in a new RDX GUI instance with MCP enabled.",
             vec!["path", "request_key"],
             false,
         ),
@@ -479,7 +485,7 @@ fn tools_list() -> Value {
         ),
         (
             "get_all_resource_file_names",
-            "List APK resource paths.",
+            "List Android package resource paths, including selected split paths.",
             vec![],
             true,
         ),
@@ -572,14 +578,19 @@ fn gateway_call(
         let path = PathBuf::from(required(args, "path")?).canonicalize()?;
         ensure!(
             path.is_file()
-                && path
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("apk")),
-            "Expected a local APK file"
+                && path.extension().is_some_and(|e| {
+                    ["apk", "xapk", "apks"]
+                        .iter()
+                        .any(|format| e.eq_ignore_ascii_case(format))
+                }),
+            "Expected a local APK, XAPK, or APKS file"
         );
         let key = required(args, "request_key")?;
         if let Some((existing, id)) = opened.get(key) {
-            ensure!(existing == &path, "request_key belongs to a different APK");
+            ensure!(
+                existing == &path,
+                "request_key belongs to a different package"
+            );
             return Ok(json!({"instance_id":id,"state":"launching","apk_path":path}));
         }
         let id = random_id()?;
@@ -716,8 +727,8 @@ mod tests {
             .join("tests/fixtures")
             .join(name)
     }
-    fn start(dir: &TestDir, name: &str) -> (Server, Registration, Value) {
-        let server = Server::start_in(fixture(name), dir.0.clone(), random_id().unwrap()).unwrap();
+    fn start_path(dir: &TestDir, path: PathBuf) -> (Server, Registration, Value) {
+        let server = Server::start_in(path, dir.0.clone(), random_id().unwrap()).unwrap();
         let record: Registration =
             serde_json::from_slice(&fs::read(&server.registration).unwrap()).unwrap();
         for _ in 0..200 {
@@ -730,6 +741,50 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("Instance did not become ready")
+    }
+    fn start(dir: &TestDir, name: &str) -> (Server, Registration, Value) {
+        start_path(dir, fixture(name))
+    }
+
+    #[test]
+    fn nested_package_mcp_roundtrip_for_xapk_and_apks_without_toc() {
+        let dir = TestDir::new();
+        let nested_apk = fs::read(fixture("navigation.apk")).unwrap();
+        for extension in ["xapk", "apks"] {
+            let path = dir.0.join(format!("navigation.{extension}"));
+            let mut zip = zip::ZipWriter::new(File::create(&path).unwrap());
+            zip.start_file("base.apk", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&nested_apk).unwrap();
+            zip.finish().unwrap();
+            let (server, record, args) = start_path(&dir, path);
+            let info = remote(&record, "get_instance_info", &json!({})).unwrap();
+            assert_eq!(info["state"], "Running");
+            let selection = info["package_selection"].as_str().unwrap();
+            assert!(selection.contains("analysis union") && selection.contains("one base"));
+            let classes = remote(&record, "get_all_classes", &args).unwrap();
+            assert!(
+                classes["data"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["class_id"] == "sample.Target")
+            );
+            let mut resource_args = args.clone();
+            resource_args["resource_path"] = json!("AndroidManifest.xml");
+            let manifest = remote(&record, "get_resource_file", &resource_args).unwrap();
+            assert!(
+                manifest["data"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("package=\"sample\"")
+            );
+            let mut source_args = args;
+            source_args["class_id"] = json!("sample.Target");
+            let source = remote(&record, "get_class_source", &source_args).unwrap();
+            assert!(!source["data"]["text"].as_str().unwrap().is_empty());
+            drop(server);
+        }
     }
     #[test]
     fn call_graph_tool_roundtrip() {
@@ -846,6 +901,15 @@ mod tests {
             )
             .is_ok()
         );
+        let tools = tools_list();
+        let open = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "open_apk")
+            .unwrap();
+        let description = open["description"].as_str().unwrap();
+        assert!(description.contains("XAPK") && description.contains("APKS"));
         assert!(read_frame(&mut std::io::Cursor::new(b"{}".as_slice())).is_err());
     }
 }

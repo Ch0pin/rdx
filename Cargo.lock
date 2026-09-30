@@ -2469,6 +2469,7 @@ dependencies = [
  "eframe",
  "getrandom 0.3.4",
  "image",
+ "pollster",
  "quick-xml 0.42.0",
  "regex",
  "rfd",

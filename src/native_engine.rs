@@ -162,7 +162,7 @@ fn read_bounded(mut reader: impl Read, remaining: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 // Bound the ZIP directory before the ZIP library allocates its entry table.
-fn check_zip_directory(file: &mut File) -> Result<()> {
+pub(crate) fn check_zip_directory(file: &mut File) -> Result<()> {
     let size = file.metadata()?.len();
     let tail_size = size.min(65_557) as usize;
     file.seek(SeekFrom::End(-(tail_size as i64)))?;
@@ -210,14 +210,42 @@ fn check_zip_directory(file: &mut File) -> Result<()> {
 }
 impl DecompilerEngine for NativeDexEngine {
     fn open(&mut self, path: &Path) -> Result<Project> {
+        self.open_input(path, None)
+    }
+    fn decompile(&mut self, name: &str) -> Result<String> {
+        ensure!(self.opened, "Open an APK or DEX first");
+        let class = self
+            .classes
+            .get(name)
+            .with_context(|| format!("Unknown class: {name}"))?;
+        Ok(self.render_class(name, class)?.source)
+    }
+    fn read_resource(&mut self, _path: &str) -> Result<String> {
+        ensure!(self.opened, "Open an APK or DEX first");
+        unsupported("decoded Android resources")
+    }
+}
+impl NativeDexEngine {
+    pub(crate) fn open_prepared(
+        &mut self,
+        container: Arc<crate::package_container::PackageContainer>,
+    ) -> Result<Project> {
+        self.open_input(container.source_path(), Some(container.clone()))
+    }
+    fn open_input(
+        &mut self,
+        path: &Path,
+        prepared: Option<Arc<crate::package_container::PackageContainer>>,
+    ) -> Result<Project> {
         // Clear stale state even if the replacement input fails.
         self.classes = Arc::default();
         self.nested_children = Arc::default();
         self.opened = false;
         let mut classes = BTreeMap::new();
+        let mut class_origins = BTreeMap::<String, String>::new();
         let mut resources = Vec::new();
         let mut parse_budget = MAX_RETAINED_DEX_BYTES;
-        let mut add_dex = |bytes: &[u8]| -> Result<()> {
+        let mut add_dex = |bytes: &[u8], origin: &str| -> Result<()> {
             let dex = native_dex::parse_with_budget(bytes, &mut parse_budget).map_err(|error| {
                 if error.downcast_ref::<native_dex::UnsupportedDex>().is_some() {
                     anyhow::Error::new(UnsupportedNative(error.to_string()))
@@ -236,15 +264,15 @@ impl DecompilerEngine for NativeDexEngine {
                     classes.len() < MAX_CLASSES,
                     "Native class inventory exceeds limit"
                 );
-                ensure!(
-                    !classes.contains_key(&name),
-                    "Duplicate class across DEX inputs: {name}"
-                );
+                if let Some(first) = class_origins.get(&name) {
+                    bail!("Duplicate class across DEX inputs: {name} in {first} and {origin}");
+                }
+                class_origins.insert(name.clone(), origin.to_owned());
                 classes.insert(name, class);
             }
             Ok(())
         };
-        let mut file = File::open(path)?;
+        let file = File::open(path)?;
         match path
             .extension()
             .and_then(|s| s.to_str())
@@ -256,31 +284,42 @@ impl DecompilerEngine for NativeDexEngine {
                     file.metadata()?.len() <= MAX_DEX_BYTES,
                     "Native DEX input exceeds size limit"
                 );
-                add_dex(&read_bounded(file, MAX_DEX_BYTES)?)?;
+                add_dex(
+                    &read_bounded(file, MAX_DEX_BYTES)?,
+                    &path.display().to_string(),
+                )?;
             }
-            Some("apk") => {
-                check_zip_directory(&mut file)?;
-                let mut archive = zip::ZipArchive::new(file)?;
-                ensure!(archive.len() <= MAX_ZIP_ENTRIES, "APK has too many entries");
+            Some("apk" | "apks" | "xapk") => {
+                let container = match prepared {
+                    Some(container) => container,
+                    None => crate::package_container::PackageContainer::open(path)?,
+                };
+                ensure!(
+                    container.entries().len() <= MAX_ZIP_ENTRIES,
+                    "Package has too many entries"
+                );
                 let mut remaining = MAX_DEX_BYTES;
                 let mut dex_count = 0;
                 let mut resource_name_bytes = 0;
-                for i in 0..archive.len() {
-                    let mut entry = archive.by_index(i)?;
-                    ensure!(entry.name().len() <= 4096, "APK entry name exceeds limit");
-                    resource_name_bytes += entry.name().len() as u64 + 24;
+                for entry in container.entries() {
+                    resource_name_bytes += entry.path.len() as u64 + 24;
                     ensure!(
                         resource_name_bytes <= MAX_ARCHIVE_METADATA,
                         "APK resource inventory exceeds native metadata budget"
                     );
-                    resources.push(entry.name().to_owned());
-                    if !dex_entry(entry.name()) {
+                    resources.push(entry.path.clone());
+                    if !entry.is_apk_member || !dex_entry(&entry.member_path) {
                         continue;
                     }
-                    ensure!(entry.size() <= remaining, "APK DEX data exceeds size limit");
-                    let bytes = read_bounded(&mut entry, remaining)?;
+                    ensure!(entry.size <= remaining, "APK DEX data exceeds size limit");
+                    let bytes = container.read_member(entry.index, remaining)?;
                     remaining -= bytes.len() as u64;
-                    add_dex(&bytes).with_context(|| format!("Parsing {}", entry.name()))?;
+                    let origin = if entry.source_path.is_empty() {
+                        entry.member_path.clone()
+                    } else {
+                        format!("{} / {}", entry.source_path, entry.member_path)
+                    };
+                    add_dex(&bytes, &origin).with_context(|| format!("Parsing {origin}"))?;
                     dex_count += 1;
                 }
                 ensure!(
@@ -288,7 +327,7 @@ impl DecompilerEngine for NativeDexEngine {
                     "APK contains no standard classes*.dex entries"
                 );
             }
-            _ => bail!("Choose an APK or DEX file"),
+            _ => bail!("Choose an APK, APKS, XAPK, or DEX file"),
         }
         ensure!(!classes.is_empty(), "No classes in DEX input");
         let hierarchy = std::sync::Arc::new(crate::native_hierarchy::TypeHierarchy::from_classes(
@@ -310,18 +349,6 @@ impl DecompilerEngine for NativeDexEngine {
         self.classes = Arc::new(classes);
         self.opened = true;
         Ok(project)
-    }
-    fn decompile(&mut self, name: &str) -> Result<String> {
-        ensure!(self.opened, "Open an APK or DEX first");
-        let class = self
-            .classes
-            .get(name)
-            .with_context(|| format!("Unknown class: {name}"))?;
-        Ok(self.render_class(name, class)?.source)
-    }
-    fn read_resource(&mut self, _path: &str) -> Result<String> {
-        ensure!(self.opened, "Open an APK or DEX first");
-        unsupported("decoded Android resources")
     }
 }
 

@@ -1,4 +1,5 @@
-//! APK previews and explicit exports. Contents are never executed.
+//! Android package previews and explicit exports. Contents are never executed.
+use crate::package_container::PackageContainer;
 use anyhow::{Context, Result, bail, ensure};
 use image::{ImageReader, Limits};
 use std::{
@@ -27,6 +28,7 @@ pub struct Archive {
     file_size: u64,
     modified: Option<SystemTime>,
     checksums: Vec<u32>,
+    prepared: Option<std::sync::Arc<PackageContainer>>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,13 +50,50 @@ pub enum Preview {
 }
 
 impl Archive {
+    /// Share the exact source set selected by the native engine.
+    pub fn from_prepared(source: std::sync::Arc<PackageContainer>) -> Self {
+        let entries = source
+            .entries()
+            .iter()
+            .map(|entry| Entry {
+                index: entry.index,
+                path: entry.path.clone(),
+                size: entry.size,
+                compressed_size: entry.compressed_size,
+            })
+            .collect();
+        Self {
+            entries,
+            path: PathBuf::new(),
+            file_size: 0,
+            modified: None,
+            checksums: Vec::new(),
+            prepared: Some(source),
+        }
+    }
+
+    pub fn source_path(&self, index: usize) -> Option<&str> {
+        self.prepared
+            .as_ref()?
+            .entries()
+            .iter()
+            .find(|entry| entry.index == index)
+            .map(|entry| entry.source_path.as_str())
+    }
+
     /// Export original member bytes, independently of preview truncation or decoding.
     pub fn export(&self, index: usize, directory: &Path) -> Result<PathBuf> {
         let expected = self
             .entries
             .iter()
             .find(|entry| entry.index == index)
-            .context("Unknown APK entry index")?;
+            .context("Unknown package entry index")?;
+        if let Some(source) = &self.prepared {
+            return crate::export::write_with(directory, &expected.path, expected.size, |file| {
+                source.copy_member(index, file, crate::export::MAX_EXPORT_BYTES)?;
+                Ok(file.metadata()?.len())
+            });
+        }
         let file = File::open(&self.path).context("Cannot reopen APK")?;
         let metadata = file.metadata()?;
         ensure!(
@@ -98,16 +137,36 @@ impl Archive {
             file_size: metadata.len(),
             modified: metadata.modified().ok(),
             checksums,
+            prepared: None,
         })
     }
 
-    /// `index` is the original ZIP member index exposed by `Entry`, not its list position.
+    /// `index` is the value exposed by `Entry`, not its list position.
     pub fn preview(&self, index: usize) -> Result<Preview> {
         let expected = self
             .entries
             .iter()
             .find(|e| e.index == index)
-            .context("Unknown APK entry index")?;
+            .context("Unknown package entry index")?;
+        if let Some(source) = &self.prepared {
+            if expected.size > MAX_BYTES {
+                let prefix = source.read_prefix(index, HEX_BYTES)?;
+                return Ok(binary(
+                    &prefix,
+                    format!(
+                        "Entry is {} bytes; showing first {} bytes (8 MiB preview limit). Full-entry integrity was not checked.",
+                        expected.size,
+                        prefix.len()
+                    ),
+                ));
+            }
+            let bytes = source.read_member(index, MAX_BYTES)?;
+            ensure!(
+                bytes.len() as u64 == expected.size,
+                "Corrupt package entry: decompressed size mismatch"
+            );
+            return preview_bytes(&expected.path, &bytes);
+        }
         let file = File::open(&self.path).context("Cannot reopen APK")?;
         let metadata = file.metadata()?;
         ensure!(
@@ -153,70 +212,74 @@ impl Archive {
             bytes.len() as u64 == expected.size,
             "Corrupt APK entry: decompressed size mismatch"
         );
-        let ext = Path::new(&expected.path)
-            .extension()
-            .and_then(|x| x.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if matches!(
-            ext.as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
-        ) {
-            let mut reader = ImageReader::new(Cursor::new(&bytes)).with_guessed_format()?;
-            let mut limits = Limits::default();
-            limits.max_image_width = Some(4096);
-            limits.max_image_height = Some(4096);
-            limits.max_alloc = Some(64 * 1024 * 1024);
-            reader.limits(limits);
-            let decoded = reader
-                .decode()
-                .context("Cannot decode image (limit: 4096 x 4096 pixels and 64 MiB allocation)")?;
-            let rgba = decoded.into_rgba8();
-            return Ok(Preview::Image {
-                width: rgba.width(),
-                height: rgba.height(),
-                rgba: rgba.into_raw(),
-            });
-        }
-        // Compiled XML is an archive format, not a text encoding. Decode it
-        // independently of the DEX engine so previews work during/after a
-        // failed class load, and for compiled XML outside res/ as well.
-        if bytes.starts_with(&[0x03, 0x00, 0x08, 0x00]) {
-            return match crate::native_resources::decode(&bytes) {
-                Ok(text) => {
-                    let (text, truncated) = truncate_text(text);
-                    Ok(Preview::Text {
-                        text,
-                        syntax: "xml".into(),
-                        note: truncated.then(|| "Text truncated at 2 MiB of UTF-8 output.".into()),
-                    })
-                }
-                Err(error) => Ok(binary(
-                    &bytes,
-                    format!(
-                        "Cannot decode compiled Android XML: {error}. Showing up to 4 KiB as hexadecimal."
-                    ),
-                )),
-            };
-        }
-        match decode_text(&bytes) {
-            Ok(Some(text)) => {
+        preview_bytes(&expected.path, &bytes)
+    }
+}
+
+fn preview_bytes(path: &str, bytes: &[u8]) -> Result<Preview> {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|x| x.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+    ) {
+        let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+        let mut limits = Limits::default();
+        limits.max_image_width = Some(4096);
+        limits.max_image_height = Some(4096);
+        limits.max_alloc = Some(64 * 1024 * 1024);
+        reader.limits(limits);
+        let decoded = reader
+            .decode()
+            .context("Cannot decode image (limit: 4096 x 4096 pixels and 64 MiB allocation)")?;
+        let rgba = decoded.into_rgba8();
+        return Ok(Preview::Image {
+            width: rgba.width(),
+            height: rgba.height(),
+            rgba: rgba.into_raw(),
+        });
+    }
+    // Compiled XML is an archive format, not a text encoding. Decode it
+    // independently of the DEX engine so previews work during/after a
+    // failed class load, and for compiled XML outside res/ as well.
+    if bytes.starts_with(&[0x03, 0x00, 0x08, 0x00]) {
+        return match crate::native_resources::decode(bytes) {
+            Ok(text) => {
                 let (text, truncated) = truncate_text(text);
                 Ok(Preview::Text {
                     text,
-                    syntax: syntax(&ext).to_owned(),
-                    note: truncated.then(|| "Text truncated at 2 MiB of UTF-8 output.".to_owned()),
+                    syntax: "xml".into(),
+                    note: truncated.then(|| "Text truncated at 2 MiB of UTF-8 output.".into()),
                 })
             }
-            Ok(None) => Ok(binary(
-                &bytes,
-                "Binary data; showing up to 4 KiB as hexadecimal.".into(),
-            )),
             Err(error) => Ok(binary(
-                &bytes,
-                format!("Invalid text encoding: {error}. Showing up to 4 KiB as hexadecimal."),
+                bytes,
+                format!(
+                    "Cannot decode compiled Android XML: {error}. Showing up to 4 KiB as hexadecimal."
+                ),
             )),
+        };
+    }
+    match decode_text(bytes) {
+        Ok(Some(text)) => {
+            let (text, truncated) = truncate_text(text);
+            Ok(Preview::Text {
+                text,
+                syntax: syntax(&ext).to_owned(),
+                note: truncated.then(|| "Text truncated at 2 MiB of UTF-8 output.".to_owned()),
+            })
         }
+        Ok(None) => Ok(binary(
+            bytes,
+            "Binary data; showing up to 4 KiB as hexadecimal.".into(),
+        )),
+        Err(error) => Ok(binary(
+            bytes,
+            format!("Invalid text encoding: {error}. Showing up to 4 KiB as hexadecimal."),
+        )),
     }
 }
 
@@ -439,6 +502,85 @@ mod tests {
                 .contains("changed")
         );
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+    }
+    #[test]
+    fn prepared_source_previews_and_exports_the_same_member() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let source = PackageContainer::open(&path).unwrap();
+        let archive = Archive::from_prepared(source.clone());
+        let entry = archive
+            .entries
+            .iter()
+            .find(|entry| entry.path == "AndroidManifest.xml")
+            .unwrap();
+        assert_eq!(archive.source_path(entry.index), Some(""));
+        assert!(matches!(
+            archive.preview(entry.index).unwrap(),
+            Preview::Text { .. }
+        ));
+        let directory = crate::export::tests::Directory::new();
+        let exported = archive.export(entry.index, &directory.0).unwrap();
+        assert_eq!(
+            fs::read(exported).unwrap(),
+            source.read_member(entry.index, MAX_BYTES).unwrap()
+        );
+    }
+    #[test]
+    fn prepared_source_rejects_changed_input_before_preview_or_export() {
+        let original =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let path = std::env::temp_dir().join(format!(
+            "rdx-prepared-change-{}-{}.apk",
+            std::process::id(),
+            ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::copy(original, &path).unwrap();
+        let fixture = Fixture(path);
+        let archive = Archive::from_prepared(PackageContainer::open(&fixture.0).unwrap());
+        let index = archive.entries[0].index;
+        fs::write(&fixture.0, b"changed").unwrap();
+        assert!(
+            archive
+                .preview(index)
+                .unwrap_err()
+                .to_string()
+                .contains("changed")
+        );
+        let directory = crate::export::tests::Directory::new();
+        assert!(archive.export(index, &directory.0).is_err());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+    }
+    #[test]
+    fn xapk_prepared_source_keeps_member_provenance_for_preview_and_export() {
+        let original =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let path = std::env::temp_dir().join(format!(
+            "rdx-preview-{}-{}.xapk",
+            std::process::id(),
+            ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut zip = zip::ZipWriter::new(File::create(&path).unwrap());
+        zip.start_file("base.apk", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::copy(&mut File::open(original).unwrap(), &mut zip).unwrap();
+        zip.finish().unwrap();
+        let fixture = Fixture(path);
+        let source = PackageContainer::open(&fixture.0).unwrap();
+        assert!(source.selection_summary().unwrap().contains("XAPK"));
+        let archive = Archive::from_prepared(source);
+        let manifest = archive
+            .entries
+            .iter()
+            .find(|entry| entry.path == "AndroidManifest.xml")
+            .unwrap();
+        assert_eq!(archive.source_path(manifest.index), Some("base.apk"));
+        assert!(matches!(
+            archive.preview(manifest.index).unwrap(),
+            Preview::Text { .. }
+        ));
+        let directory = crate::export::tests::Directory::new();
+        let output = archive.export(manifest.index, &directory.0).unwrap();
+        assert!(!fs::read(output).unwrap().is_empty());
     }
     #[test]
     fn export_preserves_original_bytes_beyond_preview_limits() {

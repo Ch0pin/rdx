@@ -39,6 +39,10 @@ impl Node {
 pub fn category(path: &str) -> (&str, &str) {
     if path == "AndroidManifest.xml" {
         ("Manifest", path)
+    } else if let Some(rest) = path.strip_prefix("splits/") {
+        ("Splits", rest)
+    } else if let Some(rest) = path.strip_prefix("container/") {
+        ("Container", rest)
     } else if let Some(rest) = path.strip_prefix("assets/") {
         ("Assets", rest)
     } else if let Some(rest) = path.strip_prefix("res/") {
@@ -82,6 +86,21 @@ pub fn build(classes: &[String], entries: &[Entry], filter: &str) -> Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn split_paths_keep_their_apk_origin_in_the_tree() {
+        assert_eq!(
+            category("splits/feature_chat/AndroidManifest.xml"),
+            ("Splits", "feature_chat/AndroidManifest.xml")
+        );
+        assert_eq!(
+            category("splits/config.en/res/values/strings.xml"),
+            ("Splits", "config.en/res/values/strings.xml")
+        );
+        assert_eq!(
+            category("container/Android/obb/main.1.obb"),
+            ("Container", "Android/obb/main.1.obb")
+        );
+    }
     #[test]
     fn preserves_asset_folders_and_unifies_packages() {
         let entries = vec![];

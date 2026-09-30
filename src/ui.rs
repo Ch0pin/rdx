@@ -28,6 +28,7 @@ use std::{
 };
 
 enum Event {
+    Dialog(u64, u64, DialogResult),
     CallGraph(
         u64,
         NativeEngine,
@@ -65,6 +66,12 @@ enum Event {
     InteractiveReady(u64, NativeEngine),
     UsagesUpdate(u64, u64, UsageUpdate),
     UsagesDone(u64, u64, NativeEngine, UsageSummary),
+}
+
+enum DialogResult {
+    Open(Option<PathBuf>),
+    Export(Target, Option<PathBuf>),
+    Plugin(Option<PathBuf>),
 }
 
 enum InteractiveRequest {
@@ -258,6 +265,8 @@ pub struct App {
     loading_progress: f32,
     asset_busy: bool,
     export_busy: bool,
+    pending_dialog: Option<u64>,
+    next_dialog_id: u64,
     status: String,
     filter: String,
     tabs: Vec<Tab>,
@@ -286,6 +295,14 @@ pub struct App {
 }
 
 impl App {
+    fn begin_dialog(&mut self) -> Option<u64> {
+        if self.pending_dialog.is_some() {
+            return None;
+        }
+        self.next_dialog_id = self.next_dialog_id.wrapping_add(1);
+        self.pending_dialog = Some(self.next_dialog_id);
+        Some(self.next_dialog_id)
+    }
     fn open_new_instance(&mut self) {
         match std::env::current_exe().and_then(|exe| {
             std::process::Command::new(exe)
@@ -371,10 +388,12 @@ impl App {
             loading_progress: 0.0,
             asset_busy: false,
             export_busy: false,
+            pending_dialog: None,
+            next_dialog_id: 0,
             status: if settings_error.is_some() {
                 "Settings could not be restored — using defaults. See Diagnostics.".into()
             } else {
-                "Ready — open an APK or DEX".into()
+                "Ready — open an APK, XAPK, APKS, or DEX".into()
             },
             filter: String::new(),
             tabs: Vec::new(),
@@ -426,7 +445,7 @@ impl App {
                 ui.label(format!("Status: {}", status.state));
                 ui.label(format!("Instance: {}", server.instance_id));
                 ui.label(format!("Project: {}", status.project_id));
-                ui.label(format!("APK SHA-256: {}", status.apk_sha256));
+                ui.label(format!("Package SHA-256: {}", status.apk_sha256));
                 ui.label(format!("Requests served: {}", status.requests));
                 if !status.active.is_empty() { ui.label(format!("Current request: {}", status.active)); if ui.button("Cancel current request").clicked() { server.cancel_request(); } }
                 if !status.last_error.is_empty() { ui.colored_label(ui.visuals().error_fg_color, &status.last_error); }
@@ -435,7 +454,7 @@ impl App {
             } else {
                 ui.label("Status: Stopped");
                 if ui.add_enabled(self.project.is_some() && !self.loading_project, egui::Button::new("Start server")).clicked() { self.start_mcp(); }
-                if self.project.is_none() { ui.label("Open an APK or DEX to enable this instance."); }
+                if self.project.is_none() { ui.label("Open an APK, XAPK, APKS, or DEX to enable this instance."); }
             }
             if ui.button("Copy MCP client configuration").clicked() {
                 match rdx::mcp::client_config() { Ok(config) => ui.ctx().copy_text(config), Err(e) => self.mcp_error=e.to_string() }
@@ -548,21 +567,24 @@ impl App {
         self.busy = true;
         self.loading_project = true;
         self.loading_progress = 0.05;
-        self.status = "Indexing APK/DEX with native Rust…".into();
+        self.status = "Indexing Android package or DEX with native Rust…".into();
         let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
         thread::spawn(move || {
             let result = (|| {
-                if path
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("apk"))
-                {
-                    let archive = Arc::new(Archive::open(&path)?);
-                    let _ = tx.send(Event::Archive(generation, archive));
-                    ctx.request_repaint();
-                }
                 let mut engine = NativeEngine::start()?;
                 ctx.request_repaint();
-                let project = engine.open(&path)?;
+                let project = if path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("dex"))
+                {
+                    engine.open(&path)?
+                } else {
+                    let source = rdx::package_container::PackageContainer::open(&path)?;
+                    let archive = Arc::new(Archive::from_prepared(source.clone()));
+                    let _ = tx.send(Event::Archive(generation, archive));
+                    ctx.request_repaint();
+                    engine.open_prepared(source)?
+                };
                 Ok((engine, project))
             })()
             .map_err(|e: anyhow::Error| format!("{e:#}"));
@@ -825,7 +847,7 @@ impl App {
             .as_ref()
             .map_or(&[][..], |p| p.classes.as_slice());
         for tab in &mut self.tabs {
-            if tab.name == "AndroidManifest.xml"
+            if is_manifest_path(&tab.name)
                 && let Content::Text(document) = &mut tab.content
             {
                 let mut links = document.resource_links();
@@ -942,9 +964,27 @@ impl App {
         }
     }
     fn export_target(&mut self, target: Target, ctx: &egui::Context) {
-        if self.export_busy {
+        if self.export_busy || self.pending_dialog.is_some() {
             return;
         }
+        let Some(id) = self.begin_dialog() else {
+            return;
+        };
+        let future = rfd::AsyncFileDialog::new()
+            .set_title("Choose export folder")
+            .pick_folder();
+        let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
+        thread::spawn(move || {
+            let directory = pollster::block_on(future).map(|handle| handle.path().to_owned());
+            let _ = tx.send(Event::Dialog(
+                generation,
+                id,
+                DialogResult::Export(target, directory),
+            ));
+            ctx.request_repaint();
+        });
+    }
+    fn export_to_directory(&mut self, target: Target, directory: PathBuf, ctx: &egui::Context) {
         let cached = self
             .tabs
             .iter()
@@ -957,12 +997,6 @@ impl App {
             );
             return;
         }
-        let Some(directory) = rfd::FileDialog::new()
-            .set_title("Choose export folder")
-            .pick_folder()
-        else {
-            return;
-        };
         let mut engine = if matches!(target, Target::Class(_)) && cached.is_none() {
             self.engine.take()
         } else {
@@ -979,7 +1013,7 @@ impl App {
             let result = (|| -> anyhow::Result<PathBuf> {
                 match target {
                     Target::File(index) => archive
-                        .ok_or_else(|| anyhow::anyhow!("APK archive is unavailable"))?
+                        .ok_or_else(|| anyhow::anyhow!("Package archive is unavailable"))?
                         .export(index, &directory),
                     Target::Class(name) => {
                         let source = match cached {
@@ -1019,7 +1053,8 @@ impl App {
             }
         };
         let Some(project) = &self.project else {
-            self.search.error("Open an APK or DEX first".into());
+            self.search
+                .error("Open an APK, XAPK, APKS, or DEX first".into());
             return;
         };
         let Some(mut engine) = self.engine.take() else {
@@ -1512,6 +1547,29 @@ impl App {
     fn events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
+                Event::Dialog(generation, id, result) => {
+                    if self.pending_dialog != Some(id) {
+                        continue;
+                    }
+                    self.pending_dialog = None;
+                    if generation != self.generation {
+                        continue;
+                    }
+                    match result {
+                        DialogResult::Open(Some(path)) => self.open(path, ctx),
+                        DialogResult::Export(target, Some(directory)) => {
+                            self.export_to_directory(target, directory, ctx);
+                        }
+                        DialogResult::Plugin(Some(path)) => match Plugin::load(&path) {
+                            Ok(plugin) if !self.plugins.iter().any(|(p, _)| p.id == plugin.id) => {
+                                self.plugins.push((plugin, false));
+                            }
+                            Ok(_) => self.error("This plugin is already loaded".into()),
+                            Err(error) => self.error(format!("Plugin manifest: {error:#}")),
+                        },
+                        _ => {}
+                    }
+                }
                 Event::Archive(generation, archive) if generation == self.generation => {
                     self.archive = Some(archive);
                     self.loading_progress = self.loading_progress.max(0.25);
@@ -1727,7 +1785,7 @@ impl App {
                             };
                             let mut document = CodeDocument::new(code.source, "xml");
                             let mut links = code.links;
-                            if name == "AndroidManifest.xml" {
+                            if is_manifest_path(&name) {
                                 links.extend(crate::manifest_links::links(
                                     document.text(),
                                     &self
@@ -1895,7 +1953,7 @@ impl App {
             && let Some(index) = self.tabs.iter().find_map(|tab| {
                 if is_android_xml(&tab.name)
                     && !tab.note.as_deref().is_some_and(|note| {
-                        note == "Android XML decoded natively"
+                        note.starts_with("Android XML decoded natively")
                             || note.starts_with("Android XML decode failed.")
                     })
                     && let Target::File(index) = tab.target
@@ -1919,17 +1977,18 @@ impl App {
                     "Enabled plugins run with your user permissions. Only enable code you trust.",
                 );
                 if ui.button("Load plugin manifest…").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Plugin manifest", &["json"])
-                        .pick_file()
+                    && let Some(id) = self.begin_dialog()
                 {
-                    match Plugin::load(&path) {
-                        Ok(plugin) if !self.plugins.iter().any(|(p, _)| p.id == plugin.id) => {
-                            self.plugins.push((plugin, false))
-                        }
-                        Ok(_) => self.error("This plugin is already loaded".into()),
-                        Err(error) => self.error(format!("Plugin manifest: {error:#}")),
-                    }
+                    let future = rfd::AsyncFileDialog::new()
+                        .add_filter("Plugin manifest", &["json"])
+                        .pick_file();
+                    let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
+                    thread::spawn(move || {
+                        let path =
+                            pollster::block_on(future).map(|handle| handle.path().to_owned());
+                        let _ = tx.send(Event::Dialog(generation, id, DialogResult::Plugin(path)));
+                        ctx.request_repaint();
+                    });
                 }
                 ui.separator();
                 let active_class = self
@@ -1997,8 +2056,15 @@ fn xml_preview_needs_resolution(name: &str, preview: &Preview) -> bool {
         }
 }
 
+fn is_manifest_path(name: &str) -> bool {
+    name == "AndroidManifest.xml"
+        || (name.starts_with("splits/") && name.ends_with("/AndroidManifest.xml"))
+}
+
 fn is_android_xml(name: &str) -> bool {
-    name == "AndroidManifest.xml" || (name.starts_with("res/") && name.ends_with(".xml"))
+    is_manifest_path(name)
+        || (name.starts_with("res/") && name.ends_with(".xml"))
+        || (name.starts_with("splits/") && name.contains("/res/") && name.ends_with(".xml"))
 }
 
 fn tree_entry(
@@ -2070,7 +2136,7 @@ fn file_icon(name: &str, target: &Target) -> Icon {
     if matches!(target, Target::Class(_)) {
         return Icon::Classes;
     }
-    if name == "AndroidManifest.xml" {
+    if is_manifest_path(name) {
         return Icon::Manifest;
     }
     match name
@@ -2263,7 +2329,7 @@ impl eframe::App for App {
                                 ui.close_menu();
                             }
                             ui.separator();
-                            if ui.button("Open APK / DEX…").clicked() {
+                            if ui.button("Open…").clicked() {
                                 choose_file = true;
                                 ui.close_menu();
                             }
@@ -2415,9 +2481,13 @@ impl eframe::App for App {
                         });
                     });
                     ui.separator();
-                    choose_file |=
-                        icons::button(ui, Icon::Open, "Open APK / DEX (Cmd/Ctrl+O)", true)
-                            .clicked();
+                    choose_file |= icons::button(
+                        ui,
+                        Icon::Open,
+                        "Open APK / XAPK / APKS / DEX (Cmd/Ctrl+O)",
+                        true,
+                    )
+                    .clicked();
                     if icons::button(
                         ui,
                         Icon::Reload,
@@ -2511,12 +2581,19 @@ impl eframe::App for App {
                     );
                 });
         }
-        if choose_file
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("Android bytecode", &["apk", "dex"])
-                .pick_file()
-        {
-            self.open(path, ctx);
+        if choose_file && let Some(id) = self.begin_dialog() {
+            let future = rfd::AsyncFileDialog::new()
+                .add_filter(
+                    "Android packages and bytecode",
+                    &["apk", "xapk", "apks", "dex"],
+                )
+                .pick_file();
+            let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
+            thread::spawn(move || {
+                let path = pollster::block_on(future).map(|handle| handle.path().to_owned());
+                let _ = tx.send(Event::Dialog(generation, id, DialogResult::Open(path)));
+                ctx.request_repaint();
+            });
         }
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -2617,7 +2694,7 @@ impl eframe::App for App {
             if self.tabs.is_empty() {
                 ui.add_space(75.0);
                 ui.vertical_centered(|ui| {
-                    ui.heading("Inspect code and APK contents");
+                    ui.heading("Inspect code and package contents");
                     ui.label("Select a class, resource, or asset from the project tree.");
                     ui.weak("Native Rust · alpha Java / DEX disassembly · assets");
                 });
@@ -2718,7 +2795,7 @@ impl eframe::App for App {
                                             source_hash: None,
                                         },
                                     ));
-                                } else if tab.name == "AndroidManifest.xml"
+                                } else if is_manifest_path(&tab.name)
                                     && let Some(link) = document.link_at(position)
                                 {
                                     manifest_jump = Some((
@@ -2977,6 +3054,14 @@ mod settings_tests {
             &preview
         ));
         assert!(super::xml_preview_needs_resolution(
+            "splits/feature_chat/AndroidManifest.xml",
+            &preview
+        ));
+        assert!(super::xml_preview_needs_resolution(
+            "splits/config.en/res/values/strings.xml",
+            &preview
+        ));
+        assert!(super::xml_preview_needs_resolution(
             "res/layout/main.xml",
             &preview
         ));
@@ -3097,6 +3182,8 @@ mod settings_tests {
             loading_progress: 0.0,
             asset_busy: false,
             export_busy: false,
+            pending_dialog: None,
+            next_dialog_id: 0,
             status: String::new(),
             filter: String::new(),
             tabs: Vec::new(),
@@ -3123,6 +3210,99 @@ mod settings_tests {
             plugin_output: String::new(),
             diagnostics: Vec::new(),
         }
+    }
+    #[test]
+    fn dialog_cancel_releases_guard_and_rejects_overlap() {
+        let mut app = navigation_test_app();
+        let id = app.begin_dialog().unwrap();
+        assert!(app.begin_dialog().is_none());
+        app.tx
+            .send(Event::Dialog(app.generation, id, DialogResult::Open(None)))
+            .unwrap();
+        app.events(&egui::Context::default());
+        assert_eq!(app.pending_dialog, None);
+        assert!(app.begin_dialog().is_some());
+    }
+    #[test]
+    fn stale_dialog_result_cannot_act_or_clear_new_guard() {
+        let mut app = navigation_test_app();
+        let old_id = app.begin_dialog().unwrap();
+        let old_generation = app.generation;
+        app.stop();
+        assert_eq!(app.pending_dialog, Some(old_id));
+        app.status = "unchanged".into();
+        app.tx
+            .send(Event::Dialog(
+                old_generation,
+                old_id,
+                DialogResult::Export(Target::File(0), Some(std::env::temp_dir())),
+            ))
+            .unwrap();
+        app.events(&egui::Context::default());
+        assert_eq!(app.pending_dialog, None);
+        assert_eq!(app.status, "unchanged");
+        assert!(!app.export_busy);
+        let stale_open_id = app.begin_dialog().unwrap();
+        let stale_open_generation = app.generation;
+        app.stop();
+        app.tx
+            .send(Event::Dialog(
+                stale_open_generation,
+                stale_open_id,
+                DialogResult::Open(Some(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk"),
+                )),
+            ))
+            .unwrap();
+        app.events(&egui::Context::default());
+        assert!(app.path.is_none());
+        assert_eq!(app.pending_dialog, None);
+        let new_id = app.begin_dialog().unwrap();
+        app.tx
+            .send(Event::Dialog(
+                app.generation,
+                old_id,
+                DialogResult::Open(Some(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk"),
+                )),
+            ))
+            .unwrap();
+        app.events(&egui::Context::default());
+        assert_eq!(app.pending_dialog, Some(new_id));
+        assert!(app.path.is_none());
+        app.tx
+            .send(Event::Dialog(
+                app.generation,
+                new_id,
+                DialogResult::Plugin(None),
+            ))
+            .unwrap();
+        app.events(&egui::Context::default());
+        assert_eq!(app.pending_dialog, None);
+    }
+    #[test]
+    fn archive_tree_survives_failed_dex_indexing() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let source = rdx::package_container::PackageContainer::open(&path).unwrap();
+        let archive = Arc::new(Archive::from_prepared(source));
+        let manifest = archive
+            .entries
+            .iter()
+            .find(|entry| entry.path == "AndroidManifest.xml")
+            .unwrap()
+            .index;
+        let mut app = navigation_test_app();
+        app.tx.send(Event::Archive(0, archive)).unwrap();
+        app.tx
+            .send(Event::Opened(0, Err("DEX indexing failed".into())))
+            .unwrap();
+        app.events(&egui::Context::default());
+        assert!(app.project.is_none());
+        assert_eq!(
+            app.entry_name(manifest).as_deref(),
+            Some("AndroidManifest.xml")
+        );
+        assert!(app.tree.count > 0);
     }
 
     #[test]

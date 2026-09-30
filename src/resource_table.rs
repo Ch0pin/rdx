@@ -26,6 +26,8 @@ pub struct Resource {
 #[derive(Default)]
 pub struct ResourceTable {
     pub entries: BTreeMap<u32, Resource>,
+    variant_count: usize,
+    retained_bytes: usize,
 }
 fn chunk(b: &[u8], p: usize) -> Result<(u16, usize, &[u8])> {
     let kind = u16_at(b, p)?;
@@ -63,6 +65,53 @@ fn config(b: &[u8]) -> String {
     }
 }
 impl ResourceTable {
+    /// Merge one split table while retaining the origin of file-backed values.
+    pub fn merge_split(&mut self, mut other: Self, prefix: &str) -> Result<()> {
+        let variant_count = self
+            .variant_count
+            .checked_add(other.variant_count)
+            .context("Resource variant count overflow")?;
+        let retained_bytes = self
+            .retained_bytes
+            .checked_add(other.retained_bytes)
+            .context("Resource index byte count overflow")?;
+        ensure!(
+            variant_count <= MAX_VALUES && retained_bytes <= 256 * 1024 * 1024,
+            "Combined resource index exceeds native budget"
+        );
+        for (id, resource) in &other.entries {
+            if let Some(existing) = self.entries.get(id) {
+                ensure!(
+                    existing.package == resource.package
+                        && existing.kind == resource.kind
+                        && existing.name == resource.name,
+                    "Conflicting resource ID 0x{id:08x} across splits"
+                );
+            }
+        }
+        self.variant_count = variant_count;
+        self.retained_bytes = retained_bytes;
+        for (id, mut resource) in std::mem::take(&mut other.entries) {
+            for variant in &mut resource.variants {
+                if !prefix.is_empty() {
+                    variant.configuration = format!(
+                        "{} [{}]",
+                        variant.configuration,
+                        prefix.trim_end_matches('/')
+                    );
+                    if let Some(file) = &mut variant.file {
+                        *file = format!("{prefix}{file}");
+                    }
+                }
+            }
+            if let Some(existing) = self.entries.get_mut(&id) {
+                existing.variants.extend(resource.variants);
+            } else {
+                self.entries.insert(id, resource);
+            }
+        }
+        Ok(())
+    }
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         ensure!(
             bytes.len() <= 64 * 1024 * 1024,
@@ -255,6 +304,8 @@ impl ResourceTable {
                     .cmp(&(b.configuration != "default", &b.configuration))
             });
         }
+        table.variant_count = count;
+        table.retained_bytes = retained;
         Ok(table)
     }
     pub fn label(&self, id: u32) -> Option<String> {

@@ -91,7 +91,7 @@ fn main() -> Result<()> {
             search_benchmark::execute(Path::new(&args[1]), &args[2], limit)?;
         }
         Some("--help") => println!(
-            "RDX\n  rdx mcp  (stdio MCP gateway)\n  rdx [FILE.apk|FILE.dex]\n  rdx --engines\n  rdx [--engine native] --list FILE\n  rdx [--engine native] --decompile FILE CLASS\n  rdx [--engine native] --native-coverage FILE [CLASS_PREFIX]\n  rdx [--engine native] --native-cfg-audit FILE [CLASS_PREFIX]\n  rdx --benchmark-search FILE QUERY [CLASS_LIMIT]\n  rdx --benchmark-search-current FILE QUERY [CLASS_LIMIT]\n\nGUI and CLI use the native Rust engine. Java reconstruction is alpha; unsupported methods are displayed as explicitly labeled DEX disassembly."
+            "RDX\n  rdx mcp  (stdio MCP gateway)\n  rdx [FILE.apk|FILE.xapk|FILE.apks|FILE.dex]\n  rdx --engines\n  rdx [--engine native] --list FILE\n  rdx [--engine native] --decompile FILE CLASS\n  rdx [--engine native] --native-coverage FILE [CLASS_PREFIX]\n  rdx [--engine native] --native-cfg-audit FILE [CLASS_PREFIX]\n  rdx --benchmark-search FILE QUERY [CLASS_LIMIT]\n  rdx --benchmark-search-current FILE QUERY [CLASS_LIMIT]\n\nGUI and CLI use the native Rust engine for APK, XAPK, APKS, and DEX. Java reconstruction is alpha; unsupported methods are displayed as explicitly labeled DEX disassembly."
         ),
         _ if args.len() <= 1 && !args.first().is_some_and(|a| a.starts_with('-')) => {
             let initial = args.first().map(std::path::PathBuf::from);

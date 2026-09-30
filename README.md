@@ -4,11 +4,12 @@
 
 <h1 align="center">RDX</h1>
 <p align="center"><strong>Explore Android apps. Follow the code. Understand what happens.</strong></p>
-<p align="center">Native Rust APK/DEX decompiler · macOS, Windows & Linux · Built-in MCP server</p>
+<p align="center">Native Rust APK/XAPK/APKS/DEX decompiler · macOS, Windows & Linux · Built-in MCP server</p>
 
-RDX is a desktop tool for Android reverse engineering and code review. Open an APK,
+RDX is a desktop tool for Android reverse engineering and code review. Open an APK, XAPK, or APKS,
 read reconstructed Java, follow method calls, and inspect its manifest and resources
 in one place. Use the GUI yourself or connect an AI assistant through MCP.
+For XAPK and APKS, RDX keeps each split's files under its own tree path.
 
 ## Why RDX?
 
@@ -28,7 +29,7 @@ services. See [performance measurements](docs/search-performance.md) for the tes
 | Read and navigate code | Reconstructed Java, exact DEX disassembly, declaration jumps, Back/Forward, tabs and bookmarks |
 | Trace relationships | Find usages, method callers/callees, direct subclasses and implementations |
 | Find what matters | Search classes, code, methods, fields and resources; exclude packages from searches |
-| Inspect the APK | Decoded manifest/XML, exported-component highlighting, resource names and values, image previews and file exports |
+| Inspect the package | Decoded manifest/XML, exported-component highlighting, resource names and values, image previews and file exports |
 | Customize your workflow | Light/dark themes, bundled code fonts, occurrence highlighting, Frida snippet copying and CLI access |
 
 **Status: alpha.** Java reconstruction is still expanding. Unsupported methods
@@ -56,7 +57,7 @@ Let an MCP-compatible assistant browse classes, read Java or DEX, inspect method
 and fields, find direct subclasses, and retrieve manifests, resources and strings.
 The server runs locally and is included in RDX—no separate server installation.
 
-1. Open an APK in RDX and select **Tools → MCP Server…**.
+1. Open an APK, XAPK, or APKS in RDX and select **Tools → MCP Server…**.
 2. Click **Start server**, then **Copy MCP client configuration**.
 3. Paste the configuration into your assistant's MCP settings and reconnect it.
 
@@ -77,7 +78,7 @@ To build from source, install [Rust](https://rustup.rs/), then run from the repo
 cargo run --release -- /path/to/app.apk
 ```
 
-Or launch with `cargo run --release` and drag an APK/DEX into the window.
+Or launch with `cargo run --release` and drag an APK, XAPK, APKS, or DEX into the window.
 Platform build requirements, macOS app packaging and CLI commands are in the
 [user guide](docs/user-guide.md).
 

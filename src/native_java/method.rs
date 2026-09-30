@@ -3612,6 +3612,7 @@ struct Graph {
     constructor_bindings: std::cell::OnceCell<
         Option<std::collections::HashMap<usize, crate::native_constructors::ConstructorBinding>>,
     >,
+    shrink_ssa: std::cell::OnceCell<Option<crate::native_ssa::SsaMethod>>,
     live: Option<super::liveness::LiveRegisters>,
     switches: Vec<Option<Switch>>,
     payloads: Vec<bool>,
@@ -3622,6 +3623,119 @@ struct Graph {
     work: std::cell::Cell<usize>,
 }
 impl Graph {
+    fn single_use_call_result(
+        &self,
+        method: &DexMethod,
+        consumer_pc: usize,
+        argument_register: u16,
+        result_type: &str,
+    ) -> bool {
+        let Some(code) = method.code.as_ref() else {
+            return false;
+        };
+        if code.tries != 0 || !code.try_regions.is_empty() || code.instructions.len() > 512 {
+            return false;
+        }
+        let Some(front) = self.front_end.as_ref() else {
+            return false;
+        };
+        let index = front
+            .ir
+            .instructions
+            .partition_point(|instruction| instruction.pc < consumer_pc);
+        if index < 2
+            || front
+                .ir
+                .instructions
+                .get(index)
+                .is_none_or(|instruction| instruction.pc != consumer_pc)
+        {
+            return false;
+        }
+        let move_result = &front.ir.instructions[index - 1];
+        let producer = &front.ir.instructions[index - 2];
+        if !matches!(move_result.opcode, 0x0a..=0x0c)
+            || !matches!(producer.opcode, 0x71 | 0x77)
+            || move_result.pc + move_result.width != consumer_pc
+            || producer.pc + producer.width != move_result.pc
+        {
+            return false;
+        }
+        let Some(bound) = front.bound.calls.iter().find(|call| call.pc == producer.pc) else {
+            return false;
+        };
+        if bound.return_type.as_ref() != result_type
+            || bound.result.as_ref().is_none_or(|result| {
+                result.move_pc != move_result.pc || result.register.register != argument_register
+            })
+        {
+            return false;
+        }
+        let Some(ssa) = self.shrink_ssa.get_or_init(|| {
+            let cfg = crate::native_cfg::ControlFlowGraph::from_decoded(
+                &front.ir,
+                code.instructions.len(),
+            )
+            .ok()?;
+            crate::native_ssa::SsaMethod::build_with_work_limit(code, &front.ir, &cfg, 2_000_000)
+                .ok()
+        }) else {
+            return false;
+        };
+        let Some(&block) = ssa.graph.block_at.get(&producer.pc) else {
+            return false;
+        };
+        if ssa.graph.block_at.get(&move_result.pc) != Some(&block)
+            || ssa.graph.block_at.get(&consumer_pc) != Some(&block)
+        {
+            return false;
+        }
+        let Some(move_insn) = ssa
+            .instructions
+            .iter()
+            .find(|insn| insn.pc == move_result.pc)
+        else {
+            return false;
+        };
+        let Some(consumer) = ssa.instructions.iter().find(|insn| insn.pc == consumer_pc) else {
+            return false;
+        };
+        let Some(write) = move_insn
+            .writes
+            .iter()
+            .find(|operand| operand.register == argument_register)
+        else {
+            return false;
+        };
+        if write.words.is_empty() || write.words.len() > 2 {
+            return false;
+        }
+        for (word, &id) in write.words.iter().enumerate() {
+            if ssa
+                .phis
+                .iter()
+                .any(|phi| phi.incoming.iter().any(|(_, incoming)| *incoming == id))
+            {
+                return false;
+            }
+            let uses = ssa
+                .instructions
+                .iter()
+                .flat_map(|insn| insn.reads.iter().map(move |read| (insn.pc, read)))
+                .flat_map(|(pc, read)| read.words.iter().map(move |&word| (pc, word)))
+                .filter(|(_, word)| *word == id)
+                .collect::<Vec<_>>();
+            if uses.len() != 1
+                || uses[0].0 != consumer_pc
+                || !consumer.reads.iter().any(|read| {
+                    read.register == argument_register + word as u16 && read.words.contains(&id)
+                })
+            {
+                return false;
+            }
+        }
+        true
+    }
     /// Build the native identity pipeline only when an extended allocation
     /// region needs it. Keep the ordinary renderer path and repeated allocation
     /// lookups cheap; failed analysis is cached as a conservative decline.
@@ -3658,6 +3772,7 @@ impl Graph {
             caught_values: Default::default(),
             catch_rethrows: Default::default(),
             constructor_bindings: std::cell::OnceCell::new(),
+            shrink_ssa: std::cell::OnceCell::new(),
             live: None,
             loops: Vec::new(),
             switches: vec![None; len],
@@ -7638,9 +7753,9 @@ fn render(
         let w = words[pc];
         let instruction = graph.instruction(pc)?;
         let op = instruction.map_or(w as u8, |insn| insn.opcode);
-        // Only an immediate result transfer may separate a producer from its
-        // terminal return. Even instructions emitting no Java are barriers.
-        if !matches!(op, 0x0a..=0x0c | 0x0f..=0x11) {
+        // Keep the last local only for a direct return or a candidate static
+        // call. The latter must pass the separate adjacent SSA proof below.
+        if !matches!(op, 0x0a..=0x0c | 0x0f..=0x11 | 0x71 | 0x77) {
             out.last_local = None;
         }
         let a = (w >> 8) as usize;
@@ -9261,6 +9376,66 @@ fn render(
                     } else {
                         target
                     };
+                    let shrink_index = if static_call && allocation.is_none() {
+                        out.last_local.as_ref().and_then(|local| {
+                            call.arguments.iter().enumerate().skip(1).find_map(
+                                |(index, argument)| {
+                                    let value =
+                                        register(&regs, usize::from(argument.register)).ok()?;
+                                    if value != local.value
+                                        || local.indent != out.indent
+                                        || local.value.ty != argument.descriptor.as_ref()
+                                        || actual[index] != value.text
+                                        || !actual[..index]
+                                            .iter()
+                                            .zip(&call.arguments[..index])
+                                            .all(|(rendered, earlier)| {
+                                                register(&regs, usize::from(earlier.register))
+                                                    .is_ok_and(|value| {
+                                                        value.ty == earlier.descriptor.as_ref()
+                                                            && rendered == &value.text
+                                                            && value
+                                                                .text
+                                                                .strip_prefix('v')
+                                                                .or_else(|| {
+                                                                    value.text.strip_prefix('p')
+                                                                })
+                                                                .is_some_and(|digits| {
+                                                                    !digits.is_empty()
+                                                                        && digits.bytes().all(
+                                                                            |byte| {
+                                                                                byte.is_ascii_digit(
+                                                                                )
+                                                                            },
+                                                                        )
+                                                                })
+                                                    })
+                                            })
+                                        || !graph.single_use_call_result(
+                                            method,
+                                            pc,
+                                            argument.register,
+                                            &local.value.ty,
+                                        )
+                                    {
+                                        return None;
+                                    }
+                                    Some(index)
+                                },
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    let moved_local = shrink_index.and_then(|index| {
+                        let prefix = format!(
+                            "(({}) ",
+                            java_type(&out.last_local.as_ref()?.value.ty).ok()?
+                        );
+                        let local = out.last_local.take()?;
+                        actual[index] = format!("{prefix}{})", local.expression);
+                        Some((index, local, prefix.chars().count()))
+                    });
                     let expr = format!("{target}.{display_name}({})", actual.join(", "));
                     let mut refs = vec![(
                         target.chars().count() + 1,
@@ -9273,6 +9448,21 @@ fn render(
                             target.chars().count(),
                             class_label(owner).context("invalid owner")?,
                         ));
+                    }
+                    if let Some((index, local, cast_prefix)) = moved_local {
+                        let offset = target.chars().count()
+                            + display_name.chars().count()
+                            + 2
+                            + actual[..index]
+                                .iter()
+                                .map(|arg| arg.chars().count() + 2)
+                                .sum::<usize>();
+                        refs.extend(local.refs.iter().map(|(start, len, label)| {
+                            (offset + cast_prefix + start, *len, label.clone())
+                        }));
+                        out.text.truncate(local.byte_start);
+                        out.chars = local.char_start;
+                        out.links.truncate(local.link_start);
                     }
                     let consumes_result = if graph.front_end.is_some() {
                         call.result.is_some()
@@ -17578,5 +17768,68 @@ mod terminal_local_tests {
             out.return_value(&value, converted, if barrier == 3 { "J" } else { "I" });
             assert!(out.text.contains("int v0 = Source.read();"), "{}", out.text);
         }
+    }
+}
+
+#[cfg(test)]
+mod call_shrink_proof_tests {
+    use super::*;
+    use crate::native_dex::{self, DexSymbols};
+    use std::sync::Arc;
+
+    #[test]
+    fn selected_call_result_rejects_protection_and_branch_entry() {
+        let mut class = native_dex::parse(include_bytes!("../../tests/fixtures/hello.dex"))
+            .unwrap()
+            .classes
+            .remove(0);
+        class.descriptor = "Lsample/Proof;".into();
+        class
+            .methods
+            .retain(|method| method.name.as_ref() == "answer");
+        class.symbols = Arc::new(DexSymbols {
+            types: vec!["Lsample/Source;".into(), "Lsample/Sink;".into()],
+            strings: vec!["make".into(), "accept".into()],
+            protos: vec![
+                ("Ljava/lang/String;".into(), vec![]),
+                (
+                    "V".into(),
+                    vec!["Ljava/lang/Object;".into(), "Ljava/lang/String;".into()],
+                ),
+            ],
+            methods: vec![(0, 0, 0), (1, 1, 1)],
+            ..Default::default()
+        });
+        let method = &mut class.methods[0];
+        method.declaring_type = class.descriptor.clone();
+        method.name = "run".into();
+        method.return_type = "V".into();
+        method.parameters = vec!["Ljava/lang/Object;".into()];
+        method.access_flags = 9;
+        let code = method.code.as_mut().unwrap();
+        code.registers = 2;
+        code.ins = 1;
+        code.outs = 2;
+        code.tries = 0;
+        code.try_regions.clear();
+        code.instructions = vec![0x0071, 0, 0, 0x000c, 0x2071, 1, 0x0001, 0x000e];
+        let mut graph = Graph::empty(code.instructions.len());
+        graph.front_end =
+            Some(crate::native_method::MethodFrontEnd::build(&class, &class.methods[0]).unwrap());
+        assert!(graph.single_use_call_result(&class.methods[0], 4, 0, "Ljava/lang/String;"));
+        class.methods[0].code.as_mut().unwrap().tries = 1;
+        assert!(!graph.single_use_call_result(&class.methods[0], 4, 0, "Ljava/lang/String;"));
+        class.methods[0].code.as_mut().unwrap().tries = 0;
+        class.methods[0].code.as_mut().unwrap().instructions[7] = 0xfd28;
+        class.methods[0]
+            .code
+            .as_mut()
+            .unwrap()
+            .instructions
+            .push(0x000e);
+        let mut branch = Graph::empty(class.methods[0].code.as_ref().unwrap().instructions.len());
+        branch.front_end =
+            Some(crate::native_method::MethodFrontEnd::build(&class, &class.methods[0]).unwrap());
+        assert!(!branch.single_use_call_result(&class.methods[0], 4, 0, "Ljava/lang/String;"));
     }
 }

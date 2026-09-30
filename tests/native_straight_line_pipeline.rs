@@ -50,14 +50,13 @@ fn wide_call_forms_preserve_calls_and_exact_navigation_spans() {
         let class = fixture(range);
         let rendered = native_java::render_method("sample.Hello", &class, &class.methods[0])
             .expect("straight-line Java");
-        let mut previous = 0;
+        let mut spans = Vec::new();
         for (name, signature) in [("first", "(I)J"), ("second", "(I)J"), ("combine", "(JJ)J")] {
             let label = format!("sample.Effects.{name}{signature}");
             let links: Vec<_> = rendered.links.iter().filter(|l| l.label == label).collect();
             assert_eq!(links.len(), 1, "{label}: {}", rendered.source);
             let link = links[0];
-            assert!(link.start >= previous, "call order: {}", rendered.source);
-            previous = link.end;
+            spans.push((link.start, link.end));
             assert_eq!(
                 rendered
                     .source
@@ -69,6 +68,11 @@ fn wide_call_forms_preserve_calls_and_exact_navigation_spans() {
                 "original signature must navigate from the emitted identifier"
             );
         }
+        // Nested calls need not appear in execution order in Java source.
+        // The JVM fixture below verifies effect order and exception identity;
+        // here each original method must retain its own nonoverlapping span.
+        spans.sort_unstable();
+        assert!(spans.windows(2).all(|pair| pair[0].1 <= pair[1].0));
         assert!(!rendered.source.contains(".method"));
     }
 }

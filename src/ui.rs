@@ -52,6 +52,7 @@ enum Event {
     Asset(u64, usize, Result<Preview, String>),
     Resource(u64, usize, NativeEngine, Result<DecompiledCode, String>),
     ResourceRefresh(u64, usize, NativeEngine, Result<DecompiledCode, String>),
+    ManifestSummary(u64, usize, NativeEngine, Result<String, String>),
     Plugin(u64, Result<String, String>),
     Exported(u64, Option<NativeEngine>, Result<PathBuf, String>),
     SearchUpdate(u64, u64, SearchUpdate),
@@ -131,11 +132,179 @@ impl InteractiveRequest {
 }
 enum Content {
     Text(Box<CodeDocument>),
+    Summary(Box<SummaryDocument>),
     Image {
         texture: egui::TextureHandle,
         width: u32,
         height: u32,
     },
+}
+
+enum SummaryBlock {
+    Title(String),
+    Heading(String),
+    Row(String, String),
+    Code(String),
+    ExportedComponent(String),
+    Bullet(String),
+    Paragraph(String),
+}
+struct SummaryDocument {
+    markdown: String,
+    blocks: Vec<SummaryBlock>,
+}
+impl SummaryDocument {
+    fn new(markdown: String) -> Self {
+        let mut blocks = Vec::new();
+        let mut exported_section = false;
+        for line in markdown.lines() {
+            if let Some(title) = line.strip_prefix("# ") {
+                blocks.push(SummaryBlock::Title(title.into()));
+            } else if let Some(heading) = line.strip_prefix("## ") {
+                exported_section = matches!(
+                    heading,
+                    "Exported activities and aliases"
+                        | "Exported services"
+                        | "Exported receivers"
+                        | "Exported providers"
+                );
+                blocks.push(SummaryBlock::Heading(heading.into()));
+            } else if line.starts_with("| ---") || line.starts_with("| Field |") || line.is_empty()
+            {
+                continue;
+            } else if let Some(row) = line.strip_prefix("| ") {
+                if let Some((key, val)) = row.split_once(" | ") {
+                    blocks.push(SummaryBlock::Row(
+                        key.into(),
+                        unescape_summary_value(val.strip_suffix(" |").unwrap_or(val)),
+                    ));
+                }
+            } else if let Some(code) = line.strip_prefix("    ") {
+                if exported_section
+                    && [
+                        "activity ",
+                        "activity-alias ",
+                        "service ",
+                        "receiver ",
+                        "provider ",
+                    ]
+                    .iter()
+                    .any(|prefix| code.starts_with(prefix))
+                {
+                    blocks.push(SummaryBlock::ExportedComponent(code.into()));
+                } else {
+                    blocks.push(SummaryBlock::Code(code.into()));
+                }
+            } else if let Some(bullet) = line.strip_prefix("- ") {
+                blocks.push(SummaryBlock::Bullet(unescape_summary_value(bullet)));
+            } else {
+                blocks.push(SummaryBlock::Paragraph(line.into()));
+            }
+        }
+        Self { markdown, blocks }
+    }
+    fn show(&self, ui: &mut egui::Ui, font_size: f32) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
+                for block in &self.blocks {
+                    match block {
+                        SummaryBlock::Title(s) => {
+                            ui.add_space(10.0);
+                            ui.heading(s);
+                            ui.add_space(10.0);
+                        }
+                        SummaryBlock::Heading(s) => {
+                            ui.add_space(16.0);
+                            ui.label(egui::RichText::new(s).heading());
+                            ui.separator();
+                        }
+                        SummaryBlock::Row(key, val) => {
+                            ui.scope(|ui| {
+                                ui.spacing_mut().interact_size.y = font_size + 4.0;
+                                ui.horizontal_top(|ui| {
+                                    let label = ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(key).strong().size(font_size),
+                                        )
+                                        .selectable(true),
+                                    );
+                                    ui.add_space((170.0 - label.rect.width()).max(0.0));
+                                    ui.add(
+                                        egui::Label::new(egui::RichText::new(val).size(font_size))
+                                            .wrap()
+                                            .selectable(true),
+                                    );
+                                });
+                            });
+                        }
+                        SummaryBlock::Code(s) | SummaryBlock::ExportedComponent(s) => {
+                            let background = matches!(block, SummaryBlock::ExportedComponent(_))
+                                .then(|| ui.painter().add(egui::Shape::Noop));
+                            let response = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(s).monospace().size(font_size),
+                                )
+                                .wrap()
+                                .selectable(true),
+                            );
+                            if let Some(background) = background {
+                                let mut rect = response.rect;
+                                rect.min.x = ui.max_rect().left();
+                                rect.max.x = ui.max_rect().right();
+                                let color = if ui.visuals().dark_mode {
+                                    egui::Color32::from_rgba_unmultiplied(70, 190, 110, 48)
+                                } else {
+                                    egui::Color32::from_rgba_unmultiplied(30, 160, 70, 30)
+                                };
+                                ui.painter()
+                                    .set(background, egui::Shape::rect_filled(rect, 2.0, color));
+                            }
+                        }
+                        SummaryBlock::Bullet(s) => {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("• {s}")).size(font_size),
+                                )
+                                .wrap()
+                                .selectable(true),
+                            );
+                        }
+                        SummaryBlock::Paragraph(s) => {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(s).size(font_size))
+                                    .wrap()
+                                    .selectable(true),
+                            );
+                        }
+                    }
+                }
+            });
+    }
+}
+fn unescape_summary_value(value: &str) -> String {
+    value
+        .split("<br>")
+        .map(unescape_summary_fragment)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+fn unescape_summary_fragment(value: &str) -> String {
+    let mut out = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(next) = chars.peek().copied()
+            && "\\|*_[]`<>".contains(next)
+        {
+            out.push(next);
+            chars.next();
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 #[derive(Clone)]
 struct JumpLocation {
@@ -220,12 +389,29 @@ impl Tab {
     fn retained_bytes(&self) -> usize {
         match &self.content {
             Content::Text(document) => document.retained_bytes(),
+            Content::Summary(document) => {
+                document.markdown.len()
+                    + document
+                        .blocks
+                        .iter()
+                        .map(|block| match block {
+                            SummaryBlock::Row(a, b) => a.len() + b.len(),
+                            SummaryBlock::Title(s)
+                            | SummaryBlock::Heading(s)
+                            | SummaryBlock::Code(s)
+                            | SummaryBlock::ExportedComponent(s)
+                            | SummaryBlock::Bullet(s)
+                            | SummaryBlock::Paragraph(s) => s.len(),
+                        })
+                        .sum::<usize>()
+            }
             Content::Image { width, height, .. } => *width as usize * *height as usize * 4,
         }
     }
     fn text(&self) -> Option<&str> {
         match &self.content {
             Content::Text(document) => Some(document.text()),
+            Content::Summary(document) => Some(&document.markdown),
             _ => None,
         }
     }
@@ -616,6 +802,7 @@ impl App {
         match target {
             Target::Class(name) => self.decompile(name, None, ctx),
             Target::File(index) => self.open_asset(index, ctx),
+            Target::ManifestSummary(index) => self.open_manifest_summary(index, ctx),
         }
     }
     fn decompile(&mut self, name: String, position: Option<usize>, ctx: &egui::Context) {
@@ -876,6 +1063,7 @@ impl App {
             source_hash: tab.source_hash.clone(),
             position: match &tab.content {
                 Content::Text(document) => document.navigation_position(),
+                Content::Summary(_) => 0,
                 Content::Image { .. } => 0,
             },
         })
@@ -944,6 +1132,7 @@ impl App {
             && match &location.target {
                 Target::Class(_) => self.engine.is_none(),
                 Target::File(_) => self.archive.is_none(),
+                Target::ManifestSummary(_) => self.engine.is_none(),
             }
         {
             return;
@@ -960,6 +1149,7 @@ impl App {
             match location.target {
                 Target::Class(class) => self.decompile(class, Some(location.position), ctx),
                 Target::File(index) => self.open_asset(index, ctx),
+                Target::ManifestSummary(index) => self.open_manifest_summary(index, ctx),
             }
         }
     }
@@ -1015,6 +1205,14 @@ impl App {
                     Target::File(index) => archive
                         .ok_or_else(|| anyhow::anyhow!("Package archive is unavailable"))?
                         .export(index, &directory),
+                    Target::ManifestSummary(_) => {
+                        let path = directory.join("Manifest-summary.md");
+                        std::fs::write(
+                            &path,
+                            cached.ok_or_else(|| anyhow::anyhow!("Summary tab is unavailable"))?,
+                        )?;
+                        Ok(path)
+                    }
                     Target::Class(name) => {
                         let source = match cached {
                             Some(source) => source,
@@ -1240,6 +1438,43 @@ impl App {
     fn decode_resource(&mut self, index: usize, ctx: &egui::Context) {
         self.decode_resource_mode(index, ctx, false);
     }
+    fn open_manifest_summary(&mut self, index: usize, ctx: &egui::Context) {
+        if let Some(existing) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.target == Target::ManifestSummary(index))
+        {
+            self.selected = existing;
+            return;
+        }
+        let (Some(name), Some(path), Some(mut engine)) = (
+            self.entry_name(index),
+            self.path.clone(),
+            self.engine.take(),
+        ) else {
+            return;
+        };
+        self.busy = true;
+        self.status = "Building manifest summary…".into();
+        let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
+        thread::spawn(move || {
+            let result = (|| -> Result<String, String> {
+                let path = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
+                let code = engine
+                    .read_resource_with_metadata(&name)
+                    .map_err(|e| format!("{e:#}"))?;
+                let digest = crate::manifest_summary::sha256(&path)?;
+                crate::manifest_summary::render(
+                    &code.source,
+                    &path,
+                    &digest,
+                    engine.resource_table(),
+                )
+            })();
+            let _ = tx.send(Event::ManifestSummary(generation, index, engine, result));
+            ctx.request_repaint();
+        });
+    }
     fn decode_resource_mode(&mut self, index: usize, ctx: &egui::Context, refresh: bool) {
         let Some(name) = self.entry_name(index) else {
             return;
@@ -1410,8 +1645,19 @@ impl App {
                     .on_hover_text(
                         "Hide the tab bar until the pointer reaches the top of the viewer",
                     );
-                if let Some(text) = self.tabs.get(self.selected).and_then(Tab::text)
-                    && icons::button(ui, Icon::Copy, "Copy source", true).clicked()
+                if let Some(tab) = self.tabs.get(self.selected)
+                    && let Some(text) = tab.text()
+                    && icons::button(
+                        ui,
+                        Icon::Copy,
+                        if matches!(tab.content, Content::Summary(_)) {
+                            "Copy Markdown"
+                        } else {
+                            "Copy source"
+                        },
+                        true,
+                    )
+                    .clicked()
                 {
                     ui.ctx().copy_text(text.to_owned());
                 }
@@ -1435,6 +1681,7 @@ impl App {
                                     }
                                     Target::Class(_) => tab.name.rsplit('.').next(),
                                     Target::File(_) => tab.name.rsplit('/').next(),
+                                    Target::ManifestSummary(_) => Some("Manifest summary"),
                                 }
                                 .unwrap_or(&tab.name);
                                 let label = if tab.name.starts_with("dex://") {
@@ -1503,7 +1750,13 @@ impl App {
                                     if ui
                                         .add_enabled(
                                             !self.export_busy,
-                                            egui::Button::new("Export…"),
+                                            egui::Button::new(
+                                                if matches!(tab.content, Content::Summary(_)) {
+                                                    "Export Markdown…"
+                                                } else {
+                                                    "Export…"
+                                                },
+                                            ),
                                         )
                                         .clicked()
                                     {
@@ -1844,6 +2097,32 @@ impl App {
                         }
                     }
                 }
+                Event::ManifestSummary(generation, index, engine, result)
+                    if generation == self.generation =>
+                {
+                    self.busy = false;
+                    self.engine = Some(engine);
+                    match result {
+                        Ok(summary) => {
+                            let tab = Tab {
+                                pinned: false,
+                                bookmarked: false,
+                                loading_navigation: false,
+                                source_hash: None,
+                                target: Target::ManifestSummary(index),
+                                name: "Manifest summary".into(),
+                                content: Content::Summary(Box::new(SummaryDocument::new(summary))),
+                                note: None,
+                            };
+                            if let Err(error) = self.push_tab(tab) {
+                                self.error(error);
+                            } else {
+                                self.status = "Manifest summary ready".into();
+                            }
+                        }
+                        Err(error) => self.error(format!("Manifest summary failed: {error}")),
+                    }
+                }
                 Event::Exported(generation, engine, result) if generation == self.generation => {
                     self.export_busy = false;
                     if let Some(engine) = engine {
@@ -2158,6 +2437,7 @@ fn file_icon(name: &str, target: &Target) -> Icon {
 struct TreeActions {
     selected: Option<Target>,
     export: Option<Target>,
+    manifest_summary: Option<usize>,
 }
 fn draw_tree(
     ui: &mut egui::Ui,
@@ -2196,6 +2476,7 @@ fn draw_tree(
             let enabled = match target {
                 Target::Class(_) => ready.0,
                 Target::File(_) => ready.1,
+                Target::ManifestSummary(_) => ready.0,
             };
             let response = tree_entry(
                 ui,
@@ -2209,6 +2490,15 @@ fn draw_tree(
                 actions.selected = Some(target.clone());
             }
             response.context_menu(|ui| {
+                if let Target::File(index) = target
+                    && is_manifest_path(name)
+                    && ui
+                        .add_enabled(ready.0, egui::Button::new("Manifest summary"))
+                        .clicked()
+                {
+                    actions.manifest_summary = Some(*index);
+                    ui.close_menu();
+                }
                 if ui.button("Export…").clicked() {
                     actions.export = Some(target.clone());
                     ui.close_menu();
@@ -2685,6 +2975,9 @@ impl eframe::App for App {
         if let Some(target) = tree_actions.selected {
             self.choose_target(target, ctx);
         }
+        if let Some(index) = tree_actions.manifest_summary {
+            self.choose_target(Target::ManifestSummary(index), ctx);
+        }
         let mut export = tree_actions.export;
         let mut jump = None;
         let mut manifest_jump = None;
@@ -2773,6 +3066,7 @@ impl eframe::App for App {
                         return;
                     }
                     ui.push_id((&tab.name, self.generation), |ui| match &mut tab.content {
+                        Content::Summary(document) => document.show(ui, self.font_size),
                         Content::Text(document) => {
                             document.set_word_wrap(self.word_wrap);
                             document.set_code_font(self.code_font);
@@ -3078,6 +3372,15 @@ mod settings_tests {
     }
 
     use super::*;
+    #[test]
+    fn summary_markdown_preserves_escaped_values() {
+        let markdown = "# Manifest summary\n| Field | Value |\n| --- | --- |\n| Label | Literal \\<br\\> \\| \\`code\\`<br>next |\n    # still code\n";
+        let doc = SummaryDocument::new(markdown.into());
+        assert!(
+            matches!(&doc.blocks[1], SummaryBlock::Row(key, val) if key == "Label" && val == "Literal <br> | `code`\nnext")
+        );
+        assert!(matches!(&doc.blocks[2], SummaryBlock::Code(line) if line == "# still code"));
+    }
     #[test]
     #[ignore = "Set RDX_ZOOM_APK to the Zoom APK"]
     fn manifest_resources_resolve_before_and_after_index_ready() {

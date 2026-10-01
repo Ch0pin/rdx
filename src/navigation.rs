@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 pub enum Target {
     Class(String),
     File(usize),
+    ManifestSummary(usize),
 }
 
 #[derive(Default)]

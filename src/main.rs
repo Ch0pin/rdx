@@ -3,6 +3,7 @@ mod code_fonts;
 mod code_view;
 mod icons;
 mod manifest_links;
+mod manifest_summary;
 mod native_coverage;
 mod navigation;
 mod render_recovery;

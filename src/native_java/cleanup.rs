@@ -439,14 +439,25 @@ fn inline_locals(body: &mut MethodBody, names: &HashSet<String>, arguments: bool
         if edits.is_empty() {
             break;
         }
-        apply_edits(body, edits);
+        if !apply_edits(body, edits) {
+            break;
+        }
     }
 }
 
-fn apply_edits(body: &mut MethodBody, mut edits: Vec<Edit>) {
-    body.links.sort_by_key(|link| link.start);
+fn apply_edits(body: &mut MethodBody, mut edits: Vec<Edit>) -> bool {
     edits.sort_by_key(|e| e.start);
     let chars: Vec<_> = body.text.chars().collect();
+    // Deletion and substitution edits form one transaction. Applying only
+    // part of a conflicting batch could remove a declaration without its use.
+    let mut end = 0;
+    for edit in &edits {
+        if edit.start < end || edit.end < edit.start || edit.end > chars.len() {
+            return false;
+        }
+        end = edit.end;
+    }
+    body.links.sort_by_key(|link| link.start);
     let mut result = String::new();
     let mut links = Vec::new();
     let mut cursor = 0;
@@ -485,6 +496,7 @@ fn apply_edits(body: &mut MethodBody, mut edits: Vec<Edit>) {
     links.sort_by_key(|l| (l.start, l.end));
     body.text = result;
     body.links = links;
+    true
 }
 
 fn generated_local(name: &str) -> bool {
@@ -708,6 +720,58 @@ mod tests {
         inline_receivers(&mut body, &names.iter().map(|s| s.to_string()).collect());
         body
     }
+    #[test]
+    fn conflicting_cleanup_edits_leave_source_and_links_unchanged() {
+        for ranges in [vec![(1, 5), (3, 4)], vec![(4, 3)], vec![(2, 99)]] {
+            let mut body = MethodBody {
+                inferred_throws: vec![],
+                text: "α beta γ".into(),
+                links: vec![CodeLink {
+                    start: 2,
+                    end: 6,
+                    label: "beta".into(),
+                }],
+            };
+            let edits = ranges
+                .into_iter()
+                .map(|(start, end)| Edit {
+                    start,
+                    end,
+                    text: "replacement".into(),
+                    links: vec![],
+                })
+                .collect();
+            assert!(!apply_edits(&mut body, edits));
+            assert_eq!(body.text, "α beta γ");
+            assert_eq!((body.links[0].start, body.links[0].end), (2, 6));
+            assert_eq!(body.links[0].label, "beta");
+        }
+    }
+
+    #[test]
+    fn valid_cleanup_edits_remap_unicode_links() {
+        let mut body = MethodBody {
+            inferred_throws: vec![],
+            text: "α beta γ".into(),
+            links: vec![CodeLink {
+                start: 2,
+                end: 6,
+                label: "beta".into(),
+            }],
+        };
+        assert!(apply_edits(
+            &mut body,
+            vec![Edit {
+                start: 0,
+                end: 1,
+                text: "hello".into(),
+                links: vec![],
+            }]
+        ));
+        assert_eq!(body.text, "hello beta γ");
+        assert_eq!((body.links[0].start, body.links[0].end), (6, 10));
+    }
+
     #[test]
     fn negated_conditions_and_this_field_assignments_inline_once() {
         let mut body = MethodBody { inferred_throws: vec![], text: "    boolean v0 = source.ready();\n    if (!v0) {\n        hit();\n    }\n    sample.A v1 = source.next();\n    this.field = v1;\n".into(), links: vec![] };

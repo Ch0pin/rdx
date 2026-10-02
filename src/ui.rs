@@ -27,6 +27,18 @@ use std::{
     thread,
 };
 
+// Always return engine ownership and a terminal event after a worker panic.
+fn search_worker_result(run: impl FnOnce() -> SearchSummary) -> Result<SearchSummary, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).map_err(|payload| {
+        let detail = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown worker panic");
+        format!("Search worker failed: {detail}")
+    })
+}
+
 enum Event {
     Dialog(u64, u64, DialogResult),
     CallGraph(
@@ -56,7 +68,7 @@ enum Event {
     Plugin(u64, Result<String, String>),
     Exported(u64, Option<NativeEngine>, Result<PathBuf, String>),
     SearchUpdate(u64, u64, SearchUpdate),
-    SearchDone(u64, u64, NativeEngine, SearchSummary),
+    SearchDone(u64, u64, NativeEngine, Result<SearchSummary, String>),
     SearchMetadata(
         u64,
         String,
@@ -1277,31 +1289,39 @@ impl App {
             ctx.clone(),
         );
         thread::spawn(move || {
-            let mut cache = search_cache
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let summary = search::run_search_interactive(
-                &mut engine,
-                &mut cache,
-                generation,
-                &classes,
-                archive.as_deref(),
-                &query,
-                &cancel,
-                |update| {
-                    let _ = tx.send(Event::SearchUpdate(generation, search_id, update));
-                    SearchWindow::wake(&ctx);
-                },
-                |engine| {
-                    let request = interactive_requests
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .pop();
-                    if let Some(request) = request {
-                        request.execute(engine, &tx, generation, &ctx);
-                    }
-                },
-            );
+            let summary = search_worker_result(|| {
+                let mut cache = search_cache
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                search::run_search_interactive(
+                    &mut engine,
+                    &mut cache,
+                    generation,
+                    &classes,
+                    archive.as_deref(),
+                    &query,
+                    &cancel,
+                    |update| {
+                        let _ = tx.send(Event::SearchUpdate(generation, search_id, update));
+                        SearchWindow::wake(&ctx);
+                    },
+                    |engine| {
+                        let request = interactive_requests
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .pop();
+                        if let Some(request) = request {
+                            request.execute(engine, &tx, generation, &ctx);
+                        }
+                    },
+                )
+            });
+            if summary.is_err() {
+                *search_cache
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Default::default();
+                search_cache.clear_poison();
+            }
             let _ = tx.send(Event::SearchDone(generation, search_id, engine, summary));
             SearchWindow::wake(&ctx);
         });
@@ -2200,7 +2220,10 @@ impl App {
                     self.busy = false;
                     self.engine = Some(engine);
                     self.search_cancel = None;
-                    self.search.finish(summary);
+                    match summary {
+                        Ok(summary) => self.search.finish(summary),
+                        Err(error) => self.search.error(error),
+                    }
                     self.status = self.search.status.clone();
                     ctx.request_repaint_of(SearchWindow::viewport_id());
                 }
@@ -3449,6 +3472,53 @@ mod settings_tests {
         }
     }
 
+    #[test]
+    fn search_worker_panic_returns_engine_and_allows_next_search() {
+        let ctx = egui::Context::default();
+        let mut app = navigation_test_app();
+        let mut engine = NativeEngine::start().unwrap();
+        let project = engine
+            .open(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk"))
+            .unwrap();
+        app.project = Some(project);
+        app.search.begin();
+        app.busy = true;
+        app.search_cancel = Some(Arc::new(AtomicBool::new(true)));
+        let result = search_worker_result(|| panic!("synthetic cleanup failure"));
+        assert!(result.is_err());
+        app.tx
+            .send(Event::SearchDone(
+                app.generation,
+                app.search_id,
+                engine,
+                result,
+            ))
+            .unwrap();
+        app.events(&ctx);
+        assert!(!app.busy);
+        assert!(!app.search.running);
+        assert!(app.search_cancel.is_none());
+        assert!(app.engine.is_some());
+        assert!(app.search.status.contains("synthetic cleanup failure"));
+        app.start_search(
+            SearchQuery {
+                text: "Target".into(),
+                classes: true,
+                code: false,
+                ..Default::default()
+            },
+            &ctx,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.search.running && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            app.events(&ctx);
+        }
+        assert!(!app.search.running);
+        assert!(!app.busy);
+        assert!(!app.search.results.is_empty());
+    }
+
     fn navigation_test_app() -> App {
         let (tx, rx) = mpsc::channel();
         App {
@@ -3680,7 +3750,7 @@ mod settings_tests {
                             0,
                             0,
                             engine,
-                            search::SearchSummary::default(),
+                            Ok(search::SearchSummary::default()),
                         ))
                         .unwrap();
                     app.events(&ctx);

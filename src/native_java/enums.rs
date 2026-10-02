@@ -11,23 +11,217 @@ enum Atom {
     New(usize),
     Constant(usize),
     Array(Vec<Option<usize>>),
+    Entries,
 }
 pub(super) struct Plan {
     constants: Vec<(String, String)>,
     array: String,
+    entries: Option<String>,
 }
 impl Plan {
+    fn kotlin_constructor(class: &DexClass) -> Result<()> {
+        let constructors = class
+            .methods
+            .iter()
+            .filter(|m| m.name.as_ref() == "<init>")
+            .collect::<Vec<_>>();
+        ensure!(constructors.len() == 1, "enum constructor count");
+        let m = constructors[0];
+        ensure!(
+            m.access_flags & 7 == 2
+                && m.access_flags & !(7 | 0x10000 | 0x1000) == 0
+                && m.return_type.as_ref() == "V"
+                && m.parameters
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .eq(["Ljava/lang/String;", "I"]),
+            "enum constructor signature"
+        );
+        let code = m
+            .code
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("enum constructor code"))?;
+        let w = &code.instructions;
+        ensure!(
+            code.try_regions.is_empty()
+                && code.registers == 3
+                && code.ins == 3
+                && w.len() == 4
+                && w[0] == 0x3070
+                && w[2] == 0x0210
+                && w[3] == 0x000e
+                && (w[1] as usize) < class.symbols.methods.len(),
+            "enum constructor body"
+        );
+        let &(owner, proto, name) = &class.symbols.methods[w[1] as usize];
+        ensure!(
+            class.symbols.types[owner as usize].as_ref() == "Ljava/lang/Enum;"
+                && class.symbols.strings[name as usize] == "<init>"
+                && class.symbols.protos[proto as usize].0.as_ref() == "V"
+                && class.symbols.protos[proto as usize]
+                    .1
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .eq(["Ljava/lang/String;", "I"]),
+            "enum constructor super call"
+        );
+        Ok(())
+    }
+
+    fn kotlin_values_helper(
+        class: &DexClass,
+        constants: &[(String, String)],
+    ) -> Result<Vec<Option<usize>>> {
+        let helpers = class
+            .methods
+            .iter()
+            .filter(|m| m.name.as_ref() == "$values")
+            .collect::<Vec<_>>();
+        ensure!(helpers.len() == 1, "enum values helper count");
+        let m = helpers[0];
+        ensure!(
+            m.access_flags & (7 | 8 | 16 | 0x1000) == 2 | 8 | 16 | 0x1000
+                && m.access_flags & !(7 | 8 | 16 | 0x1000) == 0
+                && m.parameters.is_empty()
+                && m.return_type.as_ref() == format!("[{}", class.descriptor),
+            "enum values helper signature"
+        );
+        let code = m
+            .code
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("enum values helper code"))?;
+        ensure!(code.try_regions.is_empty(), "enum values helper handlers");
+        let ir = DecodedMethod::decode(code)?;
+        let mut regs = vec![None; code.registers as usize];
+        let mut values = None;
+        for (position, insn) in ir.instructions.iter().enumerate() {
+            let pc = insn.pc;
+            let w = code.instructions[pc];
+            let a = (w >> 8) as usize;
+            match insn.opcode {
+                0x62 if values.is_none() => {
+                    let &(owner, ty, name) = class
+                        .symbols
+                        .fields
+                        .get(code.instructions[pc + 1] as usize)
+                        .ok_or_else(|| anyhow::anyhow!("enum helper field"))?;
+                    let field = &class.symbols.strings[name as usize];
+                    ensure!(
+                        class.symbols.types[owner as usize] == class.descriptor
+                            && class.symbols.types[ty as usize] == class.descriptor,
+                        "enum helper field type"
+                    );
+                    regs[a] = Some(
+                        constants
+                            .iter()
+                            .position(|(_, f)| f == field)
+                            .ok_or_else(|| anyhow::anyhow!("enum helper constant"))?,
+                    );
+                }
+                0x24 if values.is_none() => {
+                    ensure!(
+                        class.symbols.types[code.instructions[pc + 1] as usize].as_ref()
+                            == format!("[{}", class.descriptor),
+                        "enum helper array type"
+                    );
+                    let p = code.instructions[pc + 2];
+                    let rr = [
+                        (p & 15) as usize,
+                        ((p >> 4) & 15) as usize,
+                        ((p >> 8) & 15) as usize,
+                        ((p >> 12) & 15) as usize,
+                        a & 15,
+                    ];
+                    let count = a >> 4;
+                    ensure!(count == constants.len() && count <= 5, "enum helper count");
+                    let selected = rr[..count].iter().map(|&r| regs[r]).collect::<Vec<_>>();
+                    ensure!(
+                        selected.iter().copied().eq((0..count).map(Some)),
+                        "enum helper order"
+                    );
+                    values = Some(selected);
+                }
+                0x0c if values.is_some() => ensure!(a < regs.len(), "enum helper result register"),
+                0x11 if values.is_some() => ensure!(
+                    position + 1 == ir.instructions.len(),
+                    "enum helper return position"
+                ),
+                _ => bail!("enum helper instruction"),
+            }
+        }
+        let values = values.ok_or_else(|| anyhow::anyhow!("enum helper array missing"))?;
+        ensure!(
+            ir.instructions.len() == constants.len() + 3
+                && ir.instructions[ir.instructions.len() - 2].opcode == 0x0c
+                && ir.instructions.last().is_some_and(|i| i.opcode == 0x11)
+                && code.instructions[ir.instructions.last().unwrap().pc] >> 8
+                    == code.instructions[ir.instructions[ir.instructions.len() - 2].pc] >> 8,
+            "enum helper result"
+        );
+        Ok(values)
+    }
+
+    fn kotlin_value_of(class: &DexClass, m: &DexMethod) -> bool {
+        if m.access_flags != 9
+            || m.parameters
+                .iter()
+                .map(AsRef::as_ref)
+                .ne(["Ljava/lang/String;"])
+            || m.return_type != class.descriptor
+        {
+            return false;
+        }
+        let Some(code) = &m.code else {
+            return false;
+        };
+        let w = &code.instructions;
+        if !code.try_regions.is_empty()
+            || code.registers != 2
+            || code.ins != 1
+            || w.len() != 9
+            || w[0] != 0x001c
+            || w[2] != 0x2071
+            || w[4] != 0x0010
+            || w[5] != 0x010c
+            || w[6] != 0x011f
+            || w[8] != 0x0111
+        {
+            return false;
+        }
+        let Some(&(owner, proto, name)) = class.symbols.methods.get(w[3] as usize) else {
+            return false;
+        };
+        class.symbols.types.get(w[1] as usize) == Some(&class.descriptor)
+            && class.symbols.types.get(w[7] as usize) == Some(&class.descriptor)
+            && class.symbols.types[owner as usize].as_ref() == "Ljava/lang/Enum;"
+            && class.symbols.strings[name as usize] == "valueOf"
+            && class.symbols.protos[proto as usize].0.as_ref() == "Ljava/lang/Enum;"
+            && class.symbols.protos[proto as usize]
+                .1
+                .iter()
+                .map(AsRef::as_ref)
+                .eq(["Ljava/lang/Class;", "Ljava/lang/String;"])
+            && code.outs == 2
+    }
     pub(super) fn analyze(class: &DexClass) -> Result<Self> {
         ensure!(
             class.access_flags & 0x4000 != 0
                 && class.superclass.as_deref() == Some("Ljava/lang/Enum;"),
             "not enum"
         );
+        let kotlin = class.fields.iter().any(|f| f.name.as_ref() == "$ENTRIES");
         ensure!(
-            !class.methods.iter().any(|m| m.name.as_ref() == "<init>")
-                && class.fields.iter().all(|f| f.is_static),
-            "enum constructor or instance state"
+            class.fields.iter().all(|f| f.is_static),
+            "enum instance state"
         );
+        if kotlin {
+            Self::kotlin_constructor(class)?;
+        } else {
+            ensure!(
+                !class.methods.iter().any(|m| m.name.as_ref() == "<init>"),
+                "enum constructor"
+            );
+        }
         ensure!(
             class.access_flags & !0x5011 == 0
                 && !class.methods.iter().any(|m| m.access_flags & 0x400 != 0),
@@ -48,6 +242,9 @@ impl Plan {
         let mut constants: Vec<(String, String)> = vec![];
         let mut pending = None;
         let mut array = None;
+        let mut entries = None;
+        let mut helper_calls = 0usize;
+        let mut entries_calls = 0usize;
         let mut constructed = HashSet::new();
         let mut allocations = 0usize;
         for (index, insn) in ir.instructions.iter().enumerate() {
@@ -59,7 +256,9 @@ impl Plan {
             let w = code.instructions[pc];
             let a = (w >> 8) as usize;
             ensure!(
-                array.is_none() || matches!(insn.opcode, 0x00 | 0x0e),
+                array.is_none()
+                    || matches!(insn.opcode, 0x00 | 0x0e)
+                    || (kotlin && matches!(insn.opcode, 0x1f | 0x71 | 0x0c | 0x69)),
                 "enum instructions after values publication"
             );
             match insn.opcode {
@@ -107,7 +306,9 @@ impl Plan {
                         .get(code.instructions[pc + 1] as usize)
                         .ok_or_else(|| anyhow::anyhow!("enum method"))?;
                     ensure!(
-                        class.symbols.types[owner as usize].as_ref() == "Ljava/lang/Enum;"
+                        ((!kotlin
+                            && class.symbols.types[owner as usize].as_ref() == "Ljava/lang/Enum;")
+                            || (kotlin && class.symbols.types[owner as usize] == class.descriptor))
                             && class.symbols.strings[name as usize] == "<init>"
                             && class.symbols.protos[proto as usize].0.as_ref() == "V"
                             && class.symbols.protos[proto as usize]
@@ -172,6 +373,17 @@ impl Plan {
                                 "enum values array"
                             );
                             array = Some(field.clone());
+                        }
+                        Atom::Entries if kotlin => {
+                            ensure!(
+                                array.is_some()
+                                    && entries.is_none()
+                                    && field == "$ENTRIES"
+                                    && class.symbols.types[ty as usize].as_ref()
+                                        == "Lkotlin/enums/EnumEntries;",
+                                "enum entries store"
+                            );
+                            entries = Some(field.clone());
                         }
                         _ => bail!("enum nonconstant store"),
                     }
@@ -241,6 +453,59 @@ impl Plan {
                         .take()
                         .ok_or_else(|| anyhow::anyhow!("enum array result"))?
                 }
+                0x1f if kotlin => {
+                    ensure!(
+                        array.is_some()
+                            && class.symbols.types[code.instructions[pc + 1] as usize].as_ref()
+                                == "[Ljava/lang/Enum;"
+                            && matches!(regs[a], Atom::Array(_)),
+                        "enum entries array cast"
+                    );
+                }
+                0x71 if kotlin => {
+                    let &(owner, proto, name) = class
+                        .symbols
+                        .methods
+                        .get(code.instructions[pc + 1] as usize)
+                        .ok_or_else(|| anyhow::anyhow!("enum Kotlin method"))?;
+                    let owner = class.symbols.types[owner as usize].as_ref();
+                    let method = &class.symbols.strings[name as usize];
+                    let signature = &class.symbols.protos[proto as usize];
+                    if owner == class.descriptor.as_ref() && method == "$values" {
+                        ensure!(
+                            array.is_none()
+                                && helper_calls == 0
+                                && a == 0
+                                && code.instructions[pc + 2] == 0
+                                && signature.0.as_ref() == format!("[{}", class.descriptor)
+                                && signature.1.is_empty(),
+                            "enum helper invocation"
+                        );
+                        helper_calls += 1;
+                        pending = Some(Atom::Array(Self::kotlin_values_helper(class, &constants)?));
+                    } else {
+                        ensure!(
+                            owner == "Lkotlin/enums/EnumEntriesKt;"
+                                && method == "enumEntries"
+                                && signature.0.as_ref() == "Lkotlin/enums/EnumEntries;"
+                                && signature
+                                    .1
+                                    .iter()
+                                    .map(AsRef::as_ref)
+                                    .eq(["[Ljava/lang/Enum;"])
+                                && array.is_some()
+                                && entries.is_none()
+                                && entries_calls == 0
+                                && a == 0x10
+                                && code.instructions[pc + 2] == 0
+                                && matches!(&regs[(code.instructions[pc + 2] & 15) as usize], Atom::Array(values)
+                                    if values.iter().copied().eq((0..constants.len()).map(Some))),
+                            "enum entries invocation"
+                        );
+                        entries_calls += 1;
+                        pending = Some(Atom::Entries);
+                    }
+                }
                 0x0e => ensure!(index + 1 == ir.instructions.len(), "enum premature return"),
                 _ => bail!("unsupported enum initializer instruction"),
             }
@@ -263,11 +528,80 @@ impl Plan {
             "enum unused allocation or repeated constant field"
         );
         ensure!(
-            class.fields.len() == constants.len() + 1
+            class.fields.len() == constants.len() + 1 + usize::from(kotlin)
                 && class.static_values.is_empty()
-                && class.annotations_offset == 0,
+                && (class.annotations_offset == 0
+                    || (kotlin && annotation_directory(class).is_some())),
             "enum extra static state"
         );
+        ensure!(kotlin == entries.is_some(), "enum entries missing");
+        ensure!(
+            !kotlin || (helper_calls == 1 && entries_calls == 1),
+            "enum Kotlin helper calls"
+        );
+        if let Some(ref entries) = entries {
+            ensure!(
+                class
+                    .fields
+                    .iter()
+                    .find(|f| f.name.as_ref() == entries)
+                    .is_some_and(|f| f.field_type.as_ref() == "Lkotlin/enums/EnumEntries;"
+                        && f.access_flags == 0x101a),
+                "enum entries field flags"
+            );
+        }
+        if kotlin {
+            if let Some(directory) = annotation_directory(class) {
+                ensure!(
+                    directory.fields.iter().all(Option::is_none),
+                    "enum suppressed field annotations"
+                );
+                for (index, method) in class.methods.iter().enumerate() {
+                    if matches!(
+                        method.name.as_ref(),
+                        "<clinit>" | "<init>" | "$values" | "valueOf" | "values"
+                    ) {
+                        let annotation = directory.methods.get(index).and_then(Option::as_ref);
+                        ensure!(
+                            annotation.is_none_or(|set| set.iter().all(|a| a.visibility == 2
+                                && class.symbols.types.get(a.type_idx as usize).is_some_and(
+                                    |t| t.as_ref() == "Ldalvik/annotation/Signature;"
+                                ))),
+                            "enum suppressed method annotations"
+                        );
+                        ensure!(
+                            directory
+                                .parameters
+                                .get(index)
+                                .is_none_or(|sets| sets.iter().all(Option::is_none)),
+                            "enum suppressed parameter annotations"
+                        );
+                    }
+                }
+            }
+            for method in class
+                .methods
+                .iter()
+                .filter(|m| m.name.as_ref() != "<clinit>")
+            {
+                if let Some(code) = &method.code {
+                    for insn in DecodedMethod::decode(code)?.instructions {
+                        if matches!(insn.opcode, 0x6e..=0x78) {
+                            let &(owner, _, name) = class
+                                .symbols
+                                .methods
+                                .get(code.instructions[insn.pc + 1] as usize)
+                                .ok_or_else(|| anyhow::anyhow!("enum helper use"))?;
+                            ensure!(
+                                class.symbols.types[owner as usize] != class.descriptor
+                                    || class.symbols.strings[name as usize] != "$values",
+                                "enum helper has external use"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         ensure!(
             class
                 .fields
@@ -308,7 +642,11 @@ impl Plan {
                 }
             }
         }
-        let plan = Self { constants, array };
+        let plan = Self {
+            constants,
+            array,
+            entries,
+        };
         ensure!(
             class
                 .methods
@@ -318,7 +656,11 @@ impl Plan {
             "custom enum values method"
         );
         ensure!(
-            !class.methods.iter().any(|m| m.name.as_ref() == "valueOf"),
+            class
+                .methods
+                .iter()
+                .filter(|m| m.name.as_ref() == "valueOf")
+                .all(|m| kotlin && Self::kotlin_value_of(class, m)),
             "custom enum valueOf method"
         );
         Ok(plan)
@@ -405,6 +747,16 @@ impl Plan {
                 out.push(&format!(" = {constant};\n"));
             }
         }
+        if self.entries.is_some() {
+            out.push("    private static final kotlin.enums.EnumEntries ");
+            out.definition(
+                "$ENTRIES",
+                "$ENTRIES",
+                &format!("{name}.$ENTRIES:Lkotlin/enums/EnumEntries;"),
+                "field",
+            );
+            out.push(" = kotlin.enums.EnumEntriesKt.enumEntries(values());\n");
+        }
         Ok(out.finish())
     }
     pub(super) fn render(&self, name: &str, class: &DexClass) -> Result<DecompiledCode> {
@@ -414,6 +766,9 @@ impl Plan {
         if !package.is_empty() {
             out.push(&format!("package {package};\n\n"));
         }
+        let class_annotations =
+            annotation_directory(class).and_then(|directory| directory.class.as_ref());
+        out.append(annotations::lines(class, class_annotations, ""));
         out.push(access(class.access_flags)?);
         out.push("enum ");
         out.definition(simple, name, name, "class");
@@ -429,7 +784,10 @@ impl Plan {
         out.push(" {\n");
         out.append(self.initializer(name, class)?);
         for m in &class.methods {
-            if matches!(m.name.as_ref(), "<clinit>" | "values") {
+            if matches!(m.name.as_ref(), "<clinit>" | "values")
+                || (self.entries.is_some()
+                    && matches!(m.name.as_ref(), "<init>" | "$values" | "valueOf"))
+            {
                 continue;
             }
             append_presented_method(&mut out, class, m, render_method(name, class, m)?)?;

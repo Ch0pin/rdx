@@ -776,6 +776,15 @@ impl NativeEngine {
             limited: false,
         })
     }
+    pub fn implementation_names(
+        &self,
+        class: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<String>> {
+        ensure!(self.native.class(class).is_some(), "SYMBOL_NOT_FOUND");
+        self.native.implementations(class, None, cancel)
+    }
+
     pub fn implementations_at(
         &mut self,
         class: &str,

@@ -467,6 +467,9 @@ pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result
         }));
         out.push("    }\n");
     } else {
+        if class.access_flags & 0x2000 != 0 {
+            out.append(annotations::default_value(class, method)?);
+        }
         out.push(";\n");
     }
     Ok(out.finish())
@@ -863,10 +866,12 @@ fn render_mixed_field_fallback(name: &str, class: &DexClass, field: &DexField) -
 }
 
 fn render_header(name: &str, class: &DexClass) -> Result<Output> {
+    annotations::validate_declaration(class)?;
+    let annotation = class.access_flags & 0x2000 != 0;
     let interface = class.access_flags & 0x200 != 0;
     ensure!(
         // ACC_SYNTHETIC is compiler metadata, not a Java source modifier.
-        class.access_flags & !0x1611 == 0,
+        class.access_flags & !0x3611 == 0,
         "Unsupported class modifiers"
     );
     ensure!(
@@ -895,7 +900,13 @@ fn render_header(name: &str, class: &DexClass) -> Result<Output> {
     if !interface && class.access_flags & 0x400 != 0 {
         out.push("abstract ");
     }
-    out.push(if interface { "interface " } else { "class " });
+    out.push(if annotation {
+        "@interface "
+    } else if interface {
+        "interface "
+    } else {
+        "class "
+    });
     out.definition(simple, name, name, "class");
     if let Some(parent) = &class.superclass {
         ensure!(parent.starts_with('L'), "Invalid superclass type");
@@ -915,7 +926,7 @@ fn render_header(name: &str, class: &DexClass) -> Result<Output> {
             "Missing superclass"
         );
     }
-    if !class.interfaces.is_empty() {
+    if !annotation && !class.interfaces.is_empty() {
         out.push(if interface {
             " extends "
         } else {
@@ -984,7 +995,7 @@ fn class_prefix(name: &str, class: &DexClass) -> Result<Output> {
         "Annotations not reconstructed"
     );
     ensure!(
-        class.access_flags & !0x611 == 0,
+        class.access_flags & !0x2611 == 0,
         "Unsupported class modifiers"
     );
     ensure!(

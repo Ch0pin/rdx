@@ -209,3 +209,156 @@ pub(super) fn inline(class: &DexClass, set: Option<&DexAnnotationSet>) -> Decomp
     }
     out.finish()
 }
+
+// Annotation elements and their defaults live in class-level system metadata.
+fn defaults(class: &DexClass) -> Result<Vec<(u32, &DexValue)>> {
+    let mut result = Vec::new();
+    let mut found = false;
+    if let Some(set) = super::annotation_directory(class).and_then(|d| d.class.as_ref()) {
+        for annotation in set.iter() {
+            if class
+                .symbols
+                .types
+                .get(annotation.type_idx as usize)
+                .map(AsRef::as_ref)
+                != Some("Ldalvik/annotation/AnnotationDefault;")
+            {
+                continue;
+            }
+            anyhow::ensure!(
+                !found && annotation.visibility == 2,
+                "Invalid annotation defaults"
+            );
+            found = true;
+            anyhow::ensure!(
+                annotation.elements.len() == 1,
+                "Invalid annotation defaults wrapper"
+            );
+            let (name, encoded) = &annotation.elements[0];
+            anyhow::ensure!(
+                class
+                    .symbols
+                    .strings
+                    .get(*name as usize)
+                    .map(String::as_str)
+                    == Some("value"),
+                "Invalid annotation defaults name"
+            );
+            let DexValue::Annotation { type_idx, elements } = encoded else {
+                bail!("Invalid annotation defaults value")
+            };
+            anyhow::ensure!(
+                class.symbols.types.get(*type_idx as usize) == Some(&class.descriptor),
+                "Annotation defaults owner mismatch"
+            );
+            let mut seen = std::collections::HashSet::new();
+            for (name, item) in elements {
+                anyhow::ensure!(seen.insert(*name), "Duplicate annotation default");
+                let name_text = class
+                    .symbols
+                    .strings
+                    .get(*name as usize)
+                    .context("Default element name")?;
+                let method = class
+                    .methods
+                    .iter()
+                    .find(|m| m.name.as_ref() == name_text)
+                    .context("Unknown annotation default element")?;
+                anyhow::ensure!(
+                    default_matches(class, &method.return_type, item),
+                    "Annotation default type mismatch"
+                );
+                let mut out = Output::default();
+                value(&mut out, class, item)?;
+                result.push((*name, item));
+            }
+        }
+    }
+    Ok(result)
+}
+
+pub(super) fn validate_declaration(class: &DexClass) -> Result<()> {
+    if class.access_flags & 0x2000 == 0 {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        class.access_flags & 0x600 == 0x600
+            && class.superclass.as_deref() == Some("Ljava/lang/Object;")
+            && class
+                .interfaces
+                .iter()
+                .map(AsRef::as_ref)
+                .eq(["Ljava/lang/annotation/Annotation;"]),
+        "Invalid annotation declaration"
+    );
+    for method in &class.methods {
+        anyhow::ensure!(
+            method.access_flags == 0x401
+                && method.code.is_none()
+                && method.parameters.is_empty()
+                && method.thrown_types.is_empty()
+                && !method.name.starts_with('<')
+                && method.return_type.as_ref() != "V"
+                && !method.return_type.starts_with("[["),
+            "Invalid annotation element"
+        );
+    }
+    defaults(class)?;
+    Ok(())
+}
+
+pub(super) fn default_value(
+    class: &DexClass,
+    method: &crate::native_dex::DexMethod,
+) -> Result<DecompiledCode> {
+    let mut out = Output::default();
+    for (name, item) in defaults(class)? {
+        if class.symbols.strings[name as usize] == method.name.as_ref() {
+            out.push(" default ");
+            value(&mut out, class, item)?;
+        }
+    }
+    Ok(out.finish())
+}
+
+fn default_matches(class: &DexClass, ty: &str, item: &DexValue) -> bool {
+    if let Some(element) = ty.strip_prefix('[') {
+        return matches!(item, DexValue::Array(items) if items.iter().all(|item| default_matches(class, element, item)));
+    }
+    match (ty, item) {
+        ("Z", DexValue::Boolean(_))
+        | ("B", DexValue::Byte(_))
+        | ("S", DexValue::Short(_))
+        | ("C", DexValue::Char(_))
+        | ("I", DexValue::Int(_))
+        | ("J", DexValue::Long(_))
+        | ("F", DexValue::Float(_))
+        | ("D", DexValue::Double(_))
+        | ("Ljava/lang/String;", DexValue::String(_))
+        | ("Ljava/lang/Class;", DexValue::Type(_)) => true,
+        (_, DexValue::Enum(index)) => {
+            class
+                .symbols
+                .fields
+                .get(*index as usize)
+                .is_some_and(|(owner, field_type, _)| {
+                    class
+                        .symbols
+                        .types
+                        .get(*owner as usize)
+                        .is_some_and(|t| t.as_ref() == ty)
+                        && class
+                            .symbols
+                            .types
+                            .get(*field_type as usize)
+                            .is_some_and(|t| t.as_ref() == ty)
+                })
+        }
+        (_, DexValue::Annotation { type_idx, .. }) => class
+            .symbols
+            .types
+            .get(*type_idx as usize)
+            .is_some_and(|t| t.as_ref() == ty),
+        _ => false,
+    }
+}

@@ -1783,3 +1783,93 @@ public static void main(String[] args) {{
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+fn bypassed_handler_join_fixture() -> DexClass {
+    // first() is protected; normal zero skips second(), while nonzero and
+    // recovery share second(). The first shared instruction is not a join.
+    fixture(
+        vec![
+            0xf212, 0x0071, 0, 0, 0x000a, 0x0039, 7, 0x0928, 0x010d, 0x0071, 2, 0, 0x0071, 1, 0,
+            0x020a, 0x020f,
+        ],
+        vec![(Some("Ljava/lang/RuntimeException;"), 8)],
+        1,
+        5,
+        "I",
+    )
+}
+
+#[test]
+fn handler_join_does_not_cut_off_normal_bypass_return() {
+    let class = bypassed_handler_join_fixture();
+    let code = native_java::render("sample.Effects", &class).unwrap();
+    assert!(
+        code.source.contains("catch (RuntimeException"),
+        "{}",
+        code.source
+    );
+    assert!(code.source.contains("second()"));
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn handler_join_bypass_preserves_effects_and_exception_ownership_on_jvm() {
+    use std::{fs, process::Command};
+    for direct in [false, true] {
+        let mut class = bypassed_handler_join_fixture();
+        if direct {
+            let words = &mut class.methods[0].code.as_mut().unwrap().instructions;
+            words[5] = 0x0038;
+            words[6] = 11;
+            words[7] = 0x0528;
+        }
+        let code = native_java::render("sample.Effects", &class).unwrap();
+        let end = code.source.rfind('}').unwrap();
+        let helpers = r#"
+    static int mode; static String trace;
+    static int first() { trace += "A"; if(mode==2)throw new IllegalArgumentException(); return mode; }
+    static void touch() { trace += "R"; }
+    static int second() { trace += "B"; if(mode==3)throw new IllegalStateException(); return 7; }
+    public static void main(String[] args) {
+        mode=0; trace=""; if(test()!=-1||!trace.equals("A"))throw new AssertionError(trace);
+        mode=1; trace=""; if(test()!=7||!trace.equals("AB"))throw new AssertionError(trace);
+        mode=2; trace=""; if(test()!=7||!trace.equals("ARB"))throw new AssertionError(trace);
+        mode=3; trace=""; try {test();throw new AssertionError();}catch(IllegalStateException expected){} if(!trace.equals("AB"))throw new AssertionError(trace);
+    }
+"#;
+        let source = format!("{}{}{}", &code.source[..end], helpers, &code.source[end..]);
+        let dir = std::env::temp_dir().join(format!("rdx-handler-bypass-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sample")).unwrap();
+        fs::write(dir.join("sample/Effects.java"), source).unwrap();
+        let compile = Command::new("javac")
+            .current_dir(&dir)
+            .arg("sample/Effects.java")
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new("java")
+            .current_dir(&dir)
+            .args(["-cp", ".", "sample.Effects"])
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn handler_join_does_not_move_effectful_bypass_into_try() {
+    let mut class = bypassed_handler_join_fixture();
+    let words = &mut class.methods[0].code.as_mut().unwrap().instructions;
+    words[7] = 0x0a28;
+    words.extend([0x0071, 2, 0, 0x020f]);
+    assert!(native_java::render("sample.Effects", &class).is_err());
+}

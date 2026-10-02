@@ -29,7 +29,7 @@ memory while enabled. Opening/reloading a GUI project stops that service.
 | Area | Tools |
 | --- | --- |
 | Instances | `list_instances`, `get_instance_info`, `open_apk` |
-| Classes | `get_all_classes`, `search_classes_by_keyword`, `find_direct_subclasses` |
+| Classes | `get_all_classes`, `search_classes_by_keyword`, `find_direct_subclasses`, `find_implementations` |
 | Source and metadata | `get_class_source`, `get_class_disassembly`, `get_methods_of_class`, `get_fields_of_class` |
 | Resources | `get_all_resource_file_names`, `get_android_manifest`, `get_resource_file`, `get_strings` |
 | Call graphs | `get_call_graph` (exact `method_id`, `direction`: `callers` / `callees` / `both`, `depth`: 1–100, default 20) |
@@ -76,3 +76,5 @@ This is a static graph. It resolves inherited aliases through known superclass
 metadata, but does not infer runtime virtual targets, reflection or Intent
 routing. External method bodies cannot be expanded. The GUI graph continues
 to follow outgoing calls; direction selection is currently an MCP feature.
+
+`find_direct_subclasses` follows immediate superclass edges. Use `find_implementations` with `class_id` to list concrete direct and indirect implementations of an interface or class; it supports the same instance/project scope and offset/limit pagination.

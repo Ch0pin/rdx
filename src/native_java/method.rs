@@ -3596,6 +3596,16 @@ struct ProtectedLoopEscape {
     used: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
+struct ExceptionReturnBoundary<'a> {
+    active: &'a std::cell::Cell<Option<usize>>,
+    previous: Option<usize>,
+}
+impl Drop for ExceptionReturnBoundary<'_> {
+    fn drop(&mut self) {
+        self.active.set(self.previous);
+    }
+}
+
 struct Graph {
     front_end: Option<crate::native_method::MethodFrontEnd>,
     shared_cfg: Option<crate::native_cfg::ControlFlowGraph>,
@@ -3606,6 +3616,7 @@ struct Graph {
     synchronized: Vec<synchronized::Region>,
     monitor_dispatch: std::cell::RefCell<Vec<synchronized::Dispatch>>,
     protected: Vec<std::ops::Range<usize>>,
+    exception_return_boundary: std::cell::Cell<Option<usize>>,
     protected_loop_escape: std::cell::RefCell<Option<ProtectedLoopEscape>>,
     caught_values: std::cell::RefCell<std::collections::HashSet<String>>,
     catch_rethrows: std::cell::RefCell<std::collections::HashMap<String, String>>,
@@ -3768,6 +3779,7 @@ impl Graph {
             synchronized: Vec::new(),
             monitor_dispatch: Default::default(),
             protected: Vec::new(),
+            exception_return_boundary: Default::default(),
             protected_loop_escape: Default::default(),
             caught_values: Default::default(),
             catch_rethrows: Default::default(),
@@ -4846,6 +4858,16 @@ impl Graph {
         }
         pc == join
     }
+    fn bare_return_after(&self, pc: usize, stop: usize, words: &[u16]) -> bool {
+        self.exception_return_boundary.get() == Some(stop)
+            && pc > stop
+            && !self.terminal_loop_escape(pc, stop, words)
+            && self.widths.get(pc) == Some(&1)
+            && words
+                .get(pc)
+                .is_some_and(|word| matches!(*word as u8, 0x0e..=0x11))
+    }
+
     fn terminal_loop_escape(&self, pc: usize, stop: usize, words: &[u16]) -> bool {
         self.loops.iter().any(|region| {
             region.start <= stop
@@ -4930,6 +4952,10 @@ impl Graph {
         let mut pending = vec![start];
         while let Some(pc) = pending.pop() {
             self.tick()?;
+            if self.bare_return_after(pc, stop, words) {
+                seen[pc] = true;
+                continue;
+            }
             if self.terminal_loop_escape(pc, stop, words) {
                 continue;
             }
@@ -4998,7 +5024,8 @@ impl Graph {
         let mut pending = vec![start];
         while let Some(pc) = pending.pop() {
             self.tick()?;
-            if self.terminal_loop_escape(pc, stop, words) {
+            if self.bare_return_after(pc, stop, words) || self.terminal_loop_escape(pc, stop, words)
+            {
                 continue;
             }
             if pc > stop {
@@ -6921,6 +6948,12 @@ fn render_try(
             })
             .unwrap_or(stop)
     };
+    // Only exception continuations may bypass this shared join with a bare
+    // return. Other regions retain their existing loop and shared-tail rules.
+    let _return_boundary = ExceptionReturnBoundary {
+        active: &graph.exception_return_boundary,
+        previous: graph.exception_return_boundary.replace(Some(join)),
+    };
     let mut paths = Vec::new();
     let mut normal_regs = normal;
     let mut normal_terminal = normal_return;
@@ -6974,6 +7007,7 @@ fn render_try(
                     && matches!(continuation.text.trim(), "continue;" | "break;"))
                 || normal_reachable.iter().enumerate().all(|(pc, reachable)| {
                     !reachable
+                        || pc == join
                         || matches!(words[pc] as u8,
                         0x00..=0x09 | 0x0e..=0x19 | 0x28..=0x2a | 0x32..=0x3d)
                 }),
@@ -7913,6 +7947,33 @@ fn render(
                 target > pc || graph.acyclic_backwards.contains(&pc),
                 "unstructured backward jump"
             );
+            if graph.bare_return_after(target, stop, words) {
+                ensure!(
+                    pending.is_none() && allocation.is_none(),
+                    "terminal return interrupts instruction state"
+                );
+                ensure!(
+                    words[target] as u8 == 0x0e
+                        || regs
+                            .get((words[target] >> 8) as usize)
+                            .and_then(Option::as_ref)
+                            .is_some_and(stable_retry_argument),
+                    "terminal return has deferred effects"
+                );
+                return render(
+                    class,
+                    method,
+                    graph,
+                    target,
+                    target + 1,
+                    regs,
+                    out,
+                    depth + 1,
+                    initialized,
+                    suppressed_loop,
+                    exception_slots,
+                );
+            }
             ensure!(target <= stop, "goto crosses region boundary");
             pc = target;
             pending = None;
@@ -7947,6 +8008,42 @@ fn render(
             } else {
                 graph.targets[pc].context("missing branch target")?
             };
+            if graph.bare_return_after(target, stop, words) {
+                ensure!(
+                    pending.is_none() && allocation.is_none(),
+                    "terminal branch interrupts instruction state"
+                );
+                ensure!(
+                    words[target] as u8 == 0x0e
+                        || regs
+                            .get((words[target] >> 8) as usize)
+                            .and_then(Option::as_ref)
+                            .is_some_and(stable_retry_argument),
+                    "terminal return has deferred effects"
+                );
+                let test = condition(op, a, &regs)?;
+                out.line(&format!("if ({test}) {{"), &[]);
+                out.indent += 1;
+                let (_, terminal) = render(
+                    class,
+                    method,
+                    graph,
+                    target,
+                    target + 1,
+                    regs.clone(),
+                    out,
+                    depth + 1,
+                    initialized,
+                    suppressed_loop,
+                    exception_slots,
+                )?;
+                ensure!(terminal, "bare return is not terminal");
+                out.indent -= 1;
+                out.line("}", &[]);
+                pending = None;
+                pc += width;
+                continue;
+            }
             if let Some(context) = suppressed_loop
                 && target == context.start
             {

@@ -91,8 +91,8 @@ return instance records directly because they establish the project scope.
 | `get_xrefs_to_method` | `Scope & MethodRef & Page` | Incoming call sites |
 | `get_xrefs_to_field` | `Scope & FieldRef & Page` | Reference sites with read/write kind |
 | `get_method_callees` | `Scope & MethodRef & Page` | Outgoing call sites and declared targets |
-| `find_direct_subclasses` | `Scope & ClassRef & Page` | Direct subclasses only |
-| `find_implementations` | `Scope & SymbolRef & Page` | Class or method implementation matches with resolution kind |
+| `find_direct_subclasses` | `Scope & ClassRef & Page` | Direct superclass children only |
+| `find_implementations` | `Scope & ClassRef & Page` | Concrete direct and indirect implementations through known hierarchy edges |
 | `get_android_manifest` | `Scope & TextPage` | Decoded XML `Text` |
 | `get_manifest_component` | `Scope & Page & { kind?: "activity" \| "activity-alias" \| "service" \| "receiver" \| "provider", exported?: boolean }` | Components, explicit/effective exported state and derivation |
 | `get_all_resource_file_names` | `Scope & Page & { prefix?: string }` | Resource entries and opaque IDs |

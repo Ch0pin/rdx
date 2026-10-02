@@ -342,6 +342,7 @@ fn dispatch(
             let class=engine.dex_class(owner).context("SYMBOL_NOT_FOUND")?;
             metadata(class,owner,args,name=="get_fields_of_class")
         },
+        "find_implementations"=>page(engine.implementation_names(required(args,"class_id")?,cancel)?.into_iter().map(|c|json!({"class_id":c})).collect(),args),
         "find_direct_subclasses"=>page(engine.direct_subclass_names(required(args,"class_id")?).iter().map(|c|json!({"class_id":c})).collect(),args),
         "get_all_resource_file_names"=>page(project.resources.iter().filter(|r|r.contains(query)).map(|r|json!({"path":r})).collect(),args),
         "get_android_manifest"=>text_page(engine.read_resource_with_metadata("AndroidManifest.xml")?.source,args,"xml"),
@@ -478,8 +479,14 @@ fn tools_list() -> Value {
             true,
         ),
         (
+            "find_implementations",
+            "List concrete implementations of an interface or class, including indirect implementations through known hierarchy edges.",
+            vec!["class_id"],
+            true,
+        ),
+        (
             "find_direct_subclasses",
-            "List immediate subclasses.",
+            "List immediate superclass children; interface implementors are available through find_implementations.",
             vec!["class_id"],
             true,
         ),
@@ -731,7 +738,7 @@ mod tests {
         let server = Server::start_in(path, dir.0.clone(), random_id().unwrap()).unwrap();
         let record: Registration =
             serde_json::from_slice(&fs::read(&server.registration).unwrap()).unwrap();
-        for _ in 0..200 {
+        for _ in 0..6000 {
             let status = server.status();
             assert_ne!(status.state, "Failed", "{}", status.last_error);
             if status.state == "Running" {
@@ -744,6 +751,47 @@ mod tests {
     }
     fn start(dir: &TestDir, name: &str) -> (Server, Registration, Value) {
         start_path(dir, fixture(name))
+    }
+
+    #[test]
+    fn implementation_tool_is_scoped_paginated_and_dispatched() {
+        let dir = TestDir::new();
+        let (_server, record, mut args) = start(&dir, "navigation.apk");
+        args["class_id"] = json!("sample.Target");
+        args["limit"] = json!(1);
+        assert!(validate("find_implementations", &args).is_ok());
+        assert!(validate("find_implementations", &json!({"class_id":"sample.Target"})).is_err());
+        let result = remote(&record, "find_implementations", &args).unwrap();
+        assert_eq!(result["data"]["total"], 0);
+        args["class_id"] = json!("missing.Type");
+        assert!(remote(&record, "find_implementations", &args).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires RDX_IMPLEMENTATIONS_APK, RDX_IMPLEMENTATIONS_CLASS, RDX_IMPLEMENTATIONS_EXPECTED"]
+    fn implementations_match_local_apk_inventory_over_mcp() {
+        let dir = TestDir::new();
+        let path = PathBuf::from(std::env::var_os("RDX_IMPLEMENTATIONS_APK").unwrap());
+        let (_server, record, mut args) = start_path(&dir, path);
+        args["class_id"] = json!(std::env::var("RDX_IMPLEMENTATIONS_CLASS").unwrap());
+        args["limit"] = json!(2);
+        let expected: Vec<String> =
+            serde_json::from_str(&std::env::var("RDX_IMPLEMENTATIONS_EXPECTED").unwrap()).unwrap();
+        let mut found = Vec::new();
+        loop {
+            args["offset"] = json!(found.len());
+            let result = remote(&record, "find_implementations", &args).unwrap();
+            for item in result["data"]["items"].as_array().unwrap() {
+                found.push(item["class_id"].as_str().unwrap().to_owned());
+            }
+            if found.len() >= result["data"]["total"].as_u64().unwrap() as usize {
+                break;
+            }
+        }
+        assert_eq!(found, expected);
+        args["offset"] = json!(0);
+        let direct = remote(&record, "find_direct_subclasses", &args).unwrap();
+        assert_eq!(direct["data"]["total"], 0);
     }
 
     #[test]

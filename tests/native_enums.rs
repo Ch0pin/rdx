@@ -186,3 +186,224 @@ fn exposed_or_mutable_enum_backing_storage_declines() {
     });
     assert!(native_java::render("sample.Mode", &c).is_err());
 }
+
+fn kotlin_fixture() -> DexClass {
+    let mut c = fixture();
+    let symbols = Arc::get_mut(&mut c.symbols).unwrap();
+    symbols.strings.extend(
+        [
+            "$values",
+            "$ENTRIES",
+            "enumEntries",
+            "getEntries",
+            "valueOf",
+        ]
+        .map(String::from),
+    );
+    symbols.types.extend(
+        [
+            "Lkotlin/enums/EnumEntries;",
+            "Lkotlin/enums/EnumEntriesKt;",
+            "[Ljava/lang/Enum;",
+            "Ljava/lang/Class;",
+        ]
+        .map(Into::into),
+    );
+    symbols.protos.extend([
+        ("[Lsample/Mode;".into(), vec![]),
+        (
+            "Lkotlin/enums/EnumEntries;".into(),
+            vec!["[Ljava/lang/Enum;".into()],
+        ),
+        (
+            "Ljava/lang/Enum;".into(),
+            vec!["Ljava/lang/Class;".into(), "Ljava/lang/String;".into()],
+        ),
+    ]);
+    symbols
+        .methods
+        .extend([(0, 0, 5), (0, 2, 7), (4, 3, 9), (1, 4, 11)]);
+    symbols.fields.push((0, 3, 8));
+    c.fields.push(DexField {
+        declaring_type: c.descriptor.clone(),
+        name: "$ENTRIES".into(),
+        field_type: "Lkotlin/enums/EnumEntries;".into(),
+        access_flags: 0x101a,
+        is_static: true,
+    });
+    c.methods[0].code.as_mut().unwrap().instructions = vec![
+        0x0022, 0, 0x011a, 0, 0x0212, 0x3070, 2, 0x0210, 0x0069, 0, 0x0122, 0, 0x021a, 1, 0x1312,
+        0x3070, 2, 0x0321, 0x0169, 1, 0x0071, 3, 0, 0x000c, 0x0069, 2, 0x001f, 5, 0x1071, 4, 0,
+        0x000c, 0x0069, 3, 0x000e,
+    ];
+    c.methods.push(DexMethod {
+        declaring_type: c.descriptor.clone(),
+        name: "$values".into(),
+        return_type: "[Lsample/Mode;".into(),
+        parameters: vec![],
+        thrown_types: vec![],
+        access_flags: 0x101a,
+        code: Some(DexCode {
+            registers: 2,
+            ins: 0,
+            outs: 2,
+            tries: 0,
+            try_regions: vec![],
+            offset: 0,
+            instructions: vec![0x0062, 0, 0x0162, 1, 0x2024, 2, 0x0010, 0x000c, 0x0011],
+        }),
+    });
+    c.methods.push(DexMethod {
+        declaring_type: c.descriptor.clone(),
+        name: "<init>".into(),
+        return_type: "V".into(),
+        parameters: vec!["Ljava/lang/String;".into(), "I".into()],
+        thrown_types: vec![],
+        access_flags: 0x10002,
+        code: Some(DexCode {
+            registers: 3,
+            ins: 3,
+            outs: 3,
+            tries: 0,
+            try_regions: vec![],
+            offset: 0,
+            instructions: vec![0x3070, 0, 0x0210, 0x000e],
+        }),
+    });
+    c.methods.push(DexMethod {
+        declaring_type: c.descriptor.clone(),
+        name: "getEntries".into(),
+        return_type: "Lkotlin/enums/EnumEntries;".into(),
+        parameters: vec![],
+        thrown_types: vec![],
+        access_flags: 9,
+        code: Some(DexCode {
+            registers: 1,
+            ins: 0,
+            outs: 0,
+            tries: 0,
+            try_regions: vec![],
+            offset: 0,
+            instructions: vec![0x0062, 3, 0x0011],
+        }),
+    });
+    c.methods.push(DexMethod {
+        declaring_type: c.descriptor.clone(),
+        name: "valueOf".into(),
+        return_type: c.descriptor.clone(),
+        parameters: vec!["Ljava/lang/String;".into()],
+        thrown_types: vec![],
+        access_flags: 9,
+        code: Some(DexCode {
+            registers: 2,
+            ins: 1,
+            outs: 2,
+            tries: 0,
+            try_regions: vec![],
+            offset: 0,
+            instructions: vec![0x001c, 0, 0x2071, 5, 0x0010, 0x010c, 0x011f, 0, 0x0111],
+        }),
+    });
+    c
+}
+
+#[test]
+fn kotlin_enum_entries_preserve_constant_and_field_navigation() {
+    let c = kotlin_fixture();
+    let source = native_java::render("sample.Mode", &c).unwrap();
+    assert!(source.source.contains("enum Mode"), "{}", source.source);
+    assert!(
+        source
+            .source
+            .contains("$ENTRIES = kotlin.enums.EnumEntriesKt.enumEntries(values())")
+    );
+    assert!(!source.source.contains("$values("));
+    assert!(
+        source
+            .definitions
+            .iter()
+            .any(|d| d.name == "$ENTRIES" && d.kind == "field")
+    );
+}
+
+#[test]
+fn kotlin_enum_declines_changed_order_constructor_and_entries_operands() {
+    let mut c = kotlin_fixture();
+    c.methods[3].code.as_mut().unwrap().instructions[2] = 0x0011;
+    assert!(native_java::render("sample.Mode", &c).is_err());
+    let mut c = kotlin_fixture();
+    c.methods[2].code.as_mut().unwrap().instructions[6] = 0x0001;
+    assert!(native_java::render("sample.Mode", &c).is_err());
+    let mut c = kotlin_fixture();
+    c.methods[0].code.as_mut().unwrap().instructions[30] = 0x0001;
+    assert!(native_java::render("sample.Mode", &c).is_err());
+    let mut c = kotlin_fixture();
+    c.methods[5].code.as_mut().unwrap().instructions[4] = 0x0001;
+    assert!(native_java::render("sample.Mode", &c).is_err());
+    let mut c = kotlin_fixture();
+    Arc::get_mut(&mut c.symbols).unwrap().methods[5].1 = 1;
+    assert!(native_java::render("sample.Mode", &c).is_err());
+    let mut c = kotlin_fixture();
+    c.methods.push(DexMethod {
+        declaring_type: c.descriptor.clone(),
+        name: "exposeHelper".into(),
+        return_type: "[Lsample/Mode;".into(),
+        parameters: vec![],
+        thrown_types: vec![],
+        access_flags: 9,
+        code: Some(DexCode {
+            registers: 1,
+            ins: 0,
+            outs: 0,
+            tries: 0,
+            try_regions: vec![],
+            offset: 0,
+            instructions: vec![0x0071, 3, 0, 0x000c, 0x0011],
+        }),
+    });
+    assert!(native_java::render("sample.Mode", &c).is_err());
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn kotlin_enum_jvm_entries_and_values_order() {
+    use std::{fs, process::Command};
+    let c = kotlin_fixture();
+    let source = native_java::render("sample.Mode", &c).unwrap();
+    let dir = std::env::temp_dir().join(format!("rdx-kotlin-enum-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    fs::create_dir_all(dir.join("kotlin/enums")).unwrap();
+    fs::write(dir.join("sample/Mode.java"), source.source).unwrap();
+    fs::write(dir.join("kotlin/enums/EnumEntries.java"),
+        "package kotlin.enums; public class EnumEntries { public final Enum[] values; EnumEntries(Enum[] v){values=v;} }").unwrap();
+    fs::write(dir.join("kotlin/enums/EnumEntriesKt.java"),
+        "package kotlin.enums; public class EnumEntriesKt { public static EnumEntries enumEntries(Enum[] v){return new EnumEntries(v);} }").unwrap();
+    fs::write(dir.join("sample/Check.java"),
+        "package sample; public class Check { public static void main(String[] x) { Mode[] v=Mode.values(); if(v.length!=2||v[0]!=Mode.a||v[1]!=Mode.b||v[0].ordinal()!=0||v[1].ordinal()!=1) throw new AssertionError(); kotlin.enums.EnumEntries e=Mode.getEntries(); if(e!=Mode.getEntries()||e.values[0]!=Mode.a||e.values[1]!=Mode.b) throw new AssertionError(); v[0]=null; if(Mode.values()[0]!=Mode.a||e.values[0]!=Mode.a) throw new AssertionError(); }}").unwrap();
+    let compile = Command::new("javac")
+        .current_dir(&dir)
+        .args([
+            "sample/Mode.java",
+            "sample/Check.java",
+            "kotlin/enums/EnumEntries.java",
+            "kotlin/enums/EnumEntriesKt.java",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new("java")
+        .current_dir(&dir)
+        .args(["-cp", ".", "sample.Check"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    fs::remove_dir_all(dir).unwrap();
+}

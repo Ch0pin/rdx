@@ -51,11 +51,15 @@ fn independent_static_read_delegates_with_exact_overload_and_links() {
     let code = native_java::render("sample.Hello", &class).unwrap();
     assert!(!code.source.contains(".method"), "{}", code.source);
     assert!(
-        code.source.contains("this(((sample.Base) Source.a));"),
+        code.source.contains("this(((Base) Source.a));"),
         "{}",
         code.source
     );
     assert_eq!(code.source.matches("Source.a").count(), 1);
+    // Class presentation shortens same-package names; the method renderer
+    // must still retain the exact overload type before import cleanup.
+    let raw = native_java::render_method("sample.Hello", &class, &class.methods[0]).unwrap();
+    assert!(raw.source.contains("sample.Base"), "{}", raw.source);
     for (label, token) in [
         ("sample.Source.a:Lsample/Sub;", "a"),
         ("sample.Hello.<init>(Lsample/Base;)V", "this"),

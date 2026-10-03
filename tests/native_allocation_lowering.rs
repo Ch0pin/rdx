@@ -65,6 +65,19 @@ fn class(instructions: Vec<u16>, strings: Vec<&str>, methods: Vec<(u16, u16, u32
     }
 }
 
+// This constructs a DIFFERENT positive DEX fixture: its effects genuinely run
+// before new-instance. The original fixture must separately remain rejected.
+fn allocation_after_prefix(mut class: DexClass, original_constructor_pc: usize) -> DexClass {
+    let words = &mut class.methods[0].code.as_mut().unwrap().instructions;
+    assert_eq!(words[0], 0x0022);
+    let allocation: Vec<_> = words.drain(..2).collect();
+    words.splice(
+        original_constructor_pc - 2..original_constructor_pc - 2,
+        allocation,
+    );
+    class
+}
+
 fn throwable_class(
     instructions: Vec<u16>,
     strings: Vec<&str>,
@@ -507,7 +520,7 @@ fn check_cast_argument_stays_after_allocation_and_preserves_link() {
 }
 
 #[test]
-fn unused_effectful_check_cast_is_retained_under_readable_staging_policy() {
+fn discarded_cast_requires_argument_block_to_preserve_allocation_order() {
     let mut c = class(
         vec![0x0022, 0, 0x021f, 1, 0x1070, 0, 0, 0x0011],
         vec!["<init>"],
@@ -516,10 +529,15 @@ fn unused_effectful_check_cast_is_retained_under_readable_staging_policy() {
     Arc::get_mut(&mut c.symbols).unwrap().protos[1] = ("V".into(), vec![]);
     c.methods[0].parameters = vec!["Ljava/lang/Object;".into()];
     c.methods[0].code.as_mut().unwrap().ins = 1;
+    assert!(native_java::render_method("sample.Test", &c, &c.methods[0]).is_err());
+    // An argument block can retain the discarded cast after allocation.
+    Arc::get_mut(&mut c.symbols).unwrap().protos[1].1 = vec!["I".into()];
+    c.methods[0].code.as_mut().unwrap().instructions =
+        vec![0x0022, 0, 0x021f, 1, 0x1112, 0x2070, 0, 0x0010, 0x0011];
     let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
     let cast = code.source.find("((sample.Source) p0)").unwrap();
-    let construct = code.source.find("new sample.A()").unwrap();
-    assert!(cast < construct, "{}", code.source);
+    let construct = code.source.find("new sample.A(").unwrap();
+    assert!(construct < cast, "{}", code.source);
     assert_eq!(code.source.matches("((sample.Source) p0)").count(), 1);
 }
 
@@ -543,7 +561,7 @@ fn unrelated_reference_check_cast_uses_nonthrowing_object_bridge() {
 }
 
 #[test]
-fn reversed_constructor_cast_arguments_use_ordered_temporary_statements() {
+fn reversed_constructor_cast_arguments_keep_allocation_before_ordered_casts() {
     let mut c = class(
         vec![0x0022, 0, 0x021f, 1, 0x011f, 3, 0x3070, 0, 0x0210, 0x0011],
         vec!["<init>"],
@@ -556,30 +574,26 @@ fn reversed_constructor_cast_arguments_use_ordered_temporary_statements() {
     c.methods[0].parameters = vec!["Ljava/lang/Object;".into(), "Ljava/lang/Object;".into()];
     c.methods[0].code.as_mut().unwrap().ins = 2;
     let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    assert!(code.source.contains("sample.Source v0;"), "{}", code.source);
     assert!(
-        code.source
-            .contains("sample.Source v0 = ((sample.Source) p1);"),
+        code.source.contains("java.lang.String v1;"),
         "{}",
         code.source
     );
     assert!(
         code.source
-            .contains("java.lang.String v1 = ((java.lang.String) p0);"),
+            .contains("new sample.A(((v0 = ((sample.Source) p1)) == null ?"),
         "{}",
         code.source
     );
-    assert!(
-        code.source.contains("new sample.A(v1, v0)"),
-        "{}",
-        code.source
-    );
+    assert_eq!(code.source.matches("((sample.Source) p1)").count(), 1);
+    assert_eq!(code.source.matches("((java.lang.String) p0)").count(), 2);
     assert!(
         code.source.find("((sample.Source)").unwrap()
             < code.source.find("((java.lang.String)").unwrap()
     );
     assert!(
-        code.source.find("((java.lang.String)").unwrap()
-            < code.source.find("new sample.A").unwrap()
+        code.source.find("new sample.A").unwrap() < code.source.find("((sample.Source)").unwrap()
     );
     for label in ["sample.Source", "java.lang.String"] {
         let link = code.links.iter().find(|link| link.label == label).unwrap();
@@ -606,6 +620,14 @@ fn object_typed_provider_capture_keeps_explicit_interface_cast() {
         .unwrap()
         .protos
         .push(("Ljava/lang/Object;".into(), vec![]));
+    // A provider declared Object requires the original DEX check-cast.
+    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+    class.methods[0]
+        .code
+        .as_mut()
+        .unwrap()
+        .instructions
+        .splice(6..6, [0x011f, 1]);
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
     assert!(code.source.contains("sample.Source)"), "{}", code.source);
     assert_eq!(code.source.matches(".provider()").count(), 1);
@@ -673,7 +695,7 @@ fn overwritten_cast_in_constructor_arguments_is_still_executed() {
     let call = code.source.find("sample.Source.next()").unwrap();
     let check = code.source.find("((java.lang.String)").unwrap();
     let construct = code.source.find("new sample.A(").unwrap();
-    assert!(call < check && check < construct, "{}", code.source);
+    assert!(construct < call && call < check, "{}", code.source);
     assert_eq!(code.source.matches("sample.Source.next()").count(), 1);
 }
 
@@ -713,6 +735,8 @@ fn filled_array_arguments_preserve_order_in_both_dex_encodings() {
         let symbols = Arc::get_mut(&mut c.symbols).unwrap();
         symbols.types.push("[Ljava/lang/String;".into());
         symbols.protos[0] = ("V".into(), vec!["[Ljava/lang/String;".into()]);
+        assert!(native_java::render_method("sample.Test", &c, &c.methods[0]).is_err());
+        let mut c = allocation_after_prefix(c, 10);
         let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
         assert!(
             code.source.contains("new java.lang.String[]"),
@@ -732,8 +756,9 @@ fn filled_array_arguments_preserve_order_in_both_dex_encodings() {
         words.extend(array);
         words.extend([0x010c, 0x2070, 0, 0x0010, 0x0011]);
         c.methods[0].code.as_mut().unwrap().instructions = words;
+        // Pure integer elements permit direct nesting in the original order.
         let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
-        assert!(code.source.contains("new int[]"), "{}", code.source);
+        assert!(code.source.find("new sample.A").unwrap() < code.source.find("new int[]").unwrap());
         assert!(
             code.links
                 .iter()
@@ -743,13 +768,19 @@ fn filled_array_arguments_preserve_order_in_both_dex_encodings() {
 }
 
 #[test]
-fn allocation_stages_void_calls_before_constructor() {
+fn void_call_runs_inside_argument_block_after_allocation() {
     let mut class = class(
         vec![0x0022, 0, 0x0071, 0, 0, 0x1070, 1, 0, 0x0011],
         vec!["effect", "<init>"],
         vec![(1, 0, 0), (0, 0, 1)],
     );
     Arc::get_mut(&mut class.symbols).unwrap().protos[0].0 = "V".into();
+    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+    // Preserve the zero-argument rejection above; this valid A(int) shape has
+    // an argument block in which the void effect retains its original timing.
+    Arc::get_mut(&mut class.symbols).unwrap().methods[1].1 = 1;
+    class.methods[0].code.as_mut().unwrap().instructions =
+        vec![0x0022, 0, 0x0071, 0, 0, 0x1112, 0x2070, 1, 0x0010, 0x0011];
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
     assert!(
         code.source.contains("sample.Source.effect();"),
@@ -757,7 +788,7 @@ fn allocation_stages_void_calls_before_constructor() {
         code.source
     );
     assert!(!code.source.contains("void v"), "{}", code.source);
-    assert!(code.source.find("effect()").unwrap() < code.source.find("new sample.A").unwrap());
+    assert!(code.source.find("new sample.A").unwrap() < code.source.find("effect()").unwrap());
     let link = code
         .links
         .iter()
@@ -815,7 +846,7 @@ fn allocation_rejects_invalidated_wide_pairs_and_nonadjacent_arguments() {
 }
 
 #[test]
-fn unused_field_read_is_retained_before_constructor() {
+fn discarded_field_read_runs_after_allocation_inside_argument_block() {
     let mut class = class(
         vec![0x0022, 0, 0x0160, 0, 0x1112, 0x1070, 0, 0, 0x0011],
         vec!["number", "<init>"],
@@ -824,10 +855,14 @@ fn unused_field_read_is_retained_before_constructor() {
     Arc::get_mut(&mut class.symbols).unwrap().protos[1]
         .1
         .clear();
+    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+    Arc::get_mut(&mut class.symbols).unwrap().protos[1].1 = vec!["I".into()];
+    class.methods[0].code.as_mut().unwrap().instructions =
+        vec![0x0022, 0, 0x0160, 0, 0x1112, 0x2070, 0, 0x0010, 0x0011];
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
     assert!(
         code.source.find("sample.Source.number").unwrap()
-            < code.source.find("new sample.A").unwrap(),
+            > code.source.find("new sample.A").unwrap(),
         "{}",
         code.source
     );
@@ -835,7 +870,7 @@ fn unused_field_read_is_retained_before_constructor() {
 }
 
 #[test]
-fn live_wide_input_survives_allocation_staging() {
+fn live_wide_input_survives_constructor_argument_block() {
     let mut class = class(
         vec![0x0022, 0, 0x0071, 0, 0, 0x1070, 1, 0, 0x0110],
         vec!["effect", "<init>"],
@@ -845,6 +880,12 @@ fn live_wide_input_survives_allocation_staging() {
     class.methods[0].parameters = vec!["J".into()];
     class.methods[0].return_type = "J".into();
     class.methods[0].code.as_mut().unwrap().ins = 2;
+    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols.methods[1].1 = 1;
+    symbols.protos[1].1 = vec!["J".into()];
+    class.methods[0].code.as_mut().unwrap().instructions =
+        vec![0x0022, 0, 0x0071, 0, 0, 0x3070, 1, 0x0210, 0x0110];
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
     assert!(code.source.contains("return p0;"), "{}", code.source);
     assert!(!code.source.contains("wide-tail"));
@@ -946,8 +987,14 @@ fn branching_allocation() -> DexClass {
 }
 
 #[test]
-fn allocation_region_stages_conditional_argument_effects() {
+fn conditional_effects_preserve_original_allocation_order() {
     let class = branching_allocation();
+    let original = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(
+        original.source.find("new sample.A").unwrap()
+            < original.source.find("sample.Source.value()").unwrap()
+    );
+    let class = allocation_after_prefix(class, 10);
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
     assert!(code.source.contains("if ("), "{}", code.source);
     assert_eq!(code.source.matches("sample.Source.value()").count(), 1);
@@ -990,9 +1037,15 @@ fn allocation_unary_conversion_and_array_length_are_staged() {
 
 #[test]
 #[ignore = "requires javac and java"]
-fn conditional_allocation_java_keeps_branch_effects_and_exceptions() {
+fn preallocation_conditional_effects_keep_jvm_exceptions() {
     use std::{fs, process::Command};
     let class = branching_allocation();
+    let original = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(
+        original.source.find("new sample.A").unwrap()
+            < original.source.find("sample.Source.value()").unwrap()
+    );
+    let class = allocation_after_prefix(class, 10);
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
     let dir =
         std::env::temp_dir().join(format!("rdx-conditional-allocation-{}", std::process::id()));
@@ -1089,8 +1142,10 @@ fn array_store_allocation() -> DexClass {
 }
 
 #[test]
-fn allocation_array_store_widens_receiver_without_casting_value() {
+fn preallocation_array_store_widens_receiver_without_casting_value() {
     let class = array_store_allocation();
+    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+    let class = allocation_after_prefix(class, 5);
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
     assert!(
         code.source.contains("java.lang.Object[]"),
@@ -1108,9 +1163,11 @@ fn allocation_array_store_widens_receiver_without_casting_value() {
 
 #[test]
 #[ignore = "requires javac and java"]
-fn array_store_staging_preserves_jvm_exception_types_and_constructor_order() {
+fn preallocation_array_store_preserves_jvm_exception_types_and_constructor_order() {
     use std::{fs, process::Command};
     let class = array_store_allocation();
+    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+    let class = allocation_after_prefix(class, 5);
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
     let dir =
         std::env::temp_dir().join(format!("rdx-allocation-array-store-{}", std::process::id()));
@@ -1153,7 +1210,7 @@ class A {{ static int calls; A() {{ calls++; }} }}
 }
 
 #[test]
-fn allocation_field_store_precedes_read_and_constructor_and_keeps_link() {
+fn original_preallocation_field_store_keeps_read_and_links() {
     let class = class(
         vec![
             0x0022, 0, 0x7112, 0x0167, 0, 0x0160, 0, 0x2070, 0, 0x0010, 0x0011,
@@ -1161,6 +1218,14 @@ fn allocation_field_store_precedes_read_and_constructor_and_keeps_link() {
         vec!["number", "<init>"],
         vec![(0, 1, 1)],
     );
+    let original = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(
+        original.source.find("new sample.A").unwrap()
+            < original.source.find("sample.Source.number = 7;").unwrap()
+    );
+    assert_eq!(original.source.matches("sample.Source.number").count(), 2);
+    // Store before new; the field read stays in the constructor argument.
+    let class = allocation_after_prefix(class, 5);
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
     assert!(
         code.source.contains("sample.Source.number = 7;"),
@@ -1269,8 +1334,15 @@ fn protected_branching_allocation() -> DexClass {
 }
 
 #[test]
-fn protected_argument_staging_keeps_the_enclosing_handler() {
+fn protected_preallocation_effects_keep_the_enclosing_handler() {
     let c = protected_branching_allocation();
+    let original = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    assert_eq!(original.source.matches("catch (").count(), 1);
+    assert!(
+        original.source.find("new sample.A").unwrap()
+            < original.source.find("sample.Source.value()").unwrap()
+    );
+    let c = allocation_after_prefix(c, 10);
     let rendered = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
     assert_eq!(
         rendered.source.matches("catch (").count(),
@@ -1286,9 +1358,16 @@ fn protected_argument_staging_keeps_the_enclosing_handler() {
 
 #[test]
 #[ignore = "requires javac and java"]
-fn protected_argument_staging_preserves_catch_and_effects_in_java() {
+fn protected_preallocation_effects_preserve_catch_in_java() {
     use std::{fs, process::Command};
     let c = protected_branching_allocation();
+    let original = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    assert_eq!(original.source.matches("catch (").count(), 1);
+    assert!(
+        original.source.find("new sample.A").unwrap()
+            < original.source.find("sample.Source.value()").unwrap()
+    );
+    let c = allocation_after_prefix(c, 10);
     let rendered = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
     let dir = std::env::temp_dir().join(format!("rdx-protected-allocation-{}", std::process::id()));
     fs::create_dir_all(dir.join("sample")).unwrap();
@@ -1329,5 +1408,69 @@ class A {{ static int calls; static boolean fail; final int value; A(int n) {{ c
         "{}",
         String::from_utf8_lossy(&ran.stderr)
     );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn discarded_constructor_cast_preserves_initialization_and_exception_order_in_java() {
+    use std::{fs, process::Command};
+    let mut c = class(
+        vec![
+            0x0022, 0, 0x0071, 0, 0, 0x010c, 0x011f, 3, 0x1112, 0x2070, 1, 0x0010, 0x0011,
+        ],
+        vec!["next", "<init>"],
+        vec![(1, 0, 0), (0, 1, 1)],
+    );
+    Arc::get_mut(&mut c.symbols).unwrap().protos[0].0 = "Ljava/lang/Object;".into();
+    let rendered = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    let dir =
+        std::env::temp_dir().join(format!("rdx-discarded-cast-timing-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    fs::write(dir.join("sample/Test.java"), format!(r#"package sample;
+public class Test {{ {}
+ public static void main(String[] args) {{
+  State.mode=args[0]; Throwable caught=null;
+  try {{ make(); }} catch(Throwable e) {{ caught=e; }}
+  switch(State.mode) {{
+   case "ok": if(caught!=null || !State.trace.equals("ACB")) throw new AssertionError(State.trace,caught); break;
+   case "init": if(!(caught instanceof ExceptionInInitializerError) || caught.getCause()!=State.failure || !State.trace.equals("A")) throw new AssertionError(State.trace,caught); break;
+   case "call": if(caught!=State.failure || !State.trace.equals("AC")) throw new AssertionError(State.trace,caught); break;
+   case "cast": if(!(caught instanceof ClassCastException) || !State.trace.equals("AC")) throw new AssertionError(State.trace,caught); break;
+   default: throw new AssertionError();
+  }}
+  System.out.print("ok");
+ }}
+}}
+class State {{ static String mode; static String trace=""; static final RuntimeException failure=new IllegalStateException(); }}
+class Source {{ static Object next() {{ State.trace+="C"; if(State.mode.equals("call")) throw State.failure; return State.mode.equals("cast") ? new Object() : "ok"; }} }}
+class A {{ static {{ State.trace+="A"; if(State.mode.equals("init")) throw State.failure; }} A(int n) {{ if(n!=1) throw new AssertionError(); State.trace+="B"; }} }}
+"#, rendered.source)).unwrap();
+    let compiled = Command::new("javac")
+        .arg(dir.join("sample/Test.java"))
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&compiled.stderr),
+        rendered.source
+    );
+    // Fresh processes ensure each case independently exercises initialization.
+    for mode in ["ok", "init", "call", "cast"] {
+        let ran = Command::new("java")
+            .arg("-cp")
+            .arg(&dir)
+            .arg("sample.Test")
+            .arg(mode)
+            .output()
+            .unwrap();
+        assert!(
+            ran.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        assert_eq!(ran.stdout, b"ok");
+    }
     fs::remove_dir_all(dir).unwrap();
 }

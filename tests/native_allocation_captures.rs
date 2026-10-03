@@ -435,7 +435,11 @@ fn staged_output_relocates_only_root_allocation_and_keeps_statement_links() {
             ty: "Holder".into(),
         },
     ];
-    assert!(a.render_checked(&events, &["input1", "input2"]).is_err());
+    let strict = a.render_checked(&events, &["input1", "input2"]).unwrap();
+    assert_eq!(strict.events, events);
+    assert!(strict.expression.contains("== null ?"));
+    assert_eq!(strict.expression.matches("((First) input1)").count(), 1);
+    assert_eq!(strict.expression.matches("((Second) input2)").count(), 2);
     let output = a
         .render_staged_checked(&events, &["input1", "input2"])
         .unwrap();
@@ -691,4 +695,92 @@ fn nested_staging_preserves_constructor_and_call_order() {
     let mut missing = events.clone();
     missing.remove(1);
     assert!(a.render_staged_checked(&missing, &["source"]).is_err());
+}
+
+#[test]
+fn argument_block_retains_void_effect_and_full_allocation_trace() {
+    let mut a = Allocation {
+        site: 1,
+        constructor_site: 4,
+        ty: symbol("Holder", "sample.Holder"),
+        captures: vec![
+            Capture {
+                ty: "void".into(),
+                name: "ignored".into(),
+                expression: call(2, "validate", vec![]),
+            },
+            Capture {
+                ty: "java.lang.String".into(),
+                name: "text".into(),
+                expression: call(3, "produce", vec![]),
+            },
+        ],
+        arguments: vec![Expr::Capture(1)],
+    };
+    let e = vec![
+        Event::Allocate {
+            site: 1,
+            ty: "sample.Holder".into(),
+        },
+        Event::Call {
+            site: 2,
+            method: "validate".into(),
+        },
+        Event::Call {
+            site: 3,
+            method: "produce".into(),
+        },
+        Event::Construct {
+            site: 4,
+            ty: "sample.Holder".into(),
+        },
+    ];
+    let r = a
+        .render_argument_block_checked(&e, &["source"], &[0])
+        .unwrap();
+    assert_eq!(r.events, e);
+    assert_eq!(r.declarations, ["java.lang.String text;"]);
+    assert!(
+        r.expression
+            .contains("source.validate(); text = source.produce(); yield text;")
+    );
+    for name in ["validate", "produce"] {
+        let l = r.links.iter().find(|l| l.label == name).unwrap();
+        assert_eq!(
+            r.expression
+                .chars()
+                .skip(l.start)
+                .take(l.end - l.start)
+                .collect::<String>(),
+            name
+        );
+    }
+    let mut wrong = e.clone();
+    wrong.swap(1, 2);
+    assert!(
+        a.render_argument_block_checked(&wrong, &["source"], &[0])
+            .is_err()
+    );
+    wrong = e.clone();
+    wrong.insert(
+        1,
+        Event::Allocate {
+            site: 9,
+            ty: "Other".into(),
+        },
+    );
+    assert!(
+        a.render_argument_block_checked(&wrong, &["source"], &[0])
+            .is_err()
+    );
+    a.arguments = vec![Expr::Capture(0)];
+    assert!(
+        a.render_argument_block_checked(&e, &["source"], &[0])
+            .is_err()
+    );
+    a.arguments.clear();
+    assert!(
+        a.render_argument_block_checked(&e, &["source"], &[0])
+            .is_err()
+    );
 }

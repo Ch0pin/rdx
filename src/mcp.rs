@@ -78,6 +78,7 @@ pub struct Status {
     pub project_id: String,
     pub apk_sha256: String,
     pub package_selection: String,
+    pub package_name: String,
     pub requests: u64,
     pub active: String,
     pub last_error: String,
@@ -136,9 +137,16 @@ impl Server {
             while !stopped.load(Ordering::Relaxed) {
                 if let Ok(result) = rx.try_recv() {
                     match result {
-                        Ok(data) => {
+                        Ok(mut data) => {
+                            let package_name = data
+                                .0
+                                .read_resource_with_metadata("AndroidManifest.xml")
+                                .ok()
+                                .and_then(|r| crate::manifest_summary::package_name(&r.source).ok())
+                                .unwrap_or_default();
                             let mut s = shared.lock().unwrap();
                             s.state = "Running".into();
+                            s.package_name = package_name;
                             s.project_id = data.4.clone();
                             s.apk_sha256 = data.3.clone();
                             s.package_selection = data
@@ -182,7 +190,7 @@ impl Server {
                     if name == "get_instance_info" {
                         let s = shared.lock().unwrap();
                         return Ok(
-                            json!({"instance_id":entry.instance_id,"project_id":s.project_id,"state":s.state,"apk_path":path,"apk_sha256":s.apk_sha256,"package_selection":s.package_selection,"error":s.last_error}),
+                            json!({"instance_id":entry.instance_id,"project_id":s.project_id,"state":s.state,"apk_path":path,"apk_sha256":s.apk_sha256,"package_selection":s.package_selection,"package_name":s.package_name,"error":s.last_error}),
                         );
                     }
                     let (engine, project, path, hash, project_id, metadata) =
@@ -198,7 +206,10 @@ impl Server {
                         s.requests += 1;
                     }
                     validate(name, args)?;
-                    if matches!(name, "get_android_manifest" | "get_resource_file") {
+                    if matches!(
+                        name,
+                        "get_android_manifest" | "get_resource_file" | "get_manifest_summary"
+                    ) {
                         let current = fs::metadata(&*path)?;
                         ensure!(
                             current.len() == metadata.len()
@@ -206,7 +217,25 @@ impl Server {
                             "PROJECT_CHANGED: APK changed on disk; restart the server"
                         );
                     }
-                    let data = dispatch(engine, project, name, args, &request_cancel)?;
+                    let data = if name == "get_manifest_summary" {
+                        let xml = engine
+                            .read_resource_with_metadata("AndroidManifest.xml")?
+                            .source;
+                        let summary = crate::manifest_summary::render(
+                            &xml,
+                            path,
+                            hash,
+                            engine.resource_table(),
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                        let mut result = text_page(summary, args, "markdown")?;
+                        result["analysis"] = json!(
+                            "Manifest declarations only; exported does not establish runtime callback reachability or authorization."
+                        );
+                        result
+                    } else {
+                        dispatch(engine, project, name, args, &request_cancel)?
+                    };
                     ensure!(
                         !stopped.load(Ordering::Relaxed) && !request_cancel.load(Ordering::Relaxed),
                         "CANCELLED"
@@ -301,6 +330,109 @@ fn text_page(text: String, args: &Value, format: &str) -> Result<Value> {
         json!({"text":text.chars().skip(start).take(limit).collect::<String>(),"format":format,"source_hash":hash,"offset":start,"total_chars":total,"next_offset":(end<total).then_some(end)}),
     )
 }
+fn instance_matches(info: &Value, args: &Value) -> bool {
+    ["apk_path", "apk_sha256", "package_name"]
+        .iter()
+        .all(|key| {
+            args[*key].as_str().is_none_or(|filter| {
+                info[*key].as_str().is_some_and(|value| {
+                    if *key == "apk_path" {
+                        value.contains(filter)
+                    } else {
+                        value == filter
+                    }
+                })
+            })
+        })
+}
+
+fn search_code(
+    engine: &mut NativeEngine,
+    project: &Project,
+    args: &Value,
+    cancel: &AtomicBool,
+) -> Result<Value> {
+    let query = required(args, "query")?;
+    ensure!(
+        !query.is_empty() && query.len() <= 4096,
+        "Query must contain 1..4096 bytes"
+    );
+    let package = args["package_prefix"]
+        .as_str()
+        .unwrap_or("")
+        .trim_end_matches('.');
+    let classes: Vec<_> = project
+        .classes
+        .iter()
+        .filter(|c| {
+            package.is_empty()
+                || c.as_str() == package
+                || c.strip_prefix(package)
+                    .is_some_and(|tail| tail.starts_with('.'))
+        })
+        .collect();
+    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+    let limit = args["limit"].as_u64().unwrap_or(25) as usize;
+    let source_offset = args["source_offset"].as_u64().unwrap_or(0) as usize;
+    ensure!(
+        (1..=500).contains(&limit) && offset <= classes.len(),
+        "Invalid search page"
+    );
+    ensure!(
+        offset < classes.len() || source_offset == 0,
+        "Source offset without a class"
+    );
+    let end = offset.saturating_add(limit).min(classes.len());
+    let mut items = Vec::new();
+    let mut errors = Vec::new();
+    let mut scanned = 0;
+    let mut next = (end < classes.len()).then_some(end);
+    let mut next_source = 0;
+    'classes: for (index, class) in classes.iter().enumerate().take(end).skip(offset) {
+        ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+        scanned += 1;
+        let code = match engine.decompile_search_cancellable(class, cancel) {
+            Ok(code) => code,
+            Err(error) => {
+                ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+                errors.push(json!({"class_id":class,"error":format!("{error:#}")}));
+                continue;
+            }
+        };
+        let start_char = if index == offset { source_offset } else { 0 };
+        let start_byte = if start_char == code.source.chars().count() {
+            code.source.len()
+        } else {
+            code.source
+                .char_indices()
+                .nth(start_char)
+                .map(|(i, _)| i)
+                .context("Invalid source_offset")?
+        };
+        for (relative, _) in code.source[start_byte..].match_indices(query) {
+            ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+            let byte = start_byte + relative;
+            let start = code.source[..byte].chars().count();
+            let end = start + query.chars().count();
+            let line = code.source[..byte].bytes().filter(|b| *b == b'\n').count() + 1;
+            let snippet: String = code.source[byte..]
+                .chars()
+                .take(200)
+                .take_while(|c| *c != '\n')
+                .collect();
+            items.push(json!({"class_id":class,"source_hash":code.source_hash,"start":start,"end":end,"line":line,"snippet":snippet,"format":"java-or-mixed-dex"}));
+            if items.len() == 100 {
+                next = Some(index);
+                next_source = end;
+                break 'classes;
+            }
+        }
+    }
+    Ok(
+        json!({"items":items,"scope":"generated Java and mixed DEX; case-sensitive literal; resources excluded","offset":offset,"scanned_classes":scanned,"total_classes":classes.len(),"errors":errors,"next_offset":next,"next_source_offset":next.map(|_|next_source),"exhausted":next.is_none()}),
+    )
+}
+
 fn dispatch(
     engine: &mut NativeEngine,
     project: &Project,
@@ -329,11 +461,14 @@ fn dispatch(
                 "available":n.available,"reachable_components":kinds(masks[i])})).collect();
             let edges: Vec<_> = graph.edges.iter().map(|e|json!({"from":e.from,"to":e.to,"call_sites":e.sites,
                 "highlighted":masks[e.to]!=0,"reachable_components":kinds(masks[e.to])})).collect();
-            Ok(json!({"root":0,"direction":direction,"depth":depth,"nodes":nodes,"edges":edges,
+            Ok(json!({"dispatch_targets":graph.dispatch_targets,"dispatch_targets_truncated":graph.dispatch_targets_truncated,
+                "dispatch_note":"Related ancestor declarations are possible dispatch entry points, not proven runtime callers. Query their callers separately. Component ancestry and accepted service starts do not prove callback reachability. Constructor/provider callers do not establish active route registration; route-table data flow and runtime intent delivery are not inferred.",
+                "root":0,"direction":direction,"depth":depth,"nodes":nodes,"edges":edges,
                 "truncated":graph.truncated,"node_limit":5000,"edge_limit":20000,
                 "depth_boundary_reached":graph.nodes.iter().any(|n|n.depth==depth),
                 "analysis":"static DEX declared calls; inherited aliases resolved through known superclasses; no runtime dispatch, reflection, or Intent target inference"}))
         },
+        "search_code" => search_code(engine, project, args, cancel),
         "get_all_classes" | "search_classes_by_keyword" => page(project.classes.iter().filter(|c|c.contains(query)).map(|c|json!({"class_id":c,"name":c})).collect(),args),
         "get_class_source"=>text_page(engine.decompile_search_cancellable(required(args,"class_id")?,cancel)?.source,args,"java-or-mixed-dex"),
         "get_class_disassembly"=> {let name=required(args,"class_id")?; let class=engine.dex_class(name).context("SYMBOL_NOT_FOUND")?; text_page(crate::native_engine::disassembly::render(name,class).source,args,"rdx-dex")},
@@ -420,7 +555,7 @@ fn tools_list() -> Value {
     let definitions = [
         (
             "list_instances",
-            "Discover running RDX GUI instances with MCP enabled.",
+            "Discover running RDX GUI instances; optionally filter by APK path substring, exact SHA-256 or exact package name.",
             vec![],
             false,
         ),
@@ -452,6 +587,18 @@ fn tools_list() -> Value {
             "search_classes_by_keyword",
             "Search class names by literal substring (not method bodies).",
             vec!["query"],
+            true,
+        ),
+        (
+            "search_code",
+            "Search generated Java and mixed DEX by case-sensitive literal substring. No resources. Bounded class pages (limit defaults to 25, max 500), at most 100 matches per response. Resume using next_offset AND next_source_offset with the same query/package_prefix; no-match is conclusive only after all pages with no errors.",
+            vec!["query"],
+            true,
+        ),
+        (
+            "get_manifest_summary",
+            "Read the current project's manifest summary as paginated Markdown, including application identity, exported components, permissions and deeplinks. Declarations are not runtime reachability.",
+            vec![],
             true,
         ),
         (
@@ -527,7 +674,14 @@ fn tools_list() -> Value {
         for key in &required{properties.insert((*key).into(),json!({"type":"string","minLength":1}));}
         if (scoped && name!="get_call_graph")||name=="list_instances"{
             properties.insert("offset".into(),json!({"type":"integer","minimum":0}));
-            properties.insert("limit".into(),json!({"type":"integer","minimum":1,"maximum":if ["get_class_source","get_class_disassembly","get_android_manifest","get_resource_file"].contains(&name){128000}else{500}}));
+            properties.insert("limit".into(),json!({"type":"integer","minimum":1,"maximum":if ["get_class_source","get_class_disassembly","get_android_manifest","get_resource_file","get_manifest_summary"].contains(&name){128000}else{500}}));
+        }
+        if name=="list_instances" {
+            for key in ["apk_path", "apk_sha256", "package_name"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
+        }
+        if name=="search_code" {
+            properties.insert("package_prefix".into(),json!({"type":"string"}));
+            properties.insert("source_offset".into(),json!({"type":"integer","minimum":0}));
         }
         if name=="get_call_graph" {
             properties.insert("depth".into(),json!({"type":"integer","minimum":1,"maximum":100,"default":20}));
@@ -620,6 +774,7 @@ fn gateway_call(
         let items = entries
             .iter()
             .filter_map(|r| remote(r, "get_instance_info", &json!({})).ok())
+            .filter(|info| instance_matches(info, args))
             .collect();
         return page(items, args);
     }
@@ -751,6 +906,171 @@ mod tests {
     }
     fn start(dir: &TestDir, name: &str) -> (Server, Registration, Value) {
         start_path(dir, fixture(name))
+    }
+
+    #[test]
+    fn code_search_hit_cursor_does_not_skip_the_rest_of_a_class() {
+        let mut engine = NativeEngine::start().unwrap();
+        let _project = engine.open(&fixture("navigation.apk")).unwrap();
+        let source = engine
+            .decompile_search_cancellable("sample.Caller", &AtomicBool::new(false))
+            .unwrap();
+        let expected: Vec<_> = source
+            .source
+            .match_indices(" ")
+            .map(|(b, _)| source.source[..b].chars().count())
+            .collect();
+        assert!(expected.len() > 100);
+        let project = Project {
+            classes: vec!["sample.Caller".into()],
+            resources: vec![],
+        };
+        let mut args = json!({"query":" "});
+        let mut found = Vec::new();
+        for _ in 0..100 {
+            let page = search_code(&mut engine, &project, &args, &AtomicBool::new(false)).unwrap();
+            found.extend(
+                page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|hit| hit["start"].as_u64().unwrap() as usize),
+            );
+            if page["exhausted"] == true {
+                break;
+            }
+            args["offset"] = page["next_offset"].clone();
+            args["source_offset"] = page["next_source_offset"].clone();
+        }
+        assert_eq!(found, expected);
+        let absent = Project {
+            classes: vec!["missing.Class".into()],
+            resources: vec![],
+        };
+        let failure = search_code(
+            &mut engine,
+            &absent,
+            &json!({"query":"needle"}),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(failure["errors"].as_array().unwrap().len(), 1);
+        assert!(
+            search_code(
+                &mut engine,
+                &project,
+                &json!({"query":"return"}),
+                &AtomicBool::new(true)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires RDX_REVIEW_APK, RDX_REVIEW_METHOD, RDX_REVIEW_DECLARATION"]
+    fn review_tools_match_a_local_project() {
+        let dir = TestDir::new();
+        let (_server, record, args) = start_path(
+            &dir,
+            PathBuf::from(std::env::var_os("RDX_REVIEW_APK").unwrap()),
+        );
+        let method = std::env::var("RDX_REVIEW_METHOD").unwrap();
+        let declaration = std::env::var("RDX_REVIEW_DECLARATION").unwrap();
+        let owner = crate::call_graph::owner(&method).unwrap();
+        let mut graph_args = args.clone();
+        graph_args["method_id"] = json!(method);
+        graph_args["direction"] = json!("callers");
+        graph_args["depth"] = json!(1);
+        let graph = remote(&record, "get_call_graph", &graph_args).unwrap();
+        assert!(
+            graph["data"]["dispatch_targets"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(declaration))
+        );
+        let mut search_args = args.clone();
+        search_args["query"] = json!("return");
+        search_args["package_prefix"] = json!(owner);
+        let search = remote(&record, "search_code", &search_args).unwrap();
+        assert!(!search["data"]["items"].as_array().unwrap().is_empty());
+        assert_eq!(search["data"]["errors"], json!([]));
+        assert_eq!(search["data"]["exhausted"], true);
+        let summary = remote(&record, "get_manifest_summary", &args).unwrap();
+        assert_eq!(summary["data"]["format"], "markdown");
+        let info = remote(&record, "get_instance_info", &json!({})).unwrap();
+        assert!(!info["package_name"].as_str().unwrap().is_empty());
+        assert!(instance_matches(
+            &info,
+            &json!({"package_name":info["package_name"],"apk_sha256":info["apk_sha256"]})
+        ));
+        assert_eq!(summary["identity"]["apk_sha256"], info["apk_sha256"]);
+    }
+
+    #[test]
+    fn instance_filters_compose_without_cross_package_substrings() {
+        let info =
+            json!({"apk_path":"/tmp/one.apk","apk_sha256":"abc","package_name":"sample.app"});
+        assert!(instance_matches(
+            &info,
+            &json!({"apk_path":"one.apk","package_name":"sample.app","apk_sha256":"abc"})
+        ));
+        assert!(!instance_matches(&info, &json!({"package_name":"sample"})));
+        assert!(!instance_matches(&info, &json!({"apk_sha256":"different"})));
+        assert!(!instance_matches(
+            &json!({"state":"Loading"}),
+            &json!({"package_name":"sample.app"})
+        ));
+    }
+
+    #[test]
+    fn code_search_resumes_and_manifest_summary_keeps_project_identity() {
+        let dir = TestDir::new();
+        let (_server, record, args) = start(&dir, "navigation.apk");
+        let info = remote(&record, "get_instance_info", &json!({})).unwrap();
+        let manifest = remote(&record, "get_android_manifest", &args).unwrap();
+        let package =
+            crate::manifest_summary::package_name(manifest["data"]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(info["package_name"], package);
+        let summary = remote(&record, "get_manifest_summary", &args).unwrap();
+        assert_eq!(summary["identity"]["project_id"], args["project_id"]);
+        assert_eq!(summary["data"]["format"], "markdown");
+        let text = summary["data"]["text"].as_str().unwrap();
+        assert!(text.contains(info["apk_sha256"].as_str().unwrap()));
+        assert!(text.contains("# Manifest summary"));
+        let mut query = args.clone();
+        query["query"] = json!("return");
+        query["limit"] = json!(1);
+        let mut found = Vec::new();
+        for _ in 0..100 {
+            let result = remote(&record, "search_code", &query).unwrap();
+            assert_eq!(result["identity"]["project_id"], args["project_id"]);
+            assert_eq!(result["data"]["errors"], json!([]));
+            found.extend(result["data"]["items"].as_array().unwrap().iter().cloned());
+            if result["data"]["exhausted"] == true {
+                break;
+            }
+            query["offset"] = result["data"]["next_offset"].clone();
+            query["source_offset"] = result["data"]["next_source_offset"].clone();
+        }
+        assert!(!found.is_empty());
+        for hit in found {
+            let mut source_args = args.clone();
+            source_args["class_id"] = hit["class_id"].clone();
+            let source = remote(&record, "get_class_source", &source_args).unwrap();
+            assert_eq!(source["data"]["source_hash"], hit["source_hash"]);
+            let actual: String = source["data"]["text"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .skip(hit["start"].as_u64().unwrap() as usize)
+                .take(6)
+                .collect();
+            assert_eq!(actual, "return");
+        }
+        query["project_id"] = json!("wrong");
+        assert!(remote(&record, "search_code", &query).is_err());
+        assert!(remote(&record, "get_manifest_summary", &query).is_err());
     }
 
     #[test]

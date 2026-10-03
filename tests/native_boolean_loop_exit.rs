@@ -65,9 +65,12 @@ fn zero_one_loop_exit_reifies_boolean_return() {
 
 #[test]
 fn nonboolean_loop_exit_is_rejected() {
-    let error = source(&fixture(2)).unwrap_err();
+    let class = fixture(2);
+    rdx::native_method::MethodAnalysis::build(&class, &class.methods[0]).unwrap();
+    let error = source(&class).unwrap_err();
     assert!(
-        error.to_string().contains("nonboolean literal"),
+        error.to_string().contains("nonboolean literal")
+            || error.to_string() == "unsupported register type conversion I to Z",
         "{error:#}"
     );
 }

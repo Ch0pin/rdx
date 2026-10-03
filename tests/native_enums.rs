@@ -114,11 +114,65 @@ fn malformed_enum_ordinals_and_custom_values_decline() {
     c.methods[1].code.as_mut().unwrap().instructions[3] = 0;
     assert!(native_java::render("sample.Mode", &c).is_err());
 }
+
+fn standard_value_of_fixture() -> DexClass {
+    let mut class = fixture();
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols.strings.push("valueOf".into());
+    symbols.protos.push((
+        "Ljava/lang/Enum;".into(),
+        vec!["Ljava/lang/Class;".into(), "Ljava/lang/String;".into()],
+    ));
+    symbols.methods.push((1, 2, 7));
+    class.methods.push(DexMethod {
+        declaring_type: class.descriptor.clone(),
+        name: "valueOf".into(),
+        return_type: class.descriptor.clone(),
+        parameters: vec!["Ljava/lang/String;".into()],
+        thrown_types: vec![],
+        access_flags: 9,
+        code: Some(DexCode {
+            registers: 2,
+            ins: 1,
+            outs: 2,
+            tries: 0,
+            try_regions: vec![],
+            offset: 0,
+            instructions: vec![0x001c, 0, 0x2071, 2, 0x0010, 0x010c, 0x011f, 0, 0x0111],
+        }),
+    });
+    class
+}
+
+#[test]
+fn ordinary_enum_standard_value_of_is_proved_and_uses_implicit_java_method() {
+    let class = standard_value_of_fixture();
+    let source = native_java::render("sample.Mode", &class).unwrap().source;
+    assert!(source.contains("enum Mode"));
+    assert!(!source.contains(" valueOf("));
+    native_java::render_method("sample.Mode", &class, &class.methods[0]).unwrap();
+    native_java::render_method("sample.Mode", &class, &class.methods[2]).unwrap();
+    for shape in 0..4 {
+        let mut bad = standard_value_of_fixture();
+        match shape {
+            0 => bad.methods[2].access_flags |= 0x20,
+            1 => bad.methods[2]
+                .thrown_types
+                .push("Ljava/lang/Exception;".into()),
+            2 => bad.methods[2].code.as_mut().unwrap().instructions[7] = 1,
+            _ => bad.fields[2].access_flags = 0x19,
+        }
+        assert!(
+            native_java::render("sample.Mode", &bad).is_err(),
+            "accepted shape {shape}"
+        );
+    }
+}
 #[test]
 #[ignore = "requires javac and java"]
 fn enum_jvm_names_values_identity_and_clone() {
     use std::{fs, process::Command};
-    let c = fixture();
+    let c = standard_value_of_fixture();
     let code = native_java::render("sample.Mode", &c).unwrap();
     let dir = std::env::temp_dir().join(format!("rdx-enum-{}", std::process::id()));
     fs::create_dir_all(dir.join("sample")).unwrap();

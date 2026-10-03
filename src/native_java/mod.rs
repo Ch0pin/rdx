@@ -790,13 +790,19 @@ fn render_mixed_field_fallback(name: &str, class: &DexClass, field: &DexField) -
         .position(|candidate| std::ptr::eq(candidate, field))
         .is_some_and(|index| class.static_values.get(index).is_some());
     let declaration = (|| -> Result<DecompiledCode> {
+        // ACC_ENUM identifies an enum constant field even when the class-level
+        // rewrite is unsafe. Keep its DEX type and field identity in fallback.
+        let enum_constant = class.access_flags & 0x4000 != 0
+            && class.superclass.as_deref() == Some("Ljava/lang/Enum;")
+            && field.field_type == class.descriptor
+            && field.access_flags == 0x4019;
         ensure!(field.field_type.as_ref() != "V", "Unsupported field type");
         ensure!(
             field.declaring_type == class.descriptor,
             "Field owner mismatch"
         );
         ensure!(
-            field.access_flags & !0x10df == 0,
+            field.access_flags & !(0x10df | if enum_constant { 0x4000 } else { 0 }) == 0,
             "Unsupported field modifiers"
         );
         ensure!(
@@ -1372,9 +1378,13 @@ fn upgrade_methods_controlled(
         out.append(header);
         (out, replacements)
     } else {
+        // Reconstructed Java members still share one import/shadow scope when
+        // the class header cannot be reconstructed. Leave raw DEX untouched.
+        let shortened = readable::shorten(name, class, codes);
+        imports.extend(shortened.imports);
         let replacements: Vec<_> = bounds
             .into_iter()
-            .zip(codes)
+            .zip(shortened.codes)
             .map(|((start, end), code)| (start, end, code))
             .collect();
         (Output::default(), replacements)
@@ -1674,6 +1684,173 @@ mod initializer_tests {
                 .map(|link| (link.start, link.end)),
             Some((definition.start, definition.end))
         );
+    }
+
+    #[test]
+    fn enum_fallback_constant_keeps_field_annotation_and_navigation() {
+        use crate::native_dex::{DexAnnotation, DexAnnotationDirectory};
+        use std::sync::Arc;
+
+        let mut class = crate::native_dex::parse(include_bytes!("../../tests/fixtures/hello.dex"))
+            .unwrap()
+            .classes
+            .remove(0);
+        class.access_flags = 0x4011;
+        class.superclass = Some("Ljava/lang/Enum;".into());
+        class.fields = vec![DexField {
+            declaring_type: class.descriptor.clone(),
+            name: "FIRST".into(),
+            field_type: class.descriptor.clone(),
+            access_flags: 0x4019,
+            is_static: true,
+        }];
+        class.static_values.clear();
+        class.annotations_offset = 77;
+        let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+        let type_idx = symbols.types.len() as u32;
+        symbols.types.push("Lsample/Marker;".into());
+        symbols.annotations.insert(
+            77,
+            Arc::new(DexAnnotationDirectory {
+                fields: vec![Some(Arc::from([Arc::new(DexAnnotation {
+                    visibility: 1,
+                    type_idx,
+                    elements: vec![],
+                })]))],
+                ..Default::default()
+            }),
+        );
+
+        let code = render_mixed_field_fallback("sample.Hello", &class, &class.fields[0]);
+        assert!(code.source.contains("@sample.Marker"), "{}", code.source);
+        assert!(
+            code.source
+                .contains("public static final sample.Hello FIRST;"),
+            "{}",
+            code.source
+        );
+        assert!(!code.source.contains("DEX field unavailable"));
+        let definition = code.definitions.iter().find(|d| d.name == "FIRST").unwrap();
+        assert_eq!(definition.kind, "field");
+        let label = "sample.Hello.FIRST:Lsample/Hello;";
+        assert!(code.links.iter().any(|link| {
+            link.label == label && link.start == definition.start && link.end == definition.end
+        }));
+
+        let mixed = render_mixed("sample.Hello", &class);
+        assert!(
+            mixed.source.contains(".class sample.Hello"),
+            "{}",
+            mixed.source
+        );
+        assert!(
+            mixed.source.contains("public static final Hello FIRST;"),
+            "{}",
+            mixed.source
+        );
+        assert!(
+            mixed
+                .definitions
+                .iter()
+                .any(|d| d.kind == "field" && d.name == "FIRST")
+        );
+
+        class.fields[0].access_flags = 0x4009;
+        let malformed = render_mixed_field_fallback("sample.Hello", &class, &class.fields[0]);
+        assert!(malformed.source.contains("DEX field unavailable"));
+    }
+
+    #[test]
+    fn fallback_header_shortens_java_members_without_rewriting_dex_or_collisions() {
+        for collision in [false, true] {
+            let mut class =
+                crate::native_dex::parse(include_bytes!("../../tests/fixtures/hello.dex"))
+                    .unwrap()
+                    .classes
+                    .remove(0);
+            class.access_flags = 0x4011;
+            class.superclass = Some("Ljava/lang/Enum;".into());
+            class.fields = vec![DexField {
+                declaring_type: class.descriptor.clone(),
+                name: "screen".into(),
+                field_type: "Landroid/app/Activity;".into(),
+                access_flags: 1,
+                is_static: false,
+            }];
+            if collision {
+                class.fields.push(DexField {
+                    declaring_type: class.descriptor.clone(),
+                    name: "other".into(),
+                    field_type: "Lexample/String;".into(),
+                    access_flags: 1,
+                    is_static: false,
+                });
+            }
+            class.static_values.clear();
+            class.symbols = std::sync::Arc::new(crate::native_dex::DexSymbols {
+                strings: vec!["é😀 java.lang.String".into()],
+                ..Default::default()
+            });
+            class.methods[0].return_type = "Ljava/lang/String;".into();
+            class.methods[0].code.as_mut().unwrap().instructions = vec![0x001a, 0, 0x0011];
+            let mut unsupported =
+                crate::native_dex::parse(include_bytes!("../../tests/fixtures/hello.dex"))
+                    .unwrap()
+                    .classes
+                    .remove(0)
+                    .methods
+                    .remove(0);
+            unsupported.name = "unsupported".into();
+            unsupported.code.as_mut().unwrap().instructions = vec![0x0028];
+            class.methods.push(unsupported);
+            let raw = crate::native_engine::disassembly::render("sample.Hello", &class);
+            let code = render_mixed("sample.Hello", &class);
+            assert!(
+                code.source.contains(".class sample.Hello"),
+                "{}",
+                code.source
+            );
+            assert!(
+                code.source.contains("import android.app.Activity;"),
+                "{}",
+                code.source
+            );
+            assert!(code.source.contains("Activity screen;"), "{}", code.source);
+            assert!(!code.source.contains("import java.lang.String;"));
+            let expected = if collision {
+                "java.lang.String answer("
+            } else {
+                "String answer("
+            };
+            assert!(code.source.contains(expected), "{}", code.source);
+            if !collision {
+                assert!(!code.source.contains("java.lang.String answer("));
+            }
+            assert!(code.source.contains("é😀 java.lang.String"));
+            let start = raw.source.find(".method sample.Hello.unsupported").unwrap();
+            let end =
+                start + raw.source[start..].find(".end method").unwrap() + ".end method".len();
+            assert!(code.source.contains(&raw.source[start..end]));
+            for definition in &code.definitions {
+                assert!(definition.start < definition.end);
+                assert!(definition.end <= code.source.chars().count());
+            }
+            let link = code.links.iter().find(|link| {
+                link.label == "android.app.Activity"
+                    && code
+                        .source
+                        .chars()
+                        .skip(link.start)
+                        .take(link.end - link.start)
+                        .collect::<String>()
+                        == "Activity"
+            });
+            assert!(link.is_some(), "missing shortened field navigation");
+            assert_eq!(
+                code.source_hash,
+                crate::engine::source_identity(&code.source)
+            );
+        }
     }
 
     #[test]

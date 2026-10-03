@@ -161,8 +161,9 @@ impl Plan {
         Ok(values)
     }
 
-    fn kotlin_value_of(class: &DexClass, m: &DexMethod) -> bool {
+    fn standard_value_of(class: &DexClass, m: &DexMethod) -> bool {
         if m.access_flags != 9
+            || !m.thrown_types.is_empty()
             || m.parameters
                 .iter()
                 .map(AsRef::as_ref)
@@ -660,7 +661,7 @@ impl Plan {
                 .methods
                 .iter()
                 .filter(|m| m.name.as_ref() == "valueOf")
-                .all(|m| kotlin && Self::kotlin_value_of(class, m)),
+                .all(|m| Self::standard_value_of(class, m)),
             "custom enum valueOf method"
         );
         Ok(plan)
@@ -784,9 +785,8 @@ impl Plan {
         out.push(" {\n");
         out.append(self.initializer(name, class)?);
         for m in &class.methods {
-            if matches!(m.name.as_ref(), "<clinit>" | "values")
-                || (self.entries.is_some()
-                    && matches!(m.name.as_ref(), "<init>" | "$values" | "valueOf"))
+            if matches!(m.name.as_ref(), "<clinit>" | "values" | "valueOf")
+                || (self.entries.is_some() && matches!(m.name.as_ref(), "<init>" | "$values"))
             {
                 continue;
             }

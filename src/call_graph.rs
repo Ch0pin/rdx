@@ -41,6 +41,8 @@ pub struct CallGraph {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub truncated: bool,
+    pub dispatch_targets: Vec<String>,
+    pub dispatch_targets_truncated: bool,
 }
 
 pub fn owner(method: &str) -> Option<&str> {
@@ -127,6 +129,62 @@ fn canonical(engine: &NativeDexEngine, target: &str) -> String {
     format!("{name}.{member}")
 }
 
+/// Ancestor declarations are possible dispatch entry points, not proven callers.
+fn dispatch_targets_with<'a>(
+    lookup: impl Fn(&str) -> Option<&'a crate::native_dex::DexClass>,
+    root: &str,
+    cancel: &AtomicBool,
+) -> Result<(Vec<String>, bool)> {
+    let Some(owner) = owner(root) else {
+        return Ok((vec![], false));
+    };
+    let Some(class) = lookup(owner) else {
+        return Ok((vec![], false));
+    };
+    let member = &root[owner.len() + 1..];
+    if member.starts_with('<')
+        || class
+            .methods
+            .iter()
+            .find(|m| crate::native_engine::disassembly::method_id(m) == root)
+            .is_some_and(|m| m.access_flags & 0xa != 0)
+    {
+        return Ok((vec![], false));
+    }
+    let mut queue = VecDeque::new();
+    queue.extend(class.interfaces.iter().cloned());
+    queue.extend(class.superclass.iter().cloned());
+    let mut truncated = queue.len() > 256;
+    queue.truncate(256);
+    let mut seen = HashSet::from([class.descriptor.clone()]);
+    let mut targets = Vec::new();
+    while let Some(descriptor) = queue.pop_front() {
+        ensure!(!cancel.load(Ordering::Relaxed), "Call graph cancelled");
+        if !seen.insert(descriptor.clone()) {
+            continue;
+        }
+        if seen.len() > 256 {
+            return Ok((targets, true));
+        }
+        let name = crate::native_engine::disassembly::type_name(&descriptor);
+        let Some(ancestor) = lookup(&name) else {
+            continue;
+        };
+        let id = format!("{name}.{member}");
+        if ancestor.methods.iter().any(|m| {
+            m.access_flags & 0xa == 0 && crate::native_engine::disassembly::method_id(m) == id
+        }) {
+            targets.push(id);
+        }
+        queue.extend(ancestor.interfaces.iter().cloned());
+        queue.extend(ancestor.superclass.iter().cloned());
+        truncated |= queue.len() > 256;
+        queue.truncate(256);
+    }
+    targets.sort();
+    targets.dedup();
+    Ok((targets, truncated))
+}
 pub fn build(
     engine: &NativeDexEngine,
     root: &str,
@@ -161,7 +219,13 @@ pub fn build_direction(
             }
         }
     }
-    let mut graph = CallGraph::default();
+    let (dispatch_targets, dispatch_targets_truncated) =
+        dispatch_targets_with(|name| engine.class(name), root, cancel)?;
+    let mut graph = CallGraph {
+        dispatch_targets,
+        dispatch_targets_truncated,
+        ..Default::default()
+    };
     graph.nodes.push(Node {
         method: root.into(),
         depth: 0,
@@ -289,6 +353,66 @@ impl CallGraph {
 mod tests {
     use super::*;
     #[test]
+    fn dispatch_hints_follow_interfaces_without_claiming_call_edges() {
+        use crate::native_dex::{DexClass, DexMethod, DexSymbols};
+        use std::sync::Arc;
+        let make = |name: &str, interfaces: Vec<&str>| {
+            let descriptor: Arc<str> = format!("L{name};").into();
+            DexClass {
+                descriptor: descriptor.clone(),
+                superclass: None,
+                interfaces: interfaces.into_iter().map(Arc::from).collect(),
+                access_flags: 1,
+                annotations_offset: 0,
+                static_values_offset: 0,
+                static_values: vec![],
+                fields: vec![],
+                symbols: Arc::new(DexSymbols::default()),
+                methods: vec![DexMethod {
+                    declaring_type: descriptor,
+                    name: "run".into(),
+                    return_type: "V".into(),
+                    parameters: vec![],
+                    thrown_types: vec![],
+                    access_flags: 1,
+                    code: None,
+                }],
+            }
+        };
+        let mut classes = HashMap::from([
+            ("Concrete", make("Concrete", vec!["LChild;", "LParent;"])),
+            ("Child", make("Child", vec!["LParent;"])),
+            ("Parent", make("Parent", vec!["LChild;"])),
+        ]);
+        let cancel = AtomicBool::new(false);
+        let (targets, truncated) =
+            dispatch_targets_with(|name| classes.get(name), "Concrete.run()V", &cancel).unwrap();
+        assert_eq!(targets, ["Child.run()V", "Parent.run()V"]);
+        assert!(!truncated);
+        assert!(
+            dispatch_targets_with(
+                |name| classes.get(name),
+                "Concrete.run()V",
+                &AtomicBool::new(true)
+            )
+            .is_err()
+        );
+        classes.get_mut("Concrete").unwrap().methods[0].access_flags = 9;
+        assert!(
+            dispatch_targets_with(|name| classes.get(name), "Concrete.run()V", &cancel)
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        assert!(
+            dispatch_targets_with(|name| classes.get(name), "Concrete.<init>()V", &cancel)
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn ancestry_and_cycles() {
         for (base, expected) in [
             ("android.app.Activity", Component::Activity),
@@ -347,6 +471,8 @@ mod tests {
                 },
             ],
             truncated: false,
+            dispatch_targets: vec![],
+            dispatch_targets_truncated: false,
         };
         assert_eq!(graph.component_reachability(), vec![2, 2, 2, 2, 0]);
         assert_eq!(graph.nodes.len(), 5); // unrelated node remains in the graph

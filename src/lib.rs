@@ -30,3 +30,5 @@ pub mod frida_snippet;
 pub mod mcp;
 
 pub mod call_graph;
+
+pub mod manifest_summary;

@@ -119,11 +119,18 @@ impl CallGraphWindow {
                 if ui.add_enabled(self.cancel.is_none(),egui::Button::new("Rebuild")).clicked() { rebuild=true; }
                 if let Some(cancel)=&self.cancel { ui.spinner(); if ui.button("Cancel").clicked() { cancel.store(true,Ordering::Relaxed); } }
             });
-            ui.label("Outgoing static calls · virtual/interface calls use declared targets · Intent destinations are not inferred.");
+            ui.label("Outgoing static calls · virtual/interface calls use declared targets · Intent destinations are not inferred.").on_hover_text("Component highlights identify class ancestry, not exported reachability. Starting a service does not establish execution of an app callback; framework and lifecycle dispatch are not inferred. Constructor/provider callers do not establish active route registration or runtime intent delivery.");
             ui.horizontal(|ui| { for kind in [Component::Activity,Component::Service,Component::Receiver,Component::Provider] { ui.colored_label(color(kind,ui.visuals().dark_mode),kind.label()); } });
             ui.label(&self.status);
             let Some(graph)=&self.graph else { return };
             if graph.truncated { ui.colored_label(ui.visuals().warn_fg_color,"Partial graph: reached 5,000 methods / 20,000 edges. All collected calls are displayed."); }
+            if !graph.dispatch_targets.is_empty() || graph.dispatch_targets_truncated {
+                ui.collapsing("Related interface / superclass declarations", |ui| {
+                    ui.label("Calls through these declarations may dispatch to this override. They are not proven runtime callers.");
+                    for target in &graph.dispatch_targets { if ui.link(target).clicked() { selected=Some(target.clone()); } }
+                    if graph.dispatch_targets_truncated { ui.label("Ancestor traversal limit reached; list is partial."); }
+                });
+            }
             let paths=graph.component_reachability();
             ui.label("All discovered calls shown · highlighted edges lead to components · drag the canvas to pan");
             if ui.button("Fit graph").clicked() {
@@ -267,6 +274,8 @@ mod tests {
                         },
                     ],
                     truncated: false,
+                    dispatch_targets: vec![],
+                    dispatch_targets_truncated: false,
                 }),
                 ..Default::default()
             };

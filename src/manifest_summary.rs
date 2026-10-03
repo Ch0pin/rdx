@@ -1,7 +1,7 @@
 //! Human-readable inventory from the decoded manifest. This describes declarations,
 //! not runtime reachability or domain verification.
+use crate::resource_table::ResourceTable;
 use quick_xml::{events::Event, name::ResolveResult, reader::NsReader};
-use rdx::resource_table::ResourceTable;
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
@@ -244,6 +244,13 @@ pub fn sha256(path: &Path) -> Result<String, String> {
         hash.update(&buffer[..n]);
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+pub fn package_name(xml: &str) -> Result<String, String> {
+    parse(xml)?[0]
+        .get("raw:package")
+        .map(str::to_owned)
+        .ok_or_else(|| "Missing package name".into())
 }
 
 pub fn render(

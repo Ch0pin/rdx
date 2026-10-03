@@ -24,19 +24,21 @@ memory while enabled. Opening/reloading a GUI project stops that service.
 3. Get classes, then supply the exact returned `class_id` to source/metadata tools.
    Restarting the server changes project identity; stale requests are rejected.
 
-## Currently available (15 tools)
+## Currently available (19 tools)
 
 | Area | Tools |
 | --- | --- |
 | Instances | `list_instances`, `get_instance_info`, `open_apk` |
 | Classes | `get_all_classes`, `search_classes_by_keyword`, `find_direct_subclasses`, `find_implementations` |
+| Code search | `search_code` |
 | Source and metadata | `get_class_source`, `get_class_disassembly`, `get_methods_of_class`, `get_fields_of_class` |
-| Resources | `get_all_resource_file_names`, `get_android_manifest`, `get_resource_file`, `get_strings` |
+| Resources | `get_all_resource_file_names`, `get_android_manifest`, `get_manifest_summary`, `get_resource_file`, `get_strings` |
 | Call graphs | `get_call_graph` (exact `method_id`, `direction`: `callers` / `callees` / `both`, `depth`: 1–100, default 20) |
 | DEX strings | `get_dex_strings` (strings from the DEX containing `class_id`) |
 
-Search is currently a literal class-name substring search, not a method-body
-search. Resource strings include configurations; binary resources are not exposed.
+`search_classes_by_keyword` searches literal class-name substrings only.
+`search_code` searches generated Java and mixed DEX source using a case-sensitive
+literal query; it does not search resources. Resource strings include configurations; binary resources are not exposed.
 Class identifiers currently follow the native engine's class-name identity.
 Disassembly is `rdx-dex`, not assemblable Smali. Java source can contain explicit
 DEX fallbacks. Method IDs retain full DEX signatures.
@@ -78,3 +80,43 @@ routing. External method bodies cannot be expanded. The GUI graph continues
 to follow outgoing calls; direction selection is currently an MCP feature.
 
 `find_direct_subclasses` follows immediate superclass edges. Use `find_implementations` with `class_id` to list concrete direct and indirect implementations of an interface or class; it supports the same instance/project scope and offset/limit pagination.
+
+## Bounded code search
+
+`search_code` requires `instance_id`, `project_id` and `query`. Optionally set
+`package_prefix` (package boundary match), `offset` (class index), `limit`
+(classes to scan, default 25, maximum 500), and `source_offset` (Unicode character
+offset inside the first class). Each response contains at most 100 matches.
+Resume with both `next_offset` and `next_source_offset`, keeping the query and
+package prefix unchanged. Continue until `exhausted` is true, and check every
+page's `errors` before interpreting an empty result as absence. A failed class
+is reported and does not silently count as successfully searched.
+
+Hits include `class_id`, `source_hash`, Unicode `start`/`end`, one-based `line`,
+and a bounded snippet. Source hashes identify generated text; the response
+identity's APK SHA-256 identifies the input binary.
+
+## Instance filters and manifest summary
+
+`list_instances` accepts `apk_path` (substring), `apk_sha256` (exact), and
+`package_name` (exact). Filters combine with AND and apply before pagination.
+Loading instances may not have a package name yet. Filtering never replaces
+explicit instance/project IDs on subsequent calls.
+
+`get_manifest_summary` returns the same Markdown summary as the GUI, with text
+pagination and the current project's identity. It covers application metadata,
+exported components, permissions, and declared deeplinks. It describes manifest
+declarations, not proven runtime delivery or callback reachability.
+
+## Dispatch guidance
+
+Call graphs expose `dispatch_targets`: matching virtual method declarations in
+known superclass/interface ancestors of the root. `dispatch_targets_truncated`
+indicates a bounded ancestor traversal. These are navigation/query suggestions,
+not additional call edges or proven runtime targets. Query their callers
+separately. The GUI offers the same declarations in a collapsed section.
+
+Component highlights describe ancestry. An accepted service start does not
+prove an app callback executed. Constructor/provider callers do not prove a
+route is registered; route-table data flow and runtime intent delivery are not
+inferred by this static graph.

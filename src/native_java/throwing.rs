@@ -17,6 +17,19 @@ fn unchecked_type(class: &DexClass, ty: &str) -> bool {
         || (ty == class.descriptor.as_ref() && class.superclass.as_deref().is_some_and(unchecked))
 }
 
+/// Preserve an unchecked Java type at a register join only when both
+/// concrete arms have proven ancestry in the same unchecked family. A joined
+/// RuntimeException or Error can be thrown without adding a checked contract.
+pub(super) fn common_unchecked_join(
+    class: &DexClass,
+    left: &str,
+    right: &str,
+) -> Option<&'static str> {
+    ["Ljava/lang/RuntimeException;", "Ljava/lang/Error;"]
+        .into_iter()
+        .find(|ancestor| subtype(class, left, ancestor) && subtype(class, right, ancestor))
+}
+
 fn unchecked(ty: &str) -> bool {
     matches!(
         ty,

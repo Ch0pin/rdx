@@ -62,8 +62,12 @@ pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
         let primary = code
             .try_regions
             .iter()
-            .find(|region| region.start as usize == start)
-            .context("monitor body has no immediate protected region")?;
+            .filter(|region| {
+                region.start as usize >= start
+                    && region.catches.last().is_some_and(|(ty, _)| ty.is_none())
+            })
+            .min_by_key(|region| region.start)
+            .context("monitor body has no protected cleanup region")?;
         ensure!(
             primary.catches.last().is_some_and(|(ty, _)| ty.is_none())
                 && primary.catches[..primary.catches.len() - 1]
@@ -229,6 +233,10 @@ pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
             }
         }
         ensure!(!exits.is_empty(), "monitor requires a normal release");
+        ensure!(
+            body.contains(&(primary.start as usize)),
+            "monitor primary protection is not reached under its lock"
+        );
         // Earlier releases may end in a bare return; one final release may
         // continue outside the synchronized block. Returning a register performs
         // no effect between the explicit release and Java's implicit release.
@@ -480,6 +488,10 @@ pub(super) fn emit(
     out: &mut Output,
     depth: usize,
 ) -> Result<(Vec<Option<Value>>, bool)> {
+    // ACC_DECLARED_SYNCHRONIZED is reflective metadata in DEX, not an
+    // automatic acquisition. Java's method modifier supplies the one proven
+    // whole-method acquisition, so do not also render its explicit DEX block.
+    let implicit = declared_method_lock(class, method, graph)? == Some(region.enter);
     if region.dispatch_join.is_some() {
         return emit_dispatch(class, method, graph, region, regs, out, depth);
     }
@@ -487,7 +499,7 @@ pub(super) fn emit(
     ensure!(reference(&lock.ty), "monitor requires a reference value");
     let mut body = Output {
         sequence: out.sequence,
-        indent: out.indent + 1,
+        indent: out.indent + usize::from(!implicit),
         ..Default::default()
     };
     // Remove only the proven outer monitor cleanup from nested typed tries.
@@ -549,17 +561,121 @@ pub(super) fn emit(
     );
     out.sequence = body.sequence;
     if terminal {
-        out.line(&format!("synchronized ({}) {{", lock.text), &[]);
+        if !implicit {
+            out.line(&format!("synchronized ({}) {{", lock.text), &[]);
+        }
         out.append(body);
-        out.line("}", &[]);
+        if !implicit {
+            out.line("}", &[]);
+        }
         return Ok((regs, true));
     }
     let mut paths = vec![(0, body, values, false)];
     merge_path_registers(&mut regs, &mut paths, out, graph, region.exit + 1)?;
-    out.line(&format!("synchronized ({}) {{", lock.text), &[]);
+    if !implicit {
+        out.line(&format!("synchronized ({}) {{", lock.text), &[]);
+    }
     out.append(paths.remove(0).1);
-    out.line("}", &[]);
+    if !implicit {
+        out.line("}", &[]);
+    }
     Ok((regs, false))
+}
+
+/// Preserve both the reflected method modifier and the exact lock scope.
+/// The explicit DEX acquisition must cover every observable method effect.
+pub(super) fn declared_method_lock(
+    class: &DexClass,
+    method: &DexMethod,
+    graph: &Graph,
+) -> Result<Option<usize>> {
+    if method.access_flags & 0x20000 == 0 {
+        return Ok(None);
+    }
+    ensure!(
+        !matches!(method.name.as_ref(), "<init>" | "<clinit>"),
+        "initializer cannot declare synchronization"
+    );
+    let code = method.code.as_ref().context("declared monitor code")?;
+    let ir = DecodedMethod::decode(code)?;
+    let words = &code.instructions;
+    let mut aliases = HashSet::new();
+    let mut enter = 0;
+    if method.access_flags & 8 == 0 {
+        aliases.insert(usize::from(code.registers - code.ins));
+    } else {
+        // Static invocation has already resolved and initialized the declaring
+        // class. Its exact class literal and reference copies have no additional
+        // resolution, initialization or evaluation effects before acquisition.
+        let mut literal = false;
+        for instruction in &ir.instructions {
+            enter = instruction.pc;
+            if instruction.opcode == 0x1d {
+                break;
+            }
+            match instruction.opcode {
+                0x1c if !literal
+                    && instruction.pc == 0
+                    && class.symbols.types.get(usize::from(words[1]))
+                        == Some(&class.descriptor) =>
+                {
+                    literal = true;
+                    aliases.insert(usize::from(words[0] >> 8));
+                }
+                0x07..=0x09 if literal => {
+                    let (dst, src) = match instruction.opcode {
+                        0x07 => (
+                            usize::from((words[enter] >> 8) & 15),
+                            usize::from(words[enter] >> 12),
+                        ),
+                        0x08 => (
+                            usize::from(words[enter] >> 8),
+                            usize::from(words[enter + 1]),
+                        ),
+                        _ => (usize::from(words[enter + 1]), usize::from(words[enter + 2])),
+                    };
+                    ensure!(
+                        aliases.contains(&src),
+                        "declared static monitor copy identity"
+                    );
+                    aliases.insert(dst);
+                }
+                _ => bail!("effects precede declared method monitor acquisition"),
+            }
+        }
+        ensure!(
+            literal,
+            "declared static monitor lacks declaring-class identity"
+        );
+    }
+    let region = graph
+        .synchronized
+        .iter()
+        .find(|region| region.enter == enter)
+        .context("declared synchronization lacks whole-method monitor")?;
+    ensure!(
+        aliases.contains(&region.lock) && region.dispatch_join.is_none(),
+        "declared method monitor lock or scope differs"
+    );
+    let at: HashMap<_, _> = ir.instructions.iter().map(|insn| (insn.pc, insn)).collect();
+    for release in &region.releases {
+        let mut pc = release + graph.widths[*release];
+        let mut seen = HashSet::new();
+        loop {
+            ensure!(
+                seen.len() < 16 && seen.insert(pc),
+                "declared monitor return budget"
+            );
+            let instruction = at.get(&pc).context("declared monitor return boundary")?;
+            match instruction.opcode {
+                0x0e..=0x11 => break,
+                0x00 => pc += instruction.width,
+                0x28..=0x2a => pc = graph.targets[pc].context("declared monitor return jump")?,
+                _ => bail!("effects follow declared method monitor release"),
+            }
+        }
+    }
+    Ok(Some(enter))
 }
 
 pub(super) struct Dispatch {

@@ -4,7 +4,7 @@ use rdx::{
     native_hierarchy::TypeHierarchy,
     native_java,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fs, process::Command, sync::Arc};
 
 fn fixture(
     words: Vec<u16>,
@@ -55,6 +55,119 @@ fn fixture(
             }),
         }],
     }
+}
+
+fn backward_shared_unlock_fixture() -> DexClass {
+    fixture(
+        vec![
+            0x0528, 0x0071, 2, 0, 0x000f, 0x0071, 0, 0, 0x000a, 0x0038, 3, 0xf628, 0xf528, 0x010d,
+            0x0071, 1, 0, 0x000a, 0x000f,
+        ],
+        vec![(Some("Ljava/lang/IllegalArgumentException;"), 13)],
+        5,
+        13,
+        "I",
+    )
+}
+
+#[test]
+fn backward_shared_unlock_stays_outside_body_catch() {
+    let class = backward_shared_unlock_fixture();
+    let source = native_java::render_method("sample.Effects", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    assert!(source.contains("try {"), "{source}");
+    assert_eq!(
+        source.matches("sample.Effects.touch()").count(),
+        2,
+        "{source}"
+    );
+    assert!(
+        source.find("sample.Effects.touch()").unwrap() > source.find("catch (").unwrap(),
+        "{source}"
+    );
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn backward_shared_unlock_preserves_exception_identity_on_jvm() {
+    let class = backward_shared_unlock_fixture();
+    let source = native_java::render_method("sample.Effects", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    let dir = std::env::temp_dir().join(format!("rdx-backward-unlock-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    let java = format!(
+        r#"package sample;
+public class Effects {{
+ static int mode, bodies, catches, unlocks;
+ static final IllegalStateException UNLOCK = new IllegalStateException("unlock");
+ static int first() {{ bodies++; if (mode == 1) throw new IllegalArgumentException("body"); return 7; }}
+ static int second() {{ catches++; return 11; }}
+ static void touch() {{ unlocks++; if (mode == 2) throw UNLOCK; }}
+ {source}
+ public static void main(String[] args) {{
+  for (mode = 0; mode < 3; mode++) {{
+   bodies = catches = unlocks = 0;
+   try {{
+    int result = test();
+    if (mode == 2 || result != (mode == 1 ? 11 : 7)) throw new AssertionError("result " + mode);
+   }} catch (IllegalStateException actual) {{
+    if (mode != 2 || actual != UNLOCK) throw new AssertionError("unlock identity", actual);
+   }}
+   if (bodies != 1 || catches != (mode == 1 ? 1 : 0) || unlocks != (mode == 1 ? 0 : 1))
+    throw new AssertionError("effects " + mode);
+  }}
+ }}
+}}"#
+    );
+    fs::write(dir.join("sample/Effects.java"), java).unwrap();
+    for (program, args) in [
+        ("javac", vec!["sample/Effects.java"]),
+        ("java", vec!["-cp", ".", "sample.Effects"]),
+    ] {
+        let output = Command::new(program)
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}: {}",
+            program,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn shared_handler_reentry_into_its_protected_call_is_rejected() {
+    let mut class = fixture(
+        vec![
+            0x0071, 0, 0, 0x000a, 0x0071, 1, 0, 0x000a, 0x000f, 0x010d, 0xfa28,
+        ],
+        vec![(Some("Ljava/lang/RuntimeException;"), 9)],
+        0,
+        3,
+        "I",
+    );
+    let code = class.methods[0].code.as_mut().unwrap();
+    code.tries = 2;
+    code.try_regions.push(DexTryRegion {
+        start: 4,
+        end: 7,
+        catches: vec![(Some(Arc::from("Ljava/lang/RuntimeException;")), 9)].into(),
+    });
+    let error = native_java::render_method("sample.Effects", &class, &class.methods[0])
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("handler re-enters protected region"),
+        "{error:#}"
+    );
 }
 
 #[test]
@@ -161,6 +274,14 @@ fn dex_eval(class: &DexClass, fail: Option<(&str, &str)>) -> Outcome {
                     .trim_end_matches(';')
                     .replace('/', ".");
                 calls.push(format!("class:{ty}"));
+                if let Some((name, error)) = fail
+                    && name == format!("{ty}.class")
+                {
+                    return Outcome {
+                        value: Err(error.into()),
+                        calls,
+                    };
+                }
                 regs[a] = Some(match ty.as_str() {
                     "sample.First" => 2,
                     "sample.Second" => 3,
@@ -336,11 +457,76 @@ fn java_eval(source: &str, fail: Option<(&str, &str)>) -> Outcome {
         fail: Option<(&str, &str)>,
         calls: &mut Vec<String>,
     ) -> Result<i32, String> {
-        if let Some(inner) = text.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-            let (name, value) = inner.split_once(" = ").expect("nested capture assignment");
-            let value = expression(value, locals, fail, calls)?;
-            locals.insert(name.into(), Some(value));
-            return Ok(value);
+        let text = text.trim();
+        let mut depth = 0;
+        if text.starts_with('(') {
+            let closing = text.char_indices().find_map(|(offset, ch)| {
+                if ch == '(' {
+                    depth += 1;
+                }
+                if ch == ')' {
+                    depth -= 1;
+                }
+                (depth == 0).then_some(offset)
+            });
+            if closing == Some(text.len() - 1) {
+                return expression(&text[1..text.len() - 1], locals, fail, calls);
+            }
+        }
+        // Parse ordinary Java grouping, conditional, equality and assignment
+        // operators. Evaluate exactly one selected arm, independently of the
+        // decompiler's capture/event bookkeeping.
+        let mut depth = 0;
+        let mut question = None;
+        let mut conditional_depth = 0;
+        for (offset, ch) in text.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                '?' if depth == 0 => {
+                    if question.is_none() {
+                        question = Some(offset);
+                    }
+                    conditional_depth += 1;
+                }
+                ':' if depth == 0 => {
+                    conditional_depth -= 1;
+                    if conditional_depth == 0 {
+                        let question = question.expect("conditional question");
+                        let condition = expression(&text[..question], locals, fail, calls)?;
+                        let arm = if condition != 0 {
+                            &text[question + 1..offset]
+                        } else {
+                            &text[offset + 1..]
+                        };
+                        return expression(arm, locals, fail, calls);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut depth = 0;
+        for (offset, ch) in text.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                '=' if depth == 0 && text[offset..].starts_with("==") => {
+                    return Ok(i32::from(
+                        expression(&text[..offset], locals, fail, calls)?
+                            == expression(&text[offset + 2..], locals, fail, calls)?,
+                    ));
+                }
+                '=' if depth == 0 => {
+                    let name = text[..offset].trim();
+                    let value = expression(&text[offset + 1..], locals, fail, calls)?;
+                    locals.insert(name.into(), Some(value));
+                    return Ok(value);
+                }
+                _ => {}
+            }
+        }
+        if text == "null" {
+            return Ok(0);
         }
         if let Some(arguments) = text
             .strip_prefix("new sample.Box(")
@@ -378,6 +564,11 @@ fn java_eval(source: &str, fail: Option<(&str, &str)>) -> Outcome {
         }
         if let Some(ty) = text.strip_suffix(".class") {
             calls.push(format!("class:{ty}"));
+            if let Some((name, error)) = fail
+                && name == format!("{ty}.class")
+            {
+                return Err(error.into());
+            }
             return Ok(match ty {
                 "sample.First" => 2,
                 "sample.Second" => 3,
@@ -623,17 +814,14 @@ fn allocation_precedes_class_resolution_and_constructor_preserves_resolution_ord
     }
     let class = allocation(true, true);
     let rendered = native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
-    // Readable staging preserves resolution order while moving allocation after it.
+    // Conditional capture sequencing keeps allocation before the original
+    // resolution order even when constructor argument order is reversed.
     let first = rendered.source.find("sample.First.class").unwrap();
     let second = rendered.source.find("sample.Second.class").unwrap();
-    let constructor = rendered.source.find("new sample.Box(v1, v0)").unwrap();
-    assert!(
-        first < second && second < constructor,
-        "{}",
-        rendered.source
-    );
+    let constructor = rendered.source.find("new sample.Box(").unwrap();
+    assert!(constructor < first && first < second, "{}", rendered.source);
     assert_eq!(rendered.source.matches("sample.First.class").count(), 1);
-    assert_eq!(rendered.source.matches("sample.Second.class").count(), 1);
+    assert_eq!(rendered.source.matches("sample.Second.class").count(), 2);
 }
 
 #[test]
@@ -926,7 +1114,7 @@ fn focused_normal_continuation_exception_behavior_and_negative_control() {
 }
 
 #[test]
-fn focused_constructor_behavior_and_known_staging_exception_difference() {
+fn focused_constructor_behavior_preserves_allocation_even_for_reordered_arguments() {
     for two in [false, true] {
         let class = allocation(two, false);
         let code = native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
@@ -934,7 +1122,12 @@ fn focused_constructor_behavior_and_known_staging_exception_difference() {
             None,
             Some(("<init>", "java.lang.IllegalArgumentException")),
             Some(("new", "java.lang.OutOfMemoryError")),
+            Some(("sample.First.class", "java.lang.NoClassDefFoundError")),
+            Some(("sample.Second.class", "java.lang.NoClassDefFoundError")),
         ] {
+            if !two && fail.is_some_and(|(name, _)| name == "sample.Second.class") {
+                continue;
+            }
             assert_eq!(
                 java_eval(&code.source, fail),
                 dex_eval(&class, fail),
@@ -943,29 +1136,28 @@ fn focused_constructor_behavior_and_known_staging_exception_difference() {
             );
         }
     }
-    // This is the explicitly accepted readable-staging tradeoff, not exact equivalence.
     let class = allocation(true, true);
     let code = native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
-    for failure in [None, Some(("<init>", "java.lang.IllegalArgumentException"))] {
+    for failure in [
+        None,
+        Some(("<init>", "java.lang.IllegalArgumentException")),
+        Some(("new", "java.lang.OutOfMemoryError")),
+        Some(("sample.First.class", "java.lang.NoClassDefFoundError")),
+        Some(("sample.Second.class", "java.lang.NoClassDefFoundError")),
+    ] {
         let original = dex_eval(&class, failure);
         let rendered = java_eval(&code.source, failure);
-        assert_eq!(original.value, rendered.value);
-        let without_allocation = |trace: Vec<String>| {
-            trace
-                .into_iter()
-                .filter(|event| event != "new:sample.Box")
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            without_allocation(original.calls),
-            without_allocation(rendered.calls)
-        );
+        assert_eq!(original, rendered, "{}", code.source);
     }
     let fail = Some(("new", "java.lang.OutOfMemoryError"));
     let dex = dex_eval(&class, fail);
-    let java = java_eval(&code.source, fail);
+    let staged_mutant = "sample.Box test() {\njava.lang.Class v0 = sample.First.class;\njava.lang.Class v1 = sample.Second.class;\nreturn new sample.Box(v1, v0);\n}\n";
+    let java = java_eval(staged_mutant, fail);
     assert_eq!(dex.value, java.value);
-    assert_ne!(dex.calls, java.calls);
+    assert_ne!(
+        dex.calls, java.calls,
+        "negative control detects allocation moved after arguments"
+    );
     assert_eq!(dex.calls, ["new:sample.Box"]);
     assert_eq!(
         java.calls,
@@ -1007,7 +1199,7 @@ fn return_only_try_exits_are_allowed_but_effectful_exits_are_not_widened() {
 }
 
 #[test]
-fn staged_constructor_inside_try_preserves_handler_and_argument_effects() {
+fn sequenced_constructor_inside_try_preserves_handler_and_argument_effects() {
     let mut class = allocation(true, true);
     class.methods[0].return_type = "I".into();
     let code = class.methods[0].code.as_mut().unwrap();
@@ -1022,12 +1214,8 @@ fn staged_constructor_inside_try_preserves_handler_and_argument_effects() {
     }];
     let rendered = native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap();
     for fail in [None, Some(("<init>", "java.lang.Exception"))] {
-        let mut expected = dex_eval(&class, fail);
-        let mut actual = java_eval(&rendered.source, fail);
-        // Existing readable-staging policy relocates allocation. All remaining
-        // effects, constructor arguments and catch outcomes must still match.
-        expected.calls.retain(|call| !call.starts_with("new:"));
-        actual.calls.retain(|call| !call.starts_with("new:"));
+        let expected = dex_eval(&class, fail);
+        let actual = java_eval(&rendered.source, fail);
         assert_eq!(actual, expected, "{}", rendered.source);
     }
     class.methods[0].code.as_mut().unwrap().try_regions[0].end = 4;
@@ -1035,6 +1223,151 @@ fn staged_constructor_inside_try_preserves_handler_and_argument_effects() {
         native_java::render_method("sample.Effects", &class, &class.methods[0]).is_err(),
         "staging crossed exception boundary"
     );
+}
+
+#[test]
+#[ignore = "requires javac and java on PATH"]
+fn sequenced_allocation_preserves_real_class_resolution_and_failure_identity_on_jvm() {
+    // The loader observes actual literal resolution. Box initialization supplies
+    // a controlled failure at new-instance's class-initialization step; it does
+    // not attempt to exhaust JVM memory. Allocation failure ordering itself is
+    // independently modeled by the DEX/Java evaluator and its staging mutant.
+    let dir = std::env::temp_dir().join(format!("rdx-resolution-sequence-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    for protected in [false, true] {
+        let mut class = allocation(true, true);
+        if protected {
+            class.methods[0].return_type = "I".into();
+            let code = class.methods[0].code.as_mut().unwrap();
+            code.instructions = vec![
+                0x0022, 0, 0x011c, 2, 0x021c, 3, 0x3070, 0, 0x0120, 0x7012, 0x000f, 0x000d, 0xf012,
+                0x000f,
+            ];
+            code.tries = 1;
+            code.try_regions = vec![DexTryRegion {
+                start: 0,
+                end: 9,
+                catches: vec![(Some("Ljava/lang/Exception;".into()), 11)].into(),
+            }];
+        }
+        let method = native_java::render_method("sample.Effects", &class, &class.methods[0])
+            .unwrap()
+            .source;
+        fs::write(
+            dir.join("sample/Effects.java"),
+            format!("package sample; public class Effects {{ {method} }}"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("sample/First.java"),
+            "package sample; public class First {}",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("sample/Second.java"),
+            "package sample; public class Second {}",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("sample/Trace.java"),
+            r#"
+package sample;
+public class Trace {
+ public static final java.util.List<String> events=new java.util.ArrayList<>();
+ public static int fail;
+ public static final OutOfMemoryError allocation=new OutOfMemoryError();
+ public static final NoClassDefFoundError resolution=new NoClassDefFoundError();
+ public static final RuntimeException constructor=new IllegalArgumentException();
+}
+"#,
+        )
+        .unwrap();
+        fs::write(dir.join("sample/Box.java"), r#"
+package sample;
+public class Box {
+ static {Trace.events.add("new:sample.Box"); if(Trace.fail==1)throw Trace.allocation;}
+ public Box(Class<?> a,Class<?> b){
+  Trace.events.add("args:["+(a.getSimpleName().equals("First")?2:3)+", "+(b.getSimpleName().equals("First")?2:3)+"]");
+  Trace.events.add("<init>"); if(Trace.fail==4)throw Trace.constructor;
+ }
+}
+"#).unwrap();
+        fs::write(dir.join("sample/Harness.java"), r#"
+package sample;
+import java.nio.file.*; import java.lang.reflect.*;
+public class Harness {
+ static class Loader extends ClassLoader {
+  final Path directory; Loader(Path p){super(ClassLoader.getPlatformClassLoader());directory=p;}
+  protected Class<?> loadClass(String name,boolean resolve)throws ClassNotFoundException{
+   if(name.equals("sample.Trace"))return Trace.class;
+   if(!name.startsWith("sample."))return super.loadClass(name,resolve);
+   Class<?> known=findLoadedClass(name); if(known!=null)return known;
+   if(name.equals("sample.First")||name.equals("sample.Second")){
+    Trace.events.add("class:"+name);
+    if(Trace.fail==(name.endsWith("First")?2:3))throw Trace.resolution;
+   }
+   try{byte[] bytes=Files.readAllBytes(directory.resolve(name.replace('.','/')+".class"));
+    Class<?> type=defineClass(name,bytes,0,bytes.length); if(resolve)resolveClass(type);return type;
+   }catch(java.io.IOException e){throw new ClassNotFoundException(name,e);}
+  }
+ }
+ public static void main(String[] args)throws Exception{
+  Trace.fail=Integer.parseInt(args[1]);
+  Class<?> type=Class.forName("sample.Effects",true,new Loader(Path.of(args[0])));
+  Method method=type.getDeclaredMethod("test"); Trace.events.clear();
+  try{Object result=method.invoke(null);System.out.println(result instanceof Integer?result:99);}
+  catch(InvocationTargetException e){Throwable cause=e.getCause();
+   if(cause!=Trace.allocation&&cause!=Trace.resolution&&cause!=Trace.constructor)throw new AssertionError("identity",cause);
+   System.out.println(cause.getClass().getName());
+  }
+  System.out.println(String.join("|",Trace.events));
+ }
+}
+"#).unwrap();
+        let sources: Vec<_> = ["Effects", "First", "Second", "Trace", "Box", "Harness"]
+            .map(|name| dir.join(format!("sample/{name}.java")))
+            .into();
+        let compiled = Command::new("javac").args(sources).output().unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}\n{method}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        for (failure, fail) in [
+            None,
+            Some(("new", "java.lang.OutOfMemoryError")),
+            Some(("sample.First.class", "java.lang.NoClassDefFoundError")),
+            Some(("sample.Second.class", "java.lang.NoClassDefFoundError")),
+            Some(("<init>", "java.lang.IllegalArgumentException")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let expected = dex_eval(&class, fail);
+            let run = Command::new("java")
+                .arg("-cp")
+                .arg(&dir)
+                .arg("sample.Harness")
+                .arg(&dir)
+                .arg(failure.to_string())
+                .output()
+                .unwrap();
+            assert!(
+                run.status.success(),
+                "{}\n{method}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            let output = String::from_utf8(run.stdout).unwrap();
+            let mut lines = output.lines();
+            let outcome = lines.next().unwrap();
+            match expected.value {
+                Ok(Some(value)) => assert_eq!(outcome, value.to_string()),
+                Err(error) => assert_eq!(outcome, error),
+                Ok(None) => panic!("fixture must return a value"),
+            }
+            assert_eq!(lines.next().unwrap(), expected.calls.join("|"));
+        }
+    }
 }
 
 #[test]
@@ -1872,4 +2205,162 @@ fn handler_join_does_not_move_effectful_bypass_into_try() {
     words[7] = 0x0a28;
     words.extend([0x0071, 2, 0, 0x020f]);
     assert!(native_java::render("sample.Effects", &class).is_err());
+}
+
+fn comparison_return_tail_fixture(op: u16) -> DexClass {
+    let result_move = if matches!(op, 0x2d | 0x2e) {
+        0x0a
+    } else {
+        0x0b
+    };
+    let mut class = fixture(
+        vec![
+            0x0071,
+            0,
+            0,
+            result_move,
+            0x0438,
+            10,
+            0x0071,
+            1,
+            0,
+            0x0200 | result_move,
+            op,
+            0x0200,
+            0x003d,
+            4,
+            0x0012,
+            0x000f,
+            0x1012,
+            0x000f,
+            0x000d,
+            0x0071,
+            2,
+            0,
+            0xf012,
+            0x000f,
+            0x000d,
+            0xe012,
+            0x000f,
+        ],
+        vec![(Some("Ljava/lang/RuntimeException;"), 18)],
+        0,
+        10,
+        "I",
+    );
+    let ty = match op {
+        0x2d | 0x2e => "F",
+        0x2f | 0x30 => "D",
+        _ => "J",
+    };
+    Arc::get_mut(&mut class.symbols).unwrap().protos[0].0 = ty.into();
+    class.methods[0].parameters = vec!["Z".into()];
+    let code = class.methods[0].code.as_mut().unwrap();
+    code.registers = 5;
+    code.ins = 1;
+    code.tries = 2;
+    code.try_regions.push(DexTryRegion {
+        start: 19,
+        end: 22,
+        catches: vec![(Some(Arc::from("Ljava/lang/IllegalStateException;")), 24)].into(),
+    });
+    // An outer early return shares the false tail. The try must not consume
+    // the enclosing branch's true continuation while widening its pure tail.
+    code.instructions.splice(0..0, [0x0439, 3, 0x0f28]);
+    for region in &mut code.try_regions {
+        region.start += 3;
+        region.end += 3;
+        region.catches = region
+            .catches
+            .iter()
+            .map(|(ty, pc)| (ty.clone(), pc + 3))
+            .collect::<Vec<_>>()
+            .into();
+    }
+    class
+}
+
+#[test]
+fn primitive_comparison_return_tails_preserve_nested_handlers() {
+    for op in 0x2d..=0x31 {
+        let class = comparison_return_tail_fixture(op);
+        let source = native_java::render_method("sample.Effects", &class, &class.methods[0])
+            .unwrap()
+            .source;
+        assert!(
+            source.contains("catch (java.lang.RuntimeException"),
+            "{source}"
+        );
+        assert!(
+            source.contains("catch (java.lang.IllegalStateException"),
+            "{source}"
+        );
+        assert_eq!(source.matches("sample.Effects.second()").count(), 1);
+    }
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn primitive_comparison_return_tails_execute_on_jvm() {
+    use std::{fs, process::Command};
+    for op in 0x2d..=0x31 {
+        let class = comparison_return_tail_fixture(op);
+        let method = native_java::render_method("sample.Effects", &class, &class.methods[0])
+            .unwrap()
+            .source;
+        let (ty, values) = match op {
+            0x2d | 0x2e => (
+                "float",
+                "Float.NaN, Float.NEGATIVE_INFINITY, -0.0f, 0.0f, Float.POSITIVE_INFINITY",
+            ),
+            0x2f | 0x30 => (
+                "double",
+                "Double.NaN, Double.NEGATIVE_INFINITY, -0.0d, 0.0d, Double.POSITIVE_INFINITY",
+            ),
+            _ => ("long", "Long.MIN_VALUE, -1L, 0L, 1L, Long.MAX_VALUE"),
+        };
+        let expected = if matches!(op, 0x2d | 0x2f) {
+            "!(left > right)"
+        } else {
+            "left <= right"
+        };
+        let source = format!(
+            r#"package sample; public class Effects {{
+static {ty} left, right;
+static int mode, reads;
+static {ty} first() {{ if(mode==1||mode==3)throw new IllegalArgumentException(); return left; }}
+static {ty} second() {{ reads++; if(mode==2)throw new IllegalArgumentException(); return right; }}
+static void touch() {{ if(mode==3)throw new IllegalStateException(); }}
+{method}
+public static void main(String[] args) {{
+ for({ty} l:new {ty}[]{{{values}}}) for({ty} r:new {ty}[]{{{values}}}) {{
+   left=l; right=r; mode=0; reads=0;
+   if(test(false)!=0||reads!=0)throw new AssertionError("early exit");
+   if(test(true)!=({expected}?1:0)||reads!=1)throw new AssertionError("comparison");
+ }}
+ for(mode=1;mode<=3;mode++) if(test(true)!=(mode==3?-2:-1))throw new AssertionError("handler");
+}}
+}}"#
+        );
+        let dir =
+            std::env::temp_dir().join(format!("rdx-comparison-tail-{}-{op}", std::process::id()));
+        fs::create_dir_all(dir.join("sample")).unwrap();
+        fs::write(dir.join("sample/Effects.java"), source).unwrap();
+        for (program, args) in [
+            ("javac", vec!["sample/Effects.java"]),
+            ("java", vec!["-cp", ".", "sample.Effects"]),
+        ] {
+            let result = Command::new(program)
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "opcode={op:x} {program}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

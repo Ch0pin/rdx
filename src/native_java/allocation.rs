@@ -193,6 +193,153 @@ impl Fragment {
 }
 
 impl Allocation {
+    /// The allocation remains outside an argument's statement block. Declarations
+    /// have no initializers, every capture executes at its original DEX position,
+    /// and the complete trace includes allocation/resolution/constructor events.
+    pub(crate) fn render_argument_block_checked(
+        &self,
+        dex_events: &[Event],
+        locals: &[&str],
+        discarded: &[usize],
+    ) -> Result<Rendered> {
+        self.validate(locals, &mut HashSet::new(), 0, &mut 0)?;
+        ensure!(
+            !self.arguments.is_empty(),
+            "argument block requires a constructor argument"
+        );
+        ensure!(
+            self.captures.len() <= 64,
+            "argument block capture budget exceeded"
+        );
+        ensure!(
+            discarded.iter().all(|i| *i < self.captures.len()),
+            "invalid discarded capture"
+        );
+        let allocate = Event::Allocate {
+            site: self.site,
+            ty: self.ty.label.clone(),
+        };
+        let construct = Event::Construct {
+            site: self.constructor_site,
+            ty: self.ty.label.clone(),
+        };
+        ensure!(
+            dex_events.first() == Some(&allocate)
+                && dex_events.last() == Some(&construct)
+                && dex_events
+                    .iter()
+                    .filter(|e| matches!(e, Event::Allocate { .. }))
+                    .count()
+                    == 1,
+            "argument block requires one exact allocation"
+        );
+        // An ignored void call is a statement, never a value/dependency. Every
+        // nonvoid reference is backward and already assigned when it is read.
+        for (index, capture) in self.captures.iter().enumerate() {
+            if capture.ty == "void" {
+                ensure!(
+                    discarded.contains(&index) && matches!(capture.expression, Expr::Call { .. }),
+                    "void capture must be a discarded call"
+                );
+            } else {
+                sequence_comparison(&capture.ty)?;
+            }
+            let mut dependencies = HashSet::new();
+            capture
+                .expression
+                .flat_dependencies(index, &mut dependencies)?;
+            ensure!(
+                dependencies.iter().all(|i| self.captures[*i].ty != "void"),
+                "void capture used as a value"
+            );
+        }
+        for argument in &self.arguments {
+            let mut dependencies = HashSet::new();
+            argument.flat_dependencies(self.captures.len(), &mut dependencies)?;
+            ensure!(
+                dependencies.iter().all(|i| self.captures[*i].ty != "void"),
+                "void capture used as an argument"
+            );
+        }
+        let mut events = vec![allocate];
+        let mut captures = CaptureRenderer::new(&self.captures, &mut events);
+        let mut statements = Fragment::plain(String::new());
+        let mut declarations = Vec::new();
+        for (index, capture) in self.captures.iter().enumerate() {
+            let assignment = captures.capture_body(index)?;
+            let skip = if capture.ty == "void" {
+                format!("({} = ", capture.name).chars().count()
+            } else {
+                declarations.push(format!("{} {};", capture.ty, capture.name));
+                1
+            };
+            let text = assignment
+                .text
+                .chars()
+                .skip(skip)
+                .take(assignment.text.chars().count() - skip - 1)
+                .collect::<String>();
+            let links = assignment
+                .links
+                .into_iter()
+                .map(|link| {
+                    Ok(Link {
+                        start: link
+                            .start
+                            .checked_sub(skip)
+                            .context("argument block statement link")?,
+                        end: link
+                            .end
+                            .checked_sub(skip)
+                            .context("argument block statement link")?,
+                        label: link.label,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            statements.append(Fragment { text, links });
+            statements.append(Fragment::plain("; "));
+        }
+        ensure!(captures.all_consumed(), "unconsumed argument block capture");
+        let arguments = self
+            .arguments
+            .iter()
+            .map(|arg| captures.expression(arg))
+            .collect::<Result<Vec<_>>>()?;
+        captures.events.push(construct);
+        ensure!(
+            *captures.events == dex_events,
+            "argument block changes allocation or effect order"
+        );
+        let mut expression = Fragment::plain("new ");
+        expression.append(Fragment::symbol(&self.ty));
+        expression.append(Fragment::plain("(switch (0) { default -> { "));
+        expression.append(statements);
+        expression.append(Fragment::plain("yield "));
+        let mut arguments = arguments.into_iter();
+        expression.append(arguments.next().context("argument block yield")?);
+        expression.append(Fragment::plain("; } }"));
+        for argument in arguments {
+            expression.append(Fragment::plain(", "));
+            expression.append(argument);
+        }
+        expression.append(Fragment::plain(")"));
+        ensure!(
+            declarations
+                .iter()
+                .map(|d| d.chars().count())
+                .sum::<usize>()
+                .saturating_add(expression.text.chars().count())
+                <= MAX_CHARS,
+            "argument block output exceeds budget"
+        );
+        Ok(Rendered {
+            declaration_links: vec![Vec::new(); declarations.len()],
+            declarations,
+            expression: expression.text,
+            links: expression.links,
+            events,
+        })
+    }
     /// Declarations have no initializers. Effects occur only inside the returned
     /// expression, whose site-specific trace must match the DEX trace exactly.
     pub(crate) fn render_checked(&self, dex_events: &[Event], locals: &[&str]) -> Result<Rendered> {
@@ -735,10 +882,19 @@ enum CaptureState {
     Rendering,
     Done,
 }
+#[derive(Debug)]
+struct CaptureOrder;
+impl std::fmt::Display for CaptureOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("allocation constructor arguments reorder captured effects")
+    }
+}
+impl std::error::Error for CaptureOrder {}
 struct CaptureRenderer<'a> {
     captures: &'a [Capture],
     states: Vec<CaptureState>,
     next: usize,
+    sequences: usize,
     events: &'a mut Vec<Event>,
 }
 impl<'a> CaptureRenderer<'a> {
@@ -747,6 +903,7 @@ impl<'a> CaptureRenderer<'a> {
             captures,
             states: vec![CaptureState::Waiting; captures.len()],
             next: 0,
+            sequences: 0,
             events,
         }
     }
@@ -963,19 +1120,151 @@ impl<'a> CaptureRenderer<'a> {
             CaptureState::Rendering => bail!("recursive allocation capture"),
             CaptureState::Waiting => {}
         }
-        // Later captures may be requested first only if their structured
-        // expression emits every earlier capture as an actual dependency.
-        self.states[index] = CaptureState::Rendering;
-        let expression = self.expression(&capture.expression)?;
-        ensure!(
-            index == self.next,
-            "allocation constructor arguments reorder captured effects"
+        // Try natural Java evaluation first: a nested new must retain its
+        // allocation before its argument captures. Recover only a proven gap
+        // in the ordered capture environment, not arbitrary render failures.
+        let before = (
+            self.states.clone(),
+            self.next,
+            self.sequences,
+            self.events.len(),
         );
+        let natural = self.capture_body(index);
+        match natural {
+            Ok(fragment) => Ok(fragment),
+            Err(error) if error.is::<CaptureOrder>() => {
+                self.states = before.0;
+                self.next = before.1;
+                self.sequences = before.2;
+                self.events.truncate(before.3);
+                self.capture_sequenced(index)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    fn capture_body(&mut self, index: usize) -> Result<Fragment> {
+        self.states[index] = CaptureState::Rendering;
+        let expression = self.expression(&self.captures[index].expression)?;
+        if index != self.next {
+            bail!(CaptureOrder);
+        }
         self.next += 1;
         self.states[index] = CaptureState::Done;
-        let mut result = Fragment::plain(format!("({} = ", capture.name));
+        let mut result = Fragment::plain(format!("({} = ", self.captures[index].name));
         result.append(expression);
         result.append(Fragment::plain(")"));
         Ok(result)
+    }
+    fn capture_sequenced(&mut self, index: usize) -> Result<Fragment> {
+        ensure!(
+            self.next < index && self.sequences < 8,
+            "allocation sequence budget exceeded"
+        );
+        sequence_comparison(&self.captures[index].ty)?;
+        self.sequences += 1;
+        // A prefix cannot use the capture whose expression follows it.
+        self.states[index] = CaptureState::Rendering;
+        let mut prefixes = Vec::new();
+        while self.next < index {
+            let prefix = self.next;
+            let comparison = sequence_comparison(&self.captures[prefix].ty)?;
+            let mut dependencies = HashSet::new();
+            self.captures[prefix]
+                .expression
+                .flat_dependencies(prefix, &mut dependencies)?;
+            let fragment = self.capture(prefix)?;
+            prefixes.push((fragment, comparison));
+        }
+        ensure!(
+            self.next == index,
+            "allocation sequence crossed continuation"
+        );
+        let additional = prefixes.len().saturating_sub(1);
+        ensure!(
+            self.sequences + additional <= 8,
+            "allocation sequence budget exceeded"
+        );
+        self.sequences += additional;
+        self.states[index] = CaptureState::Waiting;
+        let start = (
+            self.states.clone(),
+            self.next,
+            self.sequences,
+            self.events.len(),
+        );
+        let first = self.capture_body(index)?;
+        let after = (self.states.clone(), self.next, self.sequences);
+        let branch_events = self.events[start.3..].to_vec();
+        self.states = start.0;
+        self.next = start.1;
+        self.sequences = start.2;
+        self.events.truncate(start.3);
+        let second = self.capture_body(index)?;
+        ensure!(
+            first.text == second.text
+                && first.links == second.links
+                && self.states == after.0
+                && self.next == after.1
+                && self.sequences == after.2
+                && self.events[start.3..] == branch_events,
+            "allocation sequence branches disagree"
+        );
+        // Both arms contain the same typed assignment, so the continuation
+        // executes once and all live capture locals are definitely assigned.
+        // Check before duplicating: nested sequences cannot expand without bound.
+        let mut continuation = first;
+        for (prefix, comparison) in prefixes.into_iter().rev() {
+            let chars = prefix
+                .text
+                .chars()
+                .count()
+                .checked_add(continuation.text.chars().count().saturating_mul(2))
+                .and_then(|n| n.checked_add(comparison.len() + 16))
+                .context("allocation sequence output overflow")?;
+            ensure!(
+                chars <= MAX_CHARS,
+                "allocation sequence output exceeds budget"
+            );
+            let duplicate = Fragment {
+                text: continuation.text.clone(),
+                links: continuation.links.clone(),
+            };
+            let mut result = Fragment::plain("(");
+            result.append(prefix);
+            result.append(Fragment::plain(format!("{comparison} ? ")));
+            result.append(continuation);
+            result.append(Fragment::plain(" : "));
+            result.append(duplicate);
+            result.append(Fragment::plain(")"));
+            continuation = result;
+        }
+        Ok(continuation)
+    }
+}
+
+// Java capture types come from validated descriptors, never inferred literals.
+fn sequence_comparison(ty: &str) -> Result<&'static str> {
+    match ty {
+        "boolean" => Ok(" == false"),
+        "byte" | "char" | "short" | "int" => Ok(" == 0"),
+        "long" => Ok(" == 0L"),
+        "float" => Ok(" == 0.0f"),
+        "double" => Ok(" == 0.0d"),
+        "void" | "var" | "null" => bail!("invalid allocation sequence type"),
+        _ => {
+            let base = ty.trim_end_matches("[]");
+            ensure!(
+                !base.is_empty()
+                    && base.split('.').all(|part| {
+                        let mut chars = part.chars();
+                        chars
+                            .next()
+                            .is_some_and(|c| c == '_' || c == '$' || c.is_alphabetic())
+                            && chars.all(|c| c == '_' || c == '$' || c.is_alphanumeric())
+                    }),
+                "invalid allocation sequence type"
+            );
+            Ok(" == null")
+        }
     }
 }

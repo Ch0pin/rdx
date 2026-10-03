@@ -344,3 +344,33 @@ fn dex_handler_around_super_call_does_not_cover_java_constructor_declaration() {
         .source;
     assert!(source.contains("throws java.io.IOException"), "{source}");
 }
+
+#[test]
+fn catchall_callers_cover_checked_exceptions_without_a_typed_entry() {
+    for kind in [Kind::Constructor, Kind::Static, Kind::Public] {
+        let (target, mut caller) = raw_fixture(kind, Caller::Caught);
+        let region = &mut caller.methods[0].code.as_mut().unwrap().try_regions[0];
+        region.catches = vec![(None, region.catches[0].1)].into();
+        let (target, caller) = with_hierarchy(target, caller);
+        let source = native_java::render_method("sample.Target", &target, &target.methods[0])
+            .unwrap()
+            .source;
+        assert!(
+            source.contains("throws java.io.IOException"),
+            "{kind:?}: {source}"
+        );
+        // The constructor fixture deliberately allocates before the protected
+        // invoke; test its caller proof above without requiring that separate
+        // allocation reconstruction shape here.
+        if !matches!(kind, Kind::Constructor) {
+            let caller_source =
+                native_java::render_method("sample.Caller", &caller, &caller.methods[0])
+                    .unwrap()
+                    .source;
+            assert!(
+                caller_source.contains("catch (java.lang.Throwable"),
+                "{caller_source}"
+            );
+        }
+    }
+}

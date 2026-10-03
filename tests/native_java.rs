@@ -300,9 +300,15 @@ fn null_invocation_argument_keeps_declared_overload_type() {
     });
     let code = native_java::render("sample.Arithmetic", &class).unwrap();
     assert!(
-        code.source.contains("accept(((java.lang.String) null))"),
+        code.source.contains("accept(((String) null))"),
         "{}",
         code.source
+    );
+    let raw = native_java::render_method("sample.Arithmetic", &class, &class.methods[0]).unwrap();
+    assert!(
+        raw.source.contains("accept(((java.lang.String) null))"),
+        "{}",
+        raw.source
     );
 }
 

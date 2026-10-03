@@ -1,6 +1,6 @@
 # RDX MCP v1 contract
 
-Status: target contract. The server and GUI panel now implement an initial 15-tool subset.
+Status: target contract. The server and GUI panel now implement a 19-tool subset.
 See [current MCP usage and limitations](mcp.md) for the shipped surface; schemas
 below describe the broader target, not a claim that every tool is implemented.
 

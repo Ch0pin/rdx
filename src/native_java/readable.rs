@@ -36,6 +36,19 @@ fn candidates(class: &DexClass, codes: &[DecompiledCode]) -> BTreeSet<String> {
     }
     for link in codes.iter().flat_map(|code| &code.links) {
         let label = link.label.as_str();
+        // Inferred local types may appear only in a called method's return
+        // descriptor or a referenced field, without a separate type link.
+        if let Some((_, descriptor)) = label.split_once('(').or_else(|| label.split_once(':')) {
+            let mut rest = descriptor;
+            while let Some(start) = rest.find('L') {
+                rest = &rest[start..];
+                let Some(end) = rest.find(';') else { break };
+                if let Some(name) = descriptor_name(&rest[..=end]) {
+                    names.insert(name);
+                }
+                rest = &rest[end + 1..];
+            }
+        }
         let possible = if label.contains('(') || label.contains(':') {
             label.rsplit_once('.').map(|p| p.0)
         } else {
@@ -210,11 +223,65 @@ pub(crate) fn shorten(name: &str, class: &DexClass, codes: Vec<DecompiledCode>) 
     let tokenized: Vec<_> = codes.iter().map(|code| tokens(&code.source)).collect();
     for member_tokens in &tokenized {
         for (_, _, token) in member_tokens {
+            // Inferred locals and synthesized guards can lack DEX type links.
+            // These java.lang types need no import, but still participate in
+            // the same collision and identifier-shadow checks as linked types.
+            if let Some(rest) = token.strip_prefix("java.lang.") {
+                let simple = rest.split('.').next().unwrap_or(rest);
+                if matches!(
+                    simple,
+                    "Object"
+                        | "String"
+                        | "StringBuilder"
+                        | "StringBuffer"
+                        | "Class"
+                        | "Boolean"
+                        | "Byte"
+                        | "Character"
+                        | "Short"
+                        | "Integer"
+                        | "Long"
+                        | "Float"
+                        | "Double"
+                        | "Number"
+                        | "Void"
+                        | "Throwable"
+                        | "Exception"
+                        | "RuntimeException"
+                        | "Error"
+                        | "AssertionError"
+                        | "NullPointerException"
+                        | "ArrayIndexOutOfBoundsException"
+                        | "IndexOutOfBoundsException"
+                        | "ClassCastException"
+                        | "IllegalArgumentException"
+                        | "IllegalStateException"
+                ) {
+                    candidates.insert(format!("java.lang.{simple}"));
+                }
+            }
             if !token.contains('.') {
                 blocked.insert(token.clone());
             }
         }
     }
+    // The class declaration and constructor/method definitions do not mask
+    // the type. A field, parameter or generated local with its simple name
+    // does mask it in expression owners (Own.field and Own.method()).
+    let own_value_shadow = class
+        .fields
+        .iter()
+        .any(|field| super::names::member(&field.name).is_ok_and(|name| name == own_simple))
+        || codes.iter().zip(&tokenized).any(|(code, member_tokens)| {
+            member_tokens.iter().any(|(start, end, token)| {
+                token == own_simple
+                    && !code.definitions.iter().any(|definition| {
+                        definition.start == *start
+                            && definition.end == *end
+                            && matches!(definition.kind.as_str(), "class" | "method")
+                    })
+            })
+        });
     let mut by_simple: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for fq in &candidates {
         if fq
@@ -233,7 +300,7 @@ pub(crate) fn shorten(name: &str, class: &DexClass, codes: Vec<DecompiledCode>) 
         .into_iter()
         .filter_map(|(simple, names)| {
             if names.contains(&name) {
-                Some((name, simple))
+                (!own_value_shadow).then_some((name, simple))
             } else {
                 (names.len() == 1 && !blocked.contains(simple)).then_some((names[0], simple))
             }
@@ -419,6 +486,49 @@ mod tests {
             result.source_hash,
             crate::engine::source_identity(&result.source)
         );
+    }
+
+    #[test]
+    fn unlinked_java_lang_locals_shorten_with_shadow_and_collision_checks() {
+        let mut class = activity_class();
+        let unlinked = |source: &str| {
+            let mut value = code(source, "");
+            value.links.clear();
+            value
+        };
+        let source = "java.lang.String text = \"java.lang.String\"; throw new java.lang.ArrayIndexOutOfBoundsException();";
+        let result = shorten("sample.Hello", &class, vec![unlinked(source)]);
+        assert!(result.codes[0].source.starts_with("String text"));
+        assert!(
+            result.codes[0]
+                .source
+                .contains("new ArrayIndexOutOfBoundsException()")
+        );
+        assert!(result.codes[0].source.contains("\"java.lang.String\""));
+        assert!(result.imports.is_empty());
+        class.fields[0].field_type = "Lexample/String;".into();
+        let result = shorten("sample.Hello", &class, vec![unlinked(source)]);
+        assert!(result.codes[0].source.starts_with("java.lang.String text"));
+        class.fields[0].field_type = "Ljava/lang/Object;".into();
+        let shadow = "int String = 1; java.lang.String text = null;";
+        let result = shorten("sample.Hello", &class, vec![unlinked(shadow)]);
+        assert!(result.codes[0].source.contains("java.lang.String text"));
+    }
+
+    #[test]
+    fn inferred_return_type_is_imported_in_static_initializer() {
+        let mut class = activity_class();
+        let mut code = code(
+            "static { java.util.ArrayList list = sample.Factory.make(); }",
+            "sample.Factory.make",
+        );
+        code.links[0].label = "sample.Factory.make()Ljava/util/ArrayList;".into();
+        let result = shorten("sample.Hello", &class, vec![code.clone()]);
+        assert!(result.imports.contains("java.util.ArrayList"));
+        assert!(result.codes[0].source.contains("ArrayList list"));
+        class.fields[0].field_type = "Lother/ArrayList;".into();
+        let result = shorten("sample.Hello", &class, vec![code]);
+        assert!(result.codes[0].source.contains("java.util.ArrayList list"));
     }
 
     #[test]
@@ -661,3 +771,7 @@ mod nested_member_tests {
         assert!(result.imports.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "readable_own_type_tests.rs"]
+mod own_type_shadow_tests;

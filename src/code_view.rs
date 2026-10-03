@@ -3,7 +3,7 @@ use crate::code_fonts::CodeFont;
 use rdx::engine::CodeLink;
 mod metadata_fold;
 mod palettes;
-use metadata_fold::MetadataFold;
+use metadata_fold::MetadataFolds;
 use std::{
     ops::Range,
     sync::{Arc, OnceLock},
@@ -249,7 +249,7 @@ pub struct CodeDocument {
     word_wrap: bool,
     code_font: CodeFont,
     source: String,
-    metadata_fold: Option<MetadataFold>,
+    metadata_fold: Option<MetadataFolds>,
     syntax: String,
     preview_end: usize,
     preview_start: usize,
@@ -282,7 +282,7 @@ pub struct CodeDocument {
 impl CodeDocument {
     pub fn new(text: String, syntax: &str) -> Self {
         let end = text.len();
-        let metadata_fold = MetadataFold::detect(&text, syntax);
+        let metadata_fold = MetadataFolds::detect(&text, syntax);
         Self {
             selection_key: None,
             selection_occurrences: Vec::new(),
@@ -591,14 +591,16 @@ impl CodeDocument {
         Ok(())
     }
     fn expand_for_range(&mut self, range: Range<usize>) {
-        if let Some(fold) = &mut self.metadata_fold
-            && fold.collapsed()
-            && fold.overlaps(&range)
-        {
-            fold.expanded = true;
-            self.cache = None;
+        if let Some(group) = &mut self.metadata_fold {
+            for fold in &mut group.folds {
+                if fold.collapsed() && fold.overlaps(&range) {
+                    fold.expanded = true;
+                    self.cache = None;
+                }
+            }
         }
     }
+
     fn source_to_display(&self, position: usize) -> usize {
         self.metadata_fold
             .as_ref()
@@ -868,27 +870,26 @@ impl CodeDocument {
                             }
                             line_beginning = row.ends_with_newline;
                             if row.ends_with_newline {
-                                line += if self.metadata_fold.as_ref().is_some_and(|fold| fold.collapsed() && row_start <= fold.summary_chars().end && fold.summary_chars().end <= row_start + row.glyphs.len()) {
-                                    self.source[self.metadata_fold.as_ref().unwrap().bytes.clone()].bytes().filter(|byte| *byte == b'\n').count() + 1
-                                } else { 1 };
+                                line += self.metadata_fold.as_ref().map_or(1, |group| {
+                                    1 + group.folds.iter().filter(|fold| {
+                                        let end = group.display_range(fold).end;
+                                        fold.collapsed() && row_start <= end && end <= row_start + row.glyphs.len()
+                                    }).map(|fold| self.source[fold.bytes.clone()].bytes().filter(|b| *b == b'\n').count()).sum::<usize>()
+                                });
                             }
                             row_start += row.glyphs.len() + usize::from(row.ends_with_newline);
                         }
-                        let fold_gutter_clicked = self.metadata_fold.as_ref().is_some_and(|fold| {
-                            let position = galley.pos_from_ccursor(egui::text::CCursor::new(self.source_to_display(fold.chars.start)));
-                            let button = egui::Rect::from_min_size(
-                                rect.min + egui::vec2(2.0, position.top()),
-                                egui::vec2(disclosure_width, position.height()),
-                            );
-                            let response = ui.interact(button, ui.make_persistent_id("kotlin_metadata_disclosure"), egui::Sense::click())
-                                .on_hover_text(if fold.expanded { "Collapse Kotlin compiler metadata" } else { "Expand Kotlin compiler metadata" });
-                            ui.painter().text(
-                                button.left_center(), egui::Align2::LEFT_CENTER,
-                                if fold.expanded { "▼" } else { "▶" },
-                                self.code_font.font_id(size), foreground,
-                            );
-                            response.clicked()
-                        });
+                        let mut fold_clicked = None;
+                        if let Some(group) = &self.metadata_fold {
+                            for (index, fold) in group.folds.iter().enumerate() {
+                                let position = galley.pos_from_ccursor(egui::text::CCursor::new(group.source_to_display(fold.chars.start)));
+                                let button = egui::Rect::from_min_size(rect.min + egui::vec2(2.0, position.top()), egui::vec2(disclosure_width, position.height()));
+                                let response = ui.interact(button, ui.make_persistent_id(("kotlin_metadata_disclosure", index)), egui::Sense::click())
+                                    .on_hover_text(if fold.expanded { "Collapse Kotlin compiler metadata" } else { "Expand Kotlin compiler metadata" });
+                                ui.painter().text(button.left_center(), egui::Align2::LEFT_CENTER, if fold.expanded { "▼" } else { "▶" }, self.code_font.font_id(size), foreground);
+                                if response.clicked() { fold_clicked = Some(index); }
+                            }
+                        }
                         let mut source = display.as_str();
                         let mut layouter = |_: &egui::Ui, _: &str, _: f32| Arc::clone(&galley);
                         let editor_id = ui.make_persistent_id("source_editor");
@@ -917,17 +918,19 @@ impl CodeDocument {
                             .layouter(&mut layouter)
                             .show(ui);
                         scroll_drag_selection(ui, &output);
-                        let fold_click = fold_gutter_clicked || output.response.clicked_by(egui::PointerButton::Primary)
-                            && output.response.interact_pointer_pos()
+                        if fold_clicked.is_none() && output.response.clicked_by(egui::PointerButton::Primary)
+                            && let Some(position) = output.response.interact_pointer_pos()
                                 .filter(|point| output.text_clip_rect.contains(*point))
                                 .and_then(|point| Self::glyph_at_pointer(&output.galley, point - output.galley_pos))
-                                .is_some_and(|position| self.metadata_fold.as_ref().is_some_and(|fold| {
-                                    if fold.collapsed() { fold.summary_chars().contains(&position) }
-                                    else {
-                                        let prefix = if self.source[fold.bytes.start..].starts_with("@kotlin.Metadata") { "@kotlin.Metadata" } else { "@Metadata" };
-                                        (fold.chars.start..fold.chars.start + prefix.chars().count()).contains(&position)
-                                    }
-                                }));
+                                && let Some(group) = &self.metadata_fold {
+                                fold_clicked = group.folds.iter().position(|fold| {
+                                    let range = group.display_range(fold);
+                                    let end = if fold.collapsed() { range.end } else {
+                                        range.start + if self.source[fold.bytes.start..].starts_with("@kotlin.Metadata") { 16 } else { 9 }
+                                    };
+                                    (range.start..end).contains(&position)
+                                });
+                        }
                         if preserve_selection {
                             output.state.cursor.set_char_range(previous_selection);
                             output.state.clone().store(ui.ctx(), editor_id);
@@ -954,7 +957,7 @@ impl CodeDocument {
                                 })
                                 .filter(|range| !range.is_empty())
                                 .map(|range| {
-                                    self.display_to_source(range.start).unwrap_or_else(|| self.metadata_fold.as_ref().unwrap().chars.start)..self.display_to_source(range.end).unwrap_or_else(|| self.metadata_fold.as_ref().unwrap().chars.end)
+                                    self.metadata_fold.as_ref().map_or(range.start, |group| group.source_boundary(range.start, false))..self.metadata_fold.as_ref().map_or(range.end, |group| group.source_boundary(range.end, true))
                                 });
                         }
                         output.response.context_menu(|ui| {
@@ -1118,7 +1121,7 @@ impl CodeDocument {
                             self.last_editor_visible_rect = Some(output.text_clip_rect.intersect(ui.clip_rect()));
                         }
                         if let Some(cursor) = output.state.cursor.char_range() {
-                            let position = self.display_to_source(cursor.primary.index).unwrap_or_else(|| self.metadata_fold.as_ref().unwrap().chars.start);
+                            let position = self.metadata_fold.as_ref().map_or(cursor.primary.index, |group| group.source_boundary(cursor.primary.index, false));
                             if self.jump.is_none() && self.last_navigation_cursor != Some(position)
                             {
                                 self.navigation_position = position;
@@ -1137,13 +1140,14 @@ impl CodeDocument {
                         if output.response.has_focus()
                             && ui.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::Copy)))
                             && let Some(range) = &selected
-                            && let Some(fold) = &self.metadata_fold
-                            && fold.collapsed()
-                            && range.start < fold.summary_chars().end
-                            && fold.summary_chars().start < range.end
+                            && let Some(group) = &self.metadata_fold
+                            && group.folds.iter().any(|fold| fold.collapsed() && {
+                                let summary = group.display_range(fold);
+                                range.start < summary.end && summary.start < range.end
+                            })
                         {
-                            let start = fold.display_to_source(range.start).unwrap_or(fold.chars.start);
-                            let end = fold.display_to_source(range.end).unwrap_or(fold.chars.end);
+                            let start = group.source_boundary(range.start, false);
+                            let end = group.source_boundary(range.end, true);
                             ui.ctx().copy_text(self.source.chars().skip(start).take(end - start).collect());
                         }
                         let caret = output
@@ -1238,8 +1242,8 @@ impl CodeDocument {
                                 .clip_rect()
                                 .intersects(row.rect.translate(output.galley_pos.to_vec2()))
                             {
-                                let global_start = self.display_to_source(row_start).unwrap_or_else(|| self.metadata_fold.as_ref().unwrap().chars.start);
-                                let global_end = self.display_to_source(row_end).unwrap_or_else(|| self.metadata_fold.as_ref().unwrap().chars.end);
+                                let global_start = self.metadata_fold.as_ref().map_or(row_start, |group| group.source_boundary(row_start, false));
+                                let global_end = self.metadata_fold.as_ref().map_or(row_end, |group| group.source_boundary(row_end, true));
                                 let first = self
                                     .exported_components
                                     .partition_point(|range| range.end <= global_start);
@@ -1391,9 +1395,9 @@ impl CodeDocument {
                         } else if hovered_exported {
                             output.response.on_hover_text("Exported Android component");
                         }
-                        if fold_click && let Some(fold) = &mut self.metadata_fold {
+                        if let Some(index) = fold_clicked && let Some(fold) = &mut self.metadata_fold {
                             let before = fold.clone();
-                            fold.expanded = !fold.expanded;
+                            fold.folds[index].expanded = !fold.folds[index].expanded;
                             let selected = previous_selection.and_then(|range| {
                                 let start = before.display_to_source(range.primary.index)?;
                                 let end = before.display_to_source(range.secondary.index)?;
@@ -1403,12 +1407,12 @@ impl CodeDocument {
                                 ))
                             });
                             output.state.cursor.set_char_range(selected.or_else(|| Some(
-                                egui::text::CCursorRange::one(egui::text::CCursor::new(fold.source_to_display(fold.chars.start)))
+                                egui::text::CCursorRange::one(egui::text::CCursor::new(fold.source_to_display(fold.folds[index].chars.start)))
                             )));
                             output.state.clone().store(ui.ctx(), editor_id);
                             self.clicked_word = None;
                             self.selection_key = None;
-                            if self.highlight.as_ref().is_some_and(|range| fold.overlaps(range)) && fold.collapsed() {
+                            if self.highlight.as_ref().is_some_and(|range| fold.folds[index].overlaps(range)) && fold.folds[index].collapsed() {
                                 self.highlight = None;
                             }
                             self.cache = None;
@@ -1663,7 +1667,7 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         };
         render(&mut doc, 0.0, vec![]);
-        assert!(doc.metadata_fold.as_ref().unwrap().collapsed());
+        assert!(doc.metadata_fold.as_ref().unwrap().folds[0].collapsed());
         assert!(
             doc.cache
                 .as_ref()
@@ -1674,7 +1678,7 @@ mod tests {
                 .contains(metadata_fold::SUMMARY)
         );
         assert_eq!(doc.text(), source);
-        let fold = doc.metadata_fold.as_ref().unwrap();
+        let fold = &doc.metadata_fold.as_ref().unwrap().folds[0];
         let glyph = doc
             .cache
             .as_ref()
@@ -1688,10 +1692,10 @@ mod tests {
             vec![egui::Event::PointerMoved(point), button(point, true)],
         );
         render(&mut doc, 0.2, vec![button(point, false)]);
-        assert!(doc.metadata_fold.as_ref().unwrap().expanded);
+        assert!(doc.metadata_fold.as_ref().unwrap().folds[0].expanded);
         render(&mut doc, 0.3, vec![]);
         assert_eq!(doc.cache.as_ref().unwrap().galley.job.text, source);
-        let fold = doc.metadata_fold.as_ref().unwrap();
+        let fold = &doc.metadata_fold.as_ref().unwrap().folds[0];
         let glyph = doc
             .cache
             .as_ref()
@@ -1705,10 +1709,100 @@ mod tests {
             vec![egui::Event::PointerMoved(point), button(point, true)],
         );
         render(&mut doc, 0.5, vec![button(point, false)]);
-        assert!(doc.metadata_fold.as_ref().unwrap().collapsed());
+        assert!(doc.metadata_fold.as_ref().unwrap().folds[0].collapsed());
         let start = source[..source.find("secret").unwrap()].chars().count();
         doc.jump_to_range(start, start + 6).unwrap();
-        assert!(doc.metadata_fold.as_ref().unwrap().expanded);
+        assert!(doc.metadata_fold.as_ref().unwrap().folds[0].expanded);
+        assert_eq!(doc.highlight, Some(start..start + 6));
+        assert_eq!(doc.text(), source);
+    }
+
+    #[test]
+    fn nested_metadata_row_clicks_independently_of_outer_annotation() {
+        use super::*;
+        let source = "import kotlin.Metadata;\n@Metadata(d1={\"outer\"})\nclass Example {\n    @Metadata(d1={\"α\",\n \"secret\"})\n    class Inner {}\n}\n";
+        let context = egui::Context::default();
+        let mut doc = CodeDocument::new(source.into(), "java");
+        let render = |doc: &mut CodeDocument, time, events| {
+            context.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        doc.show(ui, CodeTheme::Ocean, 14.0);
+                    });
+                },
+            )
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        render(&mut doc, 0.0, vec![]);
+        assert!(doc.metadata_fold.as_ref().unwrap().folds[1].collapsed());
+        assert!(
+            doc.cache
+                .as_ref()
+                .unwrap()
+                .galley
+                .job
+                .text
+                .contains(metadata_fold::SUMMARY)
+        );
+        assert_eq!(doc.text(), source);
+        let fold = &doc.metadata_fold.as_ref().unwrap().folds[1];
+        let glyph = doc
+            .cache
+            .as_ref()
+            .unwrap()
+            .galley
+            .pos_from_ccursor(egui::text::CCursor::new(
+                doc.source_to_display(fold.chars.start) + 3,
+            ));
+        let point = doc.last_galley_pos.unwrap() + egui::vec2(glyph.center().x, glyph.center().y);
+        render(
+            &mut doc,
+            0.1,
+            vec![egui::Event::PointerMoved(point), button(point, true)],
+        );
+        render(&mut doc, 0.2, vec![button(point, false)]);
+        assert!(doc.metadata_fold.as_ref().unwrap().folds[1].expanded);
+        render(&mut doc, 0.3, vec![]);
+        assert!(
+            doc.cache
+                .as_ref()
+                .unwrap()
+                .galley
+                .job
+                .text
+                .contains("secret")
+        );
+        assert!(doc.metadata_fold.as_ref().unwrap().folds[0].collapsed());
+        let fold = &doc.metadata_fold.as_ref().unwrap().folds[1];
+        let glyph = doc
+            .cache
+            .as_ref()
+            .unwrap()
+            .galley
+            .pos_from_ccursor(egui::text::CCursor::new(
+                doc.source_to_display(fold.chars.start) + 3,
+            ));
+        let point = doc.last_galley_pos.unwrap() + egui::vec2(glyph.center().x, glyph.center().y);
+        render(
+            &mut doc,
+            0.4,
+            vec![egui::Event::PointerMoved(point), button(point, true)],
+        );
+        render(&mut doc, 0.5, vec![button(point, false)]);
+        assert!(doc.metadata_fold.as_ref().unwrap().folds[1].collapsed());
+        let start = source[..source.find("secret").unwrap()].chars().count();
+        doc.jump_to_range(start, start + 6).unwrap();
+        assert!(doc.metadata_fold.as_ref().unwrap().folds[1].expanded);
         assert_eq!(doc.highlight, Some(start..start + 6));
         assert_eq!(doc.text(), source);
     }
@@ -1716,8 +1810,7 @@ mod tests {
     #[test]
     fn copying_collapsed_metadata_selection_uses_original_source() {
         use super::*;
-        let source =
-            "import kotlin.Metadata;\n@Metadata(d1={\"private payload\"})\nclass Test {}\n";
+        let source = "import kotlin.Metadata;\n@Metadata(d1={\"private payload\"})\nclass Test {\n @Metadata(d1={\"nested payload α😀\"})\n class Inner {}\n}\n";
         let context = egui::Context::default();
         let mut doc = CodeDocument::new(source.into(), "java");
         let render = |doc: &mut CodeDocument, time, events| {
@@ -1785,7 +1878,7 @@ mod tests {
         let b = galley.pos_from_ccursor(egui::text::CCursor::new(position + 1));
         let pointer = egui::vec2((a.left() + b.left()) / 2.0, a.center().y);
         assert_eq!(doc.link_at_pointer(galley, pointer).unwrap().start, start);
-        let fold = doc.metadata_fold.as_ref().unwrap();
+        let fold = &doc.metadata_fold.as_ref().unwrap().folds[0];
         let summary =
             galley.pos_from_ccursor(egui::text::CCursor::new(fold.summary_chars().start + 2));
         assert!(

@@ -11,10 +11,11 @@ pub struct MetadataFold {
 }
 
 impl MetadataFold {
-    pub fn detect(source: &str, syntax: &str) -> Option<Self> {
+    pub fn detect_all(source: &str, syntax: &str) -> Vec<Self> {
         if syntax != "java" {
-            return None;
+            return Vec::new();
         }
+        let mut folds = Vec::new();
         let code_lines = code_line_starts(source);
         let imported = source
             .lines()
@@ -43,25 +44,37 @@ impl MetadataFold {
                 continue;
             };
             // Keep indentation and the terminating newline in the projected row.
-            if !source[end..].split('\n').next()?.trim().is_empty() {
+            if !source[end..]
+                .split('\n')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
                 offset += line.len();
                 continue;
             }
             let line_end = source[end..].find('\n').map_or(source.len(), |n| end + n);
             let bytes = start..line_end;
             let chars = source[..start].chars().count()..source[..line_end].chars().count();
-            return Some(Self {
+            folds.push(Self {
                 bytes,
                 chars,
                 expanded: false,
             });
+            offset += line.len();
         }
-        None
+        folds
+    }
+    #[cfg(test)]
+    pub fn detect(source: &str, syntax: &str) -> Option<Self> {
+        Self::detect_all(source, syntax).into_iter().next()
     }
 
     pub fn collapsed(&self) -> bool {
         !self.expanded
     }
+    #[cfg(test)]
     pub fn display(&self, source: &str) -> String {
         if self.expanded {
             return source.to_owned();
@@ -72,9 +85,11 @@ impl MetadataFold {
         text.push_str(&source[self.bytes.end..]);
         text
     }
+    #[cfg(test)]
     pub fn summary_chars(&self) -> Range<usize> {
         self.chars.start..self.chars.start + SUMMARY.chars().count()
     }
+    #[cfg(test)]
     pub fn source_to_display(&self, source: usize) -> usize {
         if self.expanded || source <= self.chars.start {
             source
@@ -84,6 +99,7 @@ impl MetadataFold {
             source - self.chars.len() + SUMMARY.chars().count()
         }
     }
+    #[cfg(test)]
     pub fn display_to_source(&self, display: usize) -> Option<usize> {
         if self.expanded || display < self.chars.start {
             Some(display)
@@ -95,6 +111,78 @@ impl MetadataFold {
     }
     pub fn overlaps(&self, range: &Range<usize>) -> bool {
         range.start < self.chars.end && self.chars.start < range.end
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MetadataFolds {
+    pub folds: Vec<MetadataFold>,
+}
+impl MetadataFolds {
+    pub fn detect(source: &str, syntax: &str) -> Option<Self> {
+        let folds = MetadataFold::detect_all(source, syntax);
+        (!folds.is_empty()).then_some(Self { folds })
+    }
+    pub fn collapsed(&self) -> bool {
+        self.folds.iter().any(MetadataFold::collapsed)
+    }
+    pub fn display(&self, source: &str) -> String {
+        let mut text = source.to_owned();
+        for fold in self.folds.iter().rev().filter(|f| f.collapsed()) {
+            text.replace_range(fold.bytes.clone(), SUMMARY);
+        }
+        text
+    }
+    pub fn source_to_display(&self, source: usize) -> usize {
+        let mut removed = 0;
+        for fold in self.folds.iter().filter(|f| f.collapsed()) {
+            if source <= fold.chars.start {
+                break;
+            }
+            if source < fold.chars.end {
+                return (fold.chars.start as isize - removed) as usize;
+            }
+            removed += fold.chars.len() as isize - SUMMARY.chars().count() as isize;
+        }
+        (source as isize - removed) as usize
+    }
+    pub fn display_range(&self, fold: &MetadataFold) -> Range<usize> {
+        let start = self.source_to_display(fold.chars.start);
+        start
+            ..start
+                + if fold.collapsed() {
+                    SUMMARY.chars().count()
+                } else {
+                    fold.chars.len()
+                }
+    }
+    pub fn display_to_source(&self, display: usize) -> Option<usize> {
+        let mut source = display as isize;
+        for fold in self.folds.iter().filter(|f| f.collapsed()) {
+            let range = self.display_range(fold);
+            if display < range.start {
+                break;
+            }
+            if display < range.end {
+                return None;
+            }
+            source += fold.chars.len() as isize - SUMMARY.chars().count() as isize;
+        }
+        Some(source as usize)
+    }
+    pub fn source_boundary(&self, display: usize, end: bool) -> usize {
+        self.display_to_source(display).unwrap_or_else(|| {
+            let fold = self
+                .folds
+                .iter()
+                .find(|f| f.collapsed() && self.display_range(f).contains(&display))
+                .unwrap();
+            if end {
+                fold.chars.end
+            } else {
+                fold.chars.start
+            }
+        })
     }
 }
 
@@ -267,5 +355,45 @@ mod tests {
             MetadataFold::detect("class A { /*\n@kotlin.Metadata(d1={\"x\"})\n*/ }", "java")
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod multiple_tests {
+    use super::*;
+    #[test]
+    fn nested_folds_preserve_unicode_mappings_and_expand_independently() {
+        let source = "import kotlin.Metadata;\n@Metadata(d1={\"α😀\"})\nclass Outer {\n @Metadata(d1={\"β\",\n \"γ\"})\n class Inner {}\n}\n";
+        for mask in 0u32..4 {
+            let mut group = MetadataFolds::detect(source, "java").unwrap();
+            assert_eq!(group.folds.len(), 2);
+            for (i, fold) in group.folds.iter_mut().enumerate() {
+                fold.expanded = mask & (1 << i) != 0;
+            }
+            let display = group.display(source);
+            assert_eq!(
+                display.matches(SUMMARY).count(),
+                2 - mask.count_ones() as usize
+            );
+            for pos in 0..=source.chars().count() {
+                if group
+                    .folds
+                    .iter()
+                    .any(|f| f.collapsed() && f.chars.contains(&pos))
+                {
+                    continue;
+                }
+                assert_eq!(
+                    group.display_to_source(group.source_to_display(pos)),
+                    Some(pos),
+                    "mask={mask},pos={pos}"
+                );
+            }
+            for fold in group.folds.iter().filter(|f| f.collapsed()) {
+                let range = group.display_range(fold);
+                assert_eq!(group.source_boundary(range.start, false), fold.chars.start);
+                assert_eq!(group.source_boundary(range.start, true), fold.chars.end);
+            }
+        }
     }
 }

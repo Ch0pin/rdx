@@ -39,32 +39,40 @@ def parse(data):
     for _ in range(u2()):
         stream.read(6)
         attrs()
-    methods = {}
+    methods, constructors = {}, {}
     for _ in range(u2()):
         access, name, descriptor = u2(), pool[u2()], pool[u2()]
         attributes = attrs()
         exceptions = attributes.get('Exceptions')
+        thrown = []
         if exceptions:
             count = struct.unpack_from('>H', exceptions)[0]
             thrown = [cls(struct.unpack_from('>H', exceptions, 2 + j * 2)[0]) for j in range(count)]
             if thrown:
                 methods[owner + '->' + name + descriptor] = [bool(access & 8), thrown]
-    return owner, parent, interfaces, methods
+        # Named top-level parents avoid unresolved enclosing-instance and enum
+        # superclass syntax. Keep exact signature/access/throws, never bodies.
+        if (name == '<init>' and flags & 1 and not flags & (0x10 | 0x4000)
+                and '$' not in owner and owner != 'Ljava/lang/Enum;' and access & 5):
+            constructors[owner + '->' + name + descriptor] = [access, thrown]
+    return owner, parent, interfaces, methods, constructors
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('jar')
     parser.add_argument('output')
+    parser.add_argument('--constructors-output')
     args = parser.parse_args()
-    classes, methods, types = {}, {}, {}
+    classes, methods, types, constructors = {}, {}, {}, {}
     with zipfile.ZipFile(args.jar) as archive:
         for name in sorted(archive.namelist()):
             if name.endswith('.class'):
-                owner, parent, interfaces, declarations = parse(archive.read(name))
+                owner, parent, interfaces, declarations, declared_constructors = parse(archive.read(name))
                 classes[owner] = parent
                 types[owner] = [parent, interfaces]
                 methods.update(declarations)
+                constructors.update(declared_constructors)
     exceptions = {}
     for owner, parent in classes.items():
         seen, current = set(), owner
@@ -81,6 +89,11 @@ def main():
         json.dump(result, output, indent=2, sort_keys=True)
         output.write('\n')
     print(len(exceptions), 'exception types;', len(methods), 'method declarations')
+    if args.constructors_output:
+        with open(args.constructors_output, 'w') as output:
+            json.dump({'source': result['source'], 'sha256': result['sha256'],
+                       'constructors': constructors}, output, indent=2, sort_keys=True)
+            output.write('\n')
 
 
 if __name__ == '__main__':

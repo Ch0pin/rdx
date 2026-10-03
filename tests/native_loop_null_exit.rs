@@ -43,11 +43,14 @@ fn fixture(seed: u16, cast_register: u16) -> DexClass {
     ];
     class
 }
-fn source() -> String {
-    let class = fixture(0, 1);
+fn source_for(cast_register: u16) -> String {
+    let class = fixture(0, cast_register);
     native_java::render_method("sample.NullExit", &class, &class.methods[0])
         .unwrap()
         .source
+}
+fn source() -> String {
+    source_for(1)
 }
 #[test]
 fn existing_zero_exit_seed_accepts_reference_loop_values() {
@@ -59,11 +62,19 @@ fn existing_zero_exit_seed_accepts_reference_loop_values() {
     assert!(rendered.contains("while"), "{rendered}");
 }
 #[test]
-fn nonzero_or_unrelated_cast_does_not_widen_primitive_exit_seed() {
-    for (seed, cast) in [(1, 1), (0, 2)] {
-        let class = fixture(seed, cast);
-        assert!(native_java::render_method("sample.NullExit", &class, &class.methods[0]).is_err());
-    }
+fn typed_parameter_move_establishes_reference_exit_without_exit_register_cast() {
+    // v1 is zero on the bypass and exactly the String parameter after move-object.
+    // The later check-cast of v2 is unrelated and supplies no proof about v1.
+    let rendered = source_for(2);
+    assert!(
+        rendered.contains("while") && rendered.contains("null"),
+        "{rendered}"
+    );
+}
+#[test]
+fn nonzero_or_integer_use_does_not_widen_primitive_exit_seed() {
+    let class = fixture(1, 1);
+    assert!(native_java::render_method("sample.NullExit", &class, &class.methods[0]).is_err());
     let mut class = fixture(0, 1);
     // A nonzero primitive on the one-time tail cannot become a reference.
     class.methods[0].code.as_mut().unwrap().instructions[8] = 0x1112;
@@ -84,23 +95,29 @@ fn null_exit_jvm_preserves_zero_and_multiple_iterations() {
         r#"package sample;
 public class NullExit {{
 {}
+{}
 public static void main(String[] args) {{
   for(int n=-2;n<10;n++) for(String value:new String[]{{null,"payload"}})
-    if(choose(value,n)!=(n<=0?null:value)) throw new AssertionError("result "+n);
+    {{
+      String expected=n<=0?null:value;
+      if(choose(value,n)!=expected) throw new AssertionError("cast exit result "+n);
+      if(chooseWithoutExitCast(value,n)!=expected) throw new AssertionError("typed move result "+n);
+    }}
 }}
 }}"#,
-        source()
+        source(),
+        source_for(2).replace("choose(", "chooseWithoutExitCast(")
     );
     fs::write(dir.join("sample/NullExit.java"), &java).unwrap();
     for (program, argument) in [
         ("javac", "sample/NullExit.java"),
         ("java", "sample.NullExit"),
     ] {
-        let result = Command::new(program)
-            .arg(argument)
-            .current_dir(&dir)
-            .output()
-            .unwrap();
+        let mut command = Command::new(program);
+        if program == "java" {
+            command.arg("-Xverify:all");
+        }
+        let result = command.arg(argument).current_dir(&dir).output().unwrap();
         assert!(
             result.status.success(),
             "{program}: {}\n{java}",

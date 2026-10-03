@@ -322,9 +322,8 @@ fn initializer_digit_field_without_try_compiles_when_class_name_collides() {
 }
 
 #[test]
-fn initializer_field_matching_generated_local_rejects_bare_write() {
-    // sget creates local v0, then sput would use the same bare name for the
-    // field because the separate Init field shadows the class qualifier.
+fn initializer_field_matching_generated_local_reserves_a_distinct_local() {
+    // The separate Init field requires a bare write; reserve v0 for the field.
     let mut class = fixture(vec![0x0060, 0, 0x0067, 0, 0x000e]);
     Arc::get_mut(&mut class.symbols).unwrap().strings = vec!["v0".into(), "Init".into()];
     Arc::get_mut(&mut class.symbols).unwrap().fields = vec![(0, 1, 0), (0, 1, 1)];
@@ -336,11 +335,19 @@ fn initializer_field_matching_generated_local_rejects_bare_write() {
         access_flags: 9,
         is_static: true,
     });
-    let error = native_java::render_method("sample.Init", &class, &class.methods[0])
-        .unwrap_err()
-        .to_string();
+    let body = native_java::render_method("sample.Init", &class, &class.methods[0]).unwrap();
     assert!(
-        error.contains("initializer field collides with generated local namespace"),
-        "{error}"
+        body.source.contains("int v1 = sample.Init.v0;"),
+        "{}",
+        body.source
+    );
+    assert!(body.source.contains("v0 = v1;"), "{}", body.source);
+    assert!(!body.source.contains("int v0 ="));
+    assert_eq!(
+        body.links
+            .iter()
+            .filter(|link| link.label == "sample.Init.v0:I")
+            .count(),
+        2
     );
 }

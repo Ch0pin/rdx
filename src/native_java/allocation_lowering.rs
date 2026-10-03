@@ -131,8 +131,7 @@ fn expression(value: Atom, expected: &str, class: &DexClass) -> Result<Expr> {
         Atom::Expr { expression, ty } => {
             if ty != expected && super::reference(&ty) && super::reference(expected) {
                 ensure!(
-                    ty == "Ljava/lang/Object;"
-                        || expected == "Ljava/lang/Object;"
+                    expected == "Ljava/lang/Object;"
                         || class
                             .symbols
                             .hierarchy
@@ -151,9 +150,12 @@ fn expression(value: Atom, expected: &str, class: &DexClass) -> Result<Expr> {
                     value: Box::new(expression),
                 });
             }
-            if expected == "I" && matches!(ty.as_str(), "B" | "S" | "C") {
+            if (expected == "I" && matches!(ty.as_str(), "B" | "S" | "C"))
+                || (expected == "S" && ty == "B")
+            {
+                let primitive = super::java_type(expected)?;
                 return Ok(Expr::Cast {
-                    ty: symbol("int".into(), "int".into()),
+                    ty: symbol(primitive.clone(), primitive),
                     value: Box::new(expression),
                 });
             }
@@ -206,10 +208,207 @@ fn invoke_inputs(op: u8, a: usize, words: &[u16], pc: usize) -> Result<Vec<usize
     }
 }
 
-// A pure guarded integer copy can be evaluated before Java allocation. This
-// follows the readable-output policy, allowing allocation-related failure and
-// class-initialization timing to move.
-// No throwing instruction or uninitialized reference may enter the selection.
+// Only already evaluated values may be used before the delayed Java allocation.
+// A field, call, string/class literal or another deferred expression could
+// resolve, initialize, allocate or throw before the original new-instance.
+fn evaluated_staging_input(value: &Value) -> bool {
+    value.literal.is_some()
+        || value.wide_literal.is_some()
+        || value.text == "this"
+        || value
+            .text
+            .strip_prefix(['v', 'p'])
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+// A deferred caller expression predates new-instance in DEX. Moving its first
+// evaluation into the Java argument block would reverse resolution/throw order.
+// The decoder independently validates path definitions and wide ownership.
+fn evaluated_argument_block_inputs(
+    ir: &crate::native_ir::DecodedMethod,
+    bound: &crate::native_calls::BoundCalls,
+    start: usize,
+    stop: usize,
+    caller_regs: &[Option<Value>],
+) -> Result<()> {
+    let mut written = HashSet::new();
+    let mut next = start;
+    for instruction in ir
+        .instructions
+        .iter()
+        .filter(|i| start <= i.pc && i.pc < stop)
+    {
+        ensure!(
+            instruction.pc == next,
+            "argument block crosses noninstruction data"
+        );
+        next += instruction.width;
+        let reads: Vec<_> = if let Some(call) = bound.calls.iter().find(|c| c.pc == instruction.pc)
+        {
+            let typed: Vec<_> = call
+                .receiver
+                .iter()
+                .chain(&call.arguments)
+                .map(|r| {
+                    (
+                        usize::from(r.register),
+                        if matches!(r.descriptor.as_ref(), "J" | "D") {
+                            2
+                        } else {
+                            1
+                        },
+                    )
+                })
+                .collect();
+            let expected: Vec<_> = typed
+                .iter()
+                .flat_map(|(r, width)| *r..*r + *width)
+                .collect();
+            let actual: Vec<_> = instruction
+                .reads
+                .iter()
+                .flat_map(|r| {
+                    usize::from(r.register)..usize::from(r.register) + r.kind.word_count()
+                })
+                .collect();
+            ensure!(actual == expected, "argument block bound read words differ");
+            typed
+        } else {
+            instruction
+                .reads
+                .iter()
+                .map(|r| (usize::from(r.register), r.kind.word_count()))
+                .collect()
+        };
+        for (r, width) in reads {
+            if width == 2 {
+                ensure!(
+                    written.contains(&r) == written.contains(&(r + 1)),
+                    "argument block wide caller input is partially overwritten"
+                );
+                if !written.contains(&r) {
+                    let value = super::register(caller_regs, r)?;
+                    ensure!(
+                        matches!(value.ty.as_str(), "J" | "D") && evaluated_staging_input(&value),
+                        "argument block wide input is not evaluated"
+                    );
+                }
+                continue;
+            }
+            ensure!(
+                written.contains(&r)
+                    || caller_regs
+                        .get(r)
+                        .and_then(Option::as_ref)
+                        .is_some_and(evaluated_staging_input),
+                "argument block caller input is not already evaluated"
+            );
+        }
+        for write in &instruction.writes {
+            for word in 0..write.kind.word_count() {
+                written.insert(usize::from(write.register) + word);
+            }
+        }
+    }
+    ensure!(next == stop, "argument block input interval is incomplete");
+    Ok(())
+}
+
+// Statement staging may move only terminating, nonthrowing register computation
+// before new. All observable allocation/resolution/exception events stay in the
+// checked constructor expression. Address-forward edges prove termination here;
+// ordinary emission still proves definitions, types, and wide-word ownership.
+fn pure_staging_prefix(
+    ir: &crate::native_ir::DecodedMethod,
+    start: usize,
+    stop: usize,
+    allocation_register: usize,
+    caller_regs: &[Option<Value>],
+) -> Result<()> {
+    let mut next = start;
+    let mut written = HashSet::new();
+    let mut aliases = HashSet::from([allocation_register]);
+    for instruction in ir
+        .instructions
+        .iter()
+        .filter(|instruction| start <= instruction.pc && instruction.pc < stop)
+    {
+        ensure!(
+            instruction.pc == next,
+            "allocation staging crosses noninstruction data"
+        );
+        next += instruction.width;
+        let op = instruction.opcode;
+        ensure!(
+            !instruction.may_throw
+                && instruction.reference.is_none()
+                && instruction.payload_target.is_none()
+                && matches!(op, 0x00..=0x09 | 0x12..=0x19 | 0x28..=0x3d | 0x7b..=0xe2)
+                && !matches!(
+                    op,
+                    0x2b | 0x2c
+                        | 0x93
+                        | 0x94
+                        | 0x9e
+                        | 0x9f
+                        | 0xb3
+                        | 0xb4
+                        | 0xbe
+                        | 0xbf
+                        | 0xd3
+                        | 0xd4
+                        | 0xdb
+                        | 0xdc
+                ),
+            "allocation staging would move effects before allocation"
+        );
+        ensure!(
+            instruction
+                .branch_target
+                .is_none_or(|target| instruction.pc < target && target <= stop),
+            "allocation staging would move a potentially nonterminating prefix"
+        );
+        let alias_copy = matches!(op, 0x07..=0x09)
+            && instruction.reads.len() == 1
+            && aliases.contains(&(instruction.reads[0].register as usize));
+        for read in &instruction.reads {
+            let register = read.register as usize;
+            ensure!(
+                alias_copy || !aliases.contains(&register),
+                "uninitialized allocation alias escapes staging"
+            );
+            if !alias_copy && !written.contains(&register) {
+                ensure!(
+                    caller_regs
+                        .get(register)
+                        .and_then(Option::as_ref)
+                        .is_some_and(evaluated_staging_input),
+                    "allocation staging input is not already evaluated"
+                );
+            }
+        }
+        for write in &instruction.writes {
+            let register = write.register as usize;
+            written.insert(register);
+            aliases.remove(&register);
+            if write.kind == crate::native_ir::ValueKind::Wide64 {
+                written.insert(register + 1);
+                aliases.remove(&(register + 1));
+            }
+        }
+        if alias_copy {
+            aliases.insert(instruction.writes[0].register as usize);
+        }
+    }
+    ensure!(
+        next == stop,
+        "allocation staging endpoint is not an instruction boundary"
+    );
+    Ok(())
+}
+
+// A pure guarded integer copy cannot throw or change observable state before
+// allocation. No deferred expression or uninitialized reference enters it.
 fn guarded_copy(
     graph: &Graph,
     words: &[u16],
@@ -265,6 +464,10 @@ fn guarded_copy(
             .and_then(Option::as_ref)
             .context("undefined guarded copy input")?;
         ensure!(value.ty == "I", "guarded copy requires integer inputs");
+        ensure!(
+            evaluated_staging_input(value),
+            "guarded copy input is not already evaluated"
+        );
         Ok(value)
     };
     let predicate = if (words[start] as u8 == 0x39) == copy_on_taken {
@@ -288,7 +491,7 @@ fn guarded_copy(
 // Masking the allocation makes every use of its uninitialized identity fail;
 // only the proven matching constructor may introduce the initialized object.
 #[allow(clippy::too_many_arguments)]
-fn try_region_staging(
+fn try_region_staging_mode(
     class: &DexClass,
     method: &DexMethod,
     graph: &Graph,
@@ -297,6 +500,7 @@ fn try_region_staging(
     stop: usize,
     caller_regs: &[Option<Value>],
     caller_out: &Output,
+    argument_block: bool,
 ) -> Result<Lowered> {
     let dst = (words[pc] >> 8) as usize;
     let ty = class
@@ -382,6 +586,44 @@ fn try_region_staging(
     // Branches may precede alias transfers; after the first transfer, require
     // a linear suffix so all paths share the same receiver identity.
     let ir = crate::native_ir::DecodedMethod::decode(method.code.as_ref().unwrap())?;
+    let block_plan = if argument_block {
+        let plan = super::structured_argument_region::prove(class, method, pc, constructor_pc)
+            .context("no exact structured argument-region proof")?;
+        // A region renderer may choose a source cast from a broad Java local.
+        // Every original reference input must already satisfy the raw DEX
+        // invocation domain; fresh positive proof cannot repair an invalid call.
+        for call in &plan.calls {
+            if call.pc != constructor_pc && call.receiver.is_some() {
+                ensure!(
+                    graph.proven_reference_call_input(class, method, call.pc, None),
+                    "structured reference receiver lacks positive original domain"
+                );
+            }
+            for (index, input) in call.arguments.iter().enumerate() {
+                if super::reference(&input.descriptor) {
+                    ensure!(
+                        graph.proven_reference_call_input(class, method, call.pc, Some(index)),
+                        "structured reference argument lacks positive original domain"
+                    );
+                }
+            }
+        }
+        for read in &plan.first_reads {
+            let value = super::register(caller_regs, read.register)?;
+            ensure!(
+                evaluated_staging_input(&value),
+                "structured argument caller first-read is deferred"
+            );
+            ensure!(
+                read.words != 2 || matches!(value.ty.as_str(), "J" | "D"),
+                "structured argument caller wide pair is not initialized"
+            );
+        }
+        Some(plan)
+    } else {
+        pure_staging_prefix(&ir, start, constructor_pc, dst, caller_regs)?;
+        None
+    };
     let mut aliases = HashSet::from([dst]);
     let mut alias_transfer = false;
     let mut staged_words = words.to_vec();
@@ -431,6 +673,15 @@ fn try_region_staging(
         "allocation region lost constructor receiver"
     );
     let (owner, ret, args, name) = method_symbol(class, words[constructor_pc + 1] as usize)?;
+    ensure!(
+        argument_block
+            || !class
+                .symbols
+                .hierarchy
+                .get()
+                .is_some_and(|h| h.strict_forwarding_constructor(ty, owner, args)),
+        "recovered forwarding constructor requires exact allocation timing"
+    );
     ensure!(
         ret == "V"
             && name == "<init>"
@@ -491,6 +742,23 @@ fn try_region_staging(
             offset: code.offset,
         }),
     };
+    let _owned = if let Some(plan) = &block_plan {
+        let owned: std::collections::BTreeSet<_> = plan.owned.iter().copied().collect();
+        ensure!(
+            graph
+                .owned_entry_copy_instructions
+                .borrow()
+                .as_ref()
+                .is_none_or(|parent| owned.is_subset(parent)),
+            "structured argument region crosses caller instruction ownership"
+        );
+        Some(super::OwnedInstructionBoundary {
+            active: &graph.owned_entry_copy_instructions,
+            previous: graph.owned_entry_copy_instructions.replace(Some(owned)),
+        })
+    } else {
+        None
+    };
     let (mut regs, returned) = super::render(
         class,
         &staged_method,
@@ -507,7 +775,7 @@ fn try_region_staging(
     ensure!(!returned, "allocation region returned before constructor");
     let mut actual = Vec::new();
     let mut input = 1;
-    for arg in args {
+    for (argument_index, arg) in args.iter().enumerate() {
         let r = *inputs.get(input).context("allocation region argument")?;
         ensure!(
             !aliases.contains(&r),
@@ -521,6 +789,16 @@ fn try_region_staging(
         }
         let value = super::register(&regs, r)?;
         if value.ty != arg.as_ref() && super::reference(&value.ty) && super::reference(arg) {
+            ensure!(
+                !argument_block
+                    || graph.proven_reference_call_input(
+                        class,
+                        method,
+                        constructor_pc,
+                        Some(argument_index)
+                    ),
+                "structured constructor reference argument lacks positive raw storage proof"
+            );
             ensure!(
                 value.ty == "Ljava/lang/Object;"
                     || arg.as_ref() == "Ljava/lang/Object;"
@@ -555,11 +833,101 @@ fn try_region_staging(
         args.join(""),
         ret
     );
-    let value = out.local(
-        ty,
-        &format!("new {display}({})", actual.join(", ")),
-        &[(4, display.chars().count(), label)],
-    )?;
+    let (expression, refs) = if let Some(plan) = &block_plan {
+        ensure!(
+            super::structured_argument_region::validate(class, method, plan),
+            "structured argument emission proof differs"
+        );
+        let next = constructor_pc + graph.widths[constructor_pc];
+        let live = super::super::liveness::analyze(method.code.as_ref().unwrap())
+            .context("structured argument live-out analysis absent")?;
+        for (r, value) in regs.iter().enumerate() {
+            if !aliases.contains(&r)
+                && live.contains(next, r)
+                && value.is_some()
+                && caller_regs[r].is_none()
+            {
+                ensure!(
+                    plan.definitely_written.contains(&r),
+                    "structured argument live-out is not defined on every completing path"
+                );
+            }
+        }
+        let (mut declarations, mut body) = out.hoist_declarations()?;
+        // A hoisted local must not newly hide any used qualified type/package.
+        let mut qualifier_roots = std::collections::HashSet::new();
+        let front = crate::native_method::MethodFrontEnd::build(class, method)?;
+        let mut types = method.parameters.clone();
+        types.push(method.return_type.clone());
+        types.push(class.descriptor.clone());
+        for instruction in &front.ir.instructions {
+            if let Some(reference) = &instruction.reference {
+                match reference.kind {
+                    crate::native_ir::PoolKind::Type => {
+                        types.push(class.symbols.types[reference.index as usize].clone())
+                    }
+                    crate::native_ir::PoolKind::Field => {
+                        let (owner, field_ty, _) = class.symbols.fields[reference.index as usize];
+                        types.push(class.symbols.types[owner as usize].clone());
+                        types.push(class.symbols.types[field_ty as usize].clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for call in &front.bound.calls {
+            if let crate::native_calls::CallTarget::Method { declaring_type, .. } = &call.target {
+                types.push(declaring_type.clone());
+            }
+            types.extend(call.arguments.iter().map(|a| a.descriptor.clone()));
+            types.push(call.return_type.clone());
+        }
+        for ty in types {
+            if let Some(label) = super::class_label(&ty) {
+                qualifier_roots.insert(label.split('.').next().unwrap().to_string());
+            }
+        }
+        ensure!(
+            declarations
+                .local_declarations
+                .iter()
+                .all(|d| !qualifier_roots.contains(&d.value.text)),
+            "structured hoist shadows a qualified namespace"
+        );
+        declarations
+            .receiver_locals
+            .extend(body.receiver_locals.iter().cloned());
+        declarations
+            .inferred_throws
+            .extend(body.inferred_throws.iter().cloned());
+        let first = actual
+            .first()
+            .context("structured argument requires first constructor parameter")?;
+        body.line(&format!("yield {first};"), &[]);
+        let prefix = format!("new {display}(switch (0) {{ default -> {{\n");
+        let mut refs = vec![(4, display.chars().count(), label.clone())];
+        refs.extend(body.links.iter().map(|link| {
+            (
+                prefix.chars().count() + link.start,
+                link.end - link.start,
+                link.label.clone(),
+            )
+        }));
+        let rest = actual
+            .iter()
+            .skip(1)
+            .map(|s| format!(", {s}"))
+            .collect::<String>();
+        let expression = format!("{prefix}{}}}}}{rest})", body.text);
+        out = declarations;
+        (expression, refs)
+    } else {
+        (
+            format!("new {display}({})", actual.join(", ")),
+            vec![(4, display.chars().count(), label)],
+        )
+    };
+    let value = out.local(ty, &expression, &refs)?;
     for alias in aliases {
         super::assign(&mut regs, alias, value.clone())?;
     }
@@ -632,6 +1000,7 @@ pub(super) fn try_lower(
             },
         )?;
         let mut nested = false;
+        let mut strict_allocation_order = false;
         let mut captures = Vec::new();
         let mut discarded = Vec::new();
         let mut local_names: Vec<String> = selected_regs
@@ -1431,14 +1800,40 @@ pub(super) fn try_lower(
                         local_names.push(owner.clone());
                         Expr::Local(owner)
                     } else {
-                        expression(
-                            atom(&regs, *inputs.first().context("missing invoke receiver")?)?,
-                            owner,
-                            class,
-                        )?
+                        let receiver =
+                            atom(&regs, *inputs.first().context("missing invoke receiver")?)?;
+                        if let Atom::Input(value) = &receiver
+                            && value.ty != owner
+                            && value.literal != Some(0)
+                            && super::reference(&value.ty)
+                        {
+                            ensure!(
+                                owner == "Ljava/lang/Object;"
+                                    || class
+                                        .symbols
+                                        .hierarchy
+                                        .get()
+                                        .is_some_and(|h| h.assignable(&value.ty, owner)
+                                            == crate::native_hierarchy::Relation::Proven)
+                                    || graph
+                                        .proven_reference_call_input(class, method, cursor, None),
+                                "allocation receiver cast requires complete DEX reference domains"
+                            );
+                        }
+                        expression(receiver, owner, class)?
                     };
                     let mut actual = Vec::new();
                     for (argument_index, arg_ty) in args.iter().enumerate() {
+                        ensure!(
+                            !super::reference(arg_ty)
+                                || !graph.invalid_reference_call_argument(
+                                    class,
+                                    method,
+                                    cursor,
+                                    argument_index
+                                ),
+                            "DEX reference argument is not assignable to invoked descriptor"
+                        );
                         let r = *inputs
                             .get(input_cursor)
                             .context("missing invoke argument")?;
@@ -1449,6 +1844,29 @@ pub(super) fn try_lower(
                             );
                         }
                         let argument_atom = atom(&regs, r)?;
+                        if let Atom::Input(value) = &argument_atom
+                            && value.ty != arg_ty.as_ref()
+                            && value.literal != Some(0)
+                            && super::reference(&value.ty)
+                            && super::reference(arg_ty)
+                        {
+                            ensure!(
+                                arg_ty.as_ref() == "Ljava/lang/Object;"
+                                    || class
+                                        .symbols
+                                        .hierarchy
+                                        .get()
+                                        .is_some_and(|h| h.assignable(&value.ty, arg_ty)
+                                            == crate::native_hierarchy::Relation::Proven)
+                                    || graph.proven_reference_call_input(
+                                        class,
+                                        method,
+                                        cursor,
+                                        Some(argument_index)
+                                    ),
+                                "allocation storage cast requires complete DEX reference domains"
+                            );
+                        }
                         let simplified = match &argument_atom {
                             Atom::Input(value)
                                 if super::receiver_cleanup::proven_call_argument(
@@ -1506,6 +1924,9 @@ pub(super) fn try_lower(
                             kind == 0x70 && (owner == allocation_ty || retargeted) && ret == "V",
                             "allocation constructor mismatch"
                         );
+                        strict_allocation_order |= class.symbols.hierarchy.get().is_some_and(|h| {
+                            h.strict_forwarding_constructor(&allocation_ty, owner, args)
+                        });
                         if nested {
                             let binding = graph
                                 .constructor_binding(class, method, cursor)
@@ -1601,11 +2022,39 @@ pub(super) fn try_lower(
                             &live_after,
                         ) {
                             Ok(rendered) => rendered,
-                            Err(_) => allocation.render_staged_with_discarded(
-                                &events,
-                                &local_refs,
-                                &discarded,
-                            )?,
+                            Err(error) => (|| {
+                                let ir = crate::native_ir::DecodedMethod::decode(code)?;
+                                let bound = crate::native_calls::BoundCalls::bind(
+                                    code,
+                                    &ir,
+                                    &class.symbols,
+                                )?;
+                                evaluated_argument_block_inputs(
+                                    &ir,
+                                    &bound,
+                                    pc,
+                                    next_pc,
+                                    caller_regs,
+                                )?;
+                                allocation.render_argument_block_checked(
+                                    &events,
+                                    &local_refs,
+                                    &discarded,
+                                )
+                            })()
+                            .or_else(|_| {
+                                ensure!(
+                                    !strict_allocation_order,
+                                    "recovered constructor cannot stage allocation: {error}"
+                                );
+                                let ir = crate::native_ir::DecodedMethod::decode(code)?;
+                                pure_staging_prefix(&ir, start, cursor, dst, caller_regs)?;
+                                allocation.render_staged_with_discarded(
+                                    &events,
+                                    &local_refs,
+                                    &discarded,
+                                )
+                            })?,
                         };
                         // A constructor expression links its type token to the
                         // raw overloaded constructor identity.
@@ -1624,7 +2073,7 @@ pub(super) fn try_lower(
                                 .iter()
                                 .map(|link| (link.start, link.end - link.start, link.label.clone()))
                                 .collect();
-                            out.line(declaration, &refs);
+                            out.opaque_declaration(declaration, &refs);
                         }
                         // Names retain their original capture indices after
                         // shrinking; reserve every original name before local().
@@ -1691,8 +2140,10 @@ pub(super) fn try_lower(
                         && raw_name == "append"
                         && ret == owner
                         && args.len() == 1
-                        && matches!(args[0].as_ref(), "Ljava/lang/String;" | "C" | "I" | "Z")
-                    {
+                        && matches!(
+                            args[0].as_ref(),
+                            "Ljava/lang/String;" | "Ljava/lang/Object;" | "C" | "I" | "Z"
+                        ) {
                         match atom(&regs, inputs[0])? {
                             Atom::Expr {
                                 expression: Expr::Capture(index),
@@ -1750,17 +2201,168 @@ pub(super) fn try_lower(
             cursor += graph.widths[cursor];
         }
     };
-    let result = attempt().or_else(|_| {
-        try_region_staging(
-            class,
-            method,
-            graph,
-            words,
-            pc,
-            stop,
-            caller_regs,
-            caller_out,
-        )
-    });
+    let result = attempt()
+        .or_else(|_| {
+            try_region_staging_mode(
+                class,
+                method,
+                graph,
+                words,
+                pc,
+                stop,
+                caller_regs,
+                caller_out,
+                false,
+            )
+        })
+        .or_else(|_| {
+            try_region_staging_mode(
+                class,
+                method,
+                graph,
+                words,
+                pc,
+                stop,
+                caller_regs,
+                caller_out,
+                true,
+            )
+        });
     Ok(result.ok())
+}
+
+#[cfg(test)]
+mod staging_timing_tests {
+    use super::*;
+    fn proof(words: Vec<u16>, stop: usize, input: &str) -> bool {
+        let code = crate::native_dex::DexCode {
+            registers: 4,
+            ins: 0,
+            outs: 0,
+            tries: 0,
+            try_regions: vec![],
+            offset: 0,
+            instructions: words,
+        };
+        let ir = crate::native_ir::DecodedMethod::decode(&code).unwrap();
+        let regs = (0..4)
+            .map(|_| {
+                Some(Value {
+                    text: input.into(),
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                })
+            })
+            .collect::<Vec<_>>();
+        pure_staging_prefix(&ir, 0, stop, 3, &regs).is_ok()
+    }
+    #[test]
+    fn staging_prefix_rejects_resolution_throwing_reads_and_integer_division() {
+        for (words, stop) in [
+            (vec![0x001a, 0, 0x000e], 2),
+            (vec![0x001c, 0, 0x000e], 2),
+            (vec![0x001f, 0, 0x000e], 2),
+            (vec![0x0021, 0x000e], 1),
+            (vec![0x0044, 0, 0x000e], 2),
+            (vec![0x0052, 0, 0x000e], 2),
+            (vec![0x0060, 0, 0x000e], 2),
+            (vec![0x0071, 0, 0, 0x000e], 3),
+            (vec![0x0093, 0, 0x000e], 2),
+            (vec![0x0094, 0, 0x000e], 2),
+            (vec![0x009e, 0, 0x000e], 2),
+            (vec![0x009f, 0, 0x000e], 2),
+            (vec![0x00b3, 0x000e], 1),
+            (vec![0x00b4, 0x000e], 1),
+            (vec![0x00be, 0x000e], 1),
+            (vec![0x00bf, 0x000e], 1),
+            (vec![0x00d3, 0, 0x000e], 2),
+            (vec![0x00d4, 0, 0x000e], 2),
+            (vec![0x00db, 0, 0x000e], 2),
+            (vec![0x00dc, 0, 0x000e], 2),
+        ] {
+            assert!(!proof(words, stop, "p0"));
+        }
+        assert!(!proof(vec![0x0028, 0x000e], 1, "p0"));
+    }
+    #[test]
+    fn staging_inputs_are_values_not_deferred_expressions() {
+        assert!(proof(vec![0x1001, 0x000e], 1, "p0"));
+        assert!(proof(vec![0x0012, 0x1001, 0x000e], 2, "v12"));
+        for input in [
+            "this.field",
+            "Owner.field",
+            "call()",
+            "\"text\"",
+            "Type.class",
+        ] {
+            assert!(!proof(vec![0x1001, 0x000e], 1, input));
+        }
+    }
+
+    #[test]
+    fn argument_block_invokes_use_bound_wide_heads_and_reject_partial_pairs() {
+        let symbols = crate::native_dex::DexSymbols {
+            types: vec!["Lsample/Target;".into()],
+            strings: vec!["<init>".into()],
+            protos: vec![("V".into(), vec!["J".into()])],
+            methods: vec![(0, 0, 0)],
+            ..Default::default()
+        };
+        let value = |text: &str, ty: &str| {
+            Some(Value {
+                text: text.into(),
+                ty: ty.into(),
+                literal: None,
+                wide_literal: None,
+                raw_bits32: false,
+            })
+        };
+        let regs = vec![None, value("p0", "J"), value("1", "<wide-tail>")];
+        for invoke in [vec![0x3070, 0, 0x0210], vec![0x0376, 0, 0]] {
+            for overwrite in [None, Some(0x0112), Some(0x0212)] {
+                let mut words = vec![0x0022, 0];
+                words.extend(overwrite);
+                words.extend(&invoke);
+                let code = crate::native_dex::DexCode {
+                    registers: 3,
+                    ins: 2,
+                    outs: 3,
+                    tries: 0,
+                    try_regions: vec![],
+                    offset: 0,
+                    instructions: words,
+                };
+                let ir = crate::native_ir::DecodedMethod::decode(&code).unwrap();
+                let bound = crate::native_calls::BoundCalls::bind(&code, &ir, &symbols).unwrap();
+                let prove = |values: &[Option<Value>]| {
+                    evaluated_argument_block_inputs(&ir, &bound, 0, code.instructions.len(), values)
+                        .is_ok()
+                };
+                assert_eq!(prove(&regs), overwrite.is_none());
+                let mut missing = regs.clone();
+                missing[2] = None;
+                assert!(!prove(&missing));
+                let mut wrong_head = regs.clone();
+                wrong_head[1] = value("p0", "I");
+                assert!(!prove(&wrong_head));
+                let mut deferred = regs.clone();
+                deferred[1] = value("Owner.wide", "J");
+                assert!(!prove(&deferred));
+                let mut poisoned = bound.clone();
+                poisoned.calls[0].arguments[0].register = 2;
+                assert!(
+                    evaluated_argument_block_inputs(
+                        &ir,
+                        &poisoned,
+                        0,
+                        code.instructions.len(),
+                        &regs
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
 }

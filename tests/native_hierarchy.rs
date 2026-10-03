@@ -1,4 +1,4 @@
-use rdx::native_ir;
+use rdx::{native_calls, native_cfg, native_dominators, native_ir, native_ssa};
 mod native_dex {
     pub use rdx::native_dex::*;
 }
@@ -872,6 +872,10 @@ fn optimized_parameter_constructor_requires_observed_exact_accessible_parent() {
     });
     let h = TypeHierarchy::from_classes([&leaf, &parent, &caller]).unwrap();
     assert!(h.equivalent_constructor("Lsample/Leaf;", "Lsample/Parent;", &["I".into()]));
+    // An allocation-site certificate does not authorize a super-call retarget.
+    assert!(!h.equivalent_super_constructor("Lsample/Leaf;", "Ljava/lang/Object;", &["I".into()]));
+    assert!(!h.strict_forwarding_constructor("Lsample/Leaf;", "Lsample/Parent;", &["I".into()]));
+    assert!(!h.equivalent_noarg_super_constructor("Lsample/Leaf;", "Ljava/lang/Object;"));
     assert!(!h.has_accessible_noarg_super("Lsample/Leaf;"));
     assert_eq!(
         h.recovered_constructors("Lsample/Leaf;")[0].parent.as_ref(),

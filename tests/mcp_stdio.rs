@@ -40,7 +40,7 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     assert_eq!(replies[0]["error"]["code"], -32600);
     assert_eq!(replies[1]["result"]["protocolVersion"], "2025-06-18");
     let tools = replies[2]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 17);
+    assert_eq!(tools.len(), 19);
     let implementations = tools
         .iter()
         .find(|tool| tool["name"] == "find_implementations")

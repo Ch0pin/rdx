@@ -6,6 +6,8 @@
 
 #[path = "native_constructor_recovery.rs"]
 mod constructor_recovery;
+#[path = "native_this_receiver_identity.rs"]
+pub(crate) mod this_receiver_identity;
 use crate::native_dex::DexClass;
 use anyhow::{Result, ensure};
 pub use constructor_recovery::RecoveredConstructor;
@@ -603,7 +605,10 @@ fn checked_caller_index(hierarchy: &TypeHierarchy, classes: &[&DexClass]) -> Che
                         if region.start as usize <= instruction.pc
                             && instruction.pc < region.end as usize
                         {
-                            types.extend(region.catches.iter().filter_map(|(ty, _)| ty.clone()));
+                            types.extend(region.catches.iter().map(|(ty, _)| {
+                                ty.clone()
+                                    .unwrap_or_else(|| Arc::from("Ljava/lang/Throwable;"))
+                            }));
                         }
                     }
                 }
@@ -1193,6 +1198,50 @@ impl TypeHierarchy {
         if self.noninstantiable_owners.contains(allocated) {
             return false;
         }
+        self.transparent_noarg_constructor_path(allocated, invoked)
+    }
+
+    /// A Java super call can target an abstract parent, but the skipped
+    /// constructors must still be exact, accessible no-arg forwarders.
+    pub fn equivalent_noarg_super_constructor(&self, child: &str, invoked: &str) -> bool {
+        if !self.has_accessible_noarg_super(child) || self.ambiguous.contains(child) {
+            return false;
+        }
+        let Some(parent) = self
+            .entries
+            .get(child)
+            .and_then(|entry| entry.superclass.as_deref())
+        else {
+            return false;
+        };
+        self.transparent_noarg_constructor_path(parent, invoked)
+    }
+
+    pub fn equivalent_super_constructor(
+        &self,
+        child: &str,
+        invoked: &str,
+        args: &[Arc<str>],
+    ) -> bool {
+        if self.ambiguous.contains(child) || self.ambiguous.contains(invoked) {
+            return false;
+        }
+        let Some(parent) = self
+            .entries
+            .get(child)
+            .and_then(|e| e.superclass.as_deref())
+        else {
+            return false;
+        };
+        self.strict_superclass(parent, invoked) == Relation::Proven
+            && self.recovered_constructors(parent).iter().any(|ctor| {
+                ctor.observed_super
+                    && ctor.invoked_owner.as_ref() == invoked
+                    && ctor.parameters == args
+            })
+    }
+
+    fn transparent_noarg_constructor_path(&self, allocated: &str, invoked: &str) -> bool {
         if self.strict_superclass(allocated, invoked) != Relation::Proven {
             return false;
         }
@@ -1230,17 +1279,35 @@ impl TypeHierarchy {
         invoked: &str,
         args: &[Arc<str>],
     ) -> bool {
-        if args.is_empty() {
-            return self.equivalent_noarg_constructor(allocated, invoked);
-        }
-        !self.ambiguous.contains(allocated)
-            && !self.ambiguous.contains(invoked)
-            && self
-                .recovered_constructors(allocated)
-                .iter()
-                .any(|constructor| {
-                    constructor.invoked_owner.as_ref() == invoked && constructor.parameters == args
-                })
+        (args.is_empty() && self.equivalent_noarg_constructor(allocated, invoked))
+            || (!self.ambiguous.contains(allocated)
+                && !self.ambiguous.contains(invoked)
+                && self
+                    .recovered_constructors(allocated)
+                    .iter()
+                    .any(|constructor| {
+                        constructor.observed_allocation
+                            && constructor.invoked_owner.as_ref() == invoked
+                            && constructor.parameters == args
+                    }))
+    }
+
+    /// Newly recovered unloaded-platform forwarders must not enter the
+    /// historical allocation-staging path that moves allocation timing.
+    pub(crate) fn strict_forwarding_constructor(
+        &self,
+        allocated: &str,
+        invoked: &str,
+        args: &[Arc<str>],
+    ) -> bool {
+        self.recovered_constructors(allocated)
+            .iter()
+            .any(|constructor| {
+                constructor.observed_allocation
+                    && constructor.strict_allocation_order
+                    && constructor.invoked_owner.as_ref() == invoked
+                    && constructor.parameters == args
+            })
     }
 
     /// Strict superclass ancestry only: implemented interfaces must never
@@ -1518,12 +1585,42 @@ impl TypeHierarchy {
         let object_calls = verified_object_calls(&classes, false);
         let implicit_constructors = verified_implicit_constructors(&classes);
         let mut recovered_constructors = constructor_recovery::recover(&classes);
-        let accessible_noarg_superclasses =
+        let mut accessible_noarg_superclasses =
             constructor_recovery::accessible_noarg_superclasses(&classes);
+        // A loaded parent with a proven implicit constructor is also a legal
+        // super() target. Check class access from this particular child.
+        for class in &classes {
+            let Some(parent_type) = class.superclass.as_deref() else {
+                continue;
+            };
+            if !implicit_constructors.contains_key(parent_type)
+                || duplicate_owners.contains(&class.descriptor)
+                || duplicate_owners.contains(&Arc::<str>::from(parent_type))
+            {
+                continue;
+            }
+            let Some(parent) = classes_by_owner.get(parent_type) else {
+                continue;
+            };
+            let child_package = class
+                .descriptor
+                .rsplit_once('/')
+                .map_or("", |(prefix, _)| prefix);
+            let parent_package = parent_type
+                .rsplit_once('/')
+                .map_or("", |(prefix, _)| prefix);
+            if parent.access_flags & 1 != 0 || child_package == parent_package {
+                accessible_noarg_superclasses.insert(class.descriptor.clone());
+            }
+        }
         // Explicit parameter constructors suppress Java's implicit default.
         // Preserve an already-proven accessible default when adding overloads.
         for (owner, constructors) in &mut recovered_constructors {
-            if let Some(parent) = implicit_constructors.get(owner) {
+            if let Some(parent) = implicit_constructors.get(owner)
+                && !constructors
+                    .iter()
+                    .any(|constructor| constructor.parameters.is_empty())
+            {
                 constructors.insert(
                     0,
                     RecoveredConstructor {
@@ -1531,6 +1628,9 @@ impl TypeHierarchy {
                         invoked_owner: parent.clone(),
                         parameters: vec![],
                         thrown_types: vec![],
+                        strict_allocation_order: false,
+                        observed_allocation: true,
+                        observed_super: false,
                     },
                 );
             }

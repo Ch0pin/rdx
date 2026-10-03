@@ -77,6 +77,54 @@ fn float_fixture() -> DexClass {
     )
 }
 
+fn restored_float_constant_fixture() -> DexClass {
+    fixture(
+        vec![
+            0x0012, 0x0238, 9, 0x1071, 0, 0, 0x0012, 0x02d8, 0xff02, 0xf828, 0x000f,
+        ],
+        "F",
+        DexSymbols {
+            types: vec!["Lsample/LoopEntry;".into()],
+            strings: vec!["consume".into()],
+            protos: vec![("V".into(), vec!["F".into()])],
+            methods: vec![(0, 0, 0)],
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn restored_constant_loop_phi_uses_its_proven_float_domain() {
+    let java = source(&restored_float_constant_fixture()).unwrap();
+    assert!(java.contains("float v"), "{java}");
+    assert!(!java.contains("intBitsToFloat"), "{java}");
+}
+
+fn large_float_fixture() -> DexClass {
+    let mut class = float_fixture();
+    let words = &mut class.methods[0].code.as_mut().unwrap().instructions;
+    // DEX debug/instrumentation or a larger body must not disable a bounded
+    // SSA proof solely because the method exceeds 512 code units.
+    words.splice(0..0, std::iter::repeat_n(0x0000, 600));
+    class
+}
+
+#[test]
+fn large_loop_entry_uses_proven_float_type() {
+    let class = large_float_fixture();
+    let java = source(&class).unwrap();
+    assert!(java.contains("float"), "{java}");
+    assert!(java.contains("while (true)"), "{java}");
+    let mut too_large = large_float_fixture();
+    too_large.methods[0]
+        .code
+        .as_mut()
+        .unwrap()
+        .instructions
+        .splice(0..0, std::iter::repeat_n(0x0000, 4096));
+    assert!(source(&too_large).is_err());
+}
+
 fn reference_fixture() -> DexClass {
     fixture(
         vec![
@@ -242,6 +290,16 @@ fn loop_entry_types_jvm_behavior() {
         ),
         (
             float_fixture(),
+            "",
+            "for (int n=0;n<=3;n++) { int bits=Float.floatToRawIntBits(choose(n)); int expected=n==0?0:Float.floatToRawIntBits(1.0f); if (bits!=expected) throw new AssertionError(n); }",
+        ),
+        (
+            restored_float_constant_fixture(),
+            "static int calls; static void consume(float value) { if(Float.floatToRawIntBits(value)!=0) throw new AssertionError(); calls++; }",
+            "for(int n=0;n<=3;n++){calls=0; if(Float.floatToRawIntBits(choose(n))!=0 || calls!=n) throw new AssertionError(n);}",
+        ),
+        (
+            large_float_fixture(),
             "",
             "for (int n=0;n<=3;n++) { int bits=Float.floatToRawIntBits(choose(n)); int expected=n==0?0:Float.floatToRawIntBits(1.0f); if (bits!=expected) throw new AssertionError(n); }",
         ),

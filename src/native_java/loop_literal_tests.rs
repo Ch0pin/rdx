@@ -119,7 +119,7 @@ fn collect() -> serde_json::Value {
                 (if continuing { 4isize } else { exit as isize } - pc as isize) as i16 as u16;
         }
         cases.push((
-            format!("composition_{}", changed.map_or(9, |i| i)),
+            format!("composition_{}", changed.unwrap_or(9)),
             words,
             7,
             false,

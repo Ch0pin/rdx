@@ -3,11 +3,14 @@
 //! effect trace after every attempted substitution.
 use super::allocation::{Allocation, Event, Expr, Rendered};
 use anyhow::Result;
+#[path = "capture_concat.rs"]
+mod capture_concat;
 
 const MAX_CAPTURE_REWRITES: usize = 16;
 
 fn exact_type(expr: &Expr) -> Option<String> {
     match expr {
+        Expr::StringConcat { .. } => Some("java.lang.String".into()),
         Expr::StringConstant { .. } => Some("java.lang.String".into()),
         Expr::ClassConstant { .. } => Some("java.lang.Class".into()),
         Expr::Cast { ty, .. } | Expr::CheckCast { ty, .. } => Some(ty.text.clone()),
@@ -32,7 +35,8 @@ fn substitute(expr: &mut Expr, index: usize, replacement: &Expr, uses: &mut usiz
         Expr::Cast { value, .. } | Expr::CheckCast { value, .. } | Expr::Unary { value, .. } => {
             substitute(value, index, replacement, uses)
         }
-        Expr::Binary { left, right, .. }
+        Expr::StringConcat { left, right }
+        | Expr::Binary { left, right, .. }
         | Expr::ArrayRead {
             array: left,
             index: right,
@@ -134,6 +138,25 @@ pub(super) fn render_checked(
         }
     }
     Ok(rendered)
+}
+
+// This separate entry point uses an explicitly normalized platform-intrinsic
+// trace. General allocation/shrinking callers still require the exact DEX trace.
+pub(super) fn render_platform_checked(
+    class: &crate::native_dex::DexClass,
+    allocation: &Allocation,
+    events: &[Event],
+    locals: &[&str],
+    live_after: &[bool],
+) -> Result<Rendered> {
+    let baseline = render_checked(allocation, events, locals, live_after)?;
+    if let Some((candidate, normalized, live)) =
+        capture_concat::normalize(class, allocation, events, live_after)
+        && let Ok(rendered) = render_checked(&candidate, &normalized, locals, &live)
+    {
+        return Ok(rendered);
+    }
+    Ok(baseline)
 }
 
 #[cfg(test)]

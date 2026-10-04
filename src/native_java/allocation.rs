@@ -104,6 +104,13 @@ pub(crate) enum Expr {
         field: Symbol,
         value: Box<Expr>,
     },
+    /// Source-level platform string concatenation; private builder events are
+    /// deliberately normalized, while operand events remain explicit.
+    #[allow(dead_code)] // production normalizer is absent from standalone renderer tests
+    StringConcat {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     Capture(usize),
     #[allow(dead_code)] // exercised by the standalone capture renderer tests
     New(Box<Allocation>),
@@ -626,6 +633,10 @@ impl Allocation {
                 Self::validate_expr(left, locals, names, depth + 1, nodes)?;
                 Self::validate_expr(right, locals, names, depth + 1, nodes)?;
             }
+            Expr::StringConcat { left, right } => {
+                Self::validate_expr(left, locals, names, depth + 1, nodes)?;
+                Self::validate_expr(right, locals, names, depth + 1, nodes)?;
+            }
             Expr::NewArray { ty, length, .. } => {
                 ensure!(ty.text.ends_with("[]"), "invalid allocation array type");
                 Self::validate_expr(length, locals, names, depth + 1, nodes)?;
@@ -767,7 +778,7 @@ impl Expr {
             Self::Cast { value, .. } | Self::CheckCast { value, .. } => {
                 value.flat_dependencies(before, used)?
             }
-            Self::Binary { left, right, .. } => {
+            Self::Binary { left, right, .. } | Self::StringConcat { left, right } => {
                 left.flat_dependencies(before, used)?;
                 right.flat_dependencies(before, used)?;
             }
@@ -830,7 +841,7 @@ impl Expr {
             | Self::ClassConstant { .. }
             | Self::Capture(_) => Ok(()),
             Self::Cast { value, .. } | Self::CheckCast { value, .. } => value.declarations(out),
-            Self::Binary { left, right, .. } => {
+            Self::Binary { left, right, .. } | Self::StringConcat { left, right } => {
                 left.declarations(out)?;
                 right.declarations(out)
             }
@@ -1018,6 +1029,14 @@ impl<'a> CaptureRenderer<'a> {
                 self.events.push(Event::Compute { site: *site });
                 Ok(result)
             }
+            Expr::StringConcat { left, right } => {
+                let mut result = Fragment::plain("(");
+                result.append(self.expression(left)?);
+                result.append(Fragment::plain(" + "));
+                result.append(self.expression(right)?);
+                result.append(Fragment::plain(")"));
+                Ok(result)
+            }
             Expr::NewArray { site, ty, length } => {
                 let base = ty.text.trim_end_matches("[]");
                 let suffix = &ty.text[base.len() + 2..];
@@ -1165,6 +1184,7 @@ impl<'a> CaptureRenderer<'a> {
         // A prefix cannot use the capture whose expression follows it.
         self.states[index] = CaptureState::Rendering;
         let mut prefixes = Vec::new();
+        let mut prefix_names = Vec::new();
         while self.next < index {
             let prefix = self.next;
             let comparison = sequence_comparison(&self.captures[prefix].ty)?;
@@ -1174,6 +1194,7 @@ impl<'a> CaptureRenderer<'a> {
                 .flat_dependencies(prefix, &mut dependencies)?;
             let fragment = self.capture(prefix)?;
             prefixes.push((fragment, comparison));
+            prefix_names.push(self.captures[prefix].name.clone());
         }
         ensure!(
             self.next == index,
@@ -1209,6 +1230,55 @@ impl<'a> CaptureRenderer<'a> {
                 && self.events[start.3..] == branch_events,
             "allocation sequence branches disagree"
         );
+        // A repeated sequencer is an ordered statement block, not control flow.
+        // Keep it in the same argument position: hoisting these calls would move
+        // them before the enclosing allocation. Only unwrap assignments produced
+        // by capture_body; a nested sequencer retains the established fallback.
+        if prefixes.len() >= 2
+            && prefixes
+                .iter()
+                .zip(&prefix_names)
+                .all(|((fragment, _), name)| {
+                    fragment.text.starts_with(&format!("({name} = "))
+                        && fragment.text.ends_with(')')
+                })
+        {
+            let mut result = Fragment::plain("(switch (0) { default -> { ");
+            for (fragment, _) in prefixes {
+                let len = fragment.text.chars().count();
+                let text = fragment
+                    .text
+                    .chars()
+                    .skip(1)
+                    .take(len - 2)
+                    .collect::<String>();
+                let links = fragment
+                    .links
+                    .into_iter()
+                    .map(|link| {
+                        ensure!(
+                            link.start >= 1 && link.end < len,
+                            "sequencer assignment link"
+                        );
+                        Ok(Link {
+                            start: link.start - 1,
+                            end: link.end - 1,
+                            label: link.label,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                result.append(Fragment { text, links });
+                result.append(Fragment::plain("; "));
+            }
+            result.append(Fragment::plain("yield "));
+            result.append(first);
+            result.append(Fragment::plain("; } })"));
+            ensure!(
+                result.text.chars().count() <= MAX_CHARS,
+                "allocation sequence output exceeds budget"
+            );
+            return Ok(result);
+        }
         // Both arms contain the same typed assignment, so the continuation
         // executes once and all live capture locals are definitely assigned.
         // Check before duplicating: nested sequences cannot expand without bound.

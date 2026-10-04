@@ -2015,7 +2015,8 @@ pub(super) fn try_lower(
                                 live_after[*index] = true;
                             }
                         }
-                        let mut rendered = match super::shrink::render_checked(
+                        let mut rendered = match super::shrink::render_platform_checked(
+                            class,
                             &allocation,
                             &events,
                             &local_refs,
@@ -2131,7 +2132,8 @@ pub(super) fn try_lower(
                         && words[next] as u8 == result_opcode
                         && graph.widths[next] == 1;
                     // Pinned JADX SimplifyVisitor also recognizes unchained builder
-                    // uses. Keep the actual append calls here (no concat rewrite).
+                    // uses. Decode the actual append calls here; the later bounded
+                    // platform normalizer may recover source-level concatenation.
                     // Only this exact final-platform-class overload guarantees
                     // that an ignored result is the original receiver identity.
                     let fluent_receiver = if !has_result

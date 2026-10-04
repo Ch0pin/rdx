@@ -4,6 +4,7 @@ pub(crate) mod anonymous;
 mod condition_cleanup;
 mod display_names;
 mod enums;
+mod interface_default_bridge;
 mod liveness;
 mod method;
 mod names;
@@ -332,7 +333,12 @@ pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result
     let body = if declaration_only {
         None
     } else {
-        Some(method::reconstruct(name, class, method)?)
+        Some(
+            match interface_default_bridge::reconstruct(name, class, method)? {
+                Some(body) => body,
+                None => method::reconstruct(name, class, method)?,
+            },
+        )
     };
     let mut out = Output::default();
     let method_position = class

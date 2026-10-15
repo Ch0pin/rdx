@@ -285,7 +285,86 @@ pub(super) fn readable(body: &mut MethodBody) {
         })
         .collect();
     inline_locals(body, &names, true);
+    discard_unused_builder_bindings(body);
     standalone_casts(body);
+}
+
+// Dropping an unused append result keeps the invocation at exactly the same
+// statement position. Never discard the call itself or move its arguments.
+fn discard_unused_builder_bindings(body: &mut MethodBody) {
+    if body.text.len() > 512 * 1024 {
+        return;
+    }
+    let mut candidates = Vec::new();
+    let mut offset = 0;
+    body.links.sort_by_key(|link| link.start);
+    for line in body.text.split_inclusive('\n') {
+        let start = offset;
+        offset += line.chars().count();
+        let Some((declaration, expression)) = line
+            .trim()
+            .strip_suffix(';')
+            .and_then(|line| line.split_once(" = "))
+        else {
+            continue;
+        };
+        let Some(name) = declaration.strip_prefix("java.lang.StringBuilder ") else {
+            continue;
+        };
+        if !generated_local(name) {
+            continue;
+        }
+        let Some((receiver, arguments)) = expression.split_once(".append") else {
+            continue;
+        };
+        if !(generated_local(receiver)
+            || receiver.strip_prefix('p').is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            }))
+            || !enclosed(arguments)
+        {
+            continue;
+        }
+        let expression_byte = line.find(" = ").unwrap() + 3;
+        let expression_start = start + line[..expression_byte].chars().count();
+        let append_start = expression_start + receiver.len() + 1;
+        let link_start = body.links.partition_point(|link| link.start < append_start);
+        let mut call_links = body.links[link_start..]
+            .iter()
+            .take_while(|link| link.start == append_start);
+        let linked_append = call_links.next().is_some_and(|link| {
+            link.end == append_start + "append".len()
+                && link.label.starts_with("java.lang.StringBuilder.append(")
+                && link.label.ends_with(")Ljava/lang/StringBuilder;")
+        }) && call_links.next().is_none();
+        if !linked_append {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        candidates.push((
+            name.to_owned(),
+            Edit {
+                start: start + line[..indent].chars().count(),
+                end: expression_start,
+                text: String::new(),
+                links: vec![],
+            },
+        ));
+        if candidates.len() > 8192 {
+            return;
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let names = candidates.iter().map(|(name, _)| name.clone()).collect();
+    let counts = uses(&body.text, &names);
+    let edits = candidates
+        .into_iter()
+        .filter(|(name, _)| counts.get(name).is_some_and(|uses| uses.len() == 1))
+        .map(|(_, edit)| edit)
+        .collect();
+    apply_edits(body, edits);
 }
 
 fn inline_locals(body: &mut MethodBody, names: &HashSet<String>, arguments: bool) {
@@ -720,6 +799,88 @@ mod tests {
         inline_receivers(&mut body, &names.iter().map(|s| s.to_string()).collect());
         body
     }
+    #[test]
+    fn unused_builder_result_preserves_effectful_call_and_unicode_navigation() {
+        let source = concat!(
+            "    // λ\n",
+            "    java.lang.StringBuilder v2 = v1.append(sample.Effects.next(\"v2 é\"));\n",
+            "    sample.Effects.after();\n",
+        );
+        let append = source[..source.find("append").unwrap()].chars().count();
+        let next = source[..source.find("next").unwrap()].chars().count();
+        let mut body = MethodBody {
+            text: source.into(),
+            inferred_throws: vec![],
+            links: vec![
+                CodeLink { start: append, end: append + 6, label: "java.lang.StringBuilder.append(Ljava/lang/String;)Ljava/lang/StringBuilder;".into() },
+                CodeLink { start: next, end: next + 4, label: "sample.Effects.next(Ljava/lang/String;)Ljava/lang/String;".into() },
+            ],
+        };
+        discard_unused_builder_bindings(&mut body);
+        assert_eq!(
+            body.text,
+            source.replace("java.lang.StringBuilder v2 = ", "")
+        );
+        for (link, expected) in body.links.iter().zip(["append", "next"]) {
+            assert_eq!(
+                body.text
+                    .chars()
+                    .skip(link.start)
+                    .take(link.end - link.start)
+                    .collect::<String>(),
+                expected
+            );
+        }
+        assert_eq!(body.links.len(), 2);
+    }
+
+    #[test]
+    fn builder_binding_cleanup_retains_used_or_ambiguous_results() {
+        let label = "java.lang.StringBuilder.append(Ljava/lang/String;)Ljava/lang/StringBuilder;";
+        for (expression, suffix, target, duplicate) in [
+            ("v1.append(\"x\")", "    consume(v2);\n", label, false),
+            ("v1.append(\"x\").reverse()", "", label, false),
+            (
+                "((java.lang.StringBuilder) v1.append(\"x\"))",
+                "",
+                label,
+                false,
+            ),
+            (
+                "v1.append(\"x\")",
+                "",
+                "sample.StringBuilder.append(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+                false,
+            ),
+            (
+                "v1.append(\"x\")",
+                "",
+                "java.lang.StringBuilder.append(Ljava/lang/String;)Ljava/lang/Object;",
+                false,
+            ),
+            ("v1.append(\"x\")", "", label, true),
+        ] {
+            let source = format!("    java.lang.StringBuilder v2 = {expression};\n{suffix}");
+            let append = source.find("append").unwrap();
+            let link = CodeLink {
+                start: append,
+                end: append + 6,
+                label: target.into(),
+            };
+            let mut body = MethodBody {
+                text: source.clone(),
+                inferred_throws: vec![],
+                links: if duplicate {
+                    vec![link.clone(), link]
+                } else {
+                    vec![link]
+                },
+            };
+            discard_unused_builder_bindings(&mut body);
+            assert_eq!(body.text, source);
+        }
+    }
+
     #[test]
     fn conflicting_cleanup_edits_leave_source_and_links_unchanged() {
         for ranges in [vec![(1, 5), (3, 4)], vec![(4, 3)], vec![(2, 99)]] {

@@ -277,10 +277,49 @@ fn type_name(ty: &str, array: bool) -> String {
         _ => lower_camel(ty.rsplit('$').next().unwrap_or(ty)),
     }
 }
-fn inferred_name(tokens: &[Token<'_>], index: usize, ty: &str, array: bool) -> String {
+fn query_parameter_name(
+    source: &str,
+    tokens: &[Token<'_>],
+    call: usize,
+    query_calls: &HashSet<(usize, usize)>,
+) -> Option<String> {
+    let token = tokens.get(call)?;
+    if token.text != "getQueryParameter" || !query_calls.contains(&(token.start, token.end)) {
+        return None;
+    }
+    let open = tokens.get(call + 1)?;
+    let close = tokens.get(call + 2)?;
+    // Literal tokens are deliberately skipped by the lexer. Adjacent brackets
+    // therefore admit one literal, but exclude variables and compound arguments.
+    if open.text != "(" || close.text != ")" {
+        return None;
+    }
+    let argument = source.get(open.byte_end..close.byte_start)?.trim();
+    let key = argument.strip_prefix('"')?.strip_suffix('"')?;
+    // Keep plain ASCII keys verbatim. Other keys retain generic naming rather
+    // than treating Unicode numeric characters as valid Java identifier parts.
+    if key.len() > 128
+        || !key.is_ascii()
+        || !key.chars().next().is_some_and(identifier_start)
+        || !key.chars().all(|c| identifier_start(c) || c.is_numeric())
+        || generated(key)
+    {
+        return None;
+    }
+    Some(key.to_owned())
+}
+
+fn inferred_name(
+    source: &str,
+    tokens: &[Token<'_>],
+    index: usize,
+    ty: &str,
+    array: bool,
+    query_calls: &HashSet<(usize, usize)>,
+) -> String {
     if tokens.get(index + 1).is_some_and(|t| t.text == "=") {
         let mut depth = 0usize;
-        let mut selected: Option<(usize, &str)> = None;
+        let mut selected: Option<(usize, usize)> = None;
         for i in index + 2..tokens.len().min(index + 160) {
             if tokens[i].text == "new" {
                 return type_name(ty, array);
@@ -294,7 +333,7 @@ fn inferred_name(tokens: &[Token<'_>], index: usize, ty: &str, array: bool) -> S
                 && tokens.get(i + 1).is_some_and(|t| t.text == "(")
                 && selected.is_none_or(|(selected_depth, _)| depth <= selected_depth)
             {
-                selected = Some((depth, tokens[i].text));
+                selected = Some((depth, i));
             }
             match tokens[i].text {
                 "(" => depth += 1,
@@ -302,7 +341,14 @@ fn inferred_name(tokens: &[Token<'_>], index: usize, ty: &str, array: bool) -> S
                 _ => {}
             }
         }
-        if let Some((_, call)) = selected {
+        if let Some((_, call_index)) = selected {
+            if ty == "String"
+                && !array
+                && let Some(name) = query_parameter_name(source, tokens, call_index, query_calls)
+            {
+                return name;
+            }
+            let call = tokens[call_index].text;
             if let Some(suffix) = call
                 .strip_prefix("get")
                 .filter(|s| s.chars().next().is_some_and(char::is_uppercase))
@@ -342,6 +388,14 @@ pub(super) fn rename(mut code: DecompiledCode) -> DecompiledCode {
     let Some(tokens) = tokens(&code.source) else {
         return code;
     };
+    let query_calls = code
+        .links
+        .iter()
+        .filter(|link| {
+            link.label == "android.net.Uri.getQueryParameter(Ljava/lang/String;)Ljava/lang/String;"
+        })
+        .map(|link| (link.start, link.end))
+        .collect();
     let mut spans: Vec<_> = code
         .links
         .iter()
@@ -402,7 +456,10 @@ pub(super) fn rename(mut code: DecompiledCode) -> DecompiledCode {
             if !seen.insert(token.text) {
                 repeated.insert(token.text);
             }
-            candidates.push((token.text, inferred_name(&tokens, i, ty, array)));
+            candidates.push((
+                token.text,
+                inferred_name(&code.source, &tokens, i, ty, array, &query_calls),
+            ));
         }
     }
     let mut names = HashMap::new();
@@ -500,6 +557,116 @@ mod tests {
             source_hash: source_identity(source),
         }
     }
+    #[test]
+    fn uri_query_keys_name_locals_and_preserve_navigation() {
+        let source = "void f(android.net.Uri p0) { String v0 = p0.getQueryParameter(\"type\"); String v1 = p0.getQueryParameter(\"partPan\"); consume(v0, v1); }";
+        let mut original = code(source);
+        for (offset, _) in source.match_indices("getQueryParameter") {
+            let start = source[..offset].chars().count();
+            original.links.push(CodeLink {
+                start,
+                end: start + 17,
+                label: "android.net.Uri.getQueryParameter(Ljava/lang/String;)Ljava/lang/String;"
+                    .into(),
+            });
+        }
+        let renamed = rename(original);
+        assert!(
+            renamed
+                .source
+                .contains("String type = uri.getQueryParameter(\"type\");"),
+            "{}",
+            renamed.source
+        );
+        assert!(
+            renamed
+                .source
+                .contains("String partPan = uri.getQueryParameter(\"partPan\");")
+        );
+        assert!(renamed.source.contains("consume(type, partPan);"));
+        for link in &renamed.links {
+            assert_eq!(
+                renamed
+                    .source
+                    .chars()
+                    .skip(link.start)
+                    .take(link.end - link.start)
+                    .collect::<String>(),
+                "getQueryParameter"
+            );
+        }
+        assert_eq!(renamed.source_hash, source_identity(&renamed.source));
+    }
+
+    #[test]
+    fn query_key_names_retain_collision_keyword_and_unicode_guards() {
+        let source = "void f(android.net.Uri p0) { String type = \"é\"; String v0 = p0.getQueryParameter(\"type\"); String v1 = p0.getQueryParameter(\"class\"); consume(v0, v1); }";
+        let mut original = code(source);
+        for (offset, _) in source.match_indices("getQueryParameter") {
+            let start = source[..offset].chars().count();
+            original.links.push(CodeLink {
+                start,
+                end: start + 17,
+                label: "android.net.Uri.getQueryParameter(Ljava/lang/String;)Ljava/lang/String;"
+                    .into(),
+            });
+        }
+        let renamed = rename(original);
+        assert!(renamed.source.contains("String type2 ="));
+        assert!(renamed.source.contains("String classValue ="));
+        assert!(renamed.source.contains("consume(type2, classValue);"));
+        for link in &renamed.links {
+            assert_eq!(
+                renamed
+                    .source
+                    .chars()
+                    .skip(link.start)
+                    .take(link.end - link.start)
+                    .collect::<String>(),
+                "getQueryParameter"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_query_keys_and_unlinked_calls_keep_generic_names() {
+        for (argument, linked) in [
+            ("\"partPan\"", false),
+            ("key", true),
+            ("\"part-pan\"", true),
+            ("\"part\\u0050an\"", true),
+            ("\"part\" + suffix", true),
+            ("\"v0\"", true),
+            ("\"part²\"", true),
+        ] {
+            let source = format!(
+                "void f(Uri p0) {{ String v0 = p0.getQueryParameter({argument}); consume(v0); }}"
+            );
+            let mut original = code(&source);
+            let start = source.find("getQueryParameter").unwrap();
+            if linked {
+                original.links.push(CodeLink {
+                    start,
+                    end: start + 17,
+                    label:
+                        "android.net.Uri.getQueryParameter(Ljava/lang/String;)Ljava/lang/String;"
+                            .into(),
+                });
+            }
+            let renamed = rename(original);
+            assert!(
+                renamed.source.contains("String queryParameter ="),
+                "{}",
+                renamed.source
+            );
+            assert!(
+                renamed
+                    .source
+                    .contains(&format!("getQueryParameter({argument})"))
+            );
+        }
+    }
+
     #[test]
     fn types_and_calls_name_generated_bindings_consistently() {
         let c = rename(code(

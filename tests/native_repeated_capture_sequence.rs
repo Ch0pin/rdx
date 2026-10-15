@@ -218,6 +218,15 @@ fn exact_apk_private_builder_normalizes_to_readable_concat_with_navigation() {
         "{}",
         code.source
     );
+    for readable in [
+        "String type = uri.getQueryParameter(\"type\");",
+        "String partPan = uri.getQueryParameter(\"partPan\");",
+        "new DeepLinkHandlerResponse(\n",
+        "new NotificationDeepLinkModel(\n",
+    ] {
+        assert!(code.source.contains(readable), "{}", code.source);
+    }
+    assert_eq!(code.source_hash, rdx::engine::source_identity(&code.source));
     for erased in [
         "switch (0)",
         "StringBuilder",

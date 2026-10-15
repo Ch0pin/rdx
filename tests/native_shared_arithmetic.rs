@@ -18,6 +18,9 @@ fn ret(ty: &str) -> u16 {
     if width(ty) == 2 { 0x10 } else { 0x0f }
 }
 fn render(case: &Case) -> anyhow::Result<String> {
+    render_mode(case, false)
+}
+fn render_mode(case: &Case, presented: bool) -> anyhow::Result<String> {
     let mut class = native_dex::parse(include_bytes!("fixtures/hello.dex"))?
         .classes
         .remove(0);
@@ -32,7 +35,32 @@ fn render(case: &Case) -> anyhow::Result<String> {
     code.registers = 2 + code.ins;
     code.outs = 0;
     code.instructions = case.words.clone();
-    Ok(native_java::render_method("sample.Arithmetic", &class, &class.methods[0])?.source)
+    if !presented {
+        return Ok(
+            native_java::render_method("sample.Arithmetic", &class, &class.methods[0])?.source,
+        );
+    }
+    let displayed = native_java::render("sample.Arithmetic", &class)?;
+    assert_eq!(
+        displayed.source_hash,
+        rdx::engine::source_identity(&displayed.source)
+    );
+    let definition = displayed
+        .definitions
+        .iter()
+        .find(|definition| definition.kind == "method" && definition.name == case.name)
+        .unwrap();
+    let name_byte = displayed
+        .source
+        .char_indices()
+        .nth(definition.start)
+        .unwrap()
+        .0;
+    let start = displayed.source[..name_byte]
+        .rfind('\n')
+        .map_or(0, |position| position + 1);
+    let end = displayed.source.rfind("\n}").unwrap() + 1;
+    Ok(displayed.source[start..end].into())
 }
 fn cases() -> Vec<Case> {
     let mut cases = Vec::new();
@@ -225,10 +253,35 @@ fn values(ty: &str) -> &'static str {
 #[test]
 #[ignore = "requires javac and java on PATH"]
 fn arithmetic_jvm_matches_independent_boundary_references() {
+    verify_arithmetic_jvm(false);
+}
+
+#[test]
+fn arithmetic_presentation_simplifies_atoms_and_preserves_numeric_casts() {
+    for case in cases() {
+        let source = render_mode(&case, true).unwrap();
+        assert!(source.contains(&format!(" {}(", case.name)), "{source}");
+        assert!(!source.contains(".method "), "{source}");
+        if case.opcode == 0xad {
+            assert!(source.contains("return value * value2;"), "{source}");
+        }
+        if case.opcode == 0x81 {
+            assert!(source.contains("(long) value"), "{source}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires javac and java on PATH"]
+fn arithmetic_presentation_jvm_matches_independent_boundary_references() {
+    verify_arithmetic_jvm(true);
+}
+
+fn verify_arithmetic_jvm(presented: bool) {
     let mut methods = String::new();
     let mut checks = String::new();
     for case in cases() {
-        methods.push_str(&render(&case).unwrap());
+        methods.push_str(&render_mode(&case, presented).unwrap());
         let parameters = case
             .parameters
             .iter()

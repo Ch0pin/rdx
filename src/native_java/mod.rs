@@ -8,7 +8,10 @@ mod interface_default_bridge;
 mod liveness;
 mod method;
 mod names;
+mod presentation_cleanup;
 mod readable;
+mod source_layout;
+mod statement_cleanup;
 mod strings;
 mod varargs_cleanup;
 use crate::{
@@ -55,10 +58,12 @@ struct Output {
     definitions: Vec<CodeDefinition>,
 }
 
-fn presentation(code: DecompiledCode, class: &DexClass) -> DecompiledCode {
+fn presentation(code: DecompiledCode, class: &DexClass, method: &DexMethod) -> DecompiledCode {
     let code = varargs_cleanup::simplify(code, class);
     let code = method::readable_code(code);
     let code = condition_cleanup::simplify(code);
+    let code = presentation_cleanup::simplify(code, method);
+    let code = statement_cleanup::simplify(code, method);
     display_names::rename(code)
 }
 impl Output {
@@ -1107,7 +1112,7 @@ fn append_presented_method(
     method: &DexMethod,
     code: DecompiledCode,
 ) -> Result<()> {
-    let mut code = presentation(code, class);
+    let mut code = presentation(code, class, method);
     if class.access_flags & 0x200 != 0 && interface_method_default(method)? {
         code = add_default_modifier(code);
     }
@@ -1129,7 +1134,7 @@ fn finish_class_nested(
         shortened.codes.into_iter().next().unwrap(),
         &shortened.imports,
     );
-    anonymous::shorten_bound_types(code, nested_names)
+    source_layout::format(anonymous::shorten_bound_types(code, nested_names))
 }
 
 pub fn render(name: &str, class: &DexClass) -> Result<DecompiledCode> {
@@ -1318,7 +1323,7 @@ fn upgrade_methods_controlled(
             }
             continue;
         };
-        code = presentation(code, class);
+        code = presentation(code, class, method);
         if class.access_flags & 0x200 != 0 {
             let Ok(default) = interface_method_default(method) else {
                 continue;
@@ -2212,7 +2217,7 @@ mod cold_phase_profile {
                 }
                 if let Ok(code) = code {
                     let before = Instant::now();
-                    codes.push(presentation(code, class));
+                    codes.push(presentation(code, class, method));
                     presentation_us += before.elapsed().as_micros();
                 } else {
                     failed += 1;

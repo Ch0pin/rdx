@@ -874,7 +874,7 @@ pub(crate) fn render_nested(
         } else {
             Vec::new()
         };
-        let mut code = presentation(render_method(&nested.child, child, method)?, child);
+        let mut code = presentation(render_method(&nested.child, child, method)?, child, method);
         if method.name.as_ref() == "<init>" {
             code = reorder_capture_lines(code, child, &captures)?;
             code = constructor_name(code, &nested.simple)?;
@@ -1227,7 +1227,12 @@ mod tests {
         assert!(code.source.contains("new anon$1("), "{}", code.source);
         assert!(code.source.contains("final int X;"), "{}", code.source);
         assert!(code.source.contains("int value()"), "{}", code.source);
-        assert!(code.source.find("super();").unwrap() < code.source.find("this.X =").unwrap());
+        let raw = render_method("sample.Outer$anon$1", child, &child.methods[0]).unwrap();
+        assert!(raw.source.find("super();").unwrap() < raw.source.find("this.X =").unwrap());
+        // Presentation uses Java's implicit no-arg superclass invocation;
+        // the original reconstruction still proves its position above.
+        assert!(!code.source.contains("super();"), "{}", code.source);
+        assert!(code.source.contains("this.X ="), "{}", code.source);
         assert!(
             code.links
                 .iter()

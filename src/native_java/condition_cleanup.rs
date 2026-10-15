@@ -5,14 +5,14 @@ const MAX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WORK: usize = 16 * 1024 * 1024;
 const MAX_EDITS: usize = 8192;
 
-struct Syntax {
-    code: Vec<bool>,
-    pair: Vec<usize>,
+pub(super) struct Syntax {
+    pub(super) code: Vec<bool>,
+    pub(super) pair: Vec<usize>,
 }
 
 // Work in bytes for ASCII syntax, but convert every edit boundary to scalar
 // offsets before touching engine metadata. Strings and comments are opaque.
-fn syntax(source: &str) -> Option<Syntax> {
+pub(super) fn syntax(source: &str) -> Option<Syntax> {
     let bytes = source.as_bytes();
     let mut code = vec![true; bytes.len()];
     let mut pair = vec![usize::MAX; bytes.len()];
@@ -83,10 +83,10 @@ fn syntax(source: &str) -> Option<Syntax> {
 }
 
 #[derive(Clone)]
-struct Edit<'a> {
-    start: usize,
-    end: usize,
-    text: &'a str,
+pub(super) struct Edit<'a> {
+    pub(super) start: usize,
+    pub(super) end: usize,
+    pub(super) text: &'a str,
 }
 
 struct Header {
@@ -325,7 +325,7 @@ fn negations(source: &str, syntax: &Syntax) -> Vec<Edit<'static>> {
     edits
 }
 
-fn apply(mut code: DecompiledCode, mut edits: Vec<Edit<'_>>) -> (DecompiledCode, bool) {
+pub(super) fn apply(mut code: DecompiledCode, mut edits: Vec<Edit<'_>>) -> (DecompiledCode, bool) {
     if edits.is_empty() {
         return (code, false);
     }

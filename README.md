@@ -29,7 +29,8 @@ services. See [performance measurements](docs/search-performance.md) for the tes
 | Read and navigate code | Reconstructed Java, exact DEX disassembly, declaration jumps, Back/Forward, tabs and bookmarks |
 | Trace relationships | Find usages, method callers/callees, direct subclasses and implementations |
 | Find what matters | Search classes, code, methods, fields and resources; exclude packages from searches |
-| Inspect the package | Decoded manifest/XML, exported-component highlighting, resource names and values, image previews and file exports |
+| Inspect the package | Manifest Summary/Components/XML views, component filters and class navigation, Assets grouped by folder or file type, resource names and values, image previews and file exports |
+| Identify the active app | App icon with RDX fallback and package name in the window title |
 | Customize your workflow | Light/dark themes, bundled code fonts, occurrence highlighting, Frida snippet copying and CLI access |
 
 **Status: alpha.** Java reconstruction is still expanding. Unsupported methods
@@ -88,5 +89,5 @@ Platform build requirements, macOS app packaging and CLI commands are in the
 [Validation](docs/validation.md) · [Plugins](docs/plugins.md)
 
 RDX uses JADX algorithms as a reference. See [JADX attribution](third_party/jadx/README.md),
-[Android notices](third_party/android/README.md), [font licenses](third_party/fonts/README.md)
-and [theme licenses](third_party/themes/README.md).
+[Android notices](third_party/android/README.md), [font licenses](third_party/fonts/README.md),
+[theme licenses](third_party/themes/README.md), and [icon rendering licenses](third_party/icon-rendering/README.md).

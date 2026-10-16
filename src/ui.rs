@@ -2,7 +2,7 @@ use crate::code_fonts::CodeFont;
 use crate::{
     code_view::{CodeDocument, CodeTheme},
     icons::{self, Icon},
-    navigation::{self, Node, Target},
+    navigation::{self, AssetGrouping, Node, Target},
     search::{
         self, CompiledQuery, SearchHit, SearchQuery, SearchSummary, SearchTarget, SearchUpdate,
     },
@@ -27,6 +27,8 @@ use std::{
     thread,
 };
 
+pub(crate) const WINDOW_TITLE: &str = "RDX - Java & Android decompiler";
+
 // Always return engine ownership and a terminal event after a worker panic.
 fn search_worker_result(run: impl FnOnce() -> SearchSummary) -> Result<SearchSummary, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).map_err(|payload| {
@@ -47,6 +49,8 @@ enum Event {
         Result<rdx::call_graph::CallGraph, String>,
     ),
     Archive(u64, Arc<Archive>),
+    AppIcon(u64, image::RgbaImage),
+    PackageName(u64, String),
     Opened(u64, Result<(NativeEngine, Project), String>),
     Source(
         u64,
@@ -340,6 +344,7 @@ enum TabAction {
     CloseAll,
 }
 struct Tab {
+    manifest_view: Option<crate::manifest_view::ManifestView>,
     pinned: bool,
     bookmarked: bool,
     loading_navigation: bool,
@@ -369,6 +374,9 @@ impl Tab {
             return Ok(false);
         }
         document.jump_to_range(hit.start, hit.end)?;
+        if let Some(view) = &mut self.manifest_view {
+            view.select_xml();
+        }
         Ok(true)
     }
     fn attach_search_metadata(
@@ -399,26 +407,29 @@ impl Tab {
         Ok(())
     }
     fn retained_bytes(&self) -> usize {
-        match &self.content {
-            Content::Text(document) => document.retained_bytes(),
-            Content::Summary(document) => {
-                document.markdown.len()
-                    + document
-                        .blocks
-                        .iter()
-                        .map(|block| match block {
-                            SummaryBlock::Row(a, b) => a.len() + b.len(),
-                            SummaryBlock::Title(s)
-                            | SummaryBlock::Heading(s)
-                            | SummaryBlock::Code(s)
-                            | SummaryBlock::ExportedComponent(s)
-                            | SummaryBlock::Bullet(s)
-                            | SummaryBlock::Paragraph(s) => s.len(),
-                        })
-                        .sum::<usize>()
+        self.manifest_view
+            .as_ref()
+            .map_or(0, |view| view.retained_bytes())
+            + match &self.content {
+                Content::Text(document) => document.retained_bytes(),
+                Content::Summary(document) => {
+                    document.markdown.len()
+                        + document
+                            .blocks
+                            .iter()
+                            .map(|block| match block {
+                                SummaryBlock::Row(a, b) => a.len() + b.len(),
+                                SummaryBlock::Title(s)
+                                | SummaryBlock::Heading(s)
+                                | SummaryBlock::Code(s)
+                                | SummaryBlock::ExportedComponent(s)
+                                | SummaryBlock::Bullet(s)
+                                | SummaryBlock::Paragraph(s) => s.len(),
+                            })
+                            .sum::<usize>()
+                }
+                Content::Image { width, height, .. } => *width as usize * *height as usize * 4,
             }
-            Content::Image { width, height, .. } => *width as usize * *height as usize * 4,
-        }
     }
     fn text(&self) -> Option<&str> {
         match &self.content {
@@ -432,6 +443,7 @@ impl Tab {
 pub struct App {
     render_recovery: crate::render_recovery::RenderRecovery,
     toolbar_icon: Option<egui::TextureHandle>,
+    application_icon: Option<egui::TextureHandle>,
     mcp_server: Option<rdx::mcp::Server>,
     show_mcp: bool,
     mcp_error: String,
@@ -456,6 +468,7 @@ pub struct App {
     project: Option<Project>,
     archive: Option<Arc<Archive>>,
     tree: Node,
+    asset_grouping: AssetGrouping,
     path: Option<PathBuf>,
     initial: Option<PathBuf>,
     busy: bool,
@@ -555,6 +568,7 @@ impl App {
         Self {
             render_recovery: Default::default(),
             toolbar_icon: None,
+            application_icon: None,
             mcp_server: None,
             show_mcp: false,
             mcp_error: String::new(),
@@ -579,6 +593,7 @@ impl App {
             project: None,
             archive: None,
             tree: Node::default(),
+            asset_grouping: AssetGrouping::default(),
             path: None,
             initial,
             busy: false,
@@ -705,6 +720,7 @@ impl App {
             self.project.as_ref().map_or(&[], |p| p.classes.as_slice()),
             self.archive.as_ref().map_or(&[], |a| a.entries.as_slice()),
             &self.filter,
+            self.asset_grouping,
         );
     }
     fn stop(&mut self) {
@@ -732,6 +748,7 @@ impl App {
         }
         self.call_graph = crate::call_graph_window::CallGraphWindow::default();
         self.generation += 1;
+        self.application_icon = None;
         self.search_cache = Arc::new(Mutex::new(search::SearchCache::default()));
         self.engine = None;
         self.busy = false;
@@ -743,6 +760,7 @@ impl App {
     fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.mcp_server = None;
         self.stop();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(WINDOW_TITLE.into()));
         self.project = None;
         self.archive = None;
         self.search.results.clear();
@@ -783,6 +801,18 @@ impl App {
                     ctx.request_repaint();
                     engine.open_prepared(source)?
                 };
+                if let Ok(xml) = engine.read_resource("AndroidManifest.xml")
+                    && let Ok(package) = rdx::manifest_summary::package_name(&xml)
+                    && !package.trim().is_empty()
+                    && !package.chars().any(char::is_control)
+                {
+                    let _ = tx.send(Event::PackageName(generation, package));
+                }
+                if let Some(container) = engine.prepared_container()
+                    && let Some(icon) = rdx::app_icon::load(&container, engine.resource_table())
+                {
+                    let _ = tx.send(Event::AppIcon(generation, icon));
+                }
                 Ok((engine, project))
             })()
             .map_err(|e: anyhow::Error| format!("{e:#}"));
@@ -845,6 +875,7 @@ impl App {
             document.jump_to(position)?;
         }
         self.push_tab(Tab {
+            manifest_view: None,
             pinned: false,
             bookmarked: false,
             loading_navigation: false,
@@ -1377,6 +1408,7 @@ impl App {
             SearchTarget::Resource(index) => Target::File(*index),
         };
         if let Err(error) = self.push_tab(Tab {
+            manifest_view: None,
             pinned: false,
             bookmarked: false,
             loading_navigation: needs_metadata,
@@ -1557,6 +1589,11 @@ impl App {
         }
     }
     fn push_tab(&mut self, mut tab: Tab) -> Result<(), String> {
+        if is_manifest_path(&tab.name)
+            && let Content::Text(document) = &tab.content
+        {
+            tab.manifest_view = Some(crate::manifest_view::ManifestView::new(document.text()));
+        }
         const BUDGET: usize = 64 * 1024 * 1024;
         let existing = self.tabs.iter().position(|old| old.target == tab.target);
         if let Some(index) = existing {
@@ -1843,6 +1880,21 @@ impl App {
                         _ => {}
                     }
                 }
+                Event::PackageName(generation, package) if generation == self.generation => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+                        "{WINDOW_TITLE} ({package})"
+                    )));
+                }
+                Event::AppIcon(generation, icon) if generation == self.generation => {
+                    self.application_icon = Some(ctx.load_texture(
+                        format!("application-icon-{generation}"),
+                        egui::ColorImage::from_rgba_unmultiplied(
+                            [icon.width() as usize, icon.height() as usize],
+                            icon.as_raw(),
+                        ),
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
                 Event::Archive(generation, archive) if generation == self.generation => {
                     self.archive = Some(archive);
                     self.loading_progress = self.loading_progress.max(0.25);
@@ -1999,6 +2051,7 @@ impl App {
                                 "Asset ready".into()
                             };
                             if let Err(error) = self.push_tab(Tab {
+                                manifest_view: None,
                                 pinned: false,
                                 bookmarked: false,
                                 loading_navigation: false,
@@ -2070,6 +2123,7 @@ impl App {
                             }
                             document.set_links(links);
                             if let Err(error) = self.push_tab(Tab {
+                                manifest_view: None,
                                 pinned: false,
                                 bookmarked: false,
                                 loading_navigation: false,
@@ -2125,6 +2179,7 @@ impl App {
                     match result {
                         Ok(summary) => {
                             let tab = Tab {
+                                manifest_view: None,
                                 pinned: false,
                                 bookmarked: false,
                                 loading_navigation: false,
@@ -2461,6 +2516,7 @@ struct TreeActions {
     selected: Option<Target>,
     export: Option<Target>,
     manifest_summary: Option<usize>,
+    asset_grouping: Option<AssetGrouping>,
 }
 fn draw_tree(
     ui: &mut egui::Ui,
@@ -2468,9 +2524,20 @@ fn draw_tree(
     path: &str,
     active: Option<&Target>,
     ready: (bool, bool),
+    asset_grouping: AssetGrouping,
     actions: &mut TreeActions,
 ) {
-    for (name, child) in &node.children {
+    // Keep asset directories before files without changing class/package ordering.
+    let assets = path == "/Assets" || path.starts_with("/Assets/");
+    let folders = node
+        .children
+        .iter()
+        .filter(|(_, n)| !assets || !n.children.is_empty());
+    let files = node
+        .children
+        .iter()
+        .filter(|(_, n)| assets && n.children.is_empty());
+    for (name, child) in folders.chain(files) {
         let key = format!("{path}/{name}");
         if !child.children.is_empty() {
             let id = ui.make_persistent_id(&key);
@@ -2493,7 +2560,29 @@ fn draw_tree(
             if clicked {
                 header.toggle();
             }
-            header.body(|ui| draw_tree(ui, child, &key, active, ready, actions));
+            header.body(|ui| {
+                if key == "/Assets" {
+                    let mut grouping = asset_grouping;
+                    ui.horizontal(|ui| {
+                        ui.label("Group by");
+                        egui::ComboBox::from_id_salt("asset_grouping")
+                            .selected_text(grouping.label())
+                            .show_ui(ui, |ui| {
+                                for value in [AssetGrouping::Folder, AssetGrouping::FileType] {
+                                    ui.selectable_value(&mut grouping, value, value.label());
+                                }
+                            });
+                    });
+                    if grouping != asset_grouping {
+                        actions.asset_grouping = Some(grouping);
+                    }
+                    ui.push_id(asset_grouping, |ui| {
+                        draw_tree(ui, child, &key, active, ready, asset_grouping, actions);
+                    });
+                } else {
+                    draw_tree(ui, child, &key, active, ready, asset_grouping, actions);
+                }
+            });
         }
         for target in &child.targets {
             let enabled = match target {
@@ -2508,7 +2597,7 @@ fn draw_tree(
                 active == Some(target),
                 enabled,
             )
-            .on_hover_text(&key);
+            .on_hover_text(child.source_path.as_deref().unwrap_or(&key));
             if response.clicked() {
                 actions.selected = Some(target.clone());
             }
@@ -2615,13 +2704,13 @@ impl eframe::App for App {
                             egui::TextureOptions::LINEAR,
                         )
                     });
+                    let texture = self.application_icon.as_ref().unwrap_or(texture);
+                    let size = texture.size_vec2();
+                    let display_size = size * (24.0 / size.x.max(size.y));
                     let launch = ui
                         .add(
-                            egui::Button::image(egui::Image::new((
-                                texture.id(),
-                                egui::vec2(24.0, 24.0),
-                            )))
-                            .frame(false),
+                            egui::Button::image(egui::Image::new((texture.id(), display_size)))
+                                .frame(false),
                         )
                         .on_hover_text("Open a new RDX instance");
                     launch.widget_info(|| {
@@ -2990,11 +3079,16 @@ impl eframe::App for App {
                                 "",
                                 self.tabs.get(self.selected).map(|t| &t.target),
                                 (self.engine.is_some() && !self.busy, !self.asset_busy),
+                                self.asset_grouping,
                                 &mut tree_actions,
                             );
                         });
                     });
             });
+        if let Some(grouping) = tree_actions.asset_grouping {
+            self.asset_grouping = grouping;
+            self.rebuild_tree();
+        }
         if let Some(target) = tree_actions.selected {
             self.choose_target(target, ctx);
         }
@@ -3004,6 +3098,7 @@ impl eframe::App for App {
         let mut export = tree_actions.export;
         let mut jump = None;
         let mut manifest_jump = None;
+        let mut manifest_summary_request = None;
         let mut usage_request = None;
         let mut graph_request = None;
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -3091,6 +3186,28 @@ impl eframe::App for App {
                     ui.push_id((&tab.name, self.generation), |ui| match &mut tab.content {
                         Content::Summary(document) => document.show(ui, self.font_size),
                         Content::Text(document) => {
+                            if let Some(view) = &mut tab.manifest_view {
+                                let action =
+                                    view.show(ui, !self.busy || self.search_cancel.is_some());
+                                if action.summary
+                                    && let Target::File(index) = tab.target
+                                {
+                                    manifest_summary_request = Some(index);
+                                }
+                                if let Some(class) = action.class {
+                                    manifest_jump = Some((
+                                        class,
+                                        JumpLocation {
+                                            target: tab.target.clone(),
+                                            position: document.navigation_position(),
+                                            source_hash: None,
+                                        },
+                                    ));
+                                }
+                                if !action.show_xml {
+                                    return;
+                                }
+                            }
                             document.set_word_wrap(self.word_wrap);
                             document.set_code_font(self.code_font);
                             document.set_usages_enabled(
@@ -3205,6 +3322,9 @@ impl eframe::App for App {
                 }
             }
         });
+        if let Some(index) = manifest_summary_request {
+            self.open_manifest_summary(index, ctx);
+        }
         if let Some((class, offset, hash)) = graph_request {
             self.build_call_graph(class, offset, hash, ctx);
         }
@@ -3519,11 +3639,30 @@ mod settings_tests {
         assert!(!app.search.results.is_empty());
     }
 
+    #[test]
+    fn app_icon_resets_and_ignores_previous_project_results() {
+        let ctx = egui::Context::default();
+        let mut app = navigation_test_app();
+        let icon = image::RgbaImage::from_pixel(48, 48, image::Rgba([10, 20, 30, 255]));
+        app.tx
+            .send(Event::AppIcon(app.generation, icon.clone()))
+            .unwrap();
+        app.events(&ctx);
+        assert!(app.application_icon.is_some());
+        let previous = app.generation;
+        app.stop();
+        assert!(app.application_icon.is_none());
+        app.tx.send(Event::AppIcon(previous, icon)).unwrap();
+        app.events(&ctx);
+        assert!(app.application_icon.is_none());
+    }
+
     fn navigation_test_app() -> App {
         let (tx, rx) = mpsc::channel();
         App {
             render_recovery: Default::default(),
             toolbar_icon: None,
+            application_icon: None,
             mcp_server: None,
             show_mcp: false,
             mcp_error: String::new(),
@@ -3548,6 +3687,7 @@ mod settings_tests {
             project: None,
             archive: None,
             tree: Node::default(),
+            asset_grouping: AssetGrouping::default(),
             path: None,
             initial: None,
             busy: false,
@@ -3796,6 +3936,7 @@ mod settings_tests {
 
     fn sample_tab(index: usize, bytes: usize) -> Tab {
         Tab {
+            manifest_view: None,
             pinned: false,
             bookmarked: false,
             loading_navigation: false,
@@ -4159,6 +4300,7 @@ mod settings_tests {
             label: "sample.Target".into(),
         }]);
         let mut tab = Tab {
+            manifest_view: None,
             pinned: false,
             bookmarked: false,
             loading_navigation: false,
@@ -4312,6 +4454,7 @@ mod settings_tests {
     #[test]
     fn deferred_search_metadata_refreshes_changed_source_and_rejects_stale_requests() {
         let mut tab = Tab {
+            manifest_view: None,
             pinned: false,
             bookmarked: false,
             loading_navigation: true,

@@ -3,6 +3,7 @@ mod code_fonts;
 mod code_view;
 mod icons;
 mod manifest_links;
+mod manifest_view;
 use rdx::manifest_summary;
 mod native_coverage;
 mod navigation;
@@ -99,7 +100,7 @@ fn main() -> Result<()> {
             let app_icon =
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/rdx.png"))?;
             eframe::run_native(
-                "RDX — Java & Android decompiler",
+                ui::WINDOW_TITLE,
                 eframe::NativeOptions {
                     viewport: eframe::egui::ViewportBuilder::default()
                         .with_icon(app_icon)

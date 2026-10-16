@@ -1,6 +1,43 @@
 use rdx::apk::Entry;
 use std::collections::BTreeMap;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AssetGrouping {
+    #[default]
+    Folder,
+    FileType,
+}
+
+impl AssetGrouping {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Folder => "Folder",
+            Self::FileType => "File type",
+        }
+    }
+}
+
+fn asset_type(path: &str) -> &'static str {
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let extension = filename.rsplit_once('.').map_or("", |(_, ext)| ext);
+    match extension.to_ascii_lowercase().as_str() {
+        "json" => "JSON",
+        "js" | "mjs" | "cjs" => "JavaScript",
+        "xml" => "XML",
+        "html" | "htm" => "HTML",
+        "css" => "CSS",
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "svg" | "avif" | "ico" => "Images",
+        "ttf" | "otf" | "woff" | "woff2" => "Fonts",
+        "tflite" | "lite" | "onnx" | "pb" => "Models",
+        "dex" => "DEX",
+        "lottie" | "riv" => "Animations",
+        "mp3" | "wav" | "ogg" | "m4a" | "aac" | "flac" => "Audio",
+        "mp4" | "webm" | "mov" => "Video",
+        "txt" | "md" | "csv" | "properties" => "Text",
+        _ => "Other",
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
     Class(String),
@@ -13,6 +50,7 @@ pub struct Node {
     pub children: BTreeMap<String, Node>,
     pub targets: Vec<Target>,
     pub count: usize,
+    pub source_path: Option<String>,
 }
 
 impl Node {
@@ -61,7 +99,7 @@ pub fn category(path: &str) -> (&str, &str) {
     }
 }
 
-pub fn build(classes: &[String], entries: &[Entry], filter: &str) -> Node {
+pub fn build(classes: &[String], entries: &[Entry], filter: &str, grouping: AssetGrouping) -> Node {
     let mut root = Node::default();
     let filter = filter.to_lowercase();
     for class in classes {
@@ -78,8 +116,20 @@ pub fn build(classes: &[String], entries: &[Entry], filter: &str) -> Node {
         }
         let (group, path) = category(&entry.path);
         let mut parts = vec![group];
+        if group == "Assets" && grouping == AssetGrouping::FileType {
+            parts.push(asset_type(path));
+        }
         parts.extend(path.split('/'));
         root.insert(&parts, Target::File(entry.index));
+        // Keep the actual archive path for tooltips, independent of virtual groups.
+        let mut leaf = &mut root;
+        for part in parts.iter().take(63) {
+            leaf = leaf.children.get_mut(*part).unwrap();
+        }
+        if parts.len() > 63 {
+            leaf = leaf.children.get_mut(&parts[63..].join("/")).unwrap();
+        }
+        leaf.source_path = Some(entry.path.clone());
     }
     root
 }
@@ -87,6 +137,62 @@ pub fn build(classes: &[String], entries: &[Entry], filter: &str) -> Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn asset_grouping_preserves_identity_folders_and_search() {
+        let entries: Vec<_> = [
+            "assets/a/config.JSON",
+            "assets/b/config.JSON",
+            "assets/model.tflite",
+            "assets/font.ttf",
+            "assets/code.js",
+            "assets/picture.png",
+            "assets/a/no-extension",
+            "res/raw/config.JSON",
+            "splits/feature/assets/config.JSON",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| Entry {
+            index,
+            path: path.into(),
+            size: 0,
+            compressed_size: 0,
+        })
+        .collect();
+        let folders = build(&[], &entries, "", AssetGrouping::Folder);
+        assert_eq!(folders.children["Assets"].count, 7);
+        assert_eq!(
+            folders.children["Assets"].children["a"].children["config.JSON"].targets,
+            [Target::File(0)]
+        );
+        let grouped = build(&[], &entries, "", AssetGrouping::FileType);
+        let assets = &grouped.children["Assets"];
+        assert_eq!(assets.count, 7);
+        assert_eq!(assets.children["JSON"].count, 2);
+        for (folder, index) in [("a", 0), ("b", 1)] {
+            let leaf = &assets.children["JSON"].children[folder].children["config.JSON"];
+            assert_eq!(leaf.targets, [Target::File(index)]);
+            assert_eq!(
+                leaf.source_path.as_deref(),
+                Some(entries[index].path.as_str())
+            );
+        }
+        for kind in ["Models", "Fonts", "JavaScript", "Images", "Other"] {
+            assert_eq!(assets.children[kind].count, 1);
+        }
+        assert_eq!(
+            grouped.children["Resources"].children["raw"].children["config.JSON"].targets,
+            [Target::File(7)]
+        );
+        assert_eq!(grouped.children["Splits"].children["feature"].children["assets"].children["config.JSON"].targets, [Target::File(8)]);
+        let filtered = build(&[], &entries, "ASSETS/B/CONFIG", AssetGrouping::FileType);
+        assert_eq!(filtered.count, 1);
+        assert_eq!(
+            filtered.children["Assets"].children["JSON"].children["b"].children["config.JSON"]
+                .targets,
+            [Target::File(1)]
+        );
+    }
     #[test]
     fn split_paths_keep_their_apk_origin_in_the_tree() {
         assert_eq!(
@@ -109,6 +215,7 @@ mod tests {
             &["com.example.One".into(), "com.example.Two".into()],
             &entries,
             "",
+            AssetGrouping::Folder,
         );
         assert_eq!(root.count, 2);
         assert_eq!(
@@ -119,6 +226,7 @@ mod tests {
             &["com.example.One".into(), "com.example.Two".into()],
             &entries,
             "ONE",
+            AssetGrouping::Folder,
         );
         assert_eq!(filtered.count, 1);
     }
@@ -131,7 +239,7 @@ mod tests {
             size: 0,
             compressed_size: 0,
         }];
-        let root = build(&[], &entries, "");
+        let root = build(&[], &entries, "", AssetGrouping::Folder);
         let mut node = &root;
         let mut depth = 0;
         while let Some(child) = node.children.values().next() {

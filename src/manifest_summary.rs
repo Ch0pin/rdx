@@ -93,6 +93,19 @@ fn child<'a>(nodes: &'a [Node], parent: usize, tag: &str) -> Option<&'a Node> {
         .iter()
         .find(|n| n.parent == Some(parent) && n.tag == tag)
 }
+
+/// Only application-level Android attributes identify the launcher artwork.
+pub(crate) fn application_icons(xml: &str) -> Option<(String, Vec<String>)> {
+    let nodes = parse(xml).ok()?;
+    let application = child(&nodes, 0, "application")?;
+    Some((
+        nodes[0].get("raw:package").unwrap_or_default().to_owned(),
+        ["icon", "roundIcon"]
+            .into_iter()
+            .filter_map(|key| application.get(key).map(str::to_owned))
+            .collect(),
+    ))
+}
 fn value(node: &Node, key: &str) -> String {
     node.get(key).unwrap_or("Not declared").to_owned()
 }
@@ -253,6 +266,155 @@ pub fn package_name(xml: &str) -> Result<String, String> {
         .ok_or_else(|| "Missing package name".into())
 }
 
+/// Export defaults for Android API 17+, shared by the report and component table.
+fn exported_value(component: &Node, target: Option<u32>, has_filters: bool) -> String {
+    match component.get("exported") {
+        Some("true") => "true (explicit)".into(),
+        Some("false") => "false (explicit)".into(),
+        Some(v) => format!("{v} (unresolved)"),
+        None if component.tag == "provider" => target
+            .map(|t| format!("{} (inferred from target SDK {t})", t <= 16))
+            .unwrap_or_else(|| "Unresolved (target SDK)".into()),
+        None if has_filters && target.is_none() => "Unresolved (target SDK)".into(),
+        None if has_filters && target.is_some_and(|t| t >= 31) => {
+            "Unresolved (missing exported on target SDK 31+)".into()
+        }
+        None => format!("{} (inferred from intent filters)", has_filters),
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ManifestComponent {
+    pub kind: String,
+    pub name: String,
+    pub target: String,
+    pub exported: String,
+    pub enabled: String,
+    pub launcher: bool,
+    pub filters: Vec<String>,
+    pub details: Vec<(String, String)>,
+}
+impl ManifestComponent {
+    pub fn is_exported(&self) -> bool {
+        self.exported.starts_with("true")
+    }
+}
+
+/// Structured declarations; unresolved resource flags stay explicitly unknown.
+pub fn components(xml: &str) -> Result<Vec<ManifestComponent>, String> {
+    let nodes = parse(xml)?;
+    let package = nodes[0].get("raw:package").unwrap_or_default();
+    let sdk = child(&nodes, 0, "uses-sdk");
+    let target = sdk
+        .and_then(|n| n.get("targetSdkVersion"))
+        .or_else(|| sdk.and_then(|n| n.get("minSdkVersion")))
+        .unwrap_or("1")
+        .parse::<u32>()
+        .ok();
+    let Some(app_index) = nodes
+        .iter()
+        .position(|n| n.parent == Some(0) && n.tag == "application")
+    else {
+        return Ok(Vec::new());
+    };
+    let app = &nodes[app_index];
+    let mut result = Vec::new();
+    for (index, node) in nodes.iter().enumerate().filter(|(_, n)| {
+        n.parent == Some(app_index)
+            && matches!(
+                n.tag.as_str(),
+                "activity" | "activity-alias" | "service" | "receiver" | "provider"
+            )
+    }) {
+        let name = class_name(package, node.get("name").unwrap_or("Not declared"));
+        let mut launcher = false;
+        let mut filters = Vec::new();
+        for (filter_index, filter) in nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.parent == Some(index) && n.tag == "intent-filter")
+        {
+            let children: Vec<_> = nodes
+                .iter()
+                .filter(|n| n.parent == Some(filter_index))
+                .collect();
+            if matches!(node.tag.as_str(), "activity" | "activity-alias") {
+                launcher |= children.iter().any(|n| {
+                    n.tag == "action" && n.get("name") == Some("android.intent.action.MAIN")
+                }) && children.iter().any(|n| {
+                    n.tag == "category"
+                        && matches!(
+                            n.get("name"),
+                            Some(
+                                "android.intent.category.LAUNCHER"
+                                    | "android.intent.category.LEANBACK_LAUNCHER"
+                            )
+                        )
+                });
+            }
+            let mut lines = Vec::new();
+            for (key, val) in &filter.attrs {
+                lines.push(format!("{key}: {val}"));
+            }
+            // Keep each data element intact rather than inventing URL combinations.
+            for child in children {
+                lines.push(format!(
+                    "{}: {}",
+                    child.tag,
+                    child
+                        .attrs
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            filters.push(lines.join("\n"));
+        }
+        let component_enabled = bool_value(node, "enabled", Some(true));
+        let app_enabled = bool_value(app, "enabled", Some(true));
+        let enabled = if component_enabled.starts_with("false") || app_enabled.starts_with("false")
+        {
+            "false".to_owned()
+        } else if component_enabled.starts_with("true") && app_enabled.starts_with("true") {
+            "true".to_owned()
+        } else {
+            "unresolved".to_owned()
+        };
+        let mut details = vec![
+            ("Component enabled".into(), component_enabled),
+            ("Application enabled".into(), app_enabled),
+        ];
+        for (key, val) in &node.attrs {
+            details.push((key.clone(), val.clone()));
+        }
+        if node.get("permission").is_none()
+            && node.tag != "activity-alias"
+            && let Some(permission) = app.get("permission")
+        {
+            details.push(("Inherited application permission".into(), permission.into()));
+        }
+        let target_class = if node.tag == "activity-alias" {
+            node.get("targetActivity")
+                .map(|n| class_name(package, n))
+                .unwrap_or_default()
+        } else {
+            name.clone()
+        };
+        result.push(ManifestComponent {
+            kind: node.tag.clone(),
+            name,
+            target: target_class,
+            exported: exported_value(node, target, !filters.is_empty()),
+            enabled,
+            launcher,
+            filters,
+            details,
+        });
+    }
+    Ok(result)
+}
+
 pub fn render(
     xml: &str,
     path: &Path,
@@ -336,19 +498,7 @@ pub fn render(
                 .filter(|(_, n)| n.parent == Some(index) && n.tag == "intent-filter")
                 .map(|(i, _)| i)
                 .collect();
-            let exported = match component.get("exported") {
-                Some("true") => "true (explicit)".into(),
-                Some("false") => "false (explicit)".into(),
-                Some(v) => format!("{v} (unresolved)"),
-                None if component.tag == "provider" => target
-                    .map(|t| format!("{} (inferred from target SDK {t})", t <= 16))
-                    .unwrap_or_else(|| "Unresolved (target SDK)".into()),
-                None if !filters.is_empty() && target.is_none() => "Unresolved (target SDK)".into(),
-                None if !filters.is_empty() && target.is_some_and(|t| t >= 31) => {
-                    "Unresolved (missing exported on target SDK 31+)".into()
-                }
-                None => format!("{} (inferred from intent filters)", !filters.is_empty()),
-            };
+            let exported = exported_value(component, target, !filters.is_empty());
             let enabled = bool_value(component, "enabled", Some(true));
             if exported.contains("Unresolved")
                 || exported.contains("unresolved")
@@ -638,5 +788,47 @@ mod tests {
         .unwrap();
         assert!(text.contains("Unresolved (target SDK)"));
         assert!(text.contains("## Exported activities and aliases\n\nNone identified"));
+    }
+}
+
+#[cfg(test)]
+mod component_table_tests {
+    use super::*;
+    #[test]
+    fn component_table_preserves_filters_aliases_and_application_flags() {
+        let xml = r#"<manifest xmlns:a="http://schemas.android.com/apk/res/android" package="demo"><uses-sdk a:targetSdkVersion="30"/><application a:enabled="false" a:permission="demo.ACCESS"><activity a:name=".Main"><intent-filter><action a:name="android.intent.action.MAIN"/><category a:name="android.intent.category.LAUNCHER"/><data a:scheme="demo" a:host="one.test"/><data a:pathPrefix="/open"/></intent-filter></activity><activity-alias a:name="Alias" a:targetActivity=".Main" a:exported="true"/><service a:name=".Worker"/><receiver a:name=".Receiver" a:exported="@bool/exported"/><provider a:name=".Provider" a:authorities="demo.provider"/></application><activity a:name=".Outside"/></manifest>"#;
+        let rows = components(xml).unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0].name, "demo.Main");
+        assert!(rows[0].is_exported());
+        assert!(rows[0].launcher);
+        assert_eq!(rows[0].enabled, "false");
+        assert_eq!(rows[0].filters[0].matches("data:").count(), 2);
+        assert!(
+            rows[0]
+                .details
+                .iter()
+                .any(|(k, v)| k == "Inherited application permission" && v == "demo.ACCESS")
+        );
+        assert_eq!(rows[1].target, "demo.Main");
+        assert!(!rows[1].launcher);
+        assert!(!rows[2].is_exported());
+        assert!(rows[3].exported.contains("unresolved"));
+        assert!(!rows[4].is_exported());
+    }
+    #[test]
+    fn component_table_sdk_defaults_and_unknowns() {
+        for (sdk, expected) in [("16", "true"), ("17", "false"), ("Preview", "Unresolved")] {
+            let xml = format!(
+                r#"<manifest xmlns:a="http://schemas.android.com/apk/res/android"><uses-sdk a:targetSdkVersion="{sdk}"/><application><provider a:name="demo.P"/></application></manifest>"#
+            );
+            assert!(components(&xml).unwrap()[0].exported.starts_with(expected));
+        }
+        let xml = r#"<manifest xmlns:a="http://schemas.android.com/apk/res/android"><uses-sdk a:targetSdkVersion="31"/><application><activity a:name="demo.A" a:enabled="@bool/enabled"><intent-filter><action a:name="android.intent.action.MAIN"/></intent-filter><intent-filter><category a:name="android.intent.category.LAUNCHER"/></intent-filter></activity></application></manifest>"#;
+        let row = components(xml).unwrap().remove(0);
+        assert!(!row.launcher);
+        assert_eq!(row.enabled, "unresolved");
+        assert!(row.exported.contains("missing exported"));
+        assert!(components("<manifest><application>").is_err());
     }
 }

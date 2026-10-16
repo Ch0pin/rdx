@@ -4,6 +4,8 @@
 //! platform graph below only records relationships guaranteed by the Java type
 //! hierarchy and needed to anchor exception ancestry.
 
+#[path = "native_cast_calls.rs"]
+mod cast_calls;
 #[path = "native_constructor_recovery.rs"]
 mod constructor_recovery;
 #[path = "native_this_receiver_identity.rs"]
@@ -20,7 +22,9 @@ const MAX_QUERY_NODES: usize = 131_072;
 const MAX_QUERY_EDGES: usize = 524_288;
 const MAX_CACHE_ENTRIES: usize = 8_192;
 const MAX_CACHE_KEY_BYTES: usize = 512;
-const MAX_READABILITY_FAMILIES: usize = 256_000;
+// Large multidex APKs can exceed 390k families. Keep a finite certificate
+// budget while allowing their argument-cast proofs to remain available.
+const MAX_READABILITY_FAMILIES: usize = 512_000;
 const OBJECT: &str = "Ljava/lang/Object;";
 
 pub(crate) fn object_method_signature(signature: &str) -> bool {

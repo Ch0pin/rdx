@@ -79,7 +79,7 @@ fn scalar_at(source: &str, bytes: &[usize]) -> Vec<usize> {
 
 // Local names inside anonymous classes/lambdas belong to different scopes.
 // This pass accepts ordinary method/control blocks only, before class layout.
-fn ordinary_method_scopes(source: &str, parsed: &Syntax) -> bool {
+pub(super) fn ordinary_method_scopes(source: &str, parsed: &Syntax) -> bool {
     if source.contains("->") {
         return false;
     }
@@ -160,7 +160,10 @@ fn adjacent_returns(code: DecompiledCode, method: &DexMethod) -> DecompiledCode 
         {
             continue;
         }
-        let primitive = PRIMITIVES.contains(&ty) && ty == return_type;
+        // Assignment and return provide the same target type. This also covers
+        // reference-returning calls (including generic factories) without
+        // changing inference or moving the call across another statement.
+        let same_context = ty == return_type;
         let constructor = expression
             .strip_prefix("new ")
             .and_then(|s| s.strip_prefix(ty))
@@ -171,7 +174,7 @@ fn adjacent_returns(code: DecompiledCode, method: &DexMethod) -> DecompiledCode 
             });
         // An exact, non-generic `new T(...)` has no target-dependent overload
         // inference. Preserve all argument casts and the original allocation site.
-        if !(primitive || constructor && (ty == return_type || return_type == "java.lang.Object")) {
+        if !(same_context || constructor && return_type == "java.lang.Object") {
             continue;
         }
         work = work.saturating_add(code.links.len() + code.definitions.len());
@@ -404,6 +407,23 @@ mod tests {
             links: vec![],
             definitions: vec![],
         }
+    }
+
+    #[test]
+    fn adjacent_reference_calls_keep_the_same_target_type() {
+        let source = "    public java.lang.String run() {\n        java.lang.String v0 = Factory.make();\n        return v0;\n    }\n";
+        let after = simplify(code(source), &method("Ljava/lang/String;"));
+        assert_eq!(
+            after.source,
+            "    public java.lang.String run() {\n        return Factory.make();\n    }\n"
+        );
+        // A wider return target can change generic method inference; retain the
+        // original String assignment context in that case.
+        let wider = source.replace("public java.lang.String run", "public java.lang.Object run");
+        assert_eq!(
+            simplify(code(&wider), &method("Ljava/lang/Object;")).source,
+            wider
+        );
     }
     fn source(body: &str) -> String {
         format!("    public static java.lang.Object run() {{\n{body}    }}\n")
@@ -653,6 +673,14 @@ mod tests {
         use std::{fs, process::Command};
         let fixtures = [
             (
+                "Ljava/lang/String;",
+                concat!(
+                    "    public static java.lang.String generic(int p0) {\n",
+                    "        java.lang.String v0 = Effects.make(p0);\n",
+                    "        return v0;\n    }\n"
+                ),
+            ),
+            (
                 "Ljava/lang/Object;",
                 concat!(
                     "    public static Object create(int p0) {\n",
@@ -714,6 +742,7 @@ class Effects {
  static int first(int mode) { log.append("first|"); if(mode==1) throw marker; return mode; }
  static String second(int mode) { log.append("second|"); if(mode==2) throw marker; return "value"; }
  static Response existing(int mode) { log.append("existing|"); return null; }
+ @SuppressWarnings("unchecked") static <T> T make(int mode) { log.append("generic|"); if(mode==1)throw marker; return (T)(mode==2?null:"value"); }
 }
 class Response {
  static { Effects.log.append("init|"); }
@@ -730,6 +759,10 @@ public class Check {
   String[] expected={"init|first|second|object|","init|first|","init|first|second|","init|first|second|object|"};
   if(!Effects.log.toString().equals(expected[mode])) throw new AssertionError(Effects.log);
   if(c.getMethod("cast",int.class).invoke(null,0)!=null) throw new AssertionError();
+  Effects.log.setLength(0);
+  try { System.out.println("generic:"+c.getMethod("generic",int.class).invoke(null,mode)); }
+  catch(java.lang.reflect.InvocationTargetException e) { if(e.getCause()!=Effects.marker)throw e; System.out.println("generic:marker"); }
+  if(!Effects.log.toString().equals("generic|"))throw new AssertionError(Effects.log);
   for(int limit: new int[]{-2,0,1,2,3,4,10}) {
    Effects.log.setLength(0);
    Object r=c.getMethod("loop",int.class).invoke(null,limit);

@@ -1,16 +1,50 @@
-//! A display-only projection for the compiler's Kotlin metadata annotation.
-use std::ops::Range;
+//! Display-only folding for Kotlin metadata and Java import blocks.
+use std::{borrow::Cow, ops::Range};
 
 pub const SUMMARY: &str = "@Metadata — Kotlin compiler metadata";
+
+#[derive(Clone, Debug)]
+pub enum FoldKind {
+    Metadata,
+    Imports(usize),
+}
 
 #[derive(Clone, Debug)]
 pub struct MetadataFold {
     pub bytes: Range<usize>,
     pub chars: Range<usize>,
     pub expanded: bool,
+    pub kind: FoldKind,
 }
 
 impl MetadataFold {
+    pub fn summary(&self) -> Cow<'static, str> {
+        match self.kind {
+            FoldKind::Metadata => Cow::Borrowed(SUMMARY),
+            FoldKind::Imports(count) => Cow::Owned(format!("imports ({count})")),
+        }
+    }
+    pub fn tooltip(&self) -> &'static str {
+        match (&self.kind, self.expanded) {
+            (FoldKind::Metadata, false) => "Expand Kotlin compiler metadata",
+            (FoldKind::Metadata, true) => "Collapse Kotlin compiler metadata",
+            (FoldKind::Imports(_), false) => "Expand imports",
+            (FoldKind::Imports(_), true) => "Collapse imports",
+        }
+    }
+    pub fn expanded_header_len(&self, source: &str) -> usize {
+        match self.kind {
+            FoldKind::Imports(_) => 6,
+            FoldKind::Metadata => {
+                if source[self.bytes.start..].starts_with("@kotlin.Metadata") {
+                    16
+                } else {
+                    9
+                }
+            }
+        }
+    }
+
     pub fn detect_all(source: &str, syntax: &str) -> Vec<Self> {
         if syntax != "java" {
             return Vec::new();
@@ -61,6 +95,7 @@ impl MetadataFold {
                 bytes,
                 chars,
                 expanded: false,
+                kind: FoldKind::Metadata,
             });
             offset += line.len();
         }
@@ -79,15 +114,16 @@ impl MetadataFold {
         if self.expanded {
             return source.to_owned();
         }
-        let mut text = String::with_capacity(source.len() - self.bytes.len() + SUMMARY.len());
+        let mut text =
+            String::with_capacity(source.len() - self.bytes.len() + self.summary().len());
         text.push_str(&source[..self.bytes.start]);
-        text.push_str(SUMMARY);
+        text.push_str(&self.summary());
         text.push_str(&source[self.bytes.end..]);
         text
     }
     #[cfg(test)]
     pub fn summary_chars(&self) -> Range<usize> {
-        self.chars.start..self.chars.start + SUMMARY.chars().count()
+        self.chars.start..self.chars.start + self.summary().chars().count()
     }
     #[cfg(test)]
     pub fn source_to_display(&self, source: usize) -> usize {
@@ -96,7 +132,7 @@ impl MetadataFold {
         } else if source < self.chars.end {
             self.chars.start
         } else {
-            source - self.chars.len() + SUMMARY.chars().count()
+            source - self.chars.len() + self.summary().chars().count()
         }
     }
     #[cfg(test)]
@@ -106,7 +142,7 @@ impl MetadataFold {
         } else if display < self.summary_chars().end {
             None
         } else {
-            Some(display - SUMMARY.chars().count() + self.chars.len())
+            Some(display - self.summary().chars().count() + self.chars.len())
         }
     }
     pub fn overlaps(&self, range: &Range<usize>) -> bool {
@@ -120,7 +156,9 @@ pub struct MetadataFolds {
 }
 impl MetadataFolds {
     pub fn detect(source: &str, syntax: &str) -> Option<Self> {
-        let folds = MetadataFold::detect_all(source, syntax);
+        let mut folds = MetadataFold::detect_all(source, syntax);
+        folds.extend(import_folds(source, syntax));
+        folds.sort_by_key(|fold| fold.bytes.start);
         (!folds.is_empty()).then_some(Self { folds })
     }
     pub fn collapsed(&self) -> bool {
@@ -129,7 +167,7 @@ impl MetadataFolds {
     pub fn display(&self, source: &str) -> String {
         let mut text = source.to_owned();
         for fold in self.folds.iter().rev().filter(|f| f.collapsed()) {
-            text.replace_range(fold.bytes.clone(), SUMMARY);
+            text.replace_range(fold.bytes.clone(), &fold.summary());
         }
         text
     }
@@ -142,7 +180,7 @@ impl MetadataFolds {
             if source < fold.chars.end {
                 return (fold.chars.start as isize - removed) as usize;
             }
-            removed += fold.chars.len() as isize - SUMMARY.chars().count() as isize;
+            removed += fold.chars.len() as isize - fold.summary().chars().count() as isize;
         }
         (source as isize - removed) as usize
     }
@@ -151,7 +189,7 @@ impl MetadataFolds {
         start
             ..start
                 + if fold.collapsed() {
-                    SUMMARY.chars().count()
+                    fold.summary().chars().count()
                 } else {
                     fold.chars.len()
                 }
@@ -166,7 +204,7 @@ impl MetadataFolds {
             if display < range.end {
                 return None;
             }
-            source += fold.chars.len() as isize - SUMMARY.chars().count() as isize;
+            source += fold.chars.len() as isize - fold.summary().chars().count() as isize;
         }
         Some(source as usize)
     }
@@ -184,6 +222,73 @@ impl MetadataFolds {
             }
         })
     }
+}
+
+// Restrict import folding to complete declarations in the Java preamble.
+// Blank lines may separate normal/static imports; comments remain visible.
+fn import_folds(source: &str, syntax: &str) -> Vec<MetadataFold> {
+    if syntax != "java" {
+        return Vec::new();
+    }
+    let mut folds = Vec::new();
+    let mut block: Option<(usize, usize, usize)> = None;
+    let flush = |block: &mut Option<(usize, usize, usize)>, folds: &mut Vec<MetadataFold>| {
+        if let Some((start, end, count)) = block.take()
+            && count > 1
+        {
+            folds.push(MetadataFold {
+                bytes: start..end,
+                chars: source[..start].chars().count()..source[..end].chars().count(),
+                expanded: false,
+                kind: FoldKind::Imports(count),
+            });
+        }
+    };
+    let mut offset = 0;
+    for (line, code) in source.split_inclusive('\n').zip(code_line_starts(source)) {
+        let text = line.trim();
+        if text.is_empty() {
+            offset += line.len();
+            continue;
+        }
+        if !code {
+            flush(&mut block, &mut folds);
+            offset += line.len();
+            continue;
+        }
+        let import = text
+            .strip_prefix("import ")
+            .and_then(|s| s.strip_suffix(';'))
+            .map(|s| s.strip_prefix("static ").unwrap_or(s))
+            .filter(|s| {
+                let parts: Vec<_> = s.split('.').collect();
+                parts.len() >= 2
+                    && parts.iter().enumerate().all(|(i, part)| {
+                        if *part == "*" {
+                            return i + 1 == parts.len();
+                        }
+                        let mut chars = part.chars();
+                        chars
+                            .next()
+                            .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+                            && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                    })
+            });
+        if import.is_some() {
+            let start = offset + line.len() - line.trim_start().len();
+            let end = offset + line.trim_end_matches('\n').len();
+            let entry = block.get_or_insert((start, end, 0));
+            entry.1 = end;
+            entry.2 += 1;
+        } else if text.starts_with("package ") && block.is_none() {
+            // The emitter places the package declaration before imports.
+        } else {
+            break;
+        }
+        offset += line.len();
+    }
+    flush(&mut block, &mut folds);
+    folds
 }
 
 // Whether the first non-whitespace token on each line is Java code. A comment
@@ -395,5 +500,61 @@ mod multiple_tests {
                 assert_eq!(group.source_boundary(range.start, true), fold.chars.end);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    #[test]
+    fn imports_and_metadata_expand_independently_with_exact_unicode_mappings() {
+        let source = "// café😀\npackage example;\nimport kotlin.Metadata;\nimport java.util.List;\n\nimport static java.util.Collections.*;\n@Metadata(d1={\"β\"})\nclass Example {}\n";
+        for mask in 0u32..4 {
+            let mut group = MetadataFolds::detect(source, "java").unwrap();
+            assert_eq!(group.folds.len(), 2);
+            assert!(matches!(group.folds[0].kind, FoldKind::Imports(3)));
+            for (i, fold) in group.folds.iter_mut().enumerate() {
+                fold.expanded = mask & (1 << i) != 0;
+            }
+            let display = group.display(source);
+            assert_eq!(display.contains("imports (3)"), mask & 1 == 0);
+            assert_eq!(display.contains(SUMMARY), mask & 2 == 0);
+            for pos in 0..=source.chars().count() {
+                if group
+                    .folds
+                    .iter()
+                    .any(|f| f.collapsed() && f.chars.contains(&pos))
+                {
+                    continue;
+                }
+                assert_eq!(
+                    group.display_to_source(group.source_to_display(pos)),
+                    Some(pos)
+                );
+            }
+            for fold in group.folds.iter().filter(|f| f.collapsed()) {
+                let range = group.display_range(fold);
+                assert_eq!(group.source_boundary(range.start, false), fold.chars.start);
+                assert_eq!(group.source_boundary(range.start, true), fold.chars.end);
+            }
+        }
+    }
+    #[test]
+    fn comments_stay_visible_and_import_lookalikes_do_not_fold() {
+        let source = "/*\nimport fake.A;\nimport fake.B;\n*/\nimport real.A;\nimport real.B;\n// useful comment\nimport real.C;\nimport real.D;\nclass Example {}\n";
+        let group = MetadataFolds::detect(source, "java").unwrap();
+        assert_eq!(group.folds.len(), 2);
+        assert!(group.display(source).contains("// useful comment"));
+        assert!(group.display(source).contains("import fake.A;"));
+        for source in [
+            "import one.A;\nclass Example {}",
+            "class Example {\nimport fake.A;\nimport fake.B;\n}",
+            "String example = \"\"\"\nimport fake.A;\nimport fake.B;\n\"\"\";",
+            ".method example.A()V\nimport fake.A;\nimport fake.B;",
+            "import broken..A;\nimport real.B;",
+        ] {
+            assert!(MetadataFolds::detect(source, "java").is_none(), "{source}");
+        }
+        assert!(MetadataFolds::detect("import real.A;\nimport real.B;", "xml").is_none());
     }
 }

@@ -7,7 +7,10 @@ use std::{collections::HashSet, io::Cursor};
 /// Uses the same selected APK/split resource set as the decompiler. Call off the UI thread.
 pub fn load(container: &PackageContainer, table: &ResourceTable) -> Option<RgbaImage> {
     let bytes = container
-        .read_path("AndroidManifest.xml", 2 * 1024 * 1024)
+        .read_path(
+            "AndroidManifest.xml",
+            crate::native_resources::MAX_XML_BYTES as u64,
+        )
         .ok()?;
     let xml = crate::native_resources::decode(&bytes).ok()?;
     let (package, icons) = crate::manifest_summary::application_icons(&xml)?;

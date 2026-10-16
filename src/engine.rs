@@ -248,7 +248,7 @@ impl NativeEngine {
         self.prepared
             .as_ref()
             .context("Open an APK first")?
-            .read_path(name, 2 * 1024 * 1024)
+            .read_path(name, crate::native_resources::MAX_XML_BYTES as u64)
     }
     pub fn resource_error(&self) -> Option<&str> {
         self.resource_error.as_deref()

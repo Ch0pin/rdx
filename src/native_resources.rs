@@ -3,7 +3,9 @@ use anyhow::{Context, Result, bail, ensure};
 #[path = "native_resource_attributes.rs"]
 mod attributes;
 const NONE: u32 = u32::MAX;
-const LIMIT: usize = 32 * 1024 * 1024;
+/// Shared cap for XML archive reads and native decoding.
+pub const MAX_XML_BYTES: usize = 32 * 1024 * 1024;
+const LIMIT: usize = MAX_XML_BYTES;
 pub(crate) fn u16_at(b: &[u8], p: usize) -> Result<u16> {
     Ok(u16::from_le_bytes(
         b.get(p..p + 2)

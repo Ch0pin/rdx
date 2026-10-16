@@ -406,6 +406,14 @@ impl Tab {
         self.loading_navigation = false;
         Ok(())
     }
+    fn source_bytes(&self) -> usize {
+        match &self.content {
+            Content::Text(document) => {
+                self.retained_bytes() - document.retained_bytes() + document.source_bytes()
+            }
+            _ => self.retained_bytes(),
+        }
+    }
     fn retained_bytes(&self) -> usize {
         self.manifest_view
             .as_ref()
@@ -1600,39 +1608,25 @@ impl App {
             tab.pinned = self.tabs[index].pinned;
             tab.bookmarked = self.tabs[index].bookmarked;
         }
-        if tab.retained_bytes() > BUDGET {
+        if tab.source_bytes() > BUDGET {
             return Err(
-                "View exceeds the 64 MiB tab budget; export it to inspect externally".into(),
+                "View exceeds the 64 MiB source budget; export it to inspect externally".into(),
             );
         }
-        // Plan before mutating: pin-blocked admission preserves every tab and selection.
-        let mut retained: usize = self
+        // Source admission never closes an existing view. Rendering caches have
+        // a separate, disposable lifetime and cannot consume this source budget.
+        let retained: usize = self
             .tabs
             .iter()
             .enumerate()
             .filter(|(index, _)| Some(*index) != existing)
-            .map(|(_, tab)| tab.retained_bytes())
+            .map(|(_, tab)| tab.source_bytes())
             .sum();
-        let mut count = self.tabs.len() - usize::from(existing.is_some());
-        let mut evict = Vec::new();
-        for (index, old) in self.tabs.iter().enumerate() {
-            if count < 8 && retained + tab.retained_bytes() <= BUDGET {
-                break;
-            }
-            if Some(index) != existing && !old.pinned {
-                count -= 1;
-                retained -= old.retained_bytes();
-                evict.push(index);
-            }
-        }
-        if count >= 8 || retained + tab.retained_bytes() > BUDGET {
-            return Err("Pinned views fill the tab budget (8 views / 64 MiB). Unpin or close a view before opening another".into());
+        let count = self.tabs.len() - usize::from(existing.is_some());
+        if count >= 8 || retained + tab.source_bytes() > BUDGET {
+            return Err("Open views fill the tab budget (8 views / 64 MiB of source). Close a view before opening another".into());
         }
         if let Some(index) = existing {
-            evict.push(index);
-        }
-        evict.sort_unstable();
-        for index in evict.into_iter().rev() {
             self.tabs.remove(index);
         }
         self.tabs.push(tab);
@@ -1645,6 +1639,23 @@ impl App {
             self.finish_history();
         }
         Ok(())
+    }
+    fn trim_tab_layouts(&mut self, budget: usize) {
+        let mut retained: usize = self.tabs.iter().map(Tab::retained_bytes).sum();
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            if retained <= budget {
+                break;
+            }
+            if index != self.selected {
+                let before = tab.retained_bytes();
+                if let Content::Text(document) = &mut tab.content {
+                    document.discard_layout_cache();
+                }
+                retained -= before - tab.retained_bytes();
+            }
+        }
+        // A single active layout may exceed the cache target. Keep it until
+        // another view becomes active, preserving every source tab and position.
     }
     fn tab_bar(&mut self, ui: &mut egui::Ui) -> Option<Target> {
         let mut export = None;
@@ -3337,31 +3348,7 @@ impl eframe::App for App {
         if let Some((class, position, hash)) = jump {
             self.navigate(class, position, hash, ctx);
         }
-        // Layout caches are created lazily; include them when enforcing tab eviction.
-        while self.tabs.len() > 1
-            && self.tabs.iter().map(Tab::retained_bytes).sum::<usize>() > 64 * 1024 * 1024
-        {
-            let Some(index) = self
-                .tabs
-                .iter()
-                .enumerate()
-                .position(|(index, tab)| index != self.selected && !tab.pinned)
-            else {
-                // Pinned source remains open; shed inactive layout caches rather than tabs.
-                for (index, tab) in self.tabs.iter_mut().enumerate() {
-                    if index != self.selected
-                        && let Content::Text(document) = &mut tab.content
-                    {
-                        document.discard_layout_cache();
-                    }
-                }
-                break;
-            };
-            self.tabs.remove(index);
-            if index < self.selected {
-                self.selected -= 1;
-            }
-        }
+        self.trim_tab_layouts(64 * 1024 * 1024);
         self.plugins_window(ctx);
         let actions = self.search.show(
             ctx,
@@ -3948,6 +3935,94 @@ mod settings_tests {
         }
     }
     #[test]
+    fn manifest_layout_pressure_keeps_classes_navigation_and_selection() {
+        let ctx = egui::Context::default();
+        let mut app = navigation_test_app();
+        for index in 0..3 {
+            let mut tab = sample_tab(index, 64);
+            tab.target = Target::Class(format!("sample.Class{index}"));
+            tab.name = format!("sample.Class{index}");
+            let Content::Text(document) = &mut tab.content else {
+                unreachable!()
+            };
+            document.set_links(vec![rdx::engine::CodeLink {
+                start: 0,
+                end: 6,
+                label: "sample.Target".into(),
+            }]);
+            app.push_tab(tab).unwrap();
+        }
+        app.tabs[0].bookmarked = true;
+        app.history.push(app.current_location().unwrap());
+        let mut manifest = sample_tab(3, 0);
+        manifest.name = "AndroidManifest.xml".into();
+        manifest.content = Content::Text(Box::new(CodeDocument::new(
+            "<manifest package=\"sample\"><application/></manifest>".into(),
+            "xml",
+        )));
+        app.push_tab(manifest).unwrap();
+        for tab in &mut app.tabs {
+            let Content::Text(document) = &mut tab.content else {
+                unreachable!()
+            };
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    document.show(ui, CodeTheme::Ocean, 14.0);
+                });
+            });
+            assert!(tab.retained_bytes() > tab.source_bytes());
+        }
+        let selected = app.selected;
+        let active_bytes = app.tabs[selected].retained_bytes();
+        // Exercise the same pressure boundary with tiny real rendered layouts.
+        // The active layout alone exceeds this budget, as a large manifest can.
+        app.trim_tab_layouts(1);
+        assert_eq!(app.tabs.len(), 4);
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.tabs[selected].retained_bytes(), active_bytes);
+        assert!(app.tabs[selected].manifest_view.is_some());
+        for (index, tab) in app.tabs[..3].iter().enumerate() {
+            assert_eq!(tab.target, Target::Class(format!("sample.Class{index}")));
+            assert_eq!(tab.retained_bytes(), tab.source_bytes());
+            let Content::Text(document) = &tab.content else {
+                unreachable!()
+            };
+            assert_eq!(document.text(), "x".repeat(64));
+            assert_eq!(document.link_at(0).unwrap().label, "sample.Target");
+        }
+        assert!(app.tabs[0].bookmarked);
+        assert_eq!(app.history.len(), 1);
+        app.select_tab(0);
+        app.trim_tab_layouts(1);
+        assert_eq!(app.tabs.len(), 4);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.tabs[3].retained_bytes(), app.tabs[3].source_bytes());
+    }
+
+    #[test]
+    fn full_unpinned_tab_set_rejects_new_view_without_closing_any() {
+        let mut app = navigation_test_app();
+        for index in 0..8 {
+            app.push_tab(sample_tab(index, 64)).unwrap();
+        }
+        app.select_tab(2);
+        let before: Vec<_> = app.tabs.iter().map(|tab| tab.target.clone()).collect();
+        assert!(
+            app.push_tab(sample_tab(8, 64))
+                .unwrap_err()
+                .contains("Close a view")
+        );
+        assert_eq!(app.selected, 2);
+        assert_eq!(
+            app.tabs
+                .iter()
+                .map(|tab| tab.target.clone())
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
     fn pinned_tab_admission_is_transactional_and_refresh_keeps_flags() {
         let mut app = navigation_test_app();
         for index in 0..8 {
@@ -3957,7 +4032,7 @@ mod settings_tests {
         }
         app.selected = 3;
         let error = app.push_tab(sample_tab(8, 64)).unwrap_err();
-        assert!(error.contains("Unpin or close"));
+        assert!(error.contains("Close a view"));
         assert_eq!(app.tabs.len(), 8);
         assert_eq!(app.selected, 3);
         assert!(app.tabs.iter().all(|tab| tab.pinned));
@@ -3965,23 +4040,28 @@ mod settings_tests {
         app.push_tab(sample_tab(3, 128)).unwrap();
         assert!(app.tabs[app.selected].pinned && app.tabs[app.selected].bookmarked);
         app.tab_action(0, TabAction::TogglePin);
+        assert!(app.push_tab(sample_tab(8, 64)).is_err());
+        assert_eq!(app.tabs.len(), 8);
+        app.tab_action(0, TabAction::Close);
         app.push_tab(sample_tab(8, 64)).unwrap();
         assert_eq!(app.tabs.len(), 8);
         assert!(!app.tabs.iter().any(|tab| tab.target == Target::File(0)));
     }
     #[test]
-    fn pinned_memory_budget_rejects_without_evicting_or_changing_selection() {
-        let mut app = navigation_test_app();
-        for index in 0..2 {
-            let mut tab = sample_tab(index, 24 * 1024 * 1024);
-            tab.pinned = true;
-            app.push_tab(tab).unwrap();
+    fn source_budget_rejects_without_closing_pinned_or_unpinned_views() {
+        for pinned in [false, true] {
+            let mut app = navigation_test_app();
+            for index in 0..2 {
+                let mut tab = sample_tab(index, 24 * 1024 * 1024);
+                tab.pinned = pinned;
+                app.push_tab(tab).unwrap();
+            }
+            let selected = app.selected;
+            assert!(app.push_tab(sample_tab(2, 24 * 1024 * 1024)).is_err());
+            assert_eq!(app.tabs.len(), 2);
+            assert_eq!(app.selected, selected);
+            assert!(app.tabs.iter().map(Tab::retained_bytes).sum::<usize>() <= 64 * 1024 * 1024);
         }
-        let selected = app.selected;
-        assert!(app.push_tab(sample_tab(2, 24 * 1024 * 1024)).is_err());
-        assert_eq!(app.tabs.len(), 2);
-        assert_eq!(app.selected, selected);
-        assert!(app.tabs.iter().map(Tab::retained_bytes).sum::<usize>() <= 64 * 1024 * 1024);
     }
     #[test]
     fn tab_context_actions_preserve_pins_selection_and_reference_history() {

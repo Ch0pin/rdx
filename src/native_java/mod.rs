@@ -1,9 +1,12 @@
 //! Conservative native Java reconstruction with exact emitted-source mappings.
 mod annotations;
 pub(crate) mod anonymous;
+mod array_presentation;
+mod cast_cleanup;
 mod condition_cleanup;
 mod display_names;
 mod enums;
+mod expression_cleanup;
 mod interface_default_bridge;
 mod liveness;
 mod method;
@@ -63,7 +66,10 @@ fn presentation(code: DecompiledCode, class: &DexClass, method: &DexMethod) -> D
     let code = method::readable_code(code);
     let code = condition_cleanup::simplify(code);
     let code = presentation_cleanup::simplify(code, method);
+    let code = cast_cleanup::simplify(code, class, method);
+    let code = expression_cleanup::simplify(code, class, method);
     let code = statement_cleanup::simplify(code, method);
+    let code = array_presentation::simplify(code);
     display_names::rename(code)
 }
 impl Output {

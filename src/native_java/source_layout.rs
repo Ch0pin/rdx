@@ -48,6 +48,9 @@ fn identifier_part(byte: u8) -> bool {
 }
 
 fn constructor_open(line: &str, at: usize) -> Option<usize> {
+    if !line.is_char_boundary(at) {
+        return None;
+    }
     let bytes = line.as_bytes();
     if !line[at..].starts_with("new ")
         || at
@@ -74,6 +77,33 @@ fn constructor_open(line: &str, at: usize) -> Option<usize> {
         cursor += 1;
     }
     (bytes.get(cursor) == Some(&b'(')).then_some(cursor)
+}
+
+// Method invocations use the same token-preserving argument layout. Declarations,
+// casts and control headers are excluded by the enclosing statement guard.
+fn invocation_open(line: &str, at: usize) -> Option<usize> {
+    if !line.is_char_boundary(at) {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    if !identifier_start(*bytes.get(at)?)
+        || at
+            .checked_sub(1)
+            .is_some_and(|i| identifier_part(bytes[i]) || !bytes[i].is_ascii())
+    {
+        return None;
+    }
+    let mut end = at + 1;
+    while bytes.get(end).is_some_and(|b| identifier_part(*b)) {
+        end += 1;
+    }
+    if matches!(
+        &line[at..end],
+        "new" | "if" | "while" | "for" | "switch" | "catch" | "synchronized"
+    ) {
+        return None;
+    }
+    (bytes.get(end) == Some(&b'(')).then_some(end)
 }
 
 fn horizontal_after(line: &str, mut at: usize) -> usize {
@@ -186,8 +216,8 @@ fn layout_line(
         {
             return Some(());
         }
-        if byte == b'n'
-            && let Some(open) = constructor_open(content, cursor)
+        if let Some(open) =
+            constructor_open(content, cursor).or_else(|| invocation_open(content, cursor))
             && !opens.contains_key(&open)
         {
             if constructors.len() == MAX_CONSTRUCTORS {
@@ -455,20 +485,24 @@ pub(super) fn format(code: DecompiledCode) -> DecompiledCode {
         || code.links.len().saturating_add(code.definitions.len()) > MAX_METADATA_ITEMS
         || code.source.contains("/*")
         || code.source.contains("\"\"\"")
-        || code.source.lines().any(|line| {
-            let trimmed = line.trim_start();
-            trimmed.starts_with(".method ")
-                || trimmed.starts_with(".field ")
-                || trimmed.starts_with(".registers ")
-                || trimmed.starts_with(".class ")
-        })
     {
         return code;
     }
     let mut edits = Vec::new();
     let mut inserted_bytes = 0usize;
     let mut start = 0usize;
+    let mut in_dex = false;
     for line in code.source.split_inclusive('\n') {
+        if line.trim_start().starts_with(".method ") {
+            in_dex = true;
+        }
+        if in_dex {
+            if line.trim() == ".end method" {
+                in_dex = false;
+            }
+            start += line.len();
+            continue;
+        }
         if layout_line(line, start, &mut edits, &mut inserted_bytes).is_none() {
             return code;
         }
@@ -481,6 +515,64 @@ pub(super) fn format(code: DecompiledCode) -> DecompiledCode {
 mod tests {
     use super::*;
     use crate::engine::{CodeDefinition, CodeLink};
+
+    #[test]
+    fn mixed_source_formats_java_and_preserves_dex_verbatim() {
+        let dex = ".method sample.Example.f()V\n    0000: const-string v0, \"service.combine(firstArgumentWithLongName, secondArgumentWithLongName, thirdArgumentWithLongName, fourthArgumentWithLongName);\"\n.end method\n";
+        let java = "    void run() {\n        service.combine(firstArgumentWithLongName, secondArgumentWithLongName, thirdArgumentWithLongName, fourthArgumentWithLongName);\n    }\n";
+        let source = format!("class Example {{\n{dex}{java}}}\n");
+        let after = format(DecompiledCode {
+            source: source.clone(),
+            source_hash: crate::engine::source_identity(&source),
+            links: vec![],
+            definitions: vec![],
+        });
+        assert!(after.source.contains(dex));
+        assert!(after.source.contains("service.combine(\n"));
+        assert_eq!(compact_tokens(&source), compact_tokens(&after.source));
+    }
+
+    #[test]
+    fn long_nested_method_calls_wrap_without_changing_tokens_or_navigation() {
+        let source = "class Example {\n    void run() {\n        Object value = service.combine(firstArgumentWithLongName, helper.prepare(secondArgumentWithLongName, thirdArgumentWithLongName, \"λ, literal whitespace\"), fourthArgumentWithLongName);\n    }\n}\n";
+        let start = source[..source.find("prepare").unwrap()].chars().count();
+        let original = DecompiledCode {
+            source: source.into(),
+            source_hash: crate::engine::source_identity(source),
+            links: vec![CodeLink {
+                start,
+                end: start + 7,
+                label: "sample.Helper.prepare()Ljava/lang/Object;".into(),
+            }],
+            definitions: vec![],
+        };
+        let after = format(original);
+        assert!(
+            after.source.contains("service.combine(\n"),
+            "{}",
+            after.source
+        );
+        assert!(
+            after.source.contains("helper.prepare(\n"),
+            "{}",
+            after.source
+        );
+        assert_eq!(compact_tokens(source), compact_tokens(&after.source));
+        assert_eq!(
+            after
+                .source
+                .chars()
+                .skip(after.links[0].start)
+                .take(7)
+                .collect::<String>(),
+            "prepare"
+        );
+        assert_eq!(format(after.clone()).source, after.source);
+        assert_eq!(
+            after.source_hash,
+            crate::engine::source_identity(&after.source)
+        );
+    }
 
     fn code(source: &str) -> DecompiledCode {
         let class = source.find("Example").unwrap();

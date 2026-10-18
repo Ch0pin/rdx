@@ -2530,6 +2530,7 @@ dependencies = [
  "flate2",
  "getrandom 0.3.4",
  "image",
+ "libc",
  "pollster",
  "quick-xml 0.42.0",
  "regex",
@@ -2539,6 +2540,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "syntect",
+ "windows-sys 0.61.2",
  "winresource",
  "zip",
 ]

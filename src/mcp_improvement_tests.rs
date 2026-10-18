@@ -41,15 +41,18 @@ fn discovery_path_identity_resolves_aliases_and_separates_same_basenames() {
 
 #[test]
 fn legacy_basename_requires_absolute_request_and_explicit_matching_hash() {
+    let dir = Scratch::new();
+    let missing = dir.0.canonicalize().unwrap().join("missing/sample.apk");
+    let other = missing.with_file_name("other.apk");
     let info = json!({"apk_path":"sample.apk","apk_sha256":"abc"});
     assert!(instance_matches(
         &info,
-        &json!({"apk_path":"/missing/sample.apk","apk_sha256":"abc"})
+        &json!({"apk_path":missing,"apk_sha256":"abc"})
     ));
     for args in [
-        json!({"apk_path":"/missing/sample.apk"}),
-        json!({"apk_path":"/missing/sample.apk","apk_sha256":"wrong"}),
-        json!({"apk_path":"/missing/other.apk","apk_sha256":"abc"}),
+        json!({"apk_path":missing}),
+        json!({"apk_path":missing,"apk_sha256":"wrong"}),
+        json!({"apk_path":other,"apk_sha256":"abc"}),
         json!({"apk_path":"missing/sample.apk","apk_sha256":"abc"}),
     ] {
         assert!(!instance_matches(&info, &args), "unexpected match: {args}");
@@ -92,6 +95,8 @@ fn discovery_preserves_live_results_and_reports_gui_disconnect_separately() {
                     Err(e) => panic!("accept: {e}"),
                 }
             };
+            // Darwin inherits the listener's nonblocking mode on accept.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
@@ -261,6 +266,8 @@ fn discovery_registration_batches_are_stable_across_record_pagination() {
                     Err(e) => panic!("accept: {e}"),
                 }
             };
+            // Darwin inherits the listener's nonblocking mode on accept.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();

@@ -18,6 +18,8 @@ use std::{
 };
 #[path = "mcp_literals.rs"]
 mod literals;
+#[path = "mcp_socket.rs"]
+mod socket;
 
 const MAX_FRAME: u64 = 8 * 1024 * 1024;
 
@@ -293,7 +295,6 @@ impl Server {
                             request["instance_id"].as_str() == Some(&entry.instance_id),
                             "INSTANCE_NOT_FOUND"
                         );
-                        stream.set_read_timeout(Some(Duration::from_millis(1)))?;
                         parsed.store(true, Ordering::Relaxed);
                         ensure!(
                             !stop.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed),
@@ -428,6 +429,17 @@ fn poll_requests(requests: &Mutex<Vec<RequestWatch>>) {
             request.cancel.store(true, Ordering::Relaxed);
         }
         if request.parsed.load(Ordering::Relaxed) {
+            // Never wait for an idle peer on the listener thread. Cloned
+            // sockets retain blocking mode so response writes can finish.
+            match socket::readable(&request.stream) {
+                Ok(false) => return true,
+                Ok(true) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return true,
+                Err(_) => {
+                    request.cancel.store(true, Ordering::Relaxed);
+                    return true;
+                }
+            }
             let mut byte = [0];
             match request.stream.peek(&mut byte) {
                 Ok(0) => request.cancel.store(true, Ordering::Relaxed),

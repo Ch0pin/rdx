@@ -346,3 +346,65 @@ fn actual_apk_literal_index_keeps_health_responsive_and_reuses_complete_results(
     drop(server);
     let _ = fs::remove_dir_all(directory);
 }
+
+#[test]
+fn idle_parsed_requests_do_not_wait_on_socket_timeouts_or_hide_disconnects() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut clients = Vec::new();
+    let mut watched = Vec::new();
+    for _ in 0..8 {
+        clients.push(TcpStream::connect(listener.local_addr().unwrap()).unwrap());
+        let (stream, _) = listener.accept().unwrap();
+        // Readiness must remain immediate even when the stream deliberately
+        // has a long blocking-read timeout and its writer shares the socket.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        watched.push(RequestWatch {
+            stream,
+            cancel: Arc::new(AtomicBool::new(false)),
+            done: Arc::new(AtomicBool::new(false)),
+            parsed: Arc::new(AtomicBool::new(true)),
+            started: Instant::now(),
+        });
+    }
+    let requests = Mutex::new(watched);
+    let started = Instant::now();
+    poll_requests(&requests);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "idle request polling waited for a blocking read"
+    );
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| !request.cancel.load(Ordering::Relaxed))
+    );
+    // Readiness and the following peek preserve queued data for its owner.
+    clients[0].write_all(b"x").unwrap();
+    until(|| socket::readable(&requests.lock().unwrap()[0].stream).unwrap());
+    poll_requests(&requests);
+    let mut byte = [0];
+    assert_eq!(
+        requests.lock().unwrap()[0].stream.peek(&mut byte).unwrap(),
+        1
+    );
+    assert_eq!(byte, [b'x']);
+    assert!(!requests.lock().unwrap()[0].cancel.load(Ordering::Relaxed));
+    // Closing a separate idle peer still cancels its outstanding work.
+    clients[1].shutdown(std::net::Shutdown::Both).unwrap();
+    until(|| {
+        poll_requests(&requests);
+        requests.lock().unwrap()[1].cancel.load(Ordering::Relaxed)
+    });
+    requests.lock().unwrap()[2].started = Instant::now() - Duration::from_secs(121);
+    poll_requests(&requests);
+    assert!(requests.lock().unwrap()[2].cancel.load(Ordering::Relaxed));
+    requests.lock().unwrap()[3]
+        .done
+        .store(true, Ordering::Relaxed);
+    poll_requests(&requests);
+    assert_eq!(requests.lock().unwrap().len(), 7);
+}

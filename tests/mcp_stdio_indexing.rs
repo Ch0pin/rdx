@@ -19,6 +19,9 @@ const INSTANCE: &str = "stdio-index-fixture";
 const PROJECT: &str = "fixture-project";
 const TOKEN: &str = "fixture-loopback-token";
 const TIMEOUT: Duration = Duration::from_secs(10);
+// Debug builds hash the executable before the gateway can initialize.
+// Measure responsiveness only after that startup work has finished.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 
 struct Gui {
     home: PathBuf,
@@ -153,41 +156,47 @@ impl Gateway {
         let input = child.stdin.take();
         let output = child.stdout.take().unwrap();
         let (tx, replies) = mpsc::channel();
-        let (reader, unread) = if drain {
-            (
-                Some(thread::spawn(move || {
-                    for line in BufReader::new(output).lines() {
-                        let Ok(line) = line else {
-                            break;
-                        };
-                        let Ok(value) = serde_json::from_str(&line) else {
-                            break;
-                        };
-                        if tx.send(value).is_err() {
-                            break;
-                        }
-                    }
-                })),
-                None,
-            )
-        } else {
-            (None, Some(output))
-        };
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let reader = Some(thread::spawn(move || {
+            let mut output = BufReader::new(output);
+            loop {
+                let mut line = String::new();
+                if !matches!(output.read_line(&mut line), Ok(n) if n > 0) {
+                    break;
+                }
+                let Ok(value) = serde_json::from_str(&line) else {
+                    break;
+                };
+                if tx.send(value).is_err() {
+                    break;
+                }
+                if !drain {
+                    // Only initialize has been sent. Return the pipe before any
+                    // operation responses so blocked-writer coverage stays intact.
+                    let _ = stdout_tx.send(output.into_inner());
+                    break;
+                }
+            }
+        }));
         let mut gateway = Self {
             child,
             input,
-            unread,
+            unread: None,
             replies,
             reader,
         };
         gateway.send(json!({"jsonrpc":"2.0", "id":0, "method":"initialize", "params":{
             "protocolVersion":"2025-06-18", "capabilities":{}, "clientInfo":{"name":"indexing-test","version":"1"},
         }}));
-        if drain {
-            assert_eq!(
-                gateway.receive(0)["result"]["protocolVersion"],
-                "2025-06-18"
-            );
+        let initialized = gateway
+            .replies
+            .recv_timeout(STARTUP_TIMEOUT)
+            .expect("gateway initialization readiness timed out");
+        assert_eq!(initialized["id"], 0);
+        assert_eq!(initialized["result"]["protocolVersion"], "2025-06-18");
+        if !drain {
+            gateway.unread = Some(stdout_rx.recv_timeout(TIMEOUT).unwrap());
+            gateway.reader.take().unwrap().join().unwrap();
         }
         gateway.send(json!({"jsonrpc":"2.0", "method":"notifications/initialized"}));
         gateway

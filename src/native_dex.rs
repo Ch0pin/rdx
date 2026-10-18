@@ -48,6 +48,12 @@ pub struct DexFile {
 #[derive(Debug, Default)]
 pub struct DexSymbols {
     pub hierarchy: std::sync::OnceLock<Arc<crate::native_hierarchy::TypeHierarchy>>,
+    /// Reverse Java display names, initialized once after this symbol table is published.
+    /// `None` retains ambiguity between distinct original descriptors.
+    pub declaration_descriptors:
+        std::sync::OnceLock<std::collections::HashMap<String, Option<Arc<str>>>>,
+    /// Raw helper-name components, cached after the symbol table is published.
+    pub raw_helper_type_components: std::sync::OnceLock<std::collections::HashSet<String>>,
     pub strings: Vec<String>,
     pub types: Vec<Arc<str>>,
     pub protos: Vec<(Arc<str>, Vec<Arc<str>>)>,
@@ -788,6 +794,8 @@ fn parse_inner(bytes: &[u8], budget: &mut Budget) -> Result<DexFile> {
         .collect::<Result<Vec<_>>>()?;
     let symbols = Arc::new(DexSymbols {
         hierarchy: Default::default(),
+        declaration_descriptors: Default::default(),
+        raw_helper_type_components: Default::default(),
         strings,
         types,
         protos,

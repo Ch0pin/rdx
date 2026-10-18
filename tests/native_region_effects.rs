@@ -85,8 +85,7 @@ fn cyclic_tail_is_not_unrolled_as_an_acyclic_shared_effect() {
         .to_string();
     assert!(error.contains("loop"), "{error}");
 }
-#[test]
-fn unprotected_effect_cannot_be_moved_inside_try_to_force_a_join() {
+fn unprotected_effect_fixture() -> DexClass {
     // nop (protected); effect(p0); goto return; handler: move-exception; goto return.
     let mut c = fixture(vec![0, 0x1071, 0, 1, 0x0328, 0x000d, 0x0128, 0x000e]);
     let code = c.methods[0].code.as_mut().unwrap();
@@ -96,12 +95,73 @@ fn unprotected_effect_cannot_be_moved_inside_try_to_force_a_join() {
         end: 1,
         catches: vec![(Some("Ljava/lang/Exception;".into()), 5)].into(),
     });
-    let error = native_java::render_method("sample.Test", &c, &c.methods[0])
-        .err()
+    c
+}
+#[test]
+fn unprotected_effect_stays_outside_try_before_shared_return() {
+    let c = unprotected_effect_fixture();
+    let rendered = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    let catch = rendered.source.find("catch").unwrap();
+    let effect = rendered.source.find("sample.Effects.effect(").unwrap();
+    assert!(effect > catch, "{}", rendered.source);
+    assert!(!rendered.source[..catch].contains("sample.Effects.effect("));
+    assert_eq!(rendered.source.matches("sample.Effects.effect(").count(), 1);
+    let link = rendered
+        .links
+        .iter()
+        .find(|link| link.label == "sample.Effects.effect(I)V")
+        .unwrap();
+    assert_eq!(
+        rendered
+            .source
+            .chars()
+            .skip(link.start)
+            .take(link.end - link.start)
+            .collect::<String>(),
+        "effect"
+    );
+}
+#[test]
+#[ignore = "requires javac and java on PATH"]
+fn jvm_unprotected_effect_failure_escapes_original_catch() {
+    let c = unprotected_effect_fixture();
+    let source = native_java::render_method("sample.Test", &c, &c.methods[0])
         .unwrap()
-        .to_string();
+        .source;
+    let dir = std::env::temp_dir().join(format!("rdx-unprotected-effect-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
+    let java = format!(
+        r#"package sample;class Effects{{static boolean fail;static int calls;static RuntimeException original=new RuntimeException();static void effect(int value){{calls++;if(value!=7)throw new AssertionError();if(fail)throw original;}}}}class Test{{{source}}}public class Runner{{public static void main(String[]args){{for(boolean failed:new boolean[]{{false,true}}){{Effects.fail=failed;Effects.calls=0;try{{Test.run(7);if(failed)throw new AssertionError("lost failure");}}catch(RuntimeException caught){{if(!failed||caught!=Effects.original)throw new AssertionError("identity");}}if(Effects.calls!=1)throw new AssertionError("effect count");}}}}}}"#
+    );
+    let path = dir.join("Runner.java");
+    std::fs::write(&path, java).unwrap();
+    let output = std::process::Command::new("javac")
+        .arg("-d")
+        .arg(&dir)
+        .arg(path)
+        .output()
+        .unwrap();
     assert!(
-        error.contains("effectful normal continuation before exception join"),
-        "{error}"
+        output.status.success(),
+        "{}\n{source}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = std::process::Command::new("java")
+        .arg("-cp")
+        .arg(&dir)
+        .arg("sample.Runner")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

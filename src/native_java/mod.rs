@@ -3,8 +3,14 @@ mod annotations;
 pub(crate) mod anonymous;
 mod array_presentation;
 mod cast_cleanup;
+mod checked_call_bridge;
+mod explicit_checked_throw;
+mod caught_checked_throw;
+mod initializer_exits;
 mod condition_cleanup;
 mod display_names;
+mod declaration_types;
+mod helper_type_names;
 mod enums;
 mod expression_cleanup;
 mod interface_default_bridge;
@@ -13,8 +19,11 @@ mod method;
 mod names;
 mod presentation_cleanup;
 mod readable;
+mod same_object_rethrow;
 mod source_layout;
 mod statement_cleanup;
+mod static_sneaky_rethrow;
+mod super_bridge;
 mod strings;
 mod varargs_cleanup;
 use crate::{
@@ -154,18 +163,19 @@ fn render_initializer(name: &str, class: &DexClass, method: &DexMethod) -> Resul
         "Invalid static initializer"
     );
     let body = method::reconstruct(name, class, method)?;
-    // Java initializer blocks cannot contain return statements. Only the single
-    // terminal method return can become normal block completion; do not discard
-    // branch returns or infer initializer-specific control flow from source text.
-    let terminal = "        return;\n";
-    let source = body
-        .text
-        .strip_suffix(terminal)
-        .ok_or_else(|| anyhow::anyhow!("Static initializer requires a single terminal return"))?;
-    ensure!(
-        !source.lines().any(|line| line.trim() == "return;"),
-        "Static initializer early returns not reconstructed"
-    );
+    let labelled_exit = initializer_exits::select(class, method).is_some();
+    // The bounded CFG plan lowers each original return directly to a labelled
+    // break. The legacy single-return path retains its terminal-only removal.
+    let source = if labelled_exit {
+        body.text.as_str()
+    } else {
+        let terminal = "        return;\n";
+        let source = body.text.strip_suffix(terminal)
+            .ok_or_else(|| anyhow::anyhow!("Static initializer requires a single terminal return"))?;
+        ensure!(!source.lines().any(|line| line.trim() == "return;"),
+            "Static initializer early returns not reconstructed");
+        source
+    };
     let chars = source.chars().count();
     ensure!(
         body.links.iter().all(|link| link.end <= chars),
@@ -180,6 +190,9 @@ fn render_initializer(name: &str, class: &DexClass, method: &DexMethod) -> Resul
         "method",
     );
     out.push(" {\n");
+    if labelled_exit {
+        out.push(&format!("        {}: {{\n", initializer_exits::LABEL));
+    }
     let offset = out.chars;
     out.push(source);
     out.links.extend(body.links.into_iter().map(|mut link| {
@@ -187,6 +200,7 @@ fn render_initializer(name: &str, class: &DexClass, method: &DexMethod) -> Resul
         link.end += offset;
         link
     }));
+    if labelled_exit { out.push("        }\n"); }
     out.push("    }\n");
     Ok(out.finish())
 }
@@ -201,104 +215,42 @@ fn render_initializer(name: &str, class: &DexClass, method: &DexMethod) -> Resul
 pub(super) fn inherited_override_exception(
     class: &DexClass,
     method: &DexMethod,
-) -> Option<&'static str> {
-    if method.thrown_types.is_empty()
-        && method.declaring_type == class.descriptor
-        && method.access_flags & 7 == 1
-        && method.access_flags & 8 == 0
-        && class
-            .symbols
-            .hierarchy
-            .get()
-            .is_some_and(|hierarchy| hierarchy.inherited_io_exception(class, method))
-    {
-        return Some("Ljava/io/IOException;");
-    }
-    if method.thrown_types.is_empty()
-        && method.declaring_type == class.descriptor
-        && method.access_flags & 7 == 1
-        && method.access_flags & 8 == 0
-        && class.superclass.as_deref().is_some_and(|parent| {
-            class.symbols.hierarchy.get().map_or_else(
-                || {
-                    parent == "Landroid/provider/DocumentsProvider;"
-                        && crate::native_hierarchy::pinned_document_exception_contract(
-                            method,
-                            "Ljava/io/FileNotFoundException;",
-                        )
-                },
-                |hierarchy| {
-                    hierarchy.inherited_document_exception_contract(
-                        parent,
-                        method,
-                        "Ljava/io/FileNotFoundException;",
-                    )
-                },
-            )
-        })
-    {
-        return Some("Ljava/io/FileNotFoundException;");
-    }
-    if method.thrown_types.is_empty()
-        && method.declaring_type == class.descriptor
-        && method.access_flags & 15 == 1
-        && method.name.as_ref() == "openFile"
-        && method.return_type.as_ref() == "Landroid/os/ParcelFileDescriptor;"
-        && method
-            .parameters
-            .iter()
-            .map(AsRef::as_ref)
-            .eq(["Landroid/net/Uri;", "Ljava/lang/String;"])
-        && class.superclass.as_deref().is_some_and(|parent| {
-            class.symbols.hierarchy.get().map_or_else(
-                || parent == "Landroid/content/ContentProvider;",
-                |hierarchy| {
-                    hierarchy.inherited_file_exception_contract(
-                        parent,
-                        method,
-                        "Ljava/io/FileNotFoundException;",
-                    )
-                },
-            )
-        })
-    {
-        return Some("Ljava/io/FileNotFoundException;");
-    }
-    if !method.thrown_types.is_empty()
-        || method.declaring_type != class.descriptor
-        || method.access_flags & 7 != 1
-        || method.access_flags & 8 != 0
-        || method.return_type.as_ref() != "V"
-        || !matches!(
-            class.superclass.as_deref(),
-            Some("Landroid/app/backup/BackupAgent;" | "Landroid/app/backup/BackupAgentHelper;")
-        )
-    {
-        return None;
-    }
-    let expected: &[&str] = match method.name.as_ref() {
-        "onRestore" => &[
-            "Landroid/app/backup/BackupDataInput;",
-            "I",
-            "Landroid/os/ParcelFileDescriptor;",
-        ],
-        "onBackup" => &[
-            "Landroid/os/ParcelFileDescriptor;",
-            "Landroid/app/backup/BackupDataOutput;",
-            "Landroid/os/ParcelFileDescriptor;",
-        ],
-        _ => return None,
-    };
-    (method.parameters.len() == expected.len()
-        && method
-            .parameters
-            .iter()
-            .zip(expected)
-            .all(|(actual, expected)| actual.as_ref() == *expected))
-    .then_some("Ljava/io/IOException;")
+) -> Vec<&'static str> {
+    crate::native_hierarchy::source_inherited_exceptions(
+        class,
+        method,
+        class.symbols.hierarchy.get().map(AsRef::as_ref),
+    )
 }
 
 pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result<DecompiledCode> {
+    render_method_inner(name, class, method, true, true)
+}
+
+pub(super) fn render_method_without_same_object_retry(
+    name: &str,
+    class: &DexClass,
+    method: &DexMethod,
+) -> Result<DecompiledCode> {
+    render_method_inner(name, class, method, false, false)
+}
+
+// Keep the original header-proof contract directly testable when the separate
+// source-only alternative can also render a method.
+#[cfg(test)]
+pub(super) fn render_method_without_caught_source_retry(
+    name: &str, class: &DexClass, method: &DexMethod,
+) -> Result<DecompiledCode> {
+    render_method_inner(name, class, method, true, false)
+}
+
+fn render_method_inner(
+    name: &str,
+    class: &DexClass,
+    method: &DexMethod,
+    allow_same_object_retry: bool,
+    allow_caught_source_retry: bool,
+) -> Result<DecompiledCode> {
     if method.name.as_ref() == "<clinit>" {
         if let Ok(plan) = enums::Plan::analyze(class) {
             return plan.initializer(name, class);
@@ -327,6 +279,12 @@ pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result
         "Method owner mismatch"
     );
     ensure!(
+        crate::native_hierarchy::valid_pinned_override_declaration(
+            class, method, class.symbols.hierarchy.get().map(AsRef::as_ref),
+        ),
+        "Method declaration conflicts with exact inherited SDK member"
+    );
+    ensure!(
         method.access_flags & 0x400 == 0
             || method.access_flags & (2 | 8 | 0x10 | 0x20 | 0x100 | 0x800 | 0x20000) == 0,
         "Invalid abstract modifiers"
@@ -341,13 +299,71 @@ pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result
         !declaration_only || method.code.is_none(),
         "Declaration has code"
     );
+    let mut same_object_root_header = None;
+    let mut static_sneaky_type_parameter = None;
     let body = if declaration_only {
         None
     } else {
         Some(
             match interface_default_bridge::reconstruct(name, class, method)? {
                 Some(body) => body,
-                None => method::reconstruct(name, class, method)?,
+                None => match method::reconstruct(name, class, method) {
+                    Ok(body) => body,
+                    Err(baseline_error) => {
+                        if !allow_same_object_retry {
+                            return Err(baseline_error);
+                        }
+                        if let Some(failure) = baseline_error
+                            .downcast_ref::<method::PreciseRethrowFailure>()
+                            .cloned()
+                        {
+                            let established = same_object_rethrow::prove(name, class, method, &failure)
+                                .ok().and_then(|proof| {
+                                    method::reconstruct_same_object_rethrow(name, class, method, &proof.authorization)
+                                        .ok().map(|body| (body, proof.root_header))
+                                });
+                            if let Some((body, header)) = established {
+                                ensure!(body.inferred_throws.is_empty(),
+                                    "same-object retry cannot infer a root declaration");
+                                same_object_root_header = Some(header);
+                                body
+                            } else {
+                                if !allow_caught_source_retry { return Err(baseline_error); }
+                                // Preserve established precise rethrows first. A
+                                // final source-only retry changes only certified
+                                // throw actions and keeps the original header.
+                                let Ok(body) = method::reconstruct_caught_source(
+                                    name, class, method, failure.site.throw_pc,
+                                ) else { return Err(baseline_error); };
+                                body
+                            }
+                        } else if let Some(failure) = baseline_error
+                            .downcast_ref::<method::StaticSneakyRethrowFailure>()
+                            .cloned()
+                        {
+                            let Ok(proof) = static_sneaky_rethrow::prove(class, method, &failure)
+                            else {
+                                return Err(baseline_error);
+                            };
+                            let Ok(body) = method::reconstruct_static_sneaky_rethrow(
+                                name,
+                                class,
+                                method,
+                                &proof.authorization,
+                            ) else {
+                                return Err(baseline_error);
+                            };
+                            ensure!(
+                                body.inferred_throws.is_empty(),
+                                "static sneaky-rethrow retry cannot infer another declaration"
+                            );
+                            static_sneaky_type_parameter = Some(proof.type_parameter);
+                            body
+                        } else {
+                            return Err(baseline_error);
+                        }
+                    }
+                },
             },
         )
     };
@@ -376,6 +392,10 @@ pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result
     if method.access_flags & 0x40 != 0 {
         out.push("    // DEX bridge method\n");
     }
+    if static_sneaky_type_parameter.is_some() {
+        out.push("    @java.lang.SuppressWarnings(\"unchecked\")\n");
+        out.push("    // Synthesized generic throws signature for exact JVM sneaky rethrow; absent from DEX metadata.\n");
+    }
     out.push("    ");
     out.push(access(method.access_flags)?);
     for (flag, keyword) in [
@@ -391,6 +411,9 @@ pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result
     }
     if method.access_flags & (0x20 | 0x20000) != 0 {
         out.push("synchronized ");
+    }
+    if let Some(type_parameter) = static_sneaky_type_parameter.as_deref() {
+        out.push(&format!("<{type_parameter} extends java.lang.Throwable> "));
     }
     if !constructor {
         let display = java_type(&method.return_type)?;
@@ -455,6 +478,18 @@ pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result
         .collect();
     let mut seen_throws = std::collections::HashSet::new();
     declared_throws.retain(|ty| seen_throws.insert(*ty));
+    if let Some(expected) = &same_object_root_header {
+        ensure!(
+            declared_throws == expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "same-object retry changed the root source header"
+        );
+    }
+    if static_sneaky_type_parameter.is_some() {
+        ensure!(
+            declared_throws.is_empty(),
+            "static sneaky-rethrow retry changed an existing source header"
+        );
+    }
     if !declared_throws.is_empty() {
         out.push(" throws ");
         for (index, ty) in declared_throws.iter().enumerate() {
@@ -472,6 +507,10 @@ pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result
                 &names::label(ty).unwrap_or_else(|| display.clone()),
             );
         }
+    }
+    if let Some(type_parameter) = static_sneaky_type_parameter.as_deref() {
+        out.push(" throws ");
+        out.push(type_parameter);
     }
     if let Some(body) = body {
         out.push(" {\n");
@@ -1012,7 +1051,7 @@ fn add_default_modifier(mut code: DecompiledCode) -> DecompiledCode {
     code
 }
 
-fn class_prefix(name: &str, class: &DexClass) -> Result<Output> {
+fn class_header_prefix(name: &str, class: &DexClass) -> Result<Output> {
     ensure!(
         class.annotations_offset == 0 || annotation_directory(class).is_some(),
         "Annotations not reconstructed"
@@ -1065,7 +1104,11 @@ fn class_prefix(name: &str, class: &DexClass) -> Result<Output> {
             interface_method_default(method)?;
         }
     }
-    let mut out = render_header(name, class)?;
+    render_header(name, class)
+}
+
+fn class_prefix(name: &str, class: &DexClass) -> Result<Output> {
+    let mut out = class_header_prefix(name, class)?;
     for field in &class.fields {
         out.append(render_field(name, class, field)?);
     }
@@ -1074,7 +1117,10 @@ fn class_prefix(name: &str, class: &DexClass) -> Result<Output> {
             let display = java_type(&class.descriptor)?;
             let short = display.rsplit('.').next().unwrap_or(&display);
             let signature = format!("{name}.<init>({})V", constructor.parameters.join(""));
-            out.push("\n    // Reconstructed forwarding constructor removed by DEX optimization.\n    public ");
+            out.push(
+                "\n    // Reconstructed forwarding constructor removed by DEX optimization.\n    ",
+            );
+            out.push(access(constructor.access_flags)?);
             out.definition(short, "<init>", &signature, "method");
             out.push("(");
             for (index, ty) in constructor.parameters.iter().enumerate() {
@@ -1110,6 +1156,70 @@ fn class_prefix(name: &str, class: &DexClass) -> Result<Output> {
         }
     }
     Ok(out)
+}
+
+/// Proves that the ordinary flat source presentation has a complete Java
+/// class prefix. Constructor recovery uses this structured renderer result;
+/// punctuation in a descriptor (including `$`) is never nesting evidence.
+#[doc(hidden)]
+pub fn flat_source_prefix_authority(class: &DexClass) -> bool {
+    let Some(name) = class
+        .descriptor
+        .strip_prefix('L')
+        .and_then(|name| name.strip_suffix(';'))
+        .map(|name| name.replace('/', "."))
+    else {
+        return false;
+    };
+    !name.is_empty() && class_prefix(&name, class).is_ok()
+}
+
+/// Proves only the ordinary class declaration header and its structural
+/// constraints. Constructor recovery uses this for an already loaded direct
+/// parent or interface whose static-field initialization is independent of the
+/// recovered child's implicit constructor.
+#[doc(hidden)]
+pub fn source_header_authority(class: &DexClass) -> bool {
+    let Some(name) = class
+        .descriptor
+        .strip_prefix('L')
+        .and_then(|name| name.strip_suffix(';'))
+        .map(|name| name.replace('/', "."))
+    else {
+        return false;
+    };
+    !name.is_empty() && class_header_prefix(&name, class).is_ok()
+}
+
+/// Validates the source-level declaration of a non-constructor method without
+/// reconstructing its body. The caller separately proves the exact body or
+/// abstract/default obligation required by its certificate.
+#[doc(hidden)]
+pub fn ordinary_method_declaration_authority(class: &DexClass, method: &DexMethod) -> bool {
+    method.declaring_type == class.descriptor
+        && crate::native_hierarchy::valid_pinned_override_declaration(
+            class, method, class.symbols.hierarchy.get().map(AsRef::as_ref),
+        )
+        && !matches!(method.name.as_ref(), "<init>" | "<clinit>")
+        && method.access_flags & !0x31dff == 0
+        && (method.access_flags & 7).count_ones() <= 1
+        && (method.access_flags & 0x400 == 0
+            || method.access_flags & (2 | 8 | 0x10 | 0x20 | 0x100 | 0x800 | 0x20000) == 0)
+        && (method.access_flags & 0x80 == 0
+            || method
+                .parameters
+                .last()
+                .is_some_and(|ty| ty.starts_with('[')))
+        && method.parameters.iter().all(|ty| ty.as_ref() != "V")
+        && names::member(&method.name).is_ok()
+        && java_type(&method.return_type).is_ok()
+        && method.parameters.iter().all(|ty| java_type(ty).is_ok())
+        && method.thrown_types.iter().all(|ty| {
+            ty.starts_with('L')
+                && ty.ends_with(';')
+                && java_type(ty).is_ok()
+                && method::validate_exception_type(class, ty).is_ok()
+        })
 }
 
 fn append_presented_method(
@@ -1151,6 +1261,10 @@ pub fn render(name: &str, class: &DexClass) -> Result<DecompiledCode> {
     for method in &class.methods {
         append_presented_method(&mut out, class, method, render_method(name, class, method)?)?;
     }
+    for helper in super_bridge::definitions(class) { out.push(&helper); }
+    for helper in checked_call_bridge::definitions(class) { out.push(&helper); }
+    for helper in explicit_checked_throw::definitions(class) { out.push(&helper); }
+    for helper in caught_checked_throw::definitions(class, &out.text) { out.push(&helper); }
     Ok(finish_class(name, class, out))
 }
 
@@ -1240,6 +1354,10 @@ fn render_mixed_controlled(
                     .expect("validated interface method");
             }
             ensure!(!cancelled(), "decompilation cancelled");
+            for helper in super_bridge::definitions(class) { out.push(&helper); }
+            for helper in checked_call_bridge::definitions(class) { out.push(&helper); }
+    for helper in explicit_checked_throw::definitions(class) { out.push(&helper); }
+    for helper in caught_checked_throw::definitions(class, &out.text) { out.push(&helper); }
             let nested_names =
                 anonymous::append_proven(&mut out, class, children, world, cancelled)?;
             return Ok(finish_class_nested(name, class, out, &nested_names));
@@ -1459,6 +1577,10 @@ fn upgrade_methods_controlled(
         Vec::new()
     };
     if java_header {
+        for helper in super_bridge::definitions(class) { out.push(&helper); }
+        for helper in checked_call_bridge::definitions(class) { out.push(&helper); }
+    for helper in explicit_checked_throw::definitions(class) { out.push(&helper); }
+    for helper in caught_checked_throw::definitions(class, &out.text) { out.push(&helper); }
         out.push("}\n");
     }
     ensure!(!cancelled(), "decompilation cancelled");

@@ -164,16 +164,21 @@ pub(super) fn known_call_throws(
     ret: &str,
     caught: &str,
 ) -> bool {
-    (caught == "Landroid/os/RemoteException;"
-        && owner == "Landroid/os/IBinder;"
-        && name == "transact"
-        && ret == "Z"
-        && args.iter().map(AsRef::as_ref).eq([
-            "I",
-            "Landroid/os/Parcel;",
-            "Landroid/os/Parcel;",
-            "I",
-        ]))
+    (caught == "Ljava/lang/ClassNotFoundException;"
+        && owner == "Ljava/lang/Class;"
+        && name == "forName"
+        && ret == "Ljava/lang/Class;"
+        && args.iter().map(AsRef::as_ref).eq(["Ljava/lang/String;"]))
+        || (caught == "Landroid/os/RemoteException;"
+            && owner == "Landroid/os/IBinder;"
+            && name == "transact"
+            && ret == "Z"
+            && args.iter().map(AsRef::as_ref).eq([
+                "I",
+                "Landroid/os/Parcel;",
+                "Landroid/os/Parcel;",
+                "I",
+            ]))
         || caught == "Lorg/json/JSONException;"
             && owner == "Lorg/json/JSONObject;"
             && name == "<init>"
@@ -205,21 +210,7 @@ pub(super) fn simple_static_parameter_throw<'a>(
     class: &DexClass,
     method: &'a DexMethod,
 ) -> Option<&'a str> {
-    if method.access_flags & 8 == 0
-        || !method.thrown_types.is_empty()
-        || method.parameters.len() != 1
-    {
-        return None;
-    }
-    let code = method.code.as_ref()?;
-    let parameter_register = code.registers.checked_sub(code.ins)?;
-    if code.ins != 1
-        || !code.try_regions.is_empty()
-        || code.instructions.as_slice() != [0x27 | (parameter_register << 8)]
-    {
-        return None;
-    }
-    let ty = method.parameters[0].as_ref();
+    let ty = crate::native_hierarchy::static_parameter_throw_shape(method)?;
     (inferable_checked_type(class, ty)
         && may_infer_declaration(
             class,
@@ -255,6 +246,37 @@ pub(super) fn locally_caught(
                     })
             })
         })
+}
+
+pub(super) fn effect_caught(class: &DexClass, effect: &str, caught: &str) -> bool {
+    effect == caught || caught == "Ljava/lang/Throwable;" || subtype(class, effect, caught)
+}
+pub(super) fn checked_effect(class: &DexClass, ty: &str) -> bool {
+    validate_type(class, ty).is_ok() && !unchecked_type(class, ty)
+}
+
+pub(super) fn catch_effect_intersection(
+    class: &DexClass,
+    effect: &str,
+    caught: &str,
+) -> Option<String> {
+    if effect_caught(class, effect, caught) {
+        Some(effect.into())
+    } else if effect_caught(class, caught, effect) {
+        Some(caught.into())
+    } else {
+        None
+    }
+}
+
+pub(super) fn checked_effect_type(class: &DexClass, ty: &str) -> Option<String> {
+    if unchecked_type(class, ty) {
+        None
+    } else if validate_type(class, ty).is_ok() {
+        Some(ty.into())
+    } else {
+        Some("Ljava/lang/Throwable;".into())
+    }
 }
 
 #[cfg(test)]

@@ -21,6 +21,311 @@ fn empty_class(descriptor: &str, parent: Option<&str>, flags: u32) -> DexClass {
         symbols: Arc::new(DexSymbols::default()),
     }
 }
+
+fn switch_forwarder_fixture(sparse: bool) -> (DexClass, DexClass, DexClass) {
+    let leaf = empty_class("Lsample/Child;", Some("Lsample/Base;"), 1);
+    let mut base = parent("Lsample/Base;", 1);
+    base.methods[0].parameters = vec!["I".into()];
+    base.methods[0].code.as_mut().unwrap().registers = 2;
+    base.methods[0].code.as_mut().unwrap().ins = 2;
+    let mut owner = empty_class("Lsample/Caller;", Some("Ljava/lang/Object;"), 1);
+    owner.symbols = Arc::new(DexSymbols {
+        types: vec![leaf.descriptor.clone(), base.descriptor.clone()],
+        strings: vec!["<init>".into()],
+        protos: vec![("V".into(), vec!["I".into()])],
+        methods: vec![(1, 0, 0)],
+        ..Default::default()
+    });
+    owner.methods.push(DexMethod {
+        declaring_type: owner.descriptor.clone(),
+        name: "make".into(),
+        return_type: leaf.descriptor.clone(),
+        parameters: vec!["I".into()],
+        thrown_types: vec![],
+        access_flags: 9,
+        code: Some(DexCode {
+            registers: 3,
+            ins: 1,
+            outs: 2,
+            tries: 0,
+            try_regions: vec![],
+            offset: 0,
+            instructions: vec![
+                if sparse { 0x022c } else { 0x022b },
+                18,
+                0,
+                0x0022,
+                0,
+                0x1112,
+                0x2070,
+                0,
+                0x0010,
+                0x0011,
+                0x0022,
+                0,
+                0x2112,
+                0x2070,
+                0,
+                0x0010,
+                0x0011,
+                0,
+                if sparse { 0x0200 } else { 0x0100 },
+                1,
+                7,
+                0,
+                10,
+                0,
+            ],
+        }),
+    });
+    (leaf, base, owner)
+}
+
+#[test]
+fn switch_local_forwarder_recovers_exact_constructor_and_links() {
+    for sparse in [false, true] {
+        let (leaf, base, owner) = switch_forwarder_fixture(sparse);
+        let hierarchy = Arc::new(TypeHierarchy::from_classes([&leaf, &base, &owner]).unwrap());
+        assert!(hierarchy.equivalent_constructor(
+            &leaf.descriptor,
+            &base.descriptor,
+            &["I".into()]
+        ));
+        leaf.symbols.hierarchy.set(hierarchy.clone()).unwrap();
+        owner.symbols.hierarchy.set(hierarchy).unwrap();
+        let source =
+            native_java::render_method("sample.Caller", &owner, &owner.methods[0]).unwrap();
+        assert_eq!(
+            source.source.matches("new sample.Child(").count(),
+            2,
+            "{}",
+            source.source
+        );
+        assert_eq!(
+            source
+                .links
+                .iter()
+                .filter(|l| l.label == "sample.Base.<init>(I)V")
+                .count(),
+            2
+        );
+        assert!(
+            native_java::render("sample.Child", &leaf)
+                .unwrap()
+                .source
+                .contains("super(p0)")
+        );
+    }
+}
+
+#[test]
+fn switch_forwarder_declines_unproven_entries_and_invalid_payloads() {
+    for variant in 0..4 {
+        let (leaf, mut base, mut owner) = switch_forwarder_fixture(false);
+        let code = owner.methods[0].code.as_mut().unwrap();
+        match variant {
+            // Allocation before a switch cannot establish a local identity in either successor.
+            0 => {
+                code.instructions = vec![
+                    0x0022, 0, 0x022b, 10, 0, 0x1112, 0x2070, 0, 0x0010, 0x0011, 0x0011, 0, 0x0100,
+                    1, 7, 0, 4, 0,
+                ]
+            }
+            // Case edge enters the first constructor; the second allocation is unreachable.
+            1 => {
+                code.instructions[22] = 6;
+                code.instructions[10] = 0;
+                code.instructions[11] = 0;
+            }
+            2 => code.instructions[18] = 0x0200, // wrong payload family
+            _ => base.methods[0].access_flags = 2 | 0x10000,
+        }
+        let hierarchy = TypeHierarchy::from_classes([&leaf, &base, &owner]).unwrap();
+        assert!(
+            !hierarchy.equivalent_constructor(&leaf.descriptor, &base.descriptor, &["I".into()]),
+            "variant {variant}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires javac and java on PATH"]
+fn switch_forwarder_jvm_preserves_selected_argument_and_parent_exception() {
+    use std::{fs, process::Command};
+    for (sparse, member) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (mut leaf, base, mut owner) = switch_forwarder_fixture(sparse);
+        let leaf_name = if member { "Outer$Child" } else { "Child" };
+        if member {
+            leaf.descriptor = "Lsample/Outer$Child;".into();
+            static_member_metadata(&mut leaf);
+            Arc::get_mut(&mut owner.symbols).unwrap().types[0] = leaf.descriptor.clone();
+            owner.methods[0].return_type = leaf.descriptor.clone();
+        }
+        let hierarchy = Arc::new(TypeHierarchy::from_classes([&leaf, &base, &owner]).unwrap());
+        leaf.symbols.hierarchy.set(hierarchy.clone()).unwrap();
+        owner.symbols.hierarchy.set(hierarchy).unwrap();
+        let source =
+            native_java::render_method("sample.Caller", &owner, &owner.methods[0]).unwrap();
+        let leaf_source = native_java::render(&format!("sample.{leaf_name}"), &leaf).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "rdx-switch-forwarder-{}-{sparse}-{member}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join("sample")).unwrap();
+        let leaf_file = format!("sample/{leaf_name}.java");
+        fs::write(dir.join(&leaf_file), leaf_source.source).unwrap();
+        fs::write(dir.join("sample/Caller.java"), format!(r#"package sample;
+class Base {{ static int calls, last; static boolean fail; static final RuntimeException marker = new RuntimeException(); final int value; Base(int value) {{ calls++; last=value; if(fail) throw marker; this.value=value; }} }}
+public class Caller {{ {} public static void main(String[] args) {{
+  for (int key : new int[] {{Integer.MIN_VALUE, -1, 0, 7, 8, Integer.MAX_VALUE}}) {{
+    int expected=key==7?2:1;
+    Base.calls=0; Base.fail=false; {leaf_name} child=make(key);
+    if(child.getClass()!={leaf_name}.class || child.value!=expected || Base.calls!=1) throw new AssertionError();
+    Base.calls=0; Base.fail=true;
+    try {{ make(key); throw new AssertionError(); }} catch(RuntimeException actual) {{ if(actual!=Base.marker || Base.calls!=1 || Base.last!=expected) throw new AssertionError(); }}
+  }}
+}} }}"#, source.source)).unwrap();
+        for (program, args) in [
+            ("javac", vec!["sample/Caller.java", &leaf_file]),
+            ("java", vec!["sample.Caller"]),
+        ] {
+            let output = Command::new(program)
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{program}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+fn static_member_metadata(class: &mut DexClass) {
+    use rdx::native_dex::{DexAnnotation, DexAnnotationDirectory, DexValue};
+    class.annotations_offset = 1;
+    class.symbols = Arc::new(DexSymbols {
+        types: vec![
+            "Ldalvik/annotation/InnerClass;".into(),
+            "Ldalvik/annotation/EnclosingClass;".into(),
+            "Lsample/Outer;".into(),
+        ],
+        strings: vec![
+            "accessFlags".into(),
+            "name".into(),
+            "value".into(),
+            "Child".into(),
+        ],
+        annotations: [(
+            1,
+            Arc::new(DexAnnotationDirectory {
+                class: Some(
+                    vec![
+                        Arc::new(DexAnnotation {
+                            visibility: 2,
+                            type_idx: 0,
+                            elements: vec![(0, DexValue::Int(9)), (1, DexValue::String(3))],
+                        }),
+                        Arc::new(DexAnnotation {
+                            visibility: 2,
+                            type_idx: 1,
+                            elements: vec![(2, DexValue::Type(2))],
+                        }),
+                    ]
+                    .into(),
+                ),
+                ..Default::default()
+            }),
+        )]
+        .into(),
+        ..Default::default()
+    });
+}
+
+#[test]
+fn metadata_static_member_recovers_implicit_and_observed_parameter_constructors() {
+    let mut leaf = empty_class("Lsample/Outer$Child;", Some("Ljava/lang/Object;"), 1);
+    static_member_metadata(&mut leaf);
+    let h = TypeHierarchy::from_classes([&leaf]).unwrap();
+    assert!(h.equivalent_noarg_constructor(&leaf.descriptor, "Ljava/lang/Object;"));
+
+    let (mut leaf, base, mut owner) = switch_forwarder_fixture(false);
+    leaf.descriptor = "Lsample/Outer$Child;".into();
+    static_member_metadata(&mut leaf);
+    Arc::get_mut(&mut owner.symbols).unwrap().types[0] = leaf.descriptor.clone();
+    owner.methods[0].return_type = leaf.descriptor.clone();
+    let h = Arc::new(TypeHierarchy::from_classes([&leaf, &base, &owner]).unwrap());
+    assert!(h.equivalent_constructor(&leaf.descriptor, &base.descriptor, &["I".into()]));
+    leaf.symbols.hierarchy.set(h.clone()).unwrap();
+    owner.symbols.hierarchy.set(h).unwrap();
+    assert!(
+        native_java::render("sample.Outer$Child", &leaf)
+            .unwrap()
+            .source
+            .contains("super(p0)")
+    );
+    assert!(
+        native_java::render_method("sample.Caller", &owner, &owner.methods[0])
+            .unwrap()
+            .source
+            .contains("new sample.Outer$Child(")
+    );
+}
+
+#[test]
+fn member_constructor_requires_unique_consistent_static_metadata() {
+    use rdx::native_dex::DexValue;
+    for variant in 0..11 {
+        let mut leaf = empty_class("Lsample/Outer$Child;", Some("Ljava/lang/Object;"), 1);
+        static_member_metadata(&mut leaf);
+        let symbols = Arc::get_mut(&mut leaf.symbols).unwrap();
+        let dir = Arc::get_mut(symbols.annotations.get_mut(&1).unwrap()).unwrap();
+        let mut annotations = dir.class.take().unwrap().to_vec();
+        match variant {
+            0 => Arc::make_mut(&mut annotations[0]).elements[0].1 = DexValue::Int(1),
+            1 => Arc::make_mut(&mut annotations[0]).elements[1].1 = DexValue::Null,
+            2 => {
+                annotations.pop();
+            }
+            3 => annotations.push(annotations[0].clone()),
+            4 => Arc::make_mut(&mut annotations[0])
+                .elements
+                .push((0, DexValue::Int(9))),
+            5 => symbols.types[2] = "Lsample/Other;".into(),
+            6 => Arc::make_mut(&mut annotations[0]).elements[0].1 = DexValue::Int(25),
+            7 => Arc::make_mut(&mut annotations[0]).visibility = 1,
+            8 => {
+                symbols
+                    .types
+                    .push("Ldalvik/annotation/EnclosingMethod;".into());
+                annotations.push(Arc::new(rdx::native_dex::DexAnnotation {
+                    visibility: 2,
+                    type_idx: 3,
+                    elements: vec![],
+                }));
+            }
+            9 => {
+                let mut duplicate = (*annotations[0]).clone();
+                duplicate.visibility = 1;
+                annotations.push(Arc::new(duplicate));
+            }
+            _ => {
+                leaf.access_flags = 3;
+                Arc::make_mut(&mut annotations[0]).elements[0].1 = DexValue::Int(11);
+            }
+        }
+        dir.class = Some(annotations.into());
+        assert!(
+            !TypeHierarchy::from_classes([&leaf])
+                .unwrap()
+                .equivalent_noarg_constructor(&leaf.descriptor, "Ljava/lang/Object;"),
+            "variant {variant}"
+        );
+    }
+}
 fn parent(descriptor: &str, constructor_flags: u32) -> DexClass {
     let mut class = empty_class(descriptor, Some("Ljava/lang/Object;"), 1);
     class.methods.push(DexMethod {

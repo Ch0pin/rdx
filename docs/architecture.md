@@ -63,6 +63,19 @@ Metadata-only definition search narrows candidates. Matching, Unicode offsets,
 regexes, comment classification, result delivery and indexing are Rust code.
 Code search over disassembly is not equivalent to searching reconstructed Java.
 
+Cold source search uses up to twelve workers (available CPUs minus one), with a
+rolling admission window of sixteen jobs per worker. Workers render source and
+prepare trigram filters and compressed records; the coordinator preserves input
+order and owns cache admission and disk writes. Cached documents load only when
+consumed. A 128 MiB byte budget covers queued results, including prepared records.
+The next required result may exceed that budget to ensure progress, and each
+worker may hold one additional rendered result while waiting. Rendering and
+compression have transient allocations, so this is not a process memory ceiling.
+Cancellation and interactive requests are serviced during admission, result waits,
+and shutdown. A failed deferred cache load uses at most one additional worker to
+resolve the required class without waiting behind blocked future results.
+
+
 Find usages has a separate project-wide DEX reference index. Symbol fingerprints
 and owner IDs form sorted postings, with an in-memory posting buffer capped at
 32 MiB (reduced when owner names consume the index's 64 MiB admission budget).
@@ -75,9 +88,13 @@ Shared project ownership controls cancellation and temporary-file cleanup. Owner
 metadata, transient decoding allocations, and result source are additional memory;
 the posting buffer limit is not a total process memory ceiling.
 
-The project-session index is bounded to 1 GiB disk, 96 MiB conservative index
-metadata, and 64 MiB / 10,000 documents in its RAM tier. Records contain a small
-metadata frame and raw UTF-8 source. Results stop at 1,000 hits / 32 MiB retained
+The project-session index is bounded to 1 GiB disk, 256 MiB conservative index
+metadata / 150,000 entries, and 64 MiB / 10,000 documents in its RAM tier.
+Adaptive negative filters survive source-storage admission limits; possible
+matches without cached source are rendered again. Records contain a small
+metadata frame and UTF-8 source, using fast DEFLATE compression when it saves
+space. Compressed and expanded records both retain the 32 MiB document bound.
+Results stop at 1,000 hits / 32 MiB retained
 matching content. Native searches cache navigation metadata with matched source.
 Cancellation is checked between classes and resources. There are no source
 handoff files or Java code caches.

@@ -112,8 +112,18 @@ fn cast_recurses_into_nested_allocation_declarations_and_effects() {
             ty: "sample.Holder".into(),
         },
     ];
-    let rendered = allocation.render_checked(&events, &["source"]).unwrap();
+    let mut rendered = allocation.render_checked(&events, &["source"]).unwrap();
     assert_eq!(rendered.declarations, ["int value;"]);
+    assert_eq!(
+        rendered.declaration_metadata,
+        [Some(("value".into(), "int".into()))]
+    );
+    assert!(rendered.validate_declarations().is_ok());
+    rendered.declaration_metadata[0] = Some(("wrong".into(), "int".into()));
+    assert!(rendered.validate_declarations().is_err());
+    rendered.declaration_metadata[0] = Some(("value".into(), "long".into()));
+    assert!(rendered.validate_declarations().is_err());
+    rendered.declaration_metadata[0] = Some(("value".into(), "int".into()));
     assert_eq!(
         rendered.expression,
         "new Holder(((Parent) new Child((value = source.f()))))"

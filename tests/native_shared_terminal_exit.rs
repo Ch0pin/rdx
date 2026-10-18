@@ -536,3 +536,58 @@ fn unchanged_emitted_scalar_wide_reference_terminal_frames_and_call_faults_match
         );
     }
 }
+
+fn static_terminal_with_unrelated_catch() -> DexClass {
+    let mut class = fixture(1);
+    class.symbols = Arc::new(DexSymbols {
+        strings: vec!["touch".into(), "value".into()],
+        types: vec!["Lsample/Effects;".into(), "I".into()],
+        protos: vec![("I".into(), vec![])],
+        methods: vec![(0, 0, 0)],
+        fields: vec![(0, 1, 1)],
+        ..Default::default()
+    });
+    let method = &mut class.methods[0];
+    method.parameters = vec!["I".into(), "I".into()];
+    let code = method.code.as_mut().unwrap();
+    code.registers = 4;
+    code.ins = 2;
+    code.instructions = vec![
+        0x0012, 0x0339, 13, 0x0071, 0, 0, 0x010a, 0x2035, 11,
+        0x0138, 5, 0x00d8, 0x0100, 0x0428, 0x0160, 0, 0x010f,
+        0xf628, 0x000f, 0x010d, 0xf112, 0x010f,
+    ];
+    code.tries = 1;
+    code.try_regions = vec![DexTryRegion {
+        start: 3, end: 7,
+        catches: vec![(Some("Ljava/lang/RuntimeException;".into()), 19)].into(),
+    }];
+    class
+}
+
+#[test]
+fn terminal_static_read_outside_unrelated_try_keeps_exact_original_edge() {
+    let class = static_terminal_with_unrelated_catch();
+    let code = class.methods[0].code.as_ref().unwrap();
+    let proof = shared_terminal_exit::prove(code, 1, 14, 7..18).unwrap();
+    assert_eq!(proof.instructions, vec![14, 16]);
+    assert!(proof.live_in_registers.is_empty());
+    assert!(shared_terminal_exit::validate(code, &proof));
+    let source = native_java::render_method("sample.TerminalTail", &class, &class.methods[0])
+        .unwrap().source;
+    assert_eq!(source.matches("sample.Effects.value").count(), 2, "{source}");
+    assert_eq!(source.matches("sample.Effects.touch()").count(), 1, "{source}");
+    assert!(source.find("sample.Effects.value").unwrap() < source.find("try {").unwrap(), "{source}");
+}
+
+#[test]
+fn terminal_static_read_rejects_protection_at_source_target_or_handler_entry() {
+    for (start, end, handler) in [(1, 3, 19), (14, 16, 19), (3, 6, 14)] {
+        let mut class = static_terminal_with_unrelated_catch();
+        let code = class.methods[0].code.as_mut().unwrap();
+        code.try_regions[0] = DexTryRegion {
+            start, end, catches: vec![(Some("Ljava/lang/RuntimeException;".into()), handler)].into(),
+        };
+        assert!(shared_terminal_exit::prove(code, 1, 14, 7..18).is_none());
+    }
+}

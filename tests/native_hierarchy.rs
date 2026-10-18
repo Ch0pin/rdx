@@ -1,14 +1,54 @@
-use rdx::{native_calls, native_cfg, native_dominators, native_ir, native_ssa};
+use rdx::{native_call_values, native_calls, native_cfg, native_dominators, native_ir, native_ssa};
 mod native_dex {
     pub use rdx::native_dex::*;
 }
+// The included hierarchy source must consume the exact renderer predicates
+// from the linked candidate library. These hidden public functions are the
+// source-inclusion boundary; no test-local approximation supplies authority.
+mod native_java {
+    pub(crate) use rdx::native_java::{
+        flat_source_prefix_authority, ordinary_method_declaration_authority,
+        source_header_authority,
+    };
+}
 
+// This harness includes the full module; renderer-only APIs are exercised elsewhere.
+#[allow(dead_code)]
 #[path = "../src/native_hierarchy.rs"]
 mod native_hierarchy;
 
 use native_dex::{DexClass, DexSymbols};
 use native_hierarchy::{Relation, TypeHierarchy};
 use std::sync::Arc;
+
+#[test]
+fn sdk_member_source_names_keep_exact_binary_enclosing_chain() {
+    for (binary, owner, member) in [
+        (
+            "android.view.View$BaseSavedState",
+            "android.view.View",
+            "BaseSavedState",
+        ),
+        (
+            "android.os.Parcelable$Creator",
+            "android.os.Parcelable",
+            "Creator",
+        ),
+    ] {
+        let (actual_owner, actual_member, chain) =
+            native_hierarchy::platform_member_type(binary).unwrap();
+        assert_eq!((actual_owner, actual_member), (owner, member));
+        assert_eq!(
+            chain,
+            &[
+                format!("L{};", binary.replace('.', "/")),
+                format!("L{};", owner.replace('.', "/")),
+            ]
+        );
+    }
+    assert!(native_hierarchy::platform_member_type("sample.Price$Tag").is_none());
+    assert!(native_hierarchy::platform_member_type("android.view.View").is_none());
+}
 
 #[test]
 fn sdk_readability_facts_require_unshadowed_exact_platform_types() {
@@ -257,9 +297,12 @@ fn pinned_data_input_contract_proves_exact_throws_and_rejects_unknown_families()
     let mut unrelated = make_reader();
     unrelated.methods.push(method("Lsample/Reader;", "e", "V"));
     unrelated.methods[2].parameters = vec!["J".into()];
+    let code = unrelated.methods[2].code.as_mut().unwrap();
+    code.ins = 3;
+    code.registers = 4;
     let h = TypeHierarchy::from_classes([&unrelated]).unwrap();
     assert!(!h.inherited_io_exception(&unrelated, &unrelated.methods[2]));
-    assert!(!h.permits_inferred_checked_throw(
+    assert!(h.permits_inferred_checked_throw(
         &unrelated,
         &unrelated.methods[2],
         "Ljava/io/IOException;"
@@ -1105,4 +1148,145 @@ fn pinned_static_throws_and_document_contracts_require_exact_descriptors() {
         &method,
         "Ljava/io/FileNotFoundException;",
     ));
+}
+
+#[test]
+fn source_visible_checked_contracts_preserve_exact_and_potential_inference() {
+    use native_dex::{DexCode, DexMethod};
+    let mut owner = class("Lapp/Contracts;", Some("Ljava/lang/Object;"), &[]);
+    owner.methods = vec![
+        DexMethod {
+            declaring_type: owner.descriptor.clone(),
+            name: "work".into(),
+            return_type: "V".into(),
+            parameters: vec!["Ljava/io/IOException;".into()],
+            thrown_types: vec!["Ljava/io/IOException;".into()],
+            access_flags: 9,
+            code: None,
+        },
+        DexMethod {
+            declaring_type: owner.descriptor.clone(),
+            name: "work".into(),
+            return_type: "V".into(),
+            parameters: vec!["Ljava/lang/Throwable;".into()],
+            thrown_types: vec![],
+            access_flags: 10,
+            code: Some(DexCode {
+                registers: 1,
+                ins: 1,
+                outs: 0,
+                tries: 0,
+                try_regions: vec![],
+                instructions: vec![0x0027],
+                offset: 0,
+            }),
+        },
+    ];
+    let hierarchy = TypeHierarchy::from_classes([&owner]).unwrap();
+    assert_eq!(
+        hierarchy
+            .call_checked_effects(
+                &owner.descriptor,
+                "work",
+                &["Ljava/io/IOException;".into()],
+                "V",
+                true
+            )
+            .unwrap(),
+        vec![Arc::<str>::from("Ljava/io/IOException;")]
+    );
+    assert_eq!(
+        hierarchy
+            .call_checked_effects(
+                &owner.descriptor,
+                "work",
+                &["Ljava/lang/Throwable;".into()],
+                "V",
+                true
+            )
+            .unwrap(),
+        vec![Arc::<str>::from("Ljava/lang/Throwable;")]
+    );
+    assert_eq!(
+        hierarchy
+            .call_checked_effects(
+                &owner.descriptor,
+                "work",
+                &["Ljava/io/IOException;".into()],
+                "V",
+                false
+            )
+            .unwrap(),
+        vec![Arc::<str>::from("Ljava/lang/Throwable;")]
+    );
+}
+
+#[test]
+fn static_source_declaration_authority_retains_original_throw_helper() {
+    let mut owner = class("Lsample/Owner;", Some("Ljava/lang/Object;"), &[]);
+    owner.access_flags = 0x11;
+    owner.methods = vec![native_dex::DexMethod {
+        declaring_type: owner.descriptor.clone(),
+        name: "raise".into(),
+        return_type: "V".into(),
+        parameters: vec!["Ljava/io/IOException;".into()],
+        thrown_types: vec![],
+        access_flags: 10,
+        code: Some(native_dex::DexCode {
+            registers: 1,
+            ins: 1,
+            outs: 0,
+            tries: 0,
+            try_regions: vec![],
+            instructions: vec![0x0027],
+            offset: 0,
+        }),
+    }];
+    let hierarchy = TypeHierarchy::from_classes([&owner]).unwrap();
+    match hierarchy.source_static_declaration(
+        &owner,
+        &owner.descriptor,
+        "raise",
+        &owner.methods[0].parameters,
+        "V",
+    ) {
+        native_hierarchy::SourceStaticDeclaration::ParameterThrow(method) => assert_eq!(
+            native_hierarchy::static_parameter_throw_shape(method),
+            Some("Ljava/io/IOException;")
+        ),
+        _ => panic!("exact original parameter throw must remain a declaration trigger"),
+    }
+}
+
+#[test]
+fn static_parameter_throw_shape_respects_eight_bit_register_and_try_metadata() {
+    for (registers, instruction, expected) in [
+        (256, 0xff27, true),
+        (257, 0x0027, false),
+        (0, 0x0027, false),
+    ] {
+        let mut method = native_dex::DexMethod {
+            declaring_type: "Lsample/Owner;".into(),
+            name: "raise".into(),
+            return_type: "V".into(),
+            parameters: vec!["Ljava/io/IOException;".into()],
+            thrown_types: vec![],
+            access_flags: 10,
+            code: Some(native_dex::DexCode {
+                registers,
+                ins: 1,
+                outs: 0,
+                tries: 0,
+                try_regions: vec![],
+                instructions: vec![instruction],
+                offset: 0,
+            }),
+        };
+        assert_eq!(
+            native_hierarchy::static_parameter_throw_shape(&method).is_some(),
+            expected
+        );
+        method.code.as_mut().unwrap().tries = 1;
+        assert!(native_hierarchy::static_parameter_throw_shape(&method).is_none());
+    }
 }

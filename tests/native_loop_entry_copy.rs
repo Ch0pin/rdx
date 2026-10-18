@@ -1,4 +1,5 @@
 //! External effectful suffixes are copied before a common ordinary loop.
+use rdx::native_ssa;
 use rdx::{
     native_cfg,
     native_dex::{self, DexClass, DexSymbols},
@@ -215,15 +216,15 @@ fn handlers_allocations_mid_instruction_entries_and_branching_suffixes_decline()
 }
 
 #[test]
-fn linear_suffix_instruction_budget_accepts_32_and_rejects_33() {
-    for count in [29usize, 30] {
+fn linear_suffix_instruction_budget_accepts_64_and_rejects_65() {
+    for count in [61usize, 62] {
         let mut class = fixture(0);
         let code = class.methods[0].code.as_mut().unwrap();
         code.instructions
             .splice(10..10, std::iter::repeat_n(0, count));
         code.instructions[7] = (9 + count) as u16;
         code.instructions[14 + count] = (((-8 - count as i32) as i8 as u8 as u16) << 8) | 0x28;
-        assert_eq!(loop_entry_copy::select(code).is_some(), count == 29);
+        assert_eq!(loop_entry_copy::select(code).is_some(), count == 61);
     }
 }
 
@@ -296,8 +297,8 @@ fn backward_conditional_cycles_terminal_arms_and_pending_result_entries_decline(
 }
 
 #[test]
-fn copied_dag_total_instruction_budget_accepts_32_and_rejects_33() {
-    for count in [27usize, 28] {
+fn copied_dag_total_instruction_budget_accepts_64_and_rejects_65() {
+    for count in [59usize, 60] {
         let mut class = fixture(4);
         let code = class.methods[0].code.as_mut().unwrap();
         code.instructions
@@ -305,7 +306,7 @@ fn copied_dag_total_instruction_budget_accepts_32_and_rejects_33() {
         code.instructions[7] = (12 + count) as u16;
         code.instructions[11] = (6 + count) as u16;
         code.instructions[17 + count] = (((-11 - count as i32) as i8 as u8 as u16) << 8) | 0x28;
-        assert_eq!(loop_entry_copy::select(code).is_some(), count == 27);
+        assert_eq!(loop_entry_copy::select(code).is_some(), count == 59);
     }
 }
 

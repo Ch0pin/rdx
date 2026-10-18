@@ -382,8 +382,29 @@ fn production_decoder_sequences_strict_forwarder_and_ignored_object_append() {
         methods: vec![],
     };
     let h = Arc::new(TypeHierarchy::from_classes([&class, &leaf]).unwrap());
-    assert_eq!(h.recovered_constructors("Lsample/E;").len(), 1);
-    assert!(h.recovered_constructors("Lsample/E;")[0].strict_allocation_order);
+    let recovered = h.recovered_constructors("Lsample/E;");
+    assert_eq!(recovered.len(), 2);
+    let string_forwarder = recovered
+        .iter()
+        .find(|constructor| {
+            constructor.parameters.len() == 1
+                && constructor.parameters[0].as_ref() == "Ljava/lang/String;"
+        })
+        .expect("observed String constructor");
+    assert!(string_forwarder.strict_allocation_order);
+    let implicit_noarg = recovered
+        .iter()
+        .find(|constructor| constructor.parameters.is_empty())
+        .expect("accessible implicit SDK constructor");
+    assert_eq!(
+        implicit_noarg.parent.as_ref(),
+        "Ljava/lang/IllegalArgumentException;"
+    );
+    assert_eq!(
+        implicit_noarg.invoked_owner.as_ref(),
+        "Ljava/lang/IllegalArgumentException;"
+    );
+    assert!(implicit_noarg.thrown_types.is_empty());
     assert!(class.symbols.hierarchy.set(h).is_ok());
     MethodAnalysis::build(&class, &class.methods[0])
         .unwrap()

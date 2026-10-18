@@ -34,6 +34,8 @@ def parse(data):
         result = {}
         for _ in range(u2()):
             name, size = pool[u2()], u4()
+            if name in result:
+                raise ValueError('duplicate classfile attribute: ' + name)
             result[name] = stream.read(size)
         return result
     for _ in range(u2()):
@@ -50,12 +52,32 @@ def parse(data):
             thrown = [cls(struct.unpack_from('>H', exceptions, 2 + j * 2)[0]) for j in range(count)]
             if thrown:
                 methods[owner + '->' + name + descriptor] = [bool(access & 8), thrown]
-        # Named top-level parents avoid unresolved enclosing-instance and enum
-        # superclass syntax. Keep exact signature/access/throws, never bodies.
+        # Candidate parent declarations; member staticness/access is checked
+        # from the class-level InnerClasses attribute below.
         if (name == '<init>' and flags & 1 and not flags & (0x10 | 0x4000)
-                and '$' not in owner and owner != 'Ljava/lang/Enum;' and access & 5):
+                and owner != 'Ljava/lang/Enum;' and access & 5):
             constructors[owner + '->' + name + descriptor] = [access, thrown]
-    return owner, parent, interfaces, methods, constructors
+    attributes = attrs()
+    outer = None
+    if '$' in owner:
+        entries = attributes.get('InnerClasses', b'\0\0')
+        count = struct.unpack_from('>H', entries)[0]
+        matches = []
+        for index in range(count):
+            inner, enclosing, name, access = struct.unpack_from('>HHHH', entries, 2 + 8 * index)
+            if cls(inner) == owner:
+                matches.append((enclosing, name, access))
+        if len(matches) == 1 and 'EnclosingMethod' not in attributes:
+            enclosing, name, access = matches[0]
+            if (enclosing and name and access & 7 == 1 and access & 8
+                    and access & ~0x761f == 0
+                    and access & 0x7611 == flags & 0x7611):
+                outer = cls(enclosing)
+                if owner != outer[:-1] + '$' + pool[name] + ';':
+                    outer = None
+        if outer is None:
+            constructors.clear()
+    return owner, parent, interfaces, methods, constructors, flags, outer
 
 
 def main():
@@ -64,15 +86,40 @@ def main():
     parser.add_argument('output')
     parser.add_argument('--constructors-output')
     args = parser.parse_args()
-    classes, methods, types, constructors = {}, {}, {}, {}
+    classes, methods, types, constructors, declarations_by_owner = {}, {}, {}, {}, {}
     with zipfile.ZipFile(args.jar) as archive:
         for name in sorted(archive.namelist()):
             if name.endswith('.class'):
-                owner, parent, interfaces, declarations, declared_constructors = parse(archive.read(name))
+                owner, parent, interfaces, declarations, declared_constructors, flags, outer = parse(archive.read(name))
                 classes[owner] = parent
                 types[owner] = [parent, interfaces]
                 methods.update(declarations)
-                constructors.update(declared_constructors)
+                declarations_by_owner[owner] = (flags, outer, declared_constructors)
+    member_types = {}
+    for owner, (_, outer, declared_constructors) in declarations_by_owner.items():
+        # Every enclosing member must be public and static; top-level access
+        # is checked too. Missing or cyclic nesting never supplies access proof.
+        seen = {owner}
+        accessible = True
+        current, members, chain = owner, [], [owner]
+        while outer is not None:
+            if outer in seen or outer not in declarations_by_owner:
+                accessible = False
+                break
+            seen.add(outer)
+            flags, next_outer, _ = declarations_by_owner[outer]
+            if not flags & 1 or ('$' in outer and next_outer is None):
+                accessible = False
+                break
+            members.insert(0, current[len(outer):-1])
+            chain.append(outer)
+            current = outer
+            outer = next_outer
+        if accessible:
+            constructors.update(declared_constructors)
+            if members:
+                member_types[owner[1:-1].replace('/', '.')] = [
+                    current[1:-1].replace('/', '.'), '.'.join(members), chain]
     exceptions = {}
     for owner, parent in classes.items():
         seen, current = set(), owner
@@ -92,7 +139,8 @@ def main():
     if args.constructors_output:
         with open(args.constructors_output, 'w') as output:
             json.dump({'source': result['source'], 'sha256': result['sha256'],
-                       'constructors': constructors}, output, indent=2, sort_keys=True)
+                       'constructors': constructors, 'member_types': member_types},
+                      output, indent=2, sort_keys=True)
             output.write('\n')
 
 

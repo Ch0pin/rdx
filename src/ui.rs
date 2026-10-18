@@ -876,6 +876,26 @@ impl App {
         code: DecompiledCode,
         position: Option<usize>,
     ) -> Result<(), String> {
+        let target = Target::Class(name.clone());
+        if let Some(index) = self.tabs.iter().position(|tab| {
+            tab.target == target
+                && tab.source_hash.as_ref() == Some(&code.source_hash)
+                && matches!(&tab.content, Content::Text(document) if document.text() == code.source)
+        }) {
+            let tab = &mut self.tabs[index];
+            if let Content::Text(document) = &mut tab.content {
+                // Validate the jump before updating metadata or selection. Keep
+                // the document and its layout caches for unchanged source.
+                if let Some(position) = position {
+                    document.jump_to(position)?;
+                }
+                document.set_links(code.links);
+            }
+            tab.loading_navigation = false;
+            self.selected = index;
+            self.refresh_manifest_links();
+            return Ok(());
+        }
         let resource = name.starts_with(rdx::resource_table::PREFIX);
         let mut document = CodeDocument::new(code.source, if resource { "xml" } else { "java" });
         document.set_links(code.links);
@@ -1613,19 +1633,9 @@ impl App {
                 "View exceeds the 64 MiB source budget; export it to inspect externally".into(),
             );
         }
-        // Source admission never closes an existing view. Rendering caches have
-        // a separate, disposable lifetime and cannot consume this source budget.
-        let retained: usize = self
-            .tabs
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| Some(*index) != existing)
-            .map(|(_, tab)| tab.source_bytes())
-            .sum();
-        let count = self.tabs.len() - usize::from(existing.is_some());
-        if count >= 8 || retained + tab.source_bytes() > BUDGET {
-            return Err("Open views fill the tab budget (8 views / 64 MiB of source). Close a view before opening another".into());
-        }
+        // Open views retain their source and navigation state. The disposable
+        // rendering cache has its own budget; browsing never closes another view
+        // or requires the user to close one before opening a declaration.
         if let Some(index) = existing {
             self.tabs.remove(index);
         }
@@ -1641,7 +1651,11 @@ impl App {
         Ok(())
     }
     fn trim_tab_layouts(&mut self, budget: usize) {
-        let mut retained: usize = self.tabs.iter().map(Tab::retained_bytes).sum();
+        let mut retained: usize = self
+            .tabs
+            .iter()
+            .map(|tab| tab.retained_bytes().saturating_sub(tab.source_bytes()))
+            .sum();
         for (index, tab) in self.tabs.iter_mut().enumerate() {
             if retained <= budget {
                 break;
@@ -4000,26 +4014,72 @@ mod settings_tests {
     }
 
     #[test]
-    fn full_unpinned_tab_set_rejects_new_view_without_closing_any() {
+    fn source_buffers_do_not_consume_the_disposable_layout_budget() {
+        let ctx = egui::Context::default();
         let mut app = navigation_test_app();
-        for index in 0..8 {
-            app.push_tab(sample_tab(index, 64)).unwrap();
+        for index in 0..2 {
+            app.push_tab(sample_tab(index, 256)).unwrap();
+            let Content::Text(document) = &mut app.tabs[index].content else {
+                unreachable!()
+            };
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    document.show(ui, CodeTheme::Ocean, 14.0);
+                });
+            });
         }
-        app.select_tab(2);
-        let before: Vec<_> = app.tabs.iter().map(|tab| tab.target.clone()).collect();
-        assert!(
-            app.push_tab(sample_tab(8, 64))
-                .unwrap_err()
-                .contains("Close a view")
-        );
-        assert_eq!(app.selected, 2);
+        let retained: Vec<_> = app.tabs.iter().map(Tab::retained_bytes).collect();
+        let layouts: usize = app
+            .tabs
+            .iter()
+            .map(|tab| tab.retained_bytes() - tab.source_bytes())
+            .sum();
+        assert!(layouts > 0);
+        app.trim_tab_layouts(layouts);
         assert_eq!(
-            app.tabs
-                .iter()
-                .map(|tab| tab.target.clone())
-                .collect::<Vec<_>>(),
-            before
+            app.tabs.iter().map(Tab::retained_bytes).collect::<Vec<_>>(),
+            retained
         );
+        app.trim_tab_layouts(0);
+        assert_eq!(app.tabs[0].retained_bytes(), app.tabs[0].source_bytes());
+        assert_eq!(app.tabs[1].retained_bytes(), retained[1]);
+    }
+
+    #[test]
+    fn browsing_more_than_eight_views_preserves_every_tab_and_position() {
+        for pinned in [false, true] {
+            let mut app = navigation_test_app();
+            for index in 0..16 {
+                let mut tab = sample_tab(index, 64);
+                tab.pinned = pinned;
+                tab.bookmarked = index == 2;
+                let Content::Text(document) = &mut tab.content else {
+                    unreachable!()
+                };
+                document.jump_to(index + 1).unwrap();
+                document.set_links(vec![rdx::engine::CodeLink {
+                    start: 0,
+                    end: 6,
+                    label: "sample.Target".into(),
+                }]);
+                app.push_tab(tab).unwrap();
+            }
+            assert_eq!(app.tabs.len(), 16);
+            assert_eq!(app.selected, 15);
+            app.select_tab(2);
+            app.trim_tab_layouts(1);
+            assert_eq!(app.selected, 2);
+            for (index, tab) in app.tabs.iter().enumerate() {
+                assert_eq!(tab.target, Target::File(index));
+                assert_eq!(tab.pinned, pinned);
+                assert_eq!(tab.bookmarked, index == 2);
+                let Content::Text(document) = &tab.content else {
+                    unreachable!()
+                };
+                assert_eq!(document.navigation_position(), index + 1);
+                assert_eq!(document.link_at(0).unwrap().label, "sample.Target");
+            }
+        }
     }
 
     #[test]
@@ -4031,24 +4091,23 @@ mod settings_tests {
             app.push_tab(tab).unwrap();
         }
         app.selected = 3;
-        let error = app.push_tab(sample_tab(8, 64)).unwrap_err();
-        assert!(error.contains("Close a view"));
-        assert_eq!(app.tabs.len(), 8);
-        assert_eq!(app.selected, 3);
-        assert!(app.tabs.iter().all(|tab| tab.pinned));
+        app.push_tab(sample_tab(8, 64)).unwrap();
+        assert_eq!(app.tabs.len(), 9);
+        assert_eq!(app.selected, 8);
+        assert!(app.tabs[..8].iter().all(|tab| tab.pinned));
         app.tabs[3].bookmarked = true;
         app.push_tab(sample_tab(3, 128)).unwrap();
         assert!(app.tabs[app.selected].pinned && app.tabs[app.selected].bookmarked);
         app.tab_action(0, TabAction::TogglePin);
-        assert!(app.push_tab(sample_tab(8, 64)).is_err());
-        assert_eq!(app.tabs.len(), 8);
+        app.push_tab(sample_tab(9, 64)).unwrap();
+        assert_eq!(app.tabs.len(), 10);
         app.tab_action(0, TabAction::Close);
         app.push_tab(sample_tab(8, 64)).unwrap();
-        assert_eq!(app.tabs.len(), 8);
+        assert_eq!(app.tabs.len(), 9);
         assert!(!app.tabs.iter().any(|tab| tab.target == Target::File(0)));
     }
     #[test]
-    fn source_budget_rejects_without_closing_pinned_or_unpinned_views() {
+    fn aggregate_source_above_cache_budget_keeps_pinned_and_unpinned_views() {
         for pinned in [false, true] {
             let mut app = navigation_test_app();
             for index in 0..2 {
@@ -4056,11 +4115,14 @@ mod settings_tests {
                 tab.pinned = pinned;
                 app.push_tab(tab).unwrap();
             }
-            let selected = app.selected;
-            assert!(app.push_tab(sample_tab(2, 24 * 1024 * 1024)).is_err());
-            assert_eq!(app.tabs.len(), 2);
-            assert_eq!(app.selected, selected);
-            assert!(app.tabs.iter().map(Tab::retained_bytes).sum::<usize>() <= 64 * 1024 * 1024);
+            let mut tab = sample_tab(2, 24 * 1024 * 1024);
+            tab.pinned = pinned;
+            app.push_tab(tab).unwrap();
+            app.trim_tab_layouts(64 * 1024 * 1024);
+            assert_eq!(app.tabs.len(), 3);
+            assert_eq!(app.selected, 2);
+            assert!(app.tabs.iter().all(|tab| tab.pinned == pinned));
+            assert!(app.tabs.iter().map(Tab::source_bytes).sum::<usize>() > 64 * 1024 * 1024);
         }
     }
     #[test]
@@ -4167,6 +4229,98 @@ mod settings_tests {
             .1;
         render(&mut app, click(last.center()));
         assert_eq!(app.selected, 7);
+    }
+
+    #[test]
+    fn display_code_reuses_document_and_refreshes_links_for_unchanged_source() {
+        let mut app = navigation_test_app();
+        let mut code = DecompiledCode {
+            source: "class Target {}".into(),
+            source_hash: "same".into(),
+            links: vec![],
+            definitions: vec![],
+        };
+        app.display_code("sample.Target".into(), code.clone(), Some(0))
+            .unwrap();
+        let Content::Text(document) = &app.tabs[0].content else {
+            panic!("source document")
+        };
+        let original = &**document as *const CodeDocument;
+        app.tabs[0].pinned = true;
+        app.tabs[0].bookmarked = true;
+        code.links.push(rdx::engine::CodeLink {
+            start: 6,
+            end: 12,
+            label: "Target".into(),
+        });
+        app.display_code("sample.Other".into(), code.clone(), None)
+            .unwrap();
+        app.display_code("sample.Target".into(), code, Some(6))
+            .unwrap();
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.tabs.len(), 2);
+        assert!(app.tabs[0].pinned && app.tabs[0].bookmarked);
+        let Content::Text(document) = &app.tabs[0].content else {
+            panic!("source document")
+        };
+        assert_eq!(&**document as *const CodeDocument, original);
+        assert_eq!(document.navigation_position(), 6);
+        assert_eq!(document.link_at(6).unwrap().label, "Target");
+    }
+
+    #[test]
+    fn display_code_rejects_invalid_reuse_jump_without_changing_selection_or_links() {
+        let mut app = navigation_test_app();
+        let mut code = DecompiledCode {
+            source: "class Target {}".into(),
+            source_hash: "same".into(),
+            links: vec![],
+            definitions: vec![],
+        };
+        app.display_code("sample.Target".into(), code.clone(), Some(6))
+            .unwrap();
+        app.display_code("sample.Other".into(), code.clone(), None)
+            .unwrap();
+        code.links.push(rdx::engine::CodeLink {
+            start: 6,
+            end: 12,
+            label: "new".into(),
+        });
+        assert!(
+            app.display_code("sample.Target".into(), code, Some(usize::MAX))
+                .is_err()
+        );
+        assert_eq!(app.selected, 1);
+        let Content::Text(document) = &app.tabs[0].content else {
+            panic!("source document")
+        };
+        assert_eq!(document.navigation_position(), 6);
+        assert!(document.link_at(6).is_none());
+    }
+
+    #[test]
+    fn display_code_replaces_document_when_source_or_hash_changes() {
+        for (source, hash) in [("class Changed {}", "same"), ("class Target {}", "changed")] {
+            let mut app = navigation_test_app();
+            let mut code = DecompiledCode {
+                source: "class Target {}".into(),
+                source_hash: "same".into(),
+                links: vec![],
+                definitions: vec![],
+            };
+            app.display_code("sample.Target".into(), code.clone(), Some(6))
+                .unwrap();
+            code.source = source.into();
+            code.source_hash = hash.into();
+            app.display_code("sample.Target".into(), code, None)
+                .unwrap();
+            let Content::Text(document) = &app.tabs[0].content else {
+                panic!("source document")
+            };
+            assert_eq!(document.text(), source);
+            assert_eq!(document.navigation_position(), 0);
+            assert_eq!(app.tabs[0].source_hash.as_deref(), Some(hash));
+        }
     }
 
     fn wait_for_history(app: &mut App, ctx: &egui::Context) {

@@ -11,6 +11,25 @@ pub(super) struct Lowered {
     pub regs: Vec<Option<Value>>,
     pub out: Output,
     pub next_pc: usize,
+    pub internal_handler_regions: Vec<crate::native_dex::DexTryRegion>,
+}
+struct ArgumentHandlerScope<'a> {
+    active: &'a std::cell::RefCell<Vec<(crate::native_dex::DexTryRegion, usize)>>,
+    previous_len: usize,
+}
+impl Drop for ArgumentHandlerScope<'_> {
+    fn drop(&mut self) {
+        self.active.borrow_mut().truncate(self.previous_len);
+    }
+}
+struct ArgumentRegion<'a> {
+    active: &'a std::cell::RefCell<Vec<(usize, usize, Option<usize>)>>,
+    previous_len: usize,
+}
+impl Drop for ArgumentRegion<'_> {
+    fn drop(&mut self) {
+        self.active.borrow_mut().truncate(self.previous_len);
+    }
 }
 
 #[derive(Clone)]
@@ -168,6 +187,11 @@ fn expression(value: Atom, expected: &str, class: &DexClass) -> Result<Expr> {
 fn symbol(text: String, label: String) -> Symbol {
     Symbol { text, label }
 }
+fn declaration_descriptor(class: &DexClass, display: &str) -> Result<String> {
+    super::super::declaration_types::lookup(&class.symbols, display)
+        .map(str::to_owned)
+        .context("allocation declaration type has no unique original descriptor")
+}
 fn method_symbol(
     class: &DexClass,
     index: usize,
@@ -219,6 +243,10 @@ fn evaluated_staging_input(value: &Value) -> bool {
             .text
             .strip_prefix(['v', 'p'])
             .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn evaluated_structured_input(value: &Value, graph: &Graph) -> bool {
+    evaluated_staging_input(value) || graph.caught_values.borrow().contains(&value.text)
 }
 
 // A deferred caller expression predates new-instance in DEX. Moving its first
@@ -502,6 +530,7 @@ fn try_region_staging_mode(
     caller_out: &Output,
     argument_block: bool,
 ) -> Result<Lowered> {
+    let proof_projection = graph.argument_projection.borrow().clone();
     let dst = (words[pc] >> 8) as usize;
     let ty = class
         .symbols
@@ -549,21 +578,23 @@ fn try_region_staging_mode(
             !(start <= target && target <= constructor_pc)
         }
     };
-    for (origin, target) in graph.targets.iter().enumerate() {
-        if let Some(target) = target {
-            ensure!(
-                valid_edge(origin, *target),
-                "allocation region has escaping or external edge"
-            );
-        }
-        if let Some(switch) = &graph.switches[origin] {
-            ensure!(
-                switch
-                    .cases
-                    .iter()
-                    .all(|(_, target)| valid_edge(origin, *target)),
-                "allocation region has escaping switch edge"
-            );
+    if !argument_block {
+        for (origin, target) in graph.targets.iter().enumerate() {
+            if let Some(target) = target {
+                ensure!(
+                    valid_edge(origin, *target),
+                    "allocation region has escaping or external edge"
+                );
+            }
+            if let Some(switch) = &graph.switches[origin] {
+                ensure!(
+                    switch
+                        .cases
+                        .iter()
+                        .all(|(_, target)| valid_edge(origin, *target)),
+                    "allocation region has escaping switch edge"
+                );
+            }
         }
     }
     for region in &method.code.as_ref().context("method code")?.try_regions {
@@ -572,7 +603,8 @@ fn try_region_staging_mode(
         ensure!(
             end <= pc
                 || from > constructor_pc
-                || (from <= pc && constructor_pc + graph.widths[constructor_pc] <= end),
+                || (from <= pc && constructor_pc + graph.widths[constructor_pc] <= end)
+                || (argument_block && start <= from && end <= constructor_pc),
             "allocation region crosses handler boundary"
         );
     }
@@ -582,18 +614,33 @@ fn try_region_staging_mode(
         words,
         constructor_pc,
     )?;
-    // Keep exact uninitialized aliases while staging ordinary argument code.
-    // Branches may precede alias transfers; after the first transfer, require
-    // a linear suffix so all paths share the same receiver identity.
-    let ir = crate::native_ir::DecodedMethod::decode(method.code.as_ref().unwrap())?;
+    // Structured proof preserves exact original alias moves and live receiver
+    // identities across all normal paths. Pure staging retains a linear suffix.
+    let ir = if let Some(projection) = &proof_projection {
+        projection
+            .checked_ir(class, method)
+            .context("allocation projection certificate invalid")?
+    } else {
+        crate::native_ir::DecodedMethod::decode(method.code.as_ref().unwrap())?
+    };
     let block_plan = if argument_block {
-        let plan = super::structured_argument_region::prove(class, method, pc, constructor_pc)
-            .context("no exact structured argument-region proof")?;
+        let plan = if let Some(projection) = &proof_projection {
+            projection.prove(class, method, pc, constructor_pc)
+        } else {
+            super::structured_argument_region::prove(class, method, pc, constructor_pc)
+        }
+        .context("no exact structured argument-region proof")?;
         // A region renderer may choose a source cast from a broad Java local.
         // Every original reference input must already satisfy the raw DEX
         // invocation domain; fresh positive proof cannot repair an invalid call.
         for call in &plan.calls {
-            if call.pc != constructor_pc && call.receiver.is_some() {
+            if call.pc != constructor_pc
+                && !plan
+                    .nested_initializations
+                    .iter()
+                    .any(|(_, constructor)| *constructor == call.pc)
+                && call.receiver.is_some()
+            {
                 ensure!(
                     graph.proven_reference_call_input(class, method, call.pc, None),
                     "structured reference receiver lacks positive original domain"
@@ -611,7 +658,7 @@ fn try_region_staging_mode(
         for read in &plan.first_reads {
             let value = super::register(caller_regs, read.register)?;
             ensure!(
-                evaluated_staging_input(&value),
+                evaluated_structured_input(&value, graph),
                 "structured argument caller first-read is deferred"
             );
             ensure!(
@@ -627,45 +674,54 @@ fn try_region_staging_mode(
     let mut aliases = HashSet::from([dst]);
     let mut alias_transfer = false;
     let mut staged_words = words.to_vec();
-    for instruction in ir
-        .instructions
-        .iter()
-        .filter(|i| start <= i.pc && i.pc < constructor_pc)
-    {
-        ensure!(
-            !alias_transfer
-                || (instruction.branch_target.is_none()
-                    && !matches!(instruction.opcode, 0x2b | 0x2c)),
-            "allocation alias crosses control flow"
-        );
-        let from_alias = matches!(instruction.opcode, 0x07..=0x09)
-            && instruction
-                .reads
-                .first()
-                .is_some_and(|r| aliases.contains(&(r.register as usize)));
-        ensure!(
-            from_alias
-                || instruction
-                    .reads
-                    .iter()
-                    .all(|r| !aliases.contains(&(r.register as usize))),
-            "uninitialized allocation alias escapes"
-        );
-        for write in &instruction.writes {
-            aliases.remove(&(write.register as usize));
-            if write.kind == crate::native_ir::ValueKind::Wide64 {
-                aliases.remove(&(write.register as usize + 1));
-            }
+    if let Some(plan) = &block_plan {
+        aliases = plan.constructor_aliases.iter().copied().collect();
+        for &pc in &plan.alias_moves {
+            staged_words[pc..pc + graph.widths[pc]].fill(0);
         }
-        if from_alias {
-            let target = instruction
-                .writes
-                .first()
-                .context("allocation alias destination")?
-                .register as usize;
-            aliases.insert(target);
-            alias_transfer = true;
-            staged_words[instruction.pc..instruction.pc + graph.widths[instruction.pc]].fill(0);
+    } else {
+        for instruction in ir.instructions.iter().filter(|i| {
+            start <= i.pc
+                && i.pc < constructor_pc
+                && block_plan
+                    .as_ref()
+                    .is_none_or(|plan| plan.owned.contains(&i.pc))
+        }) {
+            ensure!(
+                !alias_transfer
+                    || (instruction.branch_target.is_none()
+                        && !matches!(instruction.opcode, 0x2b | 0x2c)),
+                "allocation alias crosses control flow"
+            );
+            let from_alias = matches!(instruction.opcode, 0x07..=0x09)
+                && instruction
+                    .reads
+                    .first()
+                    .is_some_and(|r| aliases.contains(&(r.register as usize)));
+            ensure!(
+                from_alias
+                    || instruction
+                        .reads
+                        .iter()
+                        .all(|r| !aliases.contains(&(r.register as usize))),
+                "uninitialized allocation alias escapes"
+            );
+            for write in &instruction.writes {
+                aliases.remove(&(write.register as usize));
+                if write.kind == crate::native_ir::ValueKind::Wide64 {
+                    aliases.remove(&(write.register as usize + 1));
+                }
+            }
+            if from_alias {
+                let target = instruction
+                    .writes
+                    .first()
+                    .context("allocation alias destination")?
+                    .register as usize;
+                aliases.insert(target);
+                alias_transfer = true;
+                staged_words[instruction.pc..instruction.pc + graph.widths[instruction.pc]].fill(0);
+            }
         }
     }
     ensure!(
@@ -710,7 +766,7 @@ fn try_region_staging_mode(
     let mut out = Output {
         sequence: caller_out.sequence,
         indent: caller_out.indent,
-        ..Output::default()
+        ..caller_out.empty_fork()
     };
     let staged_method = DexMethod {
         declaring_type: method.declaring_type.clone(),
@@ -755,6 +811,74 @@ fn try_region_staging_mode(
         Some(super::OwnedInstructionBoundary {
             active: &graph.owned_entry_copy_instructions,
             previous: graph.owned_entry_copy_instructions.replace(Some(owned)),
+        })
+    } else {
+        None
+    };
+    // Original-PC uninitialized alias lifetimes are masked from Java loop
+    // storage inference. Earlier ordinary lifetimes remain visible, while raw
+    // SSA/domain proofs and post-constructor liveness remain original.
+    let _argument_region = if let Some(plan) = &block_plan {
+        let active = &graph.constructor_argument_regions;
+        let previous_len = active.borrow().len();
+        active.borrow_mut().push((start, constructor_pc, None));
+        for &(from, to, alias) in &plan.alias_masks {
+            active.borrow_mut().push((from, to, Some(alias)));
+        }
+        Some(ArgumentRegion {
+            active,
+            previous_len,
+        })
+    } else {
+        None
+    };
+    let _projection_scope = if let Some(plan) = block_plan
+        .as_ref()
+        .filter(|plan| !plan.nested_initializations.is_empty())
+    {
+        let next = super::structured_argument_region::Projection::extend(
+            class,
+            method,
+            proof_projection.as_deref(),
+            plan,
+        )
+        .context("allocation projection parent proof invalid")?;
+        Some(ProjectionBoundary {
+            active: &graph.argument_projection,
+            previous: graph
+                .argument_projection
+                .replace(Some(std::rc::Rc::new(next))),
+        })
+    } else {
+        None
+    };
+    let _handler_scope = if let Some(plan) = block_plan
+        .as_ref()
+        .filter(|plan| !plan.exception_edges.is_empty())
+    {
+        ensure!(
+            proof_projection.as_deref().map_or_else(
+                || super::structured_argument_region::validate(class, method, plan),
+                |projection| projection.validate(class, method, plan)
+            ),
+            "internal argument handler canonical proof differs"
+        );
+        let active = &graph.argument_handler_scopes;
+        let previous_len = active.borrow().len();
+        active.borrow_mut().extend(
+            method
+                .code
+                .as_ref()
+                .unwrap()
+                .try_regions
+                .iter()
+                .filter(|r| start <= r.start as usize && r.end as usize <= constructor_pc)
+                .cloned()
+                .map(|r| (r, constructor_pc)),
+        );
+        Some(ArgumentHandlerScope {
+            active,
+            previous_len,
         })
     } else {
         None
@@ -814,6 +938,8 @@ fn try_region_staging_mode(
         actual.push(
             if arg.as_ref() == "I" && matches!(value.ty.as_str(), "B" | "S" | "C") {
                 format!("((int) {})", value.text)
+            } else if arg.as_ref() == "Z" && value.ty == "I" && value.literal.is_none() {
+                super::argument_at_read(&value, arg, r, class, method, graph, constructor_pc)?
             } else {
                 super::argument(&value, arg)?
             },
@@ -835,12 +961,21 @@ fn try_region_staging_mode(
     );
     let (expression, refs) = if let Some(plan) = &block_plan {
         ensure!(
-            super::structured_argument_region::validate(class, method, plan),
+            proof_projection.as_ref().map_or_else(
+                || super::structured_argument_region::validate(class, method, plan),
+                |projection| projection.validate(class, method, plan)
+            ),
             "structured argument emission proof differs"
         );
         let next = constructor_pc + graph.widths[constructor_pc];
-        let live = super::super::liveness::analyze(method.code.as_ref().unwrap())
-            .context("structured argument live-out analysis absent")?;
+        let live = super::super::liveness::analyze(
+            proof_projection
+                .as_ref()
+                .map_or(method.code.as_ref().unwrap(), |projection| {
+                    projection.original_code()
+                }),
+        )
+        .context("structured argument live-out analysis absent")?;
         for (r, value) in regs.iter().enumerate() {
             if !aliases.contains(&r)
                 && live.contains(next, r)
@@ -900,6 +1035,9 @@ fn try_region_staging_mode(
         declarations
             .inferred_throws
             .extend(body.inferred_throws.iter().cloned());
+        declarations
+            .checked_effects
+            .extend(body.checked_effects.iter().cloned());
         let first = actual
             .first()
             .context("structured argument requires first constructor parameter")?;
@@ -927,6 +1065,16 @@ fn try_region_staging_mode(
             vec![(4, display.chars().count(), label)],
         )
     };
+    if let Some(hierarchy) = class.symbols.hierarchy.get()
+        && let Some(effects) = hierarchy.call_checked_effects(ty, name, args, ret, false)
+    {
+        out.checked_effects.extend(
+            effects
+                .into_iter()
+                .filter_map(|ty| super::throwing::checked_effect_type(class, &ty)),
+        );
+    }
+
     let value = out.local(ty, &expression, &refs)?;
     for alias in aliases {
         super::assign(&mut regs, alias, value.clone())?;
@@ -936,10 +1084,81 @@ fn try_region_staging_mode(
         "allocation region output budget"
     );
     Ok(Lowered {
+        internal_handler_regions: if block_plan
+            .as_ref()
+            .is_some_and(|plan| !plan.exception_edges.is_empty())
+        {
+            method
+                .code
+                .as_ref()
+                .unwrap()
+                .try_regions
+                .iter()
+                .filter(|r| start <= r.start as usize && r.end as usize <= constructor_pc)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        },
         regs,
         out,
         next_pc: constructor_pc + graph.widths[constructor_pc],
     })
+}
+
+fn normalize_nonreturning_null_tails(
+    class: &DexClass,
+    method: &DexMethod,
+    graph: &Graph,
+    words: &[u16],
+    allocation: usize,
+    stop: usize,
+) -> Option<Vec<u16>> {
+    let code = method.code.as_ref()?;
+    if code.instructions != words { return None; }
+    let hierarchy = class.symbols.hierarchy.get()?;
+    let mut normalized = None;
+    let mut cursor = allocation.checked_add(*graph.widths.get(allocation)?)?;
+    for _ in 0..256 {
+        if cursor >= stop || cursor >= words.len() { break; }
+        let width = *graph.widths.get(cursor)?;
+        if width == 0 || graph.payloads[cursor] { return None; }
+        let op = words[cursor] as u8;
+        if matches!(op, 0x70 | 0x76)
+            && graph.constructor_binding(class, method, cursor).is_some_and(|binding|
+                matches!(binding.origin, crate::native_constructors::ConstructorOrigin::Allocation { pc, .. }
+                    if pc == allocation))
+        {
+            return normalized;
+        }
+        if matches!(op, 0x71 | 0x77) && width == 3 {
+            let constant = cursor + width;
+            let terminal = constant + 1;
+            if terminal < stop && terminal < words.len()
+                && graph.widths[constant] == 1 && graph.widths[terminal] == 1
+                && words[constant] as u8 == 0x12 && words[constant] >> 12 == 0
+                && words[terminal] as u8 == 0x11
+                && words[terminal] >> 8 == (words[constant] >> 8) & 15
+            {
+                let alternative_entry = graph.targets.iter().flatten().any(|target|
+                    *target == constant || *target == terminal)
+                    || graph.switches.iter().flatten().any(|switch| switch.cases.iter().any(|(_, target)|
+                        *target == constant || *target == terminal))
+                    || code.try_regions.iter().any(|region| region.catches.iter().any(|(_, handler)|
+                        *handler as usize == constant || *handler as usize == terminal));
+                let (owner, ret, args, name) = method_symbol(class, words[cursor + 1] as usize).ok()?;
+                if !alternative_entry && ret == "V"
+                    && hierarchy.loaded_static_void_never_returns(owner, name, args)
+                {
+                    let result = normalized.get_or_insert_with(|| words.to_vec());
+                    result[terminal] = (words[terminal] & 0xff00) | 0x27;
+                }
+            }
+        }
+        cursor += width;
+    }
+    // No matching exact constructor was reached within the bounded window.
+    None
 }
 
 /// Decode one allocation through its matching constructor. Unsupported regions
@@ -955,6 +1174,34 @@ pub(super) fn try_lower(
     caller_regs: &[Option<Value>],
     caller_out: &Output,
 ) -> Result<Option<Lowered>> {
+    // A compiler may retain `return null` after a statically bound throwing
+    // helper. Java cannot return from a constructor argument switch expression.
+    // Preserve the call and normalize only its proven unreachable continuation
+    // to a same-width throw, then run the ordinary exact argument-region proof.
+    let has_projection = graph.argument_projection.borrow().is_some();
+    if !has_projection
+        && let Some(normalized) = normalize_nonreturning_null_tails(class, method, graph, words, pc, stop)
+    {
+        let code = method.code.as_ref().context("allocation method code")?;
+        let normalized_method = DexMethod {
+            declaring_type: method.declaring_type.clone(),
+            name: method.name.clone(),
+            return_type: method.return_type.clone(),
+            parameters: method.parameters.clone(),
+            thrown_types: method.thrown_types.clone(),
+            access_flags: method.access_flags,
+            code: Some(crate::native_dex::DexCode {
+                registers: code.registers,
+                ins: code.ins,
+                outs: code.outs,
+                tries: code.tries,
+                try_regions: code.try_regions.clone(),
+                offset: code.offset,
+                instructions: normalized.clone(),
+            }),
+        };
+        return try_lower(class, &normalized_method, graph, &normalized, pc, stop, caller_regs, caller_out);
+    }
     let attempt = || -> Result<Lowered> {
         // Large generated injection constructors can exceed 128 instructions.
         // Keep a fixed linear scan cap plus expression-node/output budgets.
@@ -971,7 +1218,7 @@ pub(super) fn try_lower(
         let mut prelude = Output {
             sequence: caller_out.sequence,
             indent: caller_out.indent,
-            ..Output::default()
+            ..caller_out.empty_fork()
         };
         let mut selected_regs = caller_regs.to_vec();
         let start = pc + graph.widths[pc];
@@ -984,7 +1231,6 @@ pub(super) fn try_lower(
             &mut selected_regs,
             &mut prelude,
         )?;
-        let base_sequence = prelude.sequence;
         let mut regs: Vec<Option<Atom>> = selected_regs
             .iter()
             .cloned()
@@ -1066,7 +1312,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: super::java_type(ty)?,
-                        name: format!("v{}", base_sequence + index),
+                        name: prelude.next_local_name()?,
                         expression: Expr::Unary {
                             site: cursor,
                             prefix,
@@ -1101,7 +1347,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: super::java_type(binary.result.descriptor())?,
-                        name: format!("v{}", base_sequence + index),
+                        name: prelude.next_local_name()?,
                         expression: Expr::Binary {
                             site: cursor,
                             operator: binary.operator,
@@ -1153,7 +1399,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: super::java_type(result_ty)?,
-                        name: format!("v{}", base_sequence + index),
+                        name: prelude.next_local_name()?,
                         expression: Expr::Binary {
                             site: cursor,
                             operator,
@@ -1340,7 +1586,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: "java.lang.String".into(),
-                        name: format!("v{}", base_sequence + index),
+                        name: prelude.next_local_name()?,
                         expression: string,
                     });
                     events.push(Event::StringResolution { site: cursor });
@@ -1368,7 +1614,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: "java.lang.Class".into(),
-                        name: format!("v{}", base_sequence + index),
+                        name: prelude.next_local_name()?,
                         expression: class_literal,
                     });
                     events.push(Event::ClassResolution {
@@ -1439,7 +1685,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: super::java_type(descriptor)?,
-                        name: format!("v{}", base_sequence + index),
+                        name: prelude.next_local_name()?,
                         expression: Expr::CheckCast {
                             site: cursor,
                             ty: symbol(super::java_type(descriptor)?, label.clone()),
@@ -1519,7 +1765,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: super::java_type(&field_ty)?,
-                        name: format!("v{}", base_sequence + index),
+                        name: prelude.next_local_name()?,
                         expression: read,
                     });
                     events.push(Event::Read {
@@ -1587,7 +1833,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: "void".into(),
-                        name: format!("v{}", base_sequence + index),
+                        name: prelude.next_local_name()?,
                         expression: Expr::FieldStore {
                             site: cursor,
                             receiver: Box::new(receiver),
@@ -1613,7 +1859,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: display.clone(),
-                        name: format!("v{}", base_sequence + index),
+                        name: prelude.next_local_name()?,
                         expression: Expr::NewArray {
                             site: cursor,
                             ty: symbol(
@@ -1662,7 +1908,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: super::java_type(component)?,
-                        name: format!("v{}", base_sequence + index),
+                        name: prelude.next_local_name()?,
                         expression: Expr::ArrayRead {
                             site: cursor,
                             array: Box::new(array),
@@ -1720,7 +1966,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: "void".into(),
-                        name: format!("v{}", base_sequence + index),
+                        name: prelude.next_local_name()?,
                         expression: Expr::ArrayStore {
                             site: cursor,
                             array: Box::new(array),
@@ -1764,7 +2010,7 @@ pub(super) fn try_lower(
                     let index = captures.len();
                     captures.push(Capture {
                         ty: super::java_type(array)?,
-                        name: format!("v{}", base_sequence + index),
+                        name: prelude.next_local_name()?,
                         expression: Expr::FilledArray {
                             site: cursor,
                             ty: symbol(super::java_type(array)?, label.clone()),
@@ -1792,6 +2038,33 @@ pub(super) fn try_lower(
                     let kind = if op >= 0x74 { op - 6 } else { op };
                     let static_call = kind == 0x71;
                     let inputs = invoke_inputs(op, a, words, cursor)?;
+                    let effect_owner = if raw_name == "<init>" {
+                        match atom(
+                            &regs,
+                            *inputs.first().context("missing constructor receiver")?,
+                        )? {
+                            Atom::Uninitialized { ty, .. } => ty,
+                            _ => owner.to_string(),
+                        }
+                    } else {
+                        owner.to_string()
+                    };
+                    if let Some(hierarchy) = class.symbols.hierarchy.get()
+                        && let Some(effects) = hierarchy.call_checked_effects(
+                            &effect_owner,
+                            raw_name,
+                            args,
+                            ret,
+                            static_call,
+                        )
+                    {
+                        prelude.checked_effects.extend(
+                            effects
+                                .into_iter()
+                                .filter_map(|ty| super::throwing::checked_effect_type(class, &ty)),
+                        );
+                    }
+
                     let mut input_cursor = usize::from(!static_call);
                     let target = if raw_name == "<init>" {
                         Expr::Local(String::new())
@@ -1948,7 +2221,7 @@ pub(super) fn try_lower(
                             let index = captures.len();
                             captures.push(Capture {
                                 ty: super::java_type(&allocation_ty)?,
-                                name: format!("v{}", base_sequence + index),
+                                name: prelude.next_local_name()?,
                                 expression: Expr::SharedNew {
                                     allocation: Box::new(Allocation {
                                         site,
@@ -2065,20 +2338,37 @@ pub(super) fn try_lower(
                             .context("missing allocation type link")?
                             .label = label;
                         let mut out = prelude;
-                        for (declaration, links) in rendered
+                        rendered.validate_declarations()?;
+                        for ((declaration, links), metadata) in rendered
                             .declarations
                             .iter()
                             .zip(&rendered.declaration_links)
+                            .zip(&rendered.declaration_metadata)
                         {
                             let refs: Vec<_> = links
                                 .iter()
                                 .map(|link| (link.start, link.end - link.start, link.label.clone()))
                                 .collect();
-                            out.opaque_declaration(declaration, &refs);
+                            if let Some((name, display)) = metadata {
+                                ensure!(
+                                    declaration == &format!("{display} {name};") && refs.is_empty(),
+                                    "allocation declaration differs from typed metadata"
+                                );
+                                if let Ok(descriptor) = declaration_descriptor(class, display) {
+                                    out.named_declaration(&descriptor, name)?;
+                                } else {
+                                    out.opaque_declaration(declaration, &refs);
+                                }
+                            } else {
+                                out.opaque_declaration(declaration, &refs);
+                            }
                         }
-                        // Names retain their original capture indices after
-                        // shrinking; reserve every original name before local().
-                        out.sequence += rendered.declarations.len().max(allocation.captures.len());
+                        // Capture names were allocated with namespace reservations.
+                        // Keep every name reserved even when shrinking removes its declaration.
+                        ensure!(
+                            rendered.declarations.len() <= allocation.captures.len(),
+                            "allocation declarations exceed reserved capture names"
+                        );
                         let refs: Vec<_> = rendered
                             .links
                             .iter()
@@ -2101,7 +2391,7 @@ pub(super) fn try_lower(
                                     ty,
                                 }) => Some(Value {
                                     raw_bits32: false,
-                                    text: format!("v{}", base_sequence + index),
+                                    text: allocation.captures[*index].name.clone(),
                                     ty: ty.clone(),
                                     literal: None,
                                     wide_literal: None,
@@ -2112,6 +2402,7 @@ pub(super) fn try_lower(
                             };
                         }
                         return Ok(Lowered {
+                            internal_handler_regions: Vec::new(),
                             regs: final_regs,
                             out,
                             next_pc: cursor + graph.widths[cursor],
@@ -2170,7 +2461,7 @@ pub(super) fn try_lower(
                         } else {
                             super::java_type(ret)?
                         },
-                        name: format!("v{}", base_sequence + index),
+                        name: prelude.next_local_name()?,
                         expression: call,
                     });
                     events.push(Event::Call {
@@ -2203,7 +2494,16 @@ pub(super) fn try_lower(
             cursor += graph.widths[cursor];
         }
     };
+    let trace = |stage: &str, error: &anyhow::Error| {
+        if std::env::var_os("RDX_ALLOCATION_DIAGNOSTIC").is_some() {
+            eprintln!(
+                "allocation {}.{} @{pc:04x} {stage}: {error:#}",
+                class.descriptor, method.name
+            );
+        }
+    };
     let result = attempt()
+        .inspect_err(|error| trace("linear", error))
         .or_else(|_| {
             try_region_staging_mode(
                 class,
@@ -2216,6 +2516,7 @@ pub(super) fn try_lower(
                 caller_out,
                 false,
             )
+            .inspect_err(|error| trace("pure-region", error))
         })
         .or_else(|_| {
             try_region_staging_mode(
@@ -2229,13 +2530,78 @@ pub(super) fn try_lower(
                 caller_out,
                 true,
             )
+            .inspect_err(|error| trace("argument-block", error))
         });
-    Ok(result.ok())
+    Ok(result
+        .or_else(|_| {
+            super::early_noarg_allocation::lower(
+                class,
+                method,
+                graph,
+                words,
+                pc,
+                stop,
+                caller_regs,
+                caller_out,
+            )
+        })
+        .ok())
+}
+
+struct ProjectionBoundary<'a> {
+    active:
+        &'a std::cell::RefCell<Option<std::rc::Rc<super::structured_argument_region::Projection>>>,
+    previous: Option<std::rc::Rc<super::structured_argument_region::Projection>>,
+}
+impl Drop for ProjectionBoundary<'_> {
+    fn drop(&mut self) {
+        *self.active.borrow_mut() = self.previous.take();
+    }
 }
 
 #[cfg(test)]
 mod staging_timing_tests {
     use super::*;
+    #[test]
+    fn caught_input_admission_requires_exact_scoped_binding() {
+        let graph = Graph::empty(0);
+        let value = |name: &str| Value {
+            text: name.into(),
+            ty: "Ljava/lang/Throwable;".into(),
+            literal: None,
+            wide_literal: None,
+            raw_bits32: false,
+        };
+        for name in [
+            "__rdx_caught__",
+            "__rdx_caught_0__",
+            "e12",
+            "holder.e12",
+            "\"__rdx_caught__\"",
+            "__rdx_exception_input_0__",
+        ] {
+            assert!(!evaluated_structured_input(&value(name), &graph));
+        }
+        let saved = graph.caught_values.borrow().clone();
+        graph
+            .caught_values
+            .borrow_mut()
+            .insert("__rdx_caught__".into());
+        assert!(evaluated_structured_input(&value("__rdx_caught__"), &graph));
+        assert!(!evaluated_structured_input(
+            &value("__rdx_caught_0__"),
+            &graph
+        ));
+        *graph.caught_values.borrow_mut() = saved;
+        assert!(!evaluated_structured_input(
+            &value("__rdx_caught__"),
+            &graph
+        ));
+        graph.caught_values.borrow_mut().insert("e12".into());
+        assert!(evaluated_structured_input(&value("e12"), &graph));
+        assert!(!evaluated_structured_input(&value("holder.e12"), &graph));
+    }
+
     fn proof(words: Vec<u16>, stop: usize, input: &str) -> bool {
         let code = crate::native_dex::DexCode {
             registers: 4,
@@ -2365,6 +2731,79 @@ mod staging_timing_tests {
                     .is_err()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn projection_scope_restores_parent_after_success_and_failure() {
+        let class = crate::native_dex::DexClass {
+            symbols: std::sync::Arc::new(crate::native_dex::DexSymbols {
+                strings: vec!["value".into(), "<init>".into()],
+                types: vec![
+                    "Lsample/A;".into(),
+                    "Lsample/Source;".into(),
+                    "Lsample/B;".into(),
+                ],
+                protos: vec![("I".into(), vec![]), ("V".into(), vec!["I".into()])],
+                methods: vec![(1, 0, 0), (0, 1, 1), (2, 1, 1)],
+                ..Default::default()
+            }),
+            descriptor: "Lsample/Test;".into(),
+            superclass: Some("Ljava/lang/Object;".into()),
+            interfaces: vec![],
+            access_flags: 1,
+            annotations_offset: 0,
+            static_values_offset: 0,
+            static_values: vec![],
+            fields: vec![],
+            methods: vec![DexMethod {
+                declaring_type: "Lsample/Test;".into(),
+                name: "make".into(),
+                return_type: "Lsample/A;".into(),
+                parameters: vec![],
+                thrown_types: vec![],
+                access_flags: 9,
+                code: Some(crate::native_dex::DexCode {
+                    registers: 4,
+                    ins: 0,
+                    outs: 2,
+                    tries: 0,
+                    try_regions: vec![],
+                    offset: 0,
+                    instructions: vec![
+                        0x0022, 0, 0x0122, 2, 0x0308, 0, 0x0071, 0, 0, 0x020a, 0x2070, 2, 0x0021,
+                        0x2070, 1, 0x0020, 0x0011,
+                    ],
+                }),
+            }],
+        };
+        let method = &class.methods[0];
+        let plan = super::super::structured_argument_region::prove(&class, method, 0, 13).unwrap();
+        let original = std::rc::Rc::new(
+            super::super::structured_argument_region::Projection::extend(
+                &class, method, None, &plan,
+            )
+            .unwrap(),
+        );
+        let graph = Graph::empty(method.code.as_ref().unwrap().instructions.len());
+        *graph.argument_projection.borrow_mut() = Some(original.clone());
+        for fail in [false, true] {
+            let replacement = std::rc::Rc::new(original.as_ref().clone());
+            let result = (|| -> Result<()> {
+                let _scope = ProjectionBoundary {
+                    active: &graph.argument_projection,
+                    previous: graph.argument_projection.replace(Some(replacement)),
+                };
+                if fail {
+                    anyhow::bail!("nested rendering failure");
+                }
+                Ok(())
+            })();
+            assert_eq!(result.is_err(), fail);
+            assert!(std::rc::Rc::ptr_eq(
+                graph.argument_projection.borrow().as_ref().unwrap(),
+                &original
+            ));
         }
     }
 }

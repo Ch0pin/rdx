@@ -753,7 +753,10 @@ fn collect_class(class: &DexClass, out: &mut HashSet<String>, cancel: &AtomicBoo
             }
             add_type(ty, out)
         }
-        if let Some(ty) = crate::native_java::inherited_override_exception(class, method) {
+        for ty in crate::native_java::inherited_override_exception(class, method) {
+            if !guard.tick(out) {
+                return false;
+            }
             add_type(ty, out);
         }
         if let Some(code) = &method.code {

@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Domain {
     Boolean,
+    NullZero,
     Raw32,
     Raw64,
 }
@@ -79,7 +80,17 @@ pub(crate) fn proves_read(
             let Some(v) = types.values.get(id) else {
                 return false;
             };
-            if v.bounds_truncated || v.assignment.is_empty() || !v.assignment.iter().all(|a|matches!(a,AssignmentBound::Literal{bits,wide} if *wide==(width==2) && (domain!=Domain::Boolean || matches!(bits,0|1)))){return false;}
+            let constant_domain = v.assignment.iter().all(|bound| match bound {
+                AssignmentBound::Literal { bits, wide } => {
+                    *wide == (width == 2)
+                        && (domain != Domain::Boolean || matches!(bits, 0 | 1))
+                        && (domain != Domain::NullZero || *bits == 0)
+                }
+                _ => false,
+            });
+            if v.bounds_truncated || v.assignment.is_empty() || !constant_domain {
+                return false;
+            }
         }
         let Some(low) = ssa.definitions.get(words[0]) else {
             return false;
@@ -180,6 +191,7 @@ pub(crate) fn proves_read(
                             wide: width == 2,
                         }]
                         || (domain == Domain::Boolean && !matches!(bits, 0 | 1))
+                        || (domain == Domain::NullZero && bits != 0)
                     {
                         return false;
                     }

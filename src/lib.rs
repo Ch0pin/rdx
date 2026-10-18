@@ -23,6 +23,7 @@ pub mod native_method;
 pub mod package_container;
 
 pub mod resource_table;
+pub mod resource_search;
 
 pub mod native_xrefs;
 pub mod usage_index;

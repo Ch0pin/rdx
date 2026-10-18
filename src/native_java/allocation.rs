@@ -158,9 +158,33 @@ pub(crate) struct Link {
 pub(crate) struct Rendered {
     pub declarations: Vec<String>,
     pub declaration_links: Vec<Vec<Link>>,
+    pub declaration_metadata: Vec<Option<(String, String)>>,
     pub expression: String,
     pub links: Vec<Link>,
     pub events: Vec<Event>,
+}
+impl Rendered {
+    pub(crate) fn validate_declarations(&self) -> Result<()> {
+        ensure!(
+            self.declarations.len() == self.declaration_links.len()
+                && self.declarations.len() == self.declaration_metadata.len(),
+            "allocation declaration metadata differs"
+        );
+        for ((text, links), metadata) in self
+            .declarations
+            .iter()
+            .zip(&self.declaration_links)
+            .zip(&self.declaration_metadata)
+        {
+            if let Some((name, ty)) = metadata {
+                ensure!(
+                    text == &format!("{ty} {name};") && links.is_empty(),
+                    "allocation declaration differs from typed metadata"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -235,10 +259,10 @@ impl Allocation {
                 && dex_events.last() == Some(&construct)
                 && dex_events
                     .iter()
-                    .filter(|e| matches!(e, Event::Allocate { .. }))
+                    .filter(|event| **event == allocate)
                     .count()
                     == 1,
-            "argument block requires one exact allocation"
+            "argument block requires one exact outer allocation"
         );
         // An ignored void call is a statement, never a value/dependency. Every
         // nonvoid reference is backward and already assigned when it is read.
@@ -272,12 +296,14 @@ impl Allocation {
         let mut captures = CaptureRenderer::new(&self.captures, &mut events);
         let mut statements = Fragment::plain(String::new());
         let mut declarations = Vec::new();
+        let mut declaration_metadata = Vec::new();
         for (index, capture) in self.captures.iter().enumerate() {
             let assignment = captures.capture_body(index)?;
             let skip = if capture.ty == "void" {
                 format!("({} = ", capture.name).chars().count()
             } else {
                 declarations.push(format!("{} {};", capture.ty, capture.name));
+                declaration_metadata.push(Some((capture.name.clone(), capture.ty.clone())));
                 1
             };
             let text = assignment
@@ -339,13 +365,16 @@ impl Allocation {
                 <= MAX_CHARS,
             "argument block output exceeds budget"
         );
-        Ok(Rendered {
+        let rendered = Rendered {
             declaration_links: vec![Vec::new(); declarations.len()],
+            declaration_metadata,
             declarations,
             expression: expression.text,
             links: expression.links,
             events,
-        })
+        };
+        rendered.validate_declarations()?;
+        Ok(rendered)
     }
     /// Declarations have no initializers. Effects occur only inside the returned
     /// expression, whose site-specific trace must match the DEX trace exactly.
@@ -354,7 +383,8 @@ impl Allocation {
         let mut nodes = 0;
         self.validate(locals, &mut names, 0, &mut nodes)?;
         let mut declarations = Vec::new();
-        self.declarations(&mut declarations)?;
+        let mut declaration_metadata = Vec::new();
+        self.declarations(&mut declarations, &mut declaration_metadata)?;
         let mut events = Vec::new();
         let expression = self.render(&mut events)?;
         ensure!(
@@ -365,13 +395,16 @@ impl Allocation {
             expression.text.chars().count() <= MAX_CHARS,
             "allocation capture output exceeds budget"
         );
-        Ok(Rendered {
+        let rendered = Rendered {
             declaration_links: vec![Vec::new(); declarations.len()],
+            declaration_metadata,
             declarations,
             expression: expression.text,
             links: expression.links,
             events,
-        })
+        };
+        rendered.validate_declarations()?;
+        Ok(rendered)
     }
     /// JADX-compatible readable fallback: retain ordered capture statements,
     /// then allocate at the constructor. This intentionally moves allocation
@@ -512,13 +545,16 @@ impl Allocation {
             allocations(&events) == allocations(dex_events),
             "staged allocation changes allocation identities"
         );
-        Ok(Rendered {
+        let rendered = Rendered {
+            declaration_metadata: vec![None; declarations.len()],
             declarations,
             declaration_links,
             expression: expression.text,
             links: expression.links,
             events,
-        })
+        };
+        rendered.validate_declarations()?;
+        Ok(rendered)
     }
     fn validate(
         &self,
@@ -724,13 +760,18 @@ impl Allocation {
         }
         Ok(())
     }
-    fn declarations(&self, out: &mut Vec<String>) -> Result<()> {
+    fn declarations(
+        &self,
+        out: &mut Vec<String>,
+        metadata: &mut Vec<Option<(String, String)>>,
+    ) -> Result<()> {
         for capture in &self.captures {
             out.push(format!("{} {};", capture.ty, capture.name));
-            capture.expression.declarations(out)?;
+            metadata.push(Some((capture.name.clone(), capture.ty.clone())));
+            capture.expression.declarations(out, metadata)?;
         }
         for argument in &self.arguments {
-            argument.declarations(out)?;
+            argument.declarations(out, metadata)?;
         }
         Ok(())
     }
@@ -830,7 +871,11 @@ impl Expr {
         }
         Ok(())
     }
-    fn declarations(&self, out: &mut Vec<String>) -> Result<()> {
+    fn declarations(
+        &self,
+        out: &mut Vec<String>,
+        metadata: &mut Vec<Option<(String, String)>>,
+    ) -> Result<()> {
         match self {
             Self::Local(_)
             | Self::ConvertedLocal { .. }
@@ -840,16 +885,18 @@ impl Expr {
             | Self::StringConstant { .. }
             | Self::ClassConstant { .. }
             | Self::Capture(_) => Ok(()),
-            Self::Cast { value, .. } | Self::CheckCast { value, .. } => value.declarations(out),
-            Self::Binary { left, right, .. } | Self::StringConcat { left, right } => {
-                left.declarations(out)?;
-                right.declarations(out)
+            Self::Cast { value, .. } | Self::CheckCast { value, .. } => {
+                value.declarations(out, metadata)
             }
-            Self::Unary { value, .. } => value.declarations(out),
-            Self::NewArray { length, .. } => length.declarations(out),
+            Self::Binary { left, right, .. } | Self::StringConcat { left, right } => {
+                left.declarations(out, metadata)?;
+                right.declarations(out, metadata)
+            }
+            Self::Unary { value, .. } => value.declarations(out, metadata),
+            Self::NewArray { length, .. } => length.declarations(out, metadata),
             Self::ArrayRead { array, index, .. } => {
-                array.declarations(out)?;
-                index.declarations(out)
+                array.declarations(out, metadata)?;
+                index.declarations(out, metadata)
             }
             Self::ArrayStore {
                 array,
@@ -857,32 +904,32 @@ impl Expr {
                 value,
                 ..
             } => {
-                array.declarations(out)?;
-                index.declarations(out)?;
-                value.declarations(out)
+                array.declarations(out, metadata)?;
+                index.declarations(out, metadata)?;
+                value.declarations(out, metadata)
             }
             Self::FieldStore {
                 receiver, value, ..
             } => {
-                receiver.declarations(out)?;
-                value.declarations(out)
+                receiver.declarations(out, metadata)?;
+                value.declarations(out, metadata)
             }
-            Self::FieldRead { receiver, .. } => receiver.declarations(out),
+            Self::FieldRead { receiver, .. } => receiver.declarations(out, metadata),
             Self::Call { target, args, .. } => {
-                target.declarations(out)?;
+                target.declarations(out, metadata)?;
                 for arg in args {
-                    arg.declarations(out)?;
+                    arg.declarations(out, metadata)?;
                 }
                 Ok(())
             }
             Self::FilledArray { elements, .. } => {
                 for element in elements {
-                    element.declarations(out)?;
+                    element.declarations(out, metadata)?;
                 }
                 Ok(())
             }
             Self::New(allocation) | Self::SharedNew { allocation, .. } => {
-                allocation.declarations(out)
+                allocation.declarations(out, metadata)
             }
         }
     }

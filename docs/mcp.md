@@ -5,7 +5,8 @@ then **Copy MCP client configuration** and paste that JSON into your client's MC
 configuration. Restart the client connection after changing its configuration.
 The server panel shows status, instance/project IDs, APK SHA-256, request count,
 current request and errors. **Stop server** disables access without closing RDX.
-**Cancel current request** cooperatively cancels source reconstruction.
+**Cancel current request** cooperatively cancels active service requests, including
+source reconstruction and literal indexing/search.
 
 The native `rdx mcp` command is the stdio gateway. No Python, JVM or separate
 server install is required. Each enabled GUI instance has an authenticated
@@ -22,19 +23,22 @@ memory while enabled. Opening/reloading a GUI project stops that service.
 2. Poll `get_instance_info` until `state` is `Running`. Use its `instance_id` and
    `project_id` on each project tool call. `Loading` and `Failed` are explicit.
 3. Get classes, then supply the exact returned `class_id` to source/metadata tools.
-   Restarting the server changes project identity; stale requests are rejected.
+   A short class name also resolves when exactly one class matches; responses
+   include both `requested_class_id` and the resolved `class_id`. Ambiguous names
+   require a fully qualified ID. Restarting the server changes project identity;
+   stale project requests are rejected.
 
-## Currently available (19 tools)
+## Currently available (22 tools)
 
 | Area | Tools |
 | --- | --- |
-| Instances | `list_instances`, `get_instance_info`, `open_apk` |
+| Instances | `list_instances`, `get_health`, `get_instance_info`, `open_apk` |
 | Classes | `get_all_classes`, `search_classes_by_keyword`, `find_direct_subclasses`, `find_implementations` |
 | Code search | `search_code` |
-| Source and metadata | `get_class_source`, `get_class_disassembly`, `get_methods_of_class`, `get_fields_of_class` |
+| Source and metadata | `get_class_source`, `get_method_source`, `get_class_disassembly`, `get_methods_of_class`, `get_fields_of_class` |
 | Resources | `get_all_resource_file_names`, `get_android_manifest`, `get_manifest_summary`, `get_resource_file`, `get_strings` |
 | Call graphs | `get_call_graph` (exact `method_id`, `direction`: `callers` / `callees` / `both`, `depth`: 1–100, default 20) |
-| DEX strings | `get_dex_strings` (strings from the DEX containing `class_id`) |
+| DEX strings | `get_dex_strings` (strings from the DEX containing `class_id`), `find_string_references` |
 
 `search_classes_by_keyword` searches literal class-name substrings only.
 `search_code` searches generated Java and mixed DEX source using a case-sensitive
@@ -46,16 +50,23 @@ DEX fallbacks. Method IDs retain full DEX signatures.
 List responses contain `next_offset`; text responses use Unicode character
 `offset` and `next_offset`. Continue until `next_offset` is null. Text paging
 only limits tool responses: it does not truncate the GUI viewer. Lists default
-to 100 items (maximum 500); text defaults to 32,000 characters (maximum 128,000).
+to 100 items (maximum 500); text defaults to 32,000 characters (maximum 128,000),
+except `get_method_source`, which returns the complete selected method by default.
 The same filters and project identity must be retained across pages.
+Responses exceeding the 8 MiB transport frame limit return `RESPONSE_TOO_LARGE`
+while keeping the connection available. Retry with a smaller page or narrower
+filter.
 
-The broader [v1 design](mcp-v1.md) includes tools not implemented yet: method
-source/search, X-Refs/callees, implementations, main-application helpers, manifest
-component queries, resource resolution, GUI selection and coverage. Those tools
+The broader [v1 design](/Users/ch0pin/Desktop/Git-Projects/rdx/docs/mcp-v1.md) includes tools not implemented yet: method
+search by method metadata, general X-Refs, main-application helpers,
+resource resolution, GUI selection and coverage. Those tools
 are deliberately absent from `tools/list`. Renaming and debugging are excluded.
-The current gateway handles requests sequentially per connection; different
-instances can process requests in parallel. Protocol cancellation notifications
-and cross-connection open-request deduplication remain future work.
+The gateway runs up to eight `find_string_references` calls in the background,
+so the same MCP connection can send health checks and
+`notifications/cancelled` for a pending literal query. Cancellation targets that
+request ID; gateway EOF cancels its outstanding literal queries. Other calls
+remain sequential, preserving `open_apk` mutation ordering. Cross-connection
+open-request deduplication remains future work.
 
 Protocol reference: [MCP lifecycle](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle)
 and [tools](https://modelcontextprotocol.io/specification/2025-06-18/server/tools).
@@ -81,6 +92,26 @@ to follow outgoing calls; direction selection is currently an MCP feature.
 
 `find_direct_subclasses` follows immediate superclass edges. Use `find_implementations` with `class_id` to list concrete direct and indirect implementations of an interface or class; it supports the same instance/project scope and offset/limit pagination.
 
+### Method source
+
+`get_method_source` requires `instance_id`, `project_id`, and an exact `method_id`
+from `get_methods_of_class`, including parameter and return descriptors. For
+example, `sample.Target.doubleValue(I)I` selects that overload alone.
+
+The response renders only the requested method. It contains `method_id`, `text`,
+`format` (`java` or `rdx-dex`), `fallback_reason`, `source_hash`, `offset`,
+`total_chars`, and `next_offset`, alongside the usual APK/project identity.
+Enclosing imports and generated helper declarations are available through
+`get_class_source`. A DEX fallback retains the complete selected method's
+instructions, switch payloads, and exception table.
+
+Omit `limit` to retrieve the whole method. Optional `offset` and `limit` use
+Unicode scalar characters relative to this method's source; explicit pages have
+a maximum of 128,000 characters. Every page carries the hash of the complete
+method. If a complete response exceeds the transport budget, request explicit
+pages using the same method and project IDs. Oversized responses report an
+error rather than silently truncating source.
+
 ## Bounded code search
 
 `search_code` requires `instance_id`, `project_id` and `query`. Optionally set
@@ -95,18 +126,102 @@ is reported and does not silently count as successfully searched.
 Hits include `class_id`, `source_hash`, Unicode `start`/`end`, one-based `line`,
 and a bounded snippet. Source hashes identify generated text; the response
 identity's APK SHA-256 identifies the input binary.
+An exact decimal or hexadecimal Android resource-ID query also matches its
+resolved displayed symbol. The hit range points to that symbol in the returned
+source, preserving navigation and pagination after resource-name substitution.
 
 ## Instance filters and manifest summary
 
-`list_instances` accepts `apk_path` (substring), `apk_sha256` (exact), and
-`package_name` (exact). Filters combine with AND and apply before pagination.
+`list_instances` accepts `apk_path`, `apk_sha256` (exact), and
+`package_name` (exact). Bare APK names match filename substrings; paths match
+canonical filesystem identity. A legacy basename-only registration requires an
+exact `apk_sha256` alongside an absolute-path filter. Filters combine with AND
+and apply before pagination.
 Loading instances may not have a package name yet. Filtering never replaces
 explicit instance/project IDs on subsequent calls.
 
-`get_manifest_summary` returns the same Markdown summary as the GUI, with text
-pagination and the current project's identity. It covers application metadata,
-exported components, permissions, and declared deeplinks. It describes manifest
-declarations, not proven runtime delivery or callback reachability.
+Discovery scans fixed batches of 16 registrations. Exhaust `next_offset` within
+the current batch, then continue with `registration_offset` set to
+`next_registration_offset` and `offset: 0`. Keep filters unchanged. `total`
+counts matching instances in the current batch; `registered_instances` counts
+registry entries. `discovery_complete` describes registration scanning;
+`next_offset` describes result pagination. Connection failures appear in
+`diagnostics`, including the affected instance and retry guidance.
+
+`get_health` accepts the same filters and discovery pagination. It reports
+`transport: "connected"`, gateway executable path, version, PID, and executable
+SHA-256 captured at process startup, plus instance connection diagnostics.
+`get_instance_info` includes the GUI service's build identity. Compare these
+identities when diagnosing an older executable or a different running instance.
+A failed class query leaves the project in `Running`. Its diagnostic appears
+under `last_request_error`, with `tool` and `requested_class_id`; `error` is
+reserved for a failed project load. The next successful project request clears
+the request diagnostic. Discovery preserves it until then and continues to
+report the available project.
+A closed client transport requires reconnecting or restarting the MCP connector
+before `get_health` can run. An unreachable registration calls for checking the
+GUI MCP panel and retrying discovery; it alone does not establish process state.
+
+`get_manifest_summary` defaults to the GUI's Markdown summary with Unicode
+character pagination. `format: "records"`, or any filter, selects structured
+component and permission records with matching-record offsets and a maximum
+`limit` of 500. Filters combine with AND: `component` and `permission` are
+literal substrings, `component_type` is exact (`activity`, `activity-alias`,
+`service`, `receiver`, or `provider`), and `query` is a case-insensitive substring
+of the serialized record. `host` and `scheme` match exact declarations; `path`
+matches substrings of declared path attributes. Route predicates must match
+within the same intent-filter. Records preserve separate data elements and
+relative-filter groups, including their declared allow/block attributes.
+`matching_filter_indexes` identifies matching filters. These are declaration
+queries; runtime route delivery and callback reachability require separate proof.
+
+## DEX literal owners
+
+`find_string_references` requires `instance_id`, `project_id`, and `query`.
+`match_mode` is `contains` (default) or `exact`, both case-sensitive.
+`package_prefix` restricts results at package boundaries. `offset` counts matching
+occurrences; `limit` defaults to 100 and has a maximum of 500. Continue using
+`next_offset` with the same query, filters, and project identity.
+
+The project-local index builds lazily in one background worker on the first
+request, without Java decompilation. Concurrent literal queries share that build;
+health, instance information and other operations remain available. The pending
+query returns its ordinary complete result when indexing finishes. It indexes
+`const-string`/`const-string/jumbo` instructions and
+encoded string values in static fields and class, field, method, and parameter
+annotations, including nested arrays and annotations. Results include exact
+class/member IDs, occurrence kind, DEX string index, a class identifying that
+DEX, and instruction code-unit offsets when applicable. The scope covers literal
+owners; dynamically constructed strings and unreferenced pool entries require
+other analysis.
+
+`get_instance_info.literal_index` reports `state`, `completed_classes`,
+`total_classes`, `progress`, `attempt`, `active_waiters`, `error`, `retryable`, and
+`index_complete`. States are `idle`, `indexing`, `cancelling`, `ready`, `failed`,
+`cancelled`, and `invalidated`.
+
+Index construction has a 120-second deadline and a conservative 128 MiB
+allocation budget. Cancelling a query or closing its connection removes its
+waiter; the final departing waiter cancels the build. MCP cancellation
+notifications and gateway shutdown also cancel pending literal queries. Failed
+or cancelled builds publish no partial index, and the next query retries.
+Successful indexes are cached for the running project service. Stopping the
+server cancels indexing; a changed APK invalidates the project index and requires
+restarting the service. Package filters apply to search results across the
+complete project index. For an index-budget failure, use package-scoped
+`search_code` as a bounded alternative.
+
+The local service admits at most eight active operations and 32 connections.
+`get_instance_info` has reserved operation admission. A saturated operation pool
+returns retryable `INSTANCE_BUSY`; a partial request frame occupies only its own
+connection. This keeps instance discovery and health checks responsive during a
+long first query.
+
+Pages also have a 1 MiB serialized-item byte budget, so a page can contain fewer
+than `limit` occurrences. Follow `next_offset` even when a page is short.
+Literal previews contain at most 4,096 Unicode characters; `value_chars` and
+`value_truncated` describe the full value. Use `get_dex_strings` with the returned
+`dex_class_id`, then locate the returned `string_index`, to retrieve full values.
 
 ## Dispatch guidance
 

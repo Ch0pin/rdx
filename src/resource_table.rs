@@ -5,6 +5,10 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeMap;
+#[path = "resource_contracts.rs"]
+mod contracts;
+#[path = "resource_usage.rs"]
+mod usage;
 
 pub const PREFIX: &str = "resource://";
 const MAX_VALUES: usize = 2_000_000;
@@ -318,7 +322,7 @@ impl ResourceTable {
             .collect::<String>()
             .replace(['\n', '\r'], " ");
         Some(format!(
-            "{PREFIX}{id:08x}/{}/{} | {}:{}.{} = {} [{}; {} variant(s)]",
+            "{PREFIX}{id:08x}/{}/{} | {}:{}.{}\nValue: {}\nID {id} / 0x{id:08x}\nConfiguration: {}; {} variant(s)",
             r.kind,
             r.name,
             r.package,
@@ -383,24 +387,37 @@ impl ResourceTable {
         self.decorate_xml(&mut code, &references);
         Ok(code)
     }
-    /// Link/annotate numeric IDs without changing integer semantics. Java tokens
-    /// inside strings/comments and metadata spans are never rewritten.
+    /// Present resolved Java integer IDs as qualified R references. Tokens inside
+    /// strings/comments, raw DEX methods and metadata spans remain untouched.
     pub fn decorate(&self, code: &mut DecompiledCode, xml: bool) {
-        self.decorate_inner(code, xml, None);
+        self.decorate_inner(code, xml, None, None);
     }
     pub fn decorate_xml(&self, code: &mut DecompiledCode, references: &[std::ops::Range<usize>]) {
-        self.decorate_inner(code, true, Some(references));
+        self.decorate_inner(code, true, Some(references), None);
+    }
+    pub(crate) fn decorate_java(
+        &self,
+        code: &mut DecompiledCode,
+        classes: &BTreeMap<String, crate::native_dex::DexClass>,
+    ) {
+        self.decorate_inner(code, false, None, Some(classes));
     }
     fn decorate_inner(
         &self,
         code: &mut DecompiledCode,
         xml: bool,
         references: Option<&[std::ops::Range<usize>]>,
+        classes: Option<&BTreeMap<String, crate::native_dex::DexClass>>,
     ) {
         if self.entries.is_empty() {
             return;
         }
         let chars: Vec<char> = code.source.chars().collect();
+        let proven = if xml {
+            BTreeMap::new()
+        } else {
+            usage::proven_arguments(code, &chars, classes)
+        };
         let mut edits = Vec::new();
         let mut occupied: Vec<_> = code
             .links
@@ -421,8 +438,57 @@ impl ResourceTable {
         }
         let mut i = 0;
         while i < chars.len() {
+            // Mixed reconstruction embeds exact DEX methods alongside Java.
+            // Their instruction words and operands must remain byte-faithful.
+            if !xml && (i == 0 || chars[i - 1] == '\n') {
+                let line_end = chars[i..]
+                    .iter()
+                    .position(|c| *c == '\n')
+                    .map_or(chars.len(), |n| i + n);
+                let line: String = chars[i..line_end].iter().collect();
+                if line.trim_start().starts_with(".method ") {
+                    i = line_end;
+                    while i < chars.len() {
+                        i += 1;
+                        let end = chars[i..]
+                            .iter()
+                            .position(|c| *c == '\n')
+                            .map_or(chars.len(), |n| i + n);
+                        let terminal = chars[i..end].iter().collect::<String>();
+                        i = end;
+                        if terminal.trim() == ".end method" {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if usage::dex_directive(&line) {
+                    i = (line_end + 1).min(chars.len());
+                    continue;
+                }
+            }
             if !xml && (chars[i] == '"' || chars[i] == '\'') {
                 let quote = chars[i];
+                let text_block = quote == '"'
+                    && chars.get(i + 1) == Some(&'"')
+                    && chars.get(i + 2) == Some(&'"');
+                if text_block {
+                    i += 3;
+                    while i < chars.len() {
+                        if chars[i] == '\\' {
+                            i = (i + 2).min(chars.len());
+                        } else if chars[i] == '"'
+                            && chars.get(i + 1) == Some(&'"')
+                            && chars.get(i + 2) == Some(&'"')
+                        {
+                            i += 3;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
                 i += 1;
                 while i < chars.len() {
                     if chars[i] == '\\' {
@@ -507,21 +573,57 @@ impl ResourceTable {
                 continue;
             };
             let Some(r) = self.entries.get(&id) else {
+                // A known resource parameter can name a missing/split resource.
+                // Keep its literal and expose the absence on hover, without
+                // inventing an R symbol or assigning identity to arbitrary ints.
+                if !xml
+                    && id >> 24 != 0
+                    && (id >> 16) & 255 != 0
+                    && (hex || !raw.starts_with('0'))
+                    && let Some(kinds) = proven.get(&(start, i))
+                {
+                    let n = merged.partition_point(|(_, end)| *end <= start);
+                    if merged.get(n).is_none_or(|(begin, _)| *begin >= i) {
+                        edits.push((start, i, raw, format!("{PREFIX}{id:08x}/unresolved | Unresolved resource\nID {id} / 0x{id:08x}\nExpected type: {}\nNo entry in the loaded APK's resource table", kinds.join(" / "))));
+                    }
+                }
                 continue;
             };
+            if !xml
+                && !proven
+                    .get(&(start, i))
+                    .is_some_and(|kinds| kinds.contains(&r.kind.as_str()))
+            {
+                continue;
+            }
+            if !xml
+                && code.definitions.iter().any(|definition| {
+                    definition.kind == "field"
+                        && definition.name == r.name
+                        && definition.end <= start
+                        && chars[definition.end..start]
+                            .iter()
+                            .collect::<String>()
+                            .trim()
+                            == "="
+                        && code.links.iter().any(|link| {
+                            link.start == definition.start
+                                && link.end == definition.end
+                                && (link.label
+                                    == format!("{}.R${}.{}:I", r.package, r.kind, r.name)
+                                    || link.label
+                                        == format!("{}.R.{}.{}:I", r.package, r.kind, r.name))
+                        })
+                })
+            {
+                // An R field defines this value; replacing its initializer
+                // would produce a self reference instead of the encoded ID.
+                continue;
+            }
             let n = merged.partition_point(|(_, end)| *end <= start);
             if merged.get(n).is_some_and(|(begin, _)| *begin < i) {
                 continue;
             }
-            let name = format!("{}.R.{}.{}", r.package, r.kind, r.name)
-                .chars()
-                .take(200)
-                .collect::<String>()
-                .replace('\\', "\\\\")
-                .replace("*/", "* /")
-                .replace(['\n', '\r'], " ");
-            // Keep original numeric value visible, avoiding invented R classes or
-            // accidental changes to unrelated integer expressions with the same ID.
             let replacement = if xml {
                 format!(
                     "{}{}:{}/{}",
@@ -531,26 +633,16 @@ impl ResourceTable {
                     escape(&r.name)
                 )
             } else {
-                let value = r
-                    .variants
-                    .first()
-                    .filter(|v| v.configuration == "default")
-                    .map(|v| {
-                        let preview = v.value.chars().take(80).collect::<String>();
-                        let quoted = serde_json::to_string(&preview)
-                            .unwrap_or_default()
-                            .replace("*/", "* /");
-                        format!(
-                            " = {quoted}{}",
-                            if v.value.chars().count() > 80 {
-                                "…"
-                            } else {
-                                ""
-                            }
-                        )
-                    })
-                    .unwrap_or_default();
-                format!("{raw} /* {name}{value} */")
+                // ARSC names need not be legal Java identifiers. Preserve the
+                // literal rather than inventing a symbol for such entries.
+                if !r.package.split('.').all(crate::native_java::identifier)
+                    || !crate::native_java::identifier(&r.kind)
+                    || !crate::native_java::identifier(&r.name)
+                    || (!hex && raw.len() > 1 && raw.starts_with('0'))
+                {
+                    continue;
+                }
+                format!("{}.R.{}.{}", r.package, r.kind, r.name)
             };
             edits.push((start, i, replacement, self.label(id).unwrap()));
         }

@@ -735,7 +735,23 @@ fn filled_array_arguments_preserve_order_in_both_dex_encodings() {
         let symbols = Arc::get_mut(&mut c.symbols).unwrap();
         symbols.types.push("[Ljava/lang/String;".into());
         symbols.protos[0] = ("V".into(), vec!["[Ljava/lang/String;".into()]);
-        assert!(native_java::render_method("sample.Test", &c, &c.methods[0]).is_err());
+        let original = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+        let allocation = original.source.find("new sample.A").unwrap();
+        assert!(
+            allocation < original.source.find("\"first\"").unwrap(),
+            "{}",
+            original.source
+        );
+        assert!(
+            original.source.find("\"first\"").unwrap()
+                < original.source.find("\"second\"").unwrap()
+        );
+        assert!(
+            original.source.find("\"second\"").unwrap()
+                < original.source.find("new java.lang.String[]").unwrap()
+        );
+        assert_eq!(original.source.matches("new sample.A").count(), 1);
+        assert_eq!(original.source.matches("new java.lang.String[]").count(), 1);
         let mut c = allocation_after_prefix(c, 10);
         let code = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
         assert!(
@@ -1473,4 +1489,84 @@ class A {{ static {{ State.trace+="A"; if(State.mode.equals("init")) throw State
         assert_eq!(ran.stdout, b"ok");
     }
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires explicit JDK25"]
+fn filled_string_array_encodings_preserve_jvm_allocation_and_fault_order() {
+    use std::{fs, process::Command};
+    let mut methods = Vec::new();
+    for (index, array) in [[0x2024, 5, 0x0021], [0x0225, 5, 1]]
+        .into_iter()
+        .enumerate()
+    {
+        let mut words = vec![0x0022, 0, 0x011a, 1, 0x021a, 2];
+        words.extend(array);
+        words.extend([0x010c, 0x2070, 0, 0x0010, 0x0011]);
+        let mut c = class(words, vec!["<init>", "first", "second"], vec![(0, 0, 0)]);
+        let symbols = Arc::get_mut(&mut c.symbols).unwrap();
+        symbols.types.push("[Ljava/lang/String;".into());
+        symbols.protos[0] = ("V".into(), vec!["[Ljava/lang/String;".into()]);
+        c.methods[0].name = format!("make{index}").into();
+        methods.push(
+            native_java::render_method("sample.Test", &c, &c.methods[0])
+                .unwrap()
+                .source,
+        );
+    }
+    let dir = std::env::temp_dir().join(format!("rdx-filled-array-order-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    fs::write(dir.join("sample/Test.java"),format!(r#"package sample;
+public class Test {{ {} {} public static String run(int kind,int mask){{State.mask=mask;try{{A value=kind==0?make0():make1();return State.trace+":"+value.text;}}catch(Throwable error){{if(error==State.fault)return State.trace+":fault";throw new AssertionError(error);}}}} }}
+class State {{static int mask;static String trace="";static final AssertionError fault=new AssertionError();static void event(String text,int bit){{trace+=text;if((mask&bit)!=0)throw fault;}}}}
+class A {{static {{State.event("A",1);}}final String text;A(String[] items){{State.event("C",2);if(items.length!=2)throw new AssertionError();text=items[0]+items[1];}}}}
+"#,methods[0],methods[1])).unwrap();
+    fs::write(dir.join("Runner.java"),format!(r#"import java.net.*;import java.nio.file.*;public class Runner{{public static void main(String[]args)throws Exception{{for(int kind=0;kind<2;kind++)for(int mask=0;mask<4;mask++){{try(URLClassLoader loader=new URLClassLoader(new URL[]{{Paths.get("{}").toUri().toURL()}},null)){{String expected=(mask&1)!=0?"A:fault":(mask&2)!=0?"AC:fault":"AC:firstsecond";Object actual=loader.loadClass("sample.Test").getMethod("run",int.class,int.class).invoke(null,kind,mask);if(!expected.equals(actual))throw new AssertionError(expected+" != "+actual);}}}}System.out.print("ok:8");}}}}"#,dir.display())).unwrap();
+    let home = std::env::var("RDX_JAVA25_HOME").expect("explicit JDK25 home");
+    let compiled = Command::new(format!("{home}/bin/javac"))
+        .arg(dir.join("sample/Test.java"))
+        .arg(dir.join("Runner.java"))
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let disassembled = Command::new(format!("{home}/bin/javap"))
+        .args(["-c", "-cp", dir.to_str().unwrap(), "sample.Test"])
+        .output()
+        .unwrap();
+    assert!(disassembled.status.success());
+    let bytecode = String::from_utf8(disassembled.stdout).unwrap();
+    for (start, end) in [("make0()", "make1()"), ("make1()", "run(int, int)")] {
+        let body = &bytecode[bytecode.find(start).unwrap()..bytecode.find(end).unwrap()];
+        assert!(
+            body.find("class sample/A").unwrap() < body.find("String first").unwrap(),
+            "{body}"
+        );
+        assert!(
+            body.find("String first").unwrap() < body.find("String second").unwrap(),
+            "{body}"
+        );
+        assert!(
+            body.find("String second").unwrap() < body.find("anewarray").unwrap(),
+            "{body}"
+        );
+        assert!(
+            body.find("anewarray").unwrap() < body.find("sample/A.\"<init>\"").unwrap(),
+            "{body}"
+        );
+    }
+    let executed = Command::new(format!("{home}/bin/java"))
+        .args(["-cp", dir.to_str().unwrap(), "Runner"])
+        .output()
+        .unwrap();
+    assert!(
+        executed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&executed.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&executed.stdout), "ok:8");
+    fs::remove_dir_all(&dir).unwrap();
 }

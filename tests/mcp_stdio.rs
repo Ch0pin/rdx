@@ -40,7 +40,70 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     assert_eq!(replies[0]["error"]["code"], -32600);
     assert_eq!(replies[1]["result"]["protocolVersion"], "2025-06-18");
     let tools = replies[2]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 19);
+    assert_eq!(tools.len(), 22);
+    let schema = |name: &str| {
+        &tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} must be advertised over stdio"))["inputSchema"]
+    };
+    let health = schema("get_health");
+    let method_source = schema("get_method_source");
+    for key in ["method_id", "instance_id", "project_id"] {
+        assert!(
+            method_source["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(key))
+        );
+    }
+    assert_eq!(method_source["properties"]["limit"]["maximum"], 128000);
+    assert_eq!(method_source["properties"]["offset"]["minimum"], 0);
+    assert_eq!(method_source["additionalProperties"], false);
+    assert_eq!(health["required"], json!([]));
+    assert_eq!(health["additionalProperties"], false);
+    for key in ["apk_path", "apk_sha256", "package_name"] {
+        assert_eq!(health["properties"][key]["type"], "string");
+        assert_eq!(health["properties"][key]["minLength"], 1);
+    }
+    for key in ["offset", "registration_offset"] {
+        assert_eq!(health["properties"][key]["type"], "integer");
+        assert_eq!(health["properties"][key]["minimum"], 0);
+    }
+    assert_eq!(health["properties"]["limit"]["maximum"], 500);
+    let literals = schema("find_string_references");
+    let required = literals["required"].as_array().unwrap();
+    for key in ["query", "instance_id", "project_id"] {
+        assert!(required.contains(&json!(key)));
+    }
+    assert_eq!(literals["properties"]["query"]["minLength"], 1);
+    assert_eq!(
+        literals["properties"]["match_mode"]["enum"],
+        json!(["exact", "contains"])
+    );
+    assert_eq!(literals["properties"]["match_mode"]["default"], "contains");
+    assert_eq!(literals["properties"]["package_prefix"]["type"], "string");
+    assert_eq!(literals["properties"]["limit"]["maximum"], 500);
+    let manifest = schema("get_manifest_summary");
+    assert_eq!(
+        manifest["properties"]["format"]["enum"],
+        json!(["markdown", "records"])
+    );
+    assert_eq!(
+        manifest["properties"]["component_type"]["enum"],
+        json!([
+            "activity",
+            "activity-alias",
+            "service",
+            "receiver",
+            "provider"
+        ])
+    );
+    for key in ["component", "host", "scheme", "path", "permission", "query"] {
+        assert_eq!(manifest["properties"][key]["type"], "string");
+        assert_eq!(manifest["properties"][key]["minLength"], 1);
+    }
+    assert_eq!(manifest["additionalProperties"], false);
     let implementations = tools
         .iter()
         .find(|tool| tool["name"] == "find_implementations")

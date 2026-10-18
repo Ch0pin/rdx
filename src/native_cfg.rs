@@ -364,7 +364,8 @@ fn target(pc: usize, delta: i32, len: usize) -> Result<usize> {
     Ok(value as usize)
 }
 
-pub(crate) fn instruction_width(words: &[u16], pc: usize) -> Result<(usize, bool)> {
+/// Decode the exact original DEX instruction width, rejecting malformed words.
+pub fn instruction_width(words: &[u16], pc: usize) -> Result<(usize, bool)> {
     let word = *words.get(pc).context("instruction offset outside method")?;
     let op = word as u8;
     let (size, payload) = if op == 0 {

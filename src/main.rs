@@ -25,6 +25,7 @@ use rdx::engines::ENGINES;
 use std::path::Path;
 
 fn main() -> Result<()> {
+    rdx::mcp::capture_build_identity();
     let _search_cleanup = search_index::SessionCleanup::new();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let explicit_engine = args.first().is_some_and(|a| a == "--engine");

@@ -1,4 +1,5 @@
-//! Pure terminal tails may be physically inside an address-ordered loop.
+//! Unprotected terminal tails may lie inside an address-ordered loop.
+//! Static reads stay at the original edge and retain their throwing behavior.
 //! This proves an original edge and complete terminating path, not a new loop
 //! entry. Emission must use the actual incoming typed frame and reject pending
 //! result/allocation/constructor state before rendering the terminal path.
@@ -39,8 +40,7 @@ pub(super) fn prove(
     target: usize,
     interval: Range<usize>,
 ) -> Option<SharedTerminalExit> {
-    if code.tries != 0
-        || !code.try_regions.is_empty()
+    if usize::from(code.tries) != code.try_regions.len()
         || code.instructions.len() > 4096
         || target <= interval.start
         || !interval.contains(&target)
@@ -50,6 +50,17 @@ pub(super) fn prove(
     }
     let ir = DecodedMethod::decode(code).ok()?;
     let by_pc: BTreeMap<_, _> = ir.instructions.iter().map(|i| (i.pc, i)).collect();
+    // No exception range may acquire or lose an effect when a terminal path
+    // is emitted at its original incoming edge. Unrelated handlers are fine.
+    let protected = |pc: usize| {
+        code.try_regions.iter().any(|r| {
+            (r.start as usize..r.end as usize).contains(&pc)
+                || r.catches.iter().any(|(_, handler)| *handler as usize == pc)
+        })
+    };
+    if protected(from) {
+        return None;
+    }
     let source = by_pc.get(&from)?;
     if !matches!(source.opcode, 0x28..=0x2a | 0x32..=0x3d) || source.branch_target != Some(target) {
         return None;
@@ -59,10 +70,14 @@ pub(super) fn prove(
     let mut pc = target;
     for _ in 0..32 {
         let ins = by_pc.get(&pc)?;
+        if protected(pc) {
+            return None;
+        }
         nodes.push(pc);
         match ins.opcode {
             0x0e..=0x11 => break,
             0x00..=0x09 | 0x12..=0x19 if !ins.may_throw => pc += ins.width,
+            0x60..=0x66 => pc += ins.width,
             0x28..=0x2a => {
                 let next = ins.branch_target?;
                 if next <= pc {
@@ -98,13 +113,6 @@ pub(super) fn prove(
                     .collect()
             };
             normal.insert(pc, next);
-        }
-        if block
-            .successors
-            .iter()
-            .any(|e| e.kind == EdgeKind::Exceptional)
-        {
-            return None;
         }
     }
     if !normal.get(&from)?.contains(&target) {

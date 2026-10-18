@@ -66,6 +66,11 @@ fn fallthrough_throw() -> DexClass {
         0x0139, 8, 0x0012, 0x1071, 1, 0, 0x0012, 0x0027, 0x2070, 0, 0x0010, 0x000e,
     ])
 }
+fn shared_head_throw() -> DexClass {
+    fixture(vec![
+        0x0138, 8, 0x0138, 6, 0x2070, 0, 0x0010, 0x000e, 0x0012, 0x1071, 1, 0, 0x0012, 0x0027,
+    ])
+}
 fn source(class: &DexClass) -> String {
     let analysis = MethodAnalysis::build(class, &class.methods[0]).unwrap();
     assert_eq!(analysis.infer_types().unwrap().wide_pair_issues, 0);
@@ -140,7 +145,7 @@ fn undefined_terminal_operand_and_success_without_delegation_remain_rejected() {
 }
 
 #[test]
-fn protected_arm_and_additional_incoming_edge_remain_outside_the_proof() {
+fn protected_arm_and_foreign_entry_bypassing_receiver_overwrite_remain_rejected() {
     let mut protected = taken_throw();
     let code = protected.methods[0].code.as_mut().unwrap();
     code.instructions
@@ -152,12 +157,29 @@ fn protected_arm_and_additional_incoming_edge_remain_outside_the_proof() {
         catches: vec![(Some(Arc::from("Ljava/lang/RuntimeException;")), 12)].into(),
     }];
     reject(&protected);
-    // Both condition PCs enter the same terminal arm. The selected arm is not
-    // owned by one branch, so it cannot use the separate terminal context.
-    let incoming = fixture(vec![
-        0x0138, 8, 0x0138, 6, 0x2070, 0, 0x0010, 0x000e, 0x0012, 0x1071, 1, 0, 0x0012, 0x0027,
-    ]);
+    // PC2 enters the interior call at9, bypassing the overwrite at8. The
+    // original this reference therefore cannot supply Hooks.check's integer.
+    let mut incoming = shared_head_throw();
+    incoming.methods[0].code.as_mut().unwrap().instructions[3] = 7;
     reject(&incoming);
+}
+
+#[test]
+fn shared_terminal_head_uses_each_incoming_frame_without_moving_effects() {
+    let class = shared_head_throw();
+    let body = native_java::render_method("sample.Hello", &class, &class.methods[0]).unwrap();
+    assert_eq!(body.source.matches("super(").count(), 1, "{}", body.source);
+    assert!(body.source.find("throw ").unwrap() < body.source.find("super(").unwrap());
+    assert!(
+        body.links
+            .iter()
+            .any(|link| link.label == "sample.Base.<init>(Ljava/lang/Object;)V")
+    );
+    assert!(
+        body.links
+            .iter()
+            .any(|link| link.label == "sample.Hooks.check(I)V")
+    );
 }
 
 // Independent small DEX evaluator, with invocation/throw events rather than
@@ -220,7 +242,7 @@ fn jvm_preserves_throwing_helper_and_superclass_event_order_for_both_paths() {
     let directory =
         std::env::temp_dir().join(format!("rdx-terminal-constructor-{}", std::process::id()));
     fs::create_dir_all(directory.join("sample")).unwrap();
-    for class in [taken_throw(), fallthrough_throw()] {
+    for class in [taken_throw(), fallthrough_throw(), shared_head_throw()] {
         let mut cases = String::new();
         for null in [false, true] {
             for helper in [false, true] {

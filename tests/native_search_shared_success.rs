@@ -93,10 +93,84 @@ fn external_success_predecessor_does_not_enter_loop_body() {
 }
 
 #[test]
-fn external_entry_into_actual_search_body_stays_rejected() {
+fn external_body_entry_copies_first_match_before_the_original_search_loop() {
     let class = fixture(false, true);
-    let error = native_java::render_method("sample.Search", &class, &class.methods[0]).unwrap_err();
-    assert!(error.to_string().contains("interior entry"), "{error:#}");
+    let rendered = native_java::render_method("sample.Search", &class, &class.methods[0]).unwrap();
+    assert!(rendered.source.contains("while"), "{}", rendered.source);
+    assert_eq!(
+        rendered.source.matches(".matches()").count(),
+        2,
+        "{}",
+        rendered.source
+    );
+    assert_eq!(
+        rendered
+            .links
+            .iter()
+            .filter(|link| link.label == "sample.Search.matches()Z")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn protected_actual_body_entry_retains_exception_ownership_guard() {
+    let class = fixture(true, true);
+    assert!(native_java::render_method("sample.Search", &class, &class.methods[0]).is_err());
+}
+
+#[test]
+#[ignore = "requires javac and java; supports RDX_JAVA25_HOME"]
+fn actual_body_entry_jvm_preserves_first_match_loop_calls_and_fault_identity() {
+    use std::{fs, process::Command};
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let class = fixture(false, true);
+    let rendered = native_java::render_method("sample.Search", &class, &class.methods[0]).unwrap();
+    let dir = std::env::temp_dir().join(format!("rdx-search-body-entry-{}", std::process::id()));
+    let _cleanup = Cleanup(dir.clone());
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    let source = r#"package sample;
+public class Search {
+ static int n,target,index,mode;static String trace;static final RuntimeException problem=new IllegalStateException("failure");
+ static boolean more(){trace+="more"+index+",";if(mode==1)throw problem;return index<n;}
+ static boolean matches(){trace+="matches"+index+",";if(mode==2)throw problem;return index++==target;}
+ static void success(){trace+="success,";if(mode==3)throw problem;}
+ static void failure(){trace+="failure,";if(mode==4)throw problem;}
+ static void finish(){trace+="finish,";if(mode==5)throw problem;}
+ METHOD
+ static void encodedOracle(boolean entry){boolean body=entry;for(;;){if(!body&&!more()){failure();break;}if(matches()){success();break;}body=false;}finish();}
+ static void run(boolean entry){index=0;trace="";boolean actualThrow=false;try{test(entry);}catch(RuntimeException fault){if(fault!=problem)throw new AssertionError("identity");actualThrow=true;}String actualTrace=trace;int actualIndex=index;index=0;trace="";boolean expectedThrow=false;try{encodedOracle(entry);}catch(RuntimeException fault){if(fault!=problem)throw new AssertionError("oracle identity");expectedThrow=true;}if(actualThrow!=expectedThrow||actualIndex!=index||!actualTrace.equals(trace))throw new AssertionError(actualTrace+" != "+trace);}
+ public static void main(String[]args){for(n=0;n<=4;n++)for(target=-1;target<=5;target++)for(mode=0;mode<=5;mode++)for(boolean entry:new boolean[]{false,true})run(entry);}
+}"#;
+    fs::write(
+        dir.join("sample/Search.java"),
+        source.replace("METHOD", &rendered.source),
+    )
+    .unwrap();
+    for (program, args) in [
+        ("javac", vec!["sample/Search.java"]),
+        ("java", vec!["-cp", ".", "sample.Search"]),
+    ] {
+        let executable = std::env::var("RDX_JAVA25_HOME")
+            .map(|home| std::path::PathBuf::from(home).join("bin").join(program))
+            .unwrap_or_else(|_| program.into());
+        let result = Command::new(executable)
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{program}: {}\n{}",
+            String::from_utf8_lossy(&result.stderr),
+            rendered.source
+        );
+    }
 }
 
 #[test]

@@ -11,6 +11,7 @@ pub(super) struct EntryCopy {
     pub instructions: Vec<usize>,
     /// None means the copy returns, rather than supplying a header frame.
     pub header: Option<usize>,
+    pub partial_latch: Option<usize>,
     pub kind: CopyKind,
 }
 
@@ -78,6 +79,7 @@ pub(super) fn select(code: &DexCode) -> Option<EntryCopyPlan> {
                     target: inner.copy_target,
                     instructions: inner.copy.clone(),
                     header: Some(inner.header),
+                    partial_latch: None,
                     kind: CopyKind::Header,
                 }],
                 scc_members,
@@ -127,6 +129,7 @@ pub(super) fn select(code: &DexCode) -> Option<EntryCopyPlan> {
                         target: c.target,
                         instructions: c.instructions.clone(),
                         header: c.header,
+                        partial_latch: c.partial_latch,
                         kind: if c.header.is_some() {
                             CopyKind::Header
                         } else {
@@ -310,6 +313,7 @@ fn select_forward_dag(code: &DexCode) -> Option<EntryCopyPlan> {
                     target: to,
                     instructions: path,
                     header: destination,
+                    partial_latch: None,
                     kind: if destination.is_some() {
                         CopyKind::Header
                     } else {
@@ -341,6 +345,7 @@ fn select_forward_dag(code: &DexCode) -> Option<EntryCopyPlan> {
                     target: to,
                     instructions: path,
                     header: None,
+                    partial_latch: None,
                     kind: CopyKind::PrefixReturn,
                 });
             }

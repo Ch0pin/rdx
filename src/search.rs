@@ -14,6 +14,9 @@ use std::{
 
 const MAX_HITS: usize = 1000;
 const MAX_RETAINED: usize = 32 * 1024 * 1024;
+mod candidates;
+#[cfg(test)]
+mod latency_tests;
 mod streaming;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -280,6 +283,14 @@ fn matches(
         }
     }
     let is_resource = matches!(document.target, SearchTarget::Resource(_));
+    if query.query.code && !query.query.regex && !is_resource {
+        for range in rdx::resource_search::aliases(&document.links, &query.query.text) {
+            if found.len() >= remaining {
+                break;
+            }
+            found.insert((range.start, range.end), "code".into());
+        }
+    }
     if found.len() < remaining && (is_resource || query.query.code || query.query.comments) {
         let mut lazy_spans = None;
         let all_text = is_resource || (query.query.code && query.query.comments);
@@ -453,6 +464,24 @@ impl SearchCache {
         if !self.legacy {
             self.disk.insert(key.clone(), &value);
         }
+        self.insert_memory(key, value);
+    }
+
+    fn insert_prepared(
+        &mut self,
+        key: SearchTarget,
+        value: CachedValue,
+        prepared: Option<crate::search_index::PreparedEntry>,
+    ) {
+        if !self.legacy
+            && let Some(prepared) = prepared
+        {
+            self.disk.insert_prepared(key.clone(), prepared);
+        }
+        self.insert_memory(key, value);
+    }
+
+    fn insert_memory(&mut self, key: SearchTarget, value: CachedValue) {
         let cost = cached_cost(&key, &value);
         if self.entries.len() < 10_000
             && self.bytes.saturating_add(cost) <= self.budget
@@ -465,6 +494,10 @@ impl SearchCache {
 
     fn contains(&self, key: &SearchTarget) -> bool {
         self.entries.contains_key(key) || self.disk.contains(key)
+    }
+
+    pub(super) fn index_stats(&self) -> (usize, usize, usize, usize) {
+        self.disk.stats()
     }
 
     fn prefetch_sources(
@@ -527,6 +560,44 @@ fn cached_cost(key: &SearchTarget, value: &CachedValue) -> usize {
                 .sum::<usize>()
             + note.as_ref().map_or(0, String::len)
     })
+}
+
+// Queue admission charges owned capacities; the cache's historical logical-size
+// accounting is kept separate. Shared Arcs are conservatively charged per result.
+fn queued_cost(key: &SearchTarget, value: &CachedValue) -> usize {
+    128usize
+        .saturating_add(match key {
+            SearchTarget::Class(name) => name.capacity(),
+            _ => 0,
+        })
+        .saturating_add(value.as_ref().map_or(0, |(doc, defs, note)| {
+            doc.source
+                .capacity()
+                .saturating_add(doc.name.capacity())
+                .saturating_add(doc.syntax.capacity())
+                .saturating_add(doc.source_hash.as_ref().map_or(0, String::capacity))
+                .saturating_add(
+                    doc.links
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<CodeLink>()),
+                )
+                .saturating_add(
+                    doc.links
+                        .iter()
+                        .map(|link| link.label.capacity())
+                        .sum::<usize>(),
+                )
+                .saturating_add(
+                    defs.capacity()
+                        .saturating_mul(std::mem::size_of::<CodeDefinition>()),
+                )
+                .saturating_add(
+                    defs.iter()
+                        .map(|def| def.kind.capacity() + def.name.capacity())
+                        .sum::<usize>(),
+                )
+                .saturating_add(note.as_ref().map_or(0, String::capacity))
+        }))
 }
 
 type LoadedDocument = Result<Option<(SearchDocument, Vec<CodeDefinition>, Option<String>)>, String>;
@@ -621,6 +692,26 @@ pub fn run_search_interactive(
             ..Default::default()
         };
     }
+    // DEX hints change order, never coverage. Generated Java can contain text
+    // absent from the DEX pools, so every remaining class stays in the scan.
+    // An entirely indexed corpus already searches cheaply without this pass.
+    if !cache.legacy
+        && q.code
+        && selected
+            .iter()
+            .any(|name| !cache.contains(&SearchTarget::Class((*name).clone())))
+    {
+        candidates::prioritize(
+            engine,
+            &mut selected,
+            &query.matcher,
+            cancel,
+            &mut interactive,
+        );
+        if !q.regex {
+            selected.sort_by_key(|name| !query.exact_class_match(name));
+        }
+    }
     let mut class_summary = None;
     if !cache.legacy && !q.classes && !q.methods && !q.fields {
         let resource_count = if q.resources {
@@ -714,7 +805,16 @@ pub fn run_search_interactive(
         } else {
             SearchTarget::Resource(entries[index - selected.len()].index)
         };
+        let rejected = !cache.legacy
+            && cache.disk.rejects(
+                &key,
+                &q.text,
+                q.case_sensitive,
+                q.regex,
+                definitions_requested,
+            );
         if !cache.legacy
+            && !rejected
             && !definitions_requested
             && index < selected.len()
             && batches_available
@@ -724,7 +824,17 @@ pub fn run_search_interactive(
             let names: Vec<String> = selected[index..]
                 .iter()
                 .take(32)
-                .filter(|name| !cache.contains(&SearchTarget::Class((***name).to_owned())))
+                .filter(|name| {
+                    let key = SearchTarget::Class((***name).to_owned());
+                    !cache.contains(&key)
+                        && !cache.disk.rejects(
+                            &key,
+                            &q.text,
+                            q.case_sensitive,
+                            q.regex,
+                            definitions_requested,
+                        )
+                })
                 .map(|name| (*name).clone())
                 .collect();
             match cache.prefetch_sources(engine, &names) {
@@ -743,14 +853,6 @@ pub fn run_search_interactive(
         } else {
             None
         };
-        let rejected = !cache.legacy
-            && cache.disk.rejects(
-                &key,
-                &q.text,
-                q.case_sensitive,
-                q.regex,
-                definitions_requested,
-            );
         let mut result = if rejected {
             cache.index_rejections += 1;
             Ok(None)
@@ -995,6 +1097,28 @@ mod tests {
             source_hash: None,
             metadata_complete: true,
         })
+    }
+
+    #[test]
+    fn numeric_resource_search_keeps_displayed_offsets_and_literal_hits() {
+        let mut doc = document("é 2130772070 R.anim.fade");
+        Arc::get_mut(&mut doc).unwrap().links.push(CodeLink {
+            start: 13,
+            end: 24,
+            label: "resource://7f010066/anim/fade".into(),
+        });
+        for (text, expected) in [("2130772070", 2), ("0x7f010066", 1)] {
+            let query = CompiledQuery::new(SearchQuery {
+                text: text.into(),
+                ..Default::default()
+            })
+            .unwrap();
+            let hits = matches(doc.clone(), &[], &query, 100);
+            assert_eq!(hits.len(), expected);
+            let hit = hits.last().unwrap();
+            assert_eq!((hit.start, hit.end), (13, 24));
+            assert_eq!(&hit.preview[hit.preview_match.clone()], "R.anim.fade");
+        }
     }
     #[test]
     fn unicode_offsets_literal_and_regex() {

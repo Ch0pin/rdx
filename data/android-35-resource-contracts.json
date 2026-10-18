@@ -1,0 +1,3253 @@
+{
+  "admitted_annotation_counts": {
+    "AnimRes": 9,
+    "AnimatorRes": 7,
+    "ArrayRes": 14,
+    "AttrRes": 29,
+    "BoolRes": 1,
+    "ColorRes": 8,
+    "DimenRes": 11,
+    "DrawableRes": 79,
+    "FontRes": 1,
+    "FractionRes": 1,
+    "IdRes": 108,
+    "IntegerRes": 1,
+    "InterpolatorRes": 2,
+    "LayoutRes": 17,
+    "MenuRes": 3,
+    "PluralsRes": 4,
+    "RawRes": 11,
+    "StringRes": 58,
+    "StyleRes": 21,
+    "TransitionRes": 2,
+    "XmlRes": 7
+  },
+  "android_jar_sha256": "4566663c3876e022b4fa4ced8c8697c4ab1688267f090114fd92d027b32e619b",
+  "annotations_zip_sha256": "bbbe0b4bd708951887a2e372b28aadf57c3d8de7dde405e8aee32eb8e283f452",
+  "contracts": {
+    "android.animation.AnimatorInflater.loadAnimator(Landroid/content/Context;I)Landroid/animation/Animator;": [
+      [
+        1,
+        [
+          "animator"
+        ]
+      ]
+    ],
+    "android.app.ActionBar$Tab.setContentDescription(I)Landroid/app/ActionBar$Tab;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.ActionBar$Tab.setCustomView(I)Landroid/app/ActionBar$Tab;": [
+      [
+        0,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.app.ActionBar$Tab.setIcon(I)Landroid/app/ActionBar$Tab;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.app.ActionBar$Tab.setText(I)Landroid/app/ActionBar$Tab;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.ActionBar.setCustomView(I)V": [
+      [
+        0,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.app.ActionBar.setHomeActionContentDescription(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.ActionBar.setHomeAsUpIndicator(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.app.ActionBar.setIcon(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.app.ActionBar.setLogo(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.app.ActionBar.setSubtitle(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.ActionBar.setTitle(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.Activity.onApplyThemeResource(Landroid/content/res/Resources$Theme;IZ)V": [
+      [
+        1,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.app.Activity.overrideActivityTransition(III)V": [
+      [
+        1,
+        [
+          "anim"
+        ]
+      ],
+      [
+        2,
+        [
+          "anim"
+        ]
+      ]
+    ],
+    "android.app.Activity.overrideActivityTransition(IIII)V": [
+      [
+        1,
+        [
+          "anim"
+        ]
+      ],
+      [
+        2,
+        [
+          "anim"
+        ]
+      ]
+    ],
+    "android.app.Activity.setContentView(I)V": [
+      [
+        0,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.app.Activity.setFeatureDrawableResource(II)V": [
+      [
+        1,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.app.ActivityManager$TaskDescription$Builder.setIcon(I)Landroid/app/ActivityManager$TaskDescription$Builder;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.app.AlertDialog$Builder.setIcon(I)Landroid/app/AlertDialog$Builder;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.app.AlertDialog$Builder.setIconAttribute(I)Landroid/app/AlertDialog$Builder;": [
+      [
+        0,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.app.AlertDialog$Builder.setItems(ILandroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;": [
+      [
+        0,
+        [
+          "array"
+        ]
+      ]
+    ],
+    "android.app.AlertDialog$Builder.setMessage(I)Landroid/app/AlertDialog$Builder;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.AlertDialog$Builder.setMultiChoiceItems(I[ZLandroid/content/DialogInterface$OnMultiChoiceClickListener;)Landroid/app/AlertDialog$Builder;": [
+      [
+        0,
+        [
+          "array"
+        ]
+      ]
+    ],
+    "android.app.AlertDialog$Builder.setNegativeButton(ILandroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.AlertDialog$Builder.setNeutralButton(ILandroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.AlertDialog$Builder.setPositiveButton(ILandroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.AlertDialog$Builder.setSingleChoiceItems(IILandroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;": [
+      [
+        0,
+        [
+          "array"
+        ]
+      ]
+    ],
+    "android.app.AlertDialog$Builder.setTitle(I)Landroid/app/AlertDialog$Builder;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.AlertDialog.setIcon(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.app.AlertDialog.setIconAttribute(I)V": [
+      [
+        0,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.app.AutomaticZenRule$Builder.setIconResId(I)Landroid/app/AutomaticZenRule$Builder;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.app.Dialog.setContentView(I)V": [
+      [
+        0,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.app.Dialog.setFeatureDrawableResource(II)V": [
+      [
+        1,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.app.Dialog.setTitle(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.Fragment.getString(I)Ljava/lang/String;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.Fragment.getString(I[Ljava/lang/Object;)Ljava/lang/String;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.Fragment.getText(I)Ljava/lang/CharSequence;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.FragmentTransaction.add(ILandroid/app/Fragment;)Landroid/app/FragmentTransaction;": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.app.FragmentTransaction.add(ILandroid/app/Fragment;Ljava/lang/String;)Landroid/app/FragmentTransaction;": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.app.FragmentTransaction.replace(ILandroid/app/Fragment;)Landroid/app/FragmentTransaction;": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.app.FragmentTransaction.replace(ILandroid/app/Fragment;Ljava/lang/String;)Landroid/app/FragmentTransaction;": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.app.FragmentTransaction.setBreadCrumbShortTitle(I)Landroid/app/FragmentTransaction;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.FragmentTransaction.setBreadCrumbTitle(I)Landroid/app/FragmentTransaction;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.app.FragmentTransaction.setCustomAnimations(II)Landroid/app/FragmentTransaction;": [
+      [
+        0,
+        [
+          "animator"
+        ]
+      ],
+      [
+        1,
+        [
+          "animator"
+        ]
+      ]
+    ],
+    "android.app.FragmentTransaction.setCustomAnimations(IIII)Landroid/app/FragmentTransaction;": [
+      [
+        0,
+        [
+          "animator"
+        ]
+      ],
+      [
+        1,
+        [
+          "animator"
+        ]
+      ],
+      [
+        2,
+        [
+          "animator"
+        ]
+      ],
+      [
+        3,
+        [
+          "animator"
+        ]
+      ]
+    ],
+    "android.app.FragmentTransaction.setTransitionStyle(I)Landroid/app/FragmentTransaction;": [
+      [
+        0,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.app.Notification$BubbleMetadata$Builder.setDesiredHeightResId(I)Landroid/app/Notification$BubbleMetadata$Builder;": [
+      [
+        0,
+        [
+          "dimen"
+        ]
+      ]
+    ],
+    "android.app.Notification$Builder.setSmallIcon(I)Landroid/app/Notification$Builder;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.app.Notification$Builder.setSmallIcon(II)Landroid/app/Notification$Builder;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.app.Notification$MediaStyle.setRemotePlaybackInfo(Ljava/lang/CharSequence;ILandroid/app/PendingIntent;)Landroid/app/Notification$MediaStyle;": [
+      [
+        1,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.app.WallpaperManager.hasResourceWallpaper(I)Z": [
+      [
+        0,
+        [
+          "raw"
+        ]
+      ]
+    ],
+    "android.app.WallpaperManager.setResource(I)V": [
+      [
+        0,
+        [
+          "raw"
+        ]
+      ]
+    ],
+    "android.app.WallpaperManager.setResource(II)I": [
+      [
+        0,
+        [
+          "raw"
+        ]
+      ]
+    ],
+    "android.app.blob.BlobStoreManager.acquireLease(Landroid/app/blob/BlobHandle;I)V": [
+      [
+        1,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.app.blob.BlobStoreManager.acquireLease(Landroid/app/blob/BlobHandle;IJ)V": [
+      [
+        1,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.content.Context.getColor(I)I": [
+      [
+        0,
+        [
+          "color"
+        ]
+      ]
+    ],
+    "android.content.Context.getColorStateList(I)Landroid/content/res/ColorStateList;": [
+      [
+        0,
+        [
+          "color"
+        ]
+      ]
+    ],
+    "android.content.Context.getDrawable(I)Landroid/graphics/drawable/Drawable;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.content.Context.getString(I)Ljava/lang/String;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.content.Context.getString(I[Ljava/lang/Object;)Ljava/lang/String;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.content.Context.getText(I)Ljava/lang/CharSequence;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.content.Context.obtainStyledAttributes(I[I)Landroid/content/res/TypedArray;": [
+      [
+        0,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.content.Context.obtainStyledAttributes(Landroid/util/AttributeSet;[III)Landroid/content/res/TypedArray;": [
+      [
+        2,
+        [
+          "attr"
+        ]
+      ],
+      [
+        3,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.content.Context.setTheme(I)V": [
+      [
+        0,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.content.RestrictionEntry.setChoiceEntries(Landroid/content/Context;I)V": [
+      [
+        1,
+        [
+          "array"
+        ]
+      ]
+    ],
+    "android.content.RestrictionEntry.setChoiceValues(Landroid/content/Context;I)V": [
+      [
+        1,
+        [
+          "array"
+        ]
+      ]
+    ],
+    "android.content.pm.PackageManager.getDrawable(Ljava/lang/String;ILandroid/content/pm/ApplicationInfo;)Landroid/graphics/drawable/Drawable;": [
+      [
+        1,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.content.pm.PackageManager.getText(Ljava/lang/String;ILandroid/content/pm/ApplicationInfo;)Ljava/lang/CharSequence;": [
+      [
+        1,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.content.pm.PackageManager.getXml(Ljava/lang/String;ILandroid/content/pm/ApplicationInfo;)Landroid/content/res/XmlResourceParser;": [
+      [
+        1,
+        [
+          "xml"
+        ]
+      ]
+    ],
+    "android.content.res.Resources$Theme.getAttributeResolutionStack(III)[I": [
+      [
+        0,
+        [
+          "attr"
+        ]
+      ],
+      [
+        1,
+        [
+          "style"
+        ]
+      ],
+      [
+        2,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.content.res.Resources$Theme.getDrawable(I)Landroid/graphics/drawable/Drawable;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.content.res.Resources$Theme.obtainStyledAttributes(I[I)Landroid/content/res/TypedArray;": [
+      [
+        0,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.content.res.Resources$Theme.obtainStyledAttributes(Landroid/util/AttributeSet;[III)Landroid/content/res/TypedArray;": [
+      [
+        2,
+        [
+          "attr"
+        ]
+      ],
+      [
+        3,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getBoolean(I)Z": [
+      [
+        0,
+        [
+          "bool"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getColor(I)I": [
+      [
+        0,
+        [
+          "color"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getColor(ILandroid/content/res/Resources$Theme;)I": [
+      [
+        0,
+        [
+          "color"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getColorStateList(I)Landroid/content/res/ColorStateList;": [
+      [
+        0,
+        [
+          "color"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getColorStateList(ILandroid/content/res/Resources$Theme;)Landroid/content/res/ColorStateList;": [
+      [
+        0,
+        [
+          "color"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getDimension(I)F": [
+      [
+        0,
+        [
+          "dimen"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getDimensionPixelOffset(I)I": [
+      [
+        0,
+        [
+          "dimen"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getDimensionPixelSize(I)I": [
+      [
+        0,
+        [
+          "dimen"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getDrawable(I)Landroid/graphics/drawable/Drawable;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getDrawable(ILandroid/content/res/Resources$Theme;)Landroid/graphics/drawable/Drawable;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getDrawableForDensity(II)Landroid/graphics/drawable/Drawable;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getDrawableForDensity(IILandroid/content/res/Resources$Theme;)Landroid/graphics/drawable/Drawable;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getFloat(I)F": [
+      [
+        0,
+        [
+          "dimen"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getFont(I)Landroid/graphics/Typeface;": [
+      [
+        0,
+        [
+          "font"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getFraction(III)F": [
+      [
+        0,
+        [
+          "fraction"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getIntArray(I)[I": [
+      [
+        0,
+        [
+          "array"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getInteger(I)I": [
+      [
+        0,
+        [
+          "integer"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getLayout(I)Landroid/content/res/XmlResourceParser;": [
+      [
+        0,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getMovie(I)Landroid/graphics/Movie;": [
+      [
+        0,
+        [
+          "raw"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getQuantityString(II)Ljava/lang/String;": [
+      [
+        0,
+        [
+          "plurals"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getQuantityString(II[Ljava/lang/Object;)Ljava/lang/String;": [
+      [
+        0,
+        [
+          "plurals"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getQuantityText(II)Ljava/lang/CharSequence;": [
+      [
+        0,
+        [
+          "plurals"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getString(I)Ljava/lang/String;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getString(I[Ljava/lang/Object;)Ljava/lang/String;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getStringArray(I)[Ljava/lang/String;": [
+      [
+        0,
+        [
+          "array"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getText(I)Ljava/lang/CharSequence;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getText(ILjava/lang/CharSequence;)Ljava/lang/CharSequence;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getTextArray(I)[Ljava/lang/CharSequence;": [
+      [
+        0,
+        [
+          "array"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.getXml(I)Landroid/content/res/XmlResourceParser;": [
+      [
+        0,
+        [
+          "xml"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.obtainTypedArray(I)Landroid/content/res/TypedArray;": [
+      [
+        0,
+        [
+          "array"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.openRawResource(I)Ljava/io/InputStream;": [
+      [
+        0,
+        [
+          "raw"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.openRawResource(ILandroid/util/TypedValue;)Ljava/io/InputStream;": [
+      [
+        0,
+        [
+          "raw"
+        ]
+      ]
+    ],
+    "android.content.res.Resources.openRawResourceFd(I)Landroid/content/res/AssetFileDescriptor;": [
+      [
+        0,
+        [
+          "raw"
+        ]
+      ]
+    ],
+    "android.gesture.GestureLibraries.fromRawResource(Landroid/content/Context;I)Landroid/gesture/GestureLibrary;": [
+      [
+        1,
+        [
+          "raw"
+        ]
+      ]
+    ],
+    "android.graphics.drawable.Icon.createWithResource(Landroid/content/Context;I)Landroid/graphics/drawable/Icon;": [
+      [
+        1,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.graphics.drawable.Icon.createWithResource(Ljava/lang/String;I)Landroid/graphics/drawable/Icon;": [
+      [
+        1,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.hardware.biometrics.BiometricPrompt$Builder.setLogoRes(I)Landroid/hardware/biometrics/BiometricPrompt$Builder;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.inputmethodservice.InputMethodService.showStatusIcon(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.media.MediaRouter$RouteGroup.setIconResource(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.media.MediaRouter$UserRouteInfo.setIconResource(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.preference.DialogPreference.setDialogIcon(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.preference.DialogPreference.setNegativeButtonText(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.preference.DialogPreference.setPositiveButtonText(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.preference.ListPreference.setEntries(I)V": [
+      [
+        0,
+        [
+          "array"
+        ]
+      ]
+    ],
+    "android.preference.ListPreference.setEntryValues(I)V": [
+      [
+        0,
+        [
+          "array"
+        ]
+      ]
+    ],
+    "android.preference.MultiSelectListPreference.setEntries(I)V": [
+      [
+        0,
+        [
+          "array"
+        ]
+      ]
+    ],
+    "android.preference.MultiSelectListPreference.setEntryValues(I)V": [
+      [
+        0,
+        [
+          "array"
+        ]
+      ]
+    ],
+    "android.preference.Preference.setIcon(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.preference.Preference.setLayoutResource(I)V": [
+      [
+        0,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.preference.Preference.setSummary(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.preference.Preference.setTitle(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.preference.Preference.setWidgetLayoutResource(I)V": [
+      [
+        0,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.preference.PreferenceActivity.loadHeadersFromResource(ILjava/util/List;)V": [
+      [
+        0,
+        [
+          "xml"
+        ]
+      ]
+    ],
+    "android.preference.PreferenceActivity.onBuildStartFragmentIntent(Ljava/lang/String;Landroid/os/Bundle;II)Landroid/content/Intent;": [
+      [
+        2,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.preference.PreferenceActivity.startPreferencePanel(Ljava/lang/String;Landroid/os/Bundle;ILjava/lang/CharSequence;Landroid/app/Fragment;I)V": [
+      [
+        2,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.preference.PreferenceActivity.startWithFragment(Ljava/lang/String;Landroid/os/Bundle;Landroid/app/Fragment;III)V": [
+      [
+        4,
+        [
+          "string"
+        ]
+      ],
+      [
+        5,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.preference.PreferenceFragment.addPreferencesFromResource(I)V": [
+      [
+        0,
+        [
+          "xml"
+        ]
+      ]
+    ],
+    "android.preference.PreferenceManager.setDefaultValues(Landroid/content/Context;IZ)V": [
+      [
+        1,
+        [
+          "xml"
+        ]
+      ]
+    ],
+    "android.preference.SwitchPreference.setSwitchTextOff(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.preference.SwitchPreference.setSwitchTextOn(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.preference.TwoStatePreference.setSummaryOff(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.preference.TwoStatePreference.setSummaryOn(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.print.PrinterInfo$Builder.setIconResourceId(I)Landroid/print/PrinterInfo$Builder;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.printservice.PrintJob.setStatus(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.service.autofill.FillResponse$Builder.setIconResourceId(I)Landroid/service/autofill/FillResponse$Builder;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.service.autofill.FillResponse$Builder.setServiceDisplayNameResourceId(I)Landroid/service/autofill/FillResponse$Builder;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.service.autofill.ImageTransformation$Builder.addOption(Ljava/util/regex/Pattern;I)Landroid/service/autofill/ImageTransformation$Builder;": [
+      [
+        1,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.service.autofill.ImageTransformation$Builder.addOption(Ljava/util/regex/Pattern;ILjava/lang/CharSequence;)Landroid/service/autofill/ImageTransformation$Builder;": [
+      [
+        1,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.service.autofill.VisibilitySetterAction$Builder.setVisibility(II)Landroid/service/autofill/VisibilitySetterAction$Builder;": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.service.dreams.DreamService.setContentView(I)V": [
+      [
+        0,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.speech.tts.TextToSpeech.addEarcon(Ljava/lang/String;Ljava/lang/String;I)I": [
+      [
+        2,
+        [
+          "raw"
+        ]
+      ]
+    ],
+    "android.speech.tts.TextToSpeech.addSpeech(Ljava/lang/CharSequence;Ljava/lang/String;I)I": [
+      [
+        2,
+        [
+          "raw"
+        ]
+      ]
+    ],
+    "android.speech.tts.TextToSpeech.addSpeech(Ljava/lang/String;Ljava/lang/String;I)I": [
+      [
+        2,
+        [
+          "raw"
+        ]
+      ]
+    ],
+    "android.text.TextUtils.listEllipsize(Landroid/content/Context;Ljava/util/List;Ljava/lang/String;Landroid/text/TextPaint;FI)Ljava/lang/CharSequence;": [
+      [
+        5,
+        [
+          "plurals"
+        ]
+      ]
+    ],
+    "android.transition.TransitionInflater.inflateTransition(I)Landroid/transition/Transition;": [
+      [
+        0,
+        [
+          "transition"
+        ]
+      ]
+    ],
+    "android.transition.TransitionInflater.inflateTransitionManager(ILandroid/view/ViewGroup;)Landroid/transition/TransitionManager;": [
+      [
+        0,
+        [
+          "transition"
+        ]
+      ]
+    ],
+    "android.view.ActionMode.setSubtitle(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.view.ActionMode.setTitle(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.view.ContextMenu.setHeaderIcon(I)Landroid/view/ContextMenu;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.view.ContextMenu.setHeaderTitle(I)Landroid/view/ContextMenu;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.view.LayoutInflater.inflate(ILandroid/view/ViewGroup;)Landroid/view/View;": [
+      [
+        0,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.view.LayoutInflater.inflate(ILandroid/view/ViewGroup;Z)Landroid/view/View;": [
+      [
+        0,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.view.Menu.add(I)Landroid/view/MenuItem;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.view.Menu.add(IIII)Landroid/view/MenuItem;": [
+      [
+        3,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.view.Menu.addSubMenu(I)Landroid/view/SubMenu;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.view.Menu.addSubMenu(IIII)Landroid/view/SubMenu;": [
+      [
+        3,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.view.MenuInflater.inflate(ILandroid/view/Menu;)V": [
+      [
+        0,
+        [
+          "menu"
+        ]
+      ]
+    ],
+    "android.view.MenuItem.setActionView(I)Landroid/view/MenuItem;": [
+      [
+        0,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.view.MenuItem.setIcon(I)Landroid/view/MenuItem;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.view.MenuItem.setTitle(I)Landroid/view/MenuItem;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.view.PointerIcon.load(Landroid/content/res/Resources;I)Landroid/view/PointerIcon;": [
+      [
+        1,
+        [
+          "xml"
+        ]
+      ]
+    ],
+    "android.view.SubMenu.setHeaderIcon(I)Landroid/view/SubMenu;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.view.SubMenu.setHeaderTitle(I)Landroid/view/SubMenu;": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.view.SubMenu.setIcon(I)Landroid/view/SubMenu;": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.view.View.getAttributeResolutionStack(I)[I": [
+      [
+        0,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.view.View.inflate(Landroid/content/Context;ILandroid/view/ViewGroup;)Landroid/view/View;": [
+      [
+        1,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.view.View.setAccessibilityTraversalAfter(I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.view.View.setAccessibilityTraversalBefore(I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.view.View.setBackgroundResource(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.view.View.setId(I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.view.View.setLabelFor(I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.view.View.setNextClusterForwardId(I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.view.View.setNextFocusDownId(I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.view.View.setNextFocusForwardId(I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.view.View.setNextFocusLeftId(I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.view.View.setNextFocusRightId(I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.view.View.setNextFocusUpId(I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.view.ViewStub.setInflatedId(I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.view.ViewStub.setLayoutResource(I)V": [
+      [
+        0,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.view.Window.setBackgroundDrawableResource(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.view.Window.setContentView(I)V": [
+      [
+        0,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.view.Window.setFeatureDrawableResource(II)V": [
+      [
+        1,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.view.Window.setIcon(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.view.Window.setLogo(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.view.Window.setWindowAnimations(I)V": [
+      [
+        0,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.view.animation.AnimationUtils.loadAnimation(Landroid/content/Context;I)Landroid/view/animation/Animation;": [
+      [
+        1,
+        [
+          "anim"
+        ]
+      ]
+    ],
+    "android.view.animation.AnimationUtils.loadLayoutAnimation(Landroid/content/Context;I)Landroid/view/animation/LayoutAnimationController;": [
+      [
+        1,
+        [
+          "anim"
+        ]
+      ]
+    ],
+    "android.view.animation.LayoutAnimationController.setAnimation(Landroid/content/Context;I)V": [
+      [
+        1,
+        [
+          "anim"
+        ]
+      ]
+    ],
+    "android.view.animation.LayoutAnimationController.setInterpolator(Landroid/content/Context;I)V": [
+      [
+        1,
+        [
+          "anim",
+          "interpolator"
+        ]
+      ]
+    ],
+    "android.view.inputmethod.InputMethodManager.showStatusIcon(Landroid/os/IBinder;Ljava/lang/String;I)V": [
+      [
+        2,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.view.inspector.PropertyMapper.mapBoolean(Ljava/lang/String;I)I": [
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.view.inspector.PropertyMapper.mapByte(Ljava/lang/String;I)I": [
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.view.inspector.PropertyMapper.mapChar(Ljava/lang/String;I)I": [
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.view.inspector.PropertyMapper.mapColor(Ljava/lang/String;I)I": [
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.view.inspector.PropertyMapper.mapDouble(Ljava/lang/String;I)I": [
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.view.inspector.PropertyMapper.mapFloat(Ljava/lang/String;I)I": [
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.view.inspector.PropertyMapper.mapGravity(Ljava/lang/String;I)I": [
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.view.inspector.PropertyMapper.mapInt(Ljava/lang/String;I)I": [
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.view.inspector.PropertyMapper.mapIntEnum(Ljava/lang/String;ILjava/util/function/IntFunction;)I": [
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.view.inspector.PropertyMapper.mapIntFlag(Ljava/lang/String;ILjava/util/function/IntFunction;)I": [
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.view.inspector.PropertyMapper.mapLong(Ljava/lang/String;I)I": [
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.view.inspector.PropertyMapper.mapObject(Ljava/lang/String;I)I": [
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.view.inspector.PropertyMapper.mapResourceId(Ljava/lang/String;I)I": [
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.view.inspector.PropertyMapper.mapShort(Ljava/lang/String;I)I": [
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.widget.AbsListView.setSelector(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.ActionMenuView.setPopupTheme(I)V": [
+      [
+        0,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.widget.ArrayAdapter.createFromResource(Landroid/content/Context;II)Landroid/widget/ArrayAdapter;": [
+      [
+        1,
+        [
+          "array"
+        ]
+      ],
+      [
+        2,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.widget.ArrayAdapter.setDropDownViewResource(I)V": [
+      [
+        0,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.widget.AutoCompleteTextView.setDropDownBackgroundResource(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.CalendarView.setDateTextAppearance(I)V": [
+      [
+        0,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.widget.CalendarView.setSelectedDateVerticalBar(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.CalendarView.setWeekDayTextAppearance(I)V": [
+      [
+        0,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.widget.CheckedTextView.setCheckMarkDrawable(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.CompoundButton.setButtonDrawable(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.ImageSwitcher.setImageResource(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.ImageView.setImageResource(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.ListPopupWindow.setAnimationStyle(I)V": [
+      [
+        0,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.widget.PopupMenu.inflate(I)V": [
+      [
+        0,
+        [
+          "menu"
+        ]
+      ]
+    ],
+    "android.widget.ProgressBar.setInterpolator(Landroid/content/Context;I)V": [
+      [
+        1,
+        [
+          "anim",
+          "interpolator"
+        ]
+      ]
+    ],
+    "android.widget.RadioGroup$OnCheckedChangeListener.onCheckedChanged(Landroid/widget/RadioGroup;I)V": [
+      [
+        1,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RadioGroup.check(I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews$RemoteResponse.addSharedElement(ILjava/lang/String;)Landroid/widget/RemoteViews$RemoteResponse;": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.addStableView(ILandroid/widget/RemoteViews;I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.addView(ILandroid/widget/RemoteViews;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.removeAllViews(I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setAccessibilityTraversalAfter(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        1,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setAccessibilityTraversalBefore(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        1,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setBitmap(ILjava/lang/String;Landroid/graphics/Bitmap;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setBlendMode(ILjava/lang/String;Landroid/graphics/BlendMode;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setBoolean(ILjava/lang/String;Z)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setBundle(ILjava/lang/String;Landroid/os/Bundle;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setByte(ILjava/lang/String;B)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setChar(ILjava/lang/String;C)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setCharSequence(ILjava/lang/String;I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        2,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setCharSequence(ILjava/lang/String;Ljava/lang/CharSequence;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setCharSequenceAttr(ILjava/lang/String;I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        2,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setChronometer(IJLjava/lang/String;Z)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setChronometerCountDown(IZ)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setColor(ILjava/lang/String;I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        2,
+        [
+          "color"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setColorAttr(ILjava/lang/String;I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        2,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setColorInt(ILjava/lang/String;II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setColorStateList(ILjava/lang/String;I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        2,
+        [
+          "color"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setColorStateList(ILjava/lang/String;Landroid/content/res/ColorStateList;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setColorStateList(ILjava/lang/String;Landroid/content/res/ColorStateList;Landroid/content/res/ColorStateList;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setColorStateListAttr(ILjava/lang/String;I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        2,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setCompoundButtonChecked(IZ)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setContentDescription(ILjava/lang/CharSequence;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setDisplayedChild(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setDouble(ILjava/lang/String;D)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setEmptyView(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        1,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setFloat(ILjava/lang/String;F)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setFloatDimen(ILjava/lang/String;FI)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setFloatDimen(ILjava/lang/String;I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        2,
+        [
+          "dimen"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setFloatDimenAttr(ILjava/lang/String;I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        2,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setIcon(ILjava/lang/String;Landroid/graphics/drawable/Icon;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setIcon(ILjava/lang/String;Landroid/graphics/drawable/Icon;Landroid/graphics/drawable/Icon;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setImageViewBitmap(ILandroid/graphics/Bitmap;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setImageViewIcon(ILandroid/graphics/drawable/Icon;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setImageViewResource(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        1,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setImageViewUri(ILandroid/net/Uri;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setInt(ILjava/lang/String;I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setIntDimen(ILjava/lang/String;FI)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setIntDimen(ILjava/lang/String;I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        2,
+        [
+          "dimen"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setIntDimenAttr(ILjava/lang/String;I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        2,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setIntent(ILjava/lang/String;Landroid/content/Intent;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setLabelFor(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        1,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setLightBackgroundLayoutId(I)V": [
+      [
+        0,
+        [
+          "layout"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setLong(ILjava/lang/String;J)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setOnCheckedChangeResponse(ILandroid/widget/RemoteViews$RemoteResponse;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setOnClickFillInIntent(ILandroid/content/Intent;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setOnClickPendingIntent(ILandroid/app/PendingIntent;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setOnClickResponse(ILandroid/widget/RemoteViews$RemoteResponse;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setOnStylusHandwritingPendingIntent(ILandroid/app/PendingIntent;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setPendingIntentTemplate(ILandroid/app/PendingIntent;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setProgressBar(IIIZ)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setRadioGroupChecked(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        1,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setRelativeScrollPosition(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setRemoteAdapter(IILandroid/content/Intent;)V": [
+      [
+        1,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setRemoteAdapter(ILandroid/content/Intent;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setRemoteAdapter(ILandroid/widget/RemoteViews$RemoteCollectionItems;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setScrollPosition(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setShort(ILjava/lang/String;S)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setString(ILjava/lang/String;Ljava/lang/String;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setTextColor(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setTextViewCompoundDrawables(IIIII)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        1,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ],
+      [
+        2,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ],
+      [
+        3,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ],
+      [
+        4,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setTextViewCompoundDrawablesRelative(IIIII)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        1,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ],
+      [
+        2,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ],
+      [
+        3,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ],
+      [
+        4,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setTextViewText(ILjava/lang/CharSequence;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setTextViewTextSize(IIF)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setUri(ILjava/lang/String;Landroid/net/Uri;)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setViewLayoutHeight(IFI)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setViewLayoutHeightAttr(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setViewLayoutHeightDimen(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        1,
+        [
+          "dimen"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setViewLayoutMargin(IIFI)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setViewLayoutMarginAttr(III)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        2,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setViewLayoutMarginDimen(III)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        2,
+        [
+          "dimen"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setViewLayoutWidth(IFI)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setViewLayoutWidthAttr(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setViewLayoutWidthDimen(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        1,
+        [
+          "dimen"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setViewOutlinePreferredRadius(IFI)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setViewOutlinePreferredRadiusAttr(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        1,
+        [
+          "attr"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setViewOutlinePreferredRadiusDimen(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ],
+      [
+        1,
+        [
+          "dimen"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setViewPadding(IIIII)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.setViewVisibility(II)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.showNext(I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.RemoteViews.showPrevious(I)V": [
+      [
+        0,
+        [
+          "id"
+        ]
+      ]
+    ],
+    "android.widget.Spinner.setPopupBackgroundResource(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.Switch.setSwitchTextAppearance(Landroid/content/Context;I)V": [
+      [
+        1,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.widget.Switch.setThumbResource(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.Switch.setTrackResource(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.TabWidget.setDividerDrawable(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.TabWidget.setLeftStripDrawable(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.TabWidget.setRightStripDrawable(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.TextView.setCompoundDrawablesRelativeWithIntrinsicBounds(IIII)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ],
+      [
+        1,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ],
+      [
+        2,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ],
+      [
+        3,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.TextView.setCompoundDrawablesWithIntrinsicBounds(IIII)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ],
+      [
+        1,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ],
+      [
+        2,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ],
+      [
+        3,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.TextView.setHint(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.widget.TextView.setInputExtras(I)V": [
+      [
+        0,
+        [
+          "xml"
+        ]
+      ]
+    ],
+    "android.widget.TextView.setText(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.widget.TextView.setText(ILandroid/widget/TextView$BufferType;)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.widget.TextView.setTextAppearance(I)V": [
+      [
+        0,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.widget.TextView.setTextAppearance(Landroid/content/Context;I)V": [
+      [
+        1,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.widget.TextView.setTextCursorDrawable(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.TextView.setTextSelectHandle(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.TextView.setTextSelectHandleLeft(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.TextView.setTextSelectHandleRight(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.Toast.makeText(Landroid/content/Context;II)Landroid/widget/Toast;": [
+      [
+        1,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.widget.Toast.setText(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.widget.Toolbar.inflateMenu(I)V": [
+      [
+        0,
+        [
+          "menu"
+        ]
+      ]
+    ],
+    "android.widget.Toolbar.setCollapseContentDescription(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.widget.Toolbar.setCollapseIcon(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.Toolbar.setLogo(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.Toolbar.setLogoDescription(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.widget.Toolbar.setNavigationContentDescription(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.widget.Toolbar.setNavigationIcon(I)V": [
+      [
+        0,
+        [
+          "color",
+          "drawable",
+          "mipmap"
+        ]
+      ]
+    ],
+    "android.widget.Toolbar.setPopupTheme(I)V": [
+      [
+        0,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.widget.Toolbar.setSubtitle(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.widget.Toolbar.setSubtitleTextAppearance(Landroid/content/Context;I)V": [
+      [
+        1,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.widget.Toolbar.setTitle(I)V": [
+      [
+        0,
+        [
+          "string"
+        ]
+      ]
+    ],
+    "android.widget.Toolbar.setTitleTextAppearance(Landroid/content/Context;I)V": [
+      [
+        1,
+        [
+          "style"
+        ]
+      ]
+    ],
+    "android.widget.ViewAnimator.setInAnimation(Landroid/content/Context;I)V": [
+      [
+        1,
+        [
+          "anim"
+        ]
+      ]
+    ],
+    "android.widget.ViewAnimator.setOutAnimation(Landroid/content/Context;I)V": [
+      [
+        1,
+        [
+          "anim"
+        ]
+      ]
+    ],
+    "android.window.SplashScreen.setSplashScreenTheme(I)V": [
+      [
+        0,
+        [
+          "style"
+        ]
+      ]
+    ]
+  },
+  "declarations_sha256": "2d68393523f78b028f2abd5b154eb1c04f859de75304349bebc89425f3094cdc",
+  "method_count": 344,
+  "parameter_count": 394,
+  "schema": 1,
+  "skipped": {
+    "conflicting_resource_annotations": 3,
+    "excluded_annotation:androidx.annotation.AnyRes": 14,
+    "excluded_annotation:androidx.annotation.StyleableRes": 33,
+    "not_parameter": 40,
+    "unresolved_or_ambiguous_declaration": 49
+  },
+  "source": "Android SDK API 35 external parameter annotations, matched to exact android.jar declarations"
+}

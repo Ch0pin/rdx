@@ -21,6 +21,9 @@ pub(crate) struct Arm {
     pub post_start: usize,
     pub end: usize,
     pub prefix_written_words: Vec<usize>,
+    pub arguments: Vec<crate::native_calls::TypedRegister>,
+    pub suffix_entries: Vec<(usize, Identity)>,
+    pub needed_tail_words: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,10 +37,11 @@ pub(crate) struct Plan {
     /// Distinct physical words, in first-read order in the common suffix.
     /// A renderer compares only these words, never dead prefix temporaries.
     pub needed_tail_words: Vec<usize>,
+    pub separate_suffixes: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Identity {
+pub(crate) enum Identity {
     Parameter(u16),
     Literal(i64, bool),
     String(u32),
@@ -49,6 +53,7 @@ struct Proof<'a, 'm> {
     ir: HashMap<usize, &'a Instruction>,
     ssa: HashMap<usize, &'a SsaInstruction>,
     identities: HashMap<usize, Option<Identity>>,
+    this_aliases: HashMap<usize, Option<bool>>,
     work: usize,
 }
 
@@ -63,6 +68,70 @@ impl Proof<'_, '_> {
                     .any(|a| matches!(a, AssignmentBound::Undefined | AssignmentBound::Unknown))
                 && matches!(v.resolution, TypeResolution::Resolved(_))
         })
+    }
+
+    // None means the bounded proof could not establish absence of this.
+    // This is independent of identity(), whose None also represents ordinary
+    // computed values and therefore cannot certify receiver exclusion.
+    fn may_alias_this(&mut self, id: usize, receiver: u16, depth: usize) -> Option<bool> {
+        if depth > 32 || self.work == 0 || !self.complete(id) {
+            return None;
+        }
+        self.work -= 1;
+        if let Some(result) = self.this_aliases.get(&id) {
+            return *result;
+        }
+        self.this_aliases.insert(id, None);
+        let definition = self.analysis.ssa().definitions.get(id)?;
+        let result = match definition.kind {
+            DefinitionKind::Parameter => Some(definition.register == receiver),
+            DefinitionKind::Undefined => None,
+            DefinitionKind::Phi { .. } => {
+                let incoming: Vec<_> = self
+                    .analysis
+                    .ssa()
+                    .phis
+                    .iter()
+                    .find(|phi| phi.result == id)?
+                    .incoming
+                    .iter()
+                    .filter(|(from, _)| {
+                        from.is_none_or(|block| {
+                            self.analysis
+                                .ssa()
+                                .reachable
+                                .get(block)
+                                .copied()
+                                .unwrap_or(false)
+                        })
+                    })
+                    .map(|(_, value)| *value)
+                    .collect();
+                if incoming.is_empty() {
+                    return None;
+                }
+                let mut aliases = false;
+                for value in incoming {
+                    aliases |= self.may_alias_this(value, receiver, depth + 1)?;
+                }
+                Some(aliases)
+            }
+            DefinitionKind::Instruction { pc, word, .. } => {
+                let instruction = *self.ir.get(&pc)?;
+                if matches!(instruction.opcode, 0x01..=0x09 | 0x1f) {
+                    let values = *self.ssa.get(&pc)?;
+                    if values.reads.len() != 1 {
+                        return None;
+                    }
+                    let source = *values.reads[0].words.get(word)?;
+                    self.may_alias_this(source, receiver, depth + 1)
+                } else {
+                    Some(false)
+                }
+            }
+        };
+        self.this_aliases.insert(id, result);
+        result
     }
 
     fn identity(&mut self, id: usize, depth: usize) -> Option<Identity> {
@@ -136,6 +205,50 @@ impl Proof<'_, '_> {
         self.identities.insert(id, value.clone());
         value
     }
+}
+
+// A final instance field can be assigned once per constructor path, only
+// through the exact uninitialized/current receiver. Resolve pool aliases to
+// the class field index before counting assignments.
+fn final_write(
+    proof: &mut Proof<'_, '_>,
+    class: &DexClass,
+    instruction: &Instruction,
+    this: u16,
+) -> Option<Option<usize>> {
+    if !matches!(instruction.opcode, 0x59..=0x5f | 0x67..=0x6d) {
+        return Some(None);
+    }
+    let reference = instruction.reference?;
+    let &(owner, ty, name) = class.symbols.fields.get(reference.index as usize)?;
+    if class.symbols.types.get(owner as usize)?.as_ref() != class.descriptor.as_ref() {
+        return Some(None);
+    }
+    let name = class.symbols.strings.get(name as usize)?;
+    let ty = class.symbols.types.get(ty as usize)?;
+    let mut fields = class
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name.as_ref() == name.as_str() && field.field_type == *ty);
+    let (index, field) = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    if field.access_flags & 0x10 == 0 {
+        return Some(None);
+    }
+    if field.is_static || !matches!(instruction.opcode, 0x59..=0x5f) {
+        return None;
+    }
+    let values = *proof.ssa.get(&instruction.pc)?;
+    let receiver = values.reads.first()?;
+    if receiver.words.len() != 1
+        || proof.identity(receiver.words[0], 0) != Some(Identity::Parameter(this))
+    {
+        return None;
+    }
+    Some(Some(index))
 }
 
 fn i32_at(words: &[u16], pc: usize) -> Option<i32> {
@@ -234,6 +347,7 @@ pub(crate) fn select(class: &DexClass, method: &DexMethod, pc: usize) -> Option<
             .map(|i| (i.pc, i))
             .collect(),
         identities: HashMap::new(),
+        this_aliases: HashMap::new(),
         work: 65536,
     };
     let selector_register = usize::from(instruction.reads[0].register);
@@ -254,17 +368,40 @@ pub(crate) fn select(class: &DexClass, method: &DexMethod, pc: usize) -> Option<
             starts.push(start);
         }
     }
+    let mut prelude_final_writes = HashSet::new();
+    let prelude: Vec<_> = proof
+        .ir
+        .values()
+        .copied()
+        .filter(|instruction| instruction.pc < pc)
+        .collect();
+    for instruction in prelude {
+        if let Some(field) = final_write(&mut proof, class, instruction, this)?
+            && !prelude_final_writes.insert(field)
+        {
+            return None;
+        }
+    }
     let mut arms: Vec<Arm> = Vec::with_capacity(starts.len());
     let mut common_entries: Option<Vec<(usize, Identity)>> = None;
+    let mut separate_suffixes = false;
+    let mut common_field_writes = None;
+    let mut common_argument_types = None;
     for start in starts {
         let mut at = start;
         let mut written = BTreeSet::new();
+        let mut final_writes = prelude_final_writes.clone();
         let mut delegation = None;
         for step in 0..=256 {
             if step == 256 {
                 return None;
             }
             let instruction = *proof.ir.get(&at)?;
+            if let Some(field) = final_write(&mut proof, class, instruction, this)?
+                && !final_writes.insert(field)
+            {
+                return None;
+            }
             if matches!(instruction.opcode, 0x70 | 0x76) {
                 let call = bound.calls.iter().find(|c| c.pc == at)?;
                 if let CallTarget::Method {
@@ -286,10 +423,78 @@ pub(crate) fn select(class: &DexClass, method: &DexMethod, pc: usize) -> Option<
                         || call.receiver.as_ref()?.register != this
                         || call.kind != CallKind::Direct
                         || Some(declaring_type.as_ref()) != class.superclass.as_deref()
-                        || !call.arguments.is_empty()
                         || call.return_type.as_ref() != "V"
                     {
                         return None;
+                    }
+                    if call.arguments.len() > 16 {
+                        return None;
+                    }
+                    if !call.arguments.is_empty()
+                        && proof.ir.values().any(|instruction| {
+                            (instruction.pc < pc || (start..at).contains(&instruction.pc))
+                                && matches!(instruction.opcode, 0x59..=0x5f | 0x67..=0x6d)
+                        })
+                    {
+                        return None;
+                    }
+                    if !call.arguments.is_empty() {
+                        let reads: Vec<_> = proof
+                            .ssa
+                            .iter()
+                            .filter(|(read_pc, _)| **read_pc < pc || (start..at).contains(read_pc))
+                            .flat_map(|(_, values)| {
+                                values
+                                    .reads
+                                    .iter()
+                                    .flat_map(|read| read.words.iter().copied())
+                            })
+                            .collect();
+                        for id in reads {
+                            if proof.may_alias_this(id, this, 0) != Some(false) {
+                                return None;
+                            }
+                        }
+                    }
+                    // The common emitter reads physical registers. Distinct
+                    // typed carriers cannot share one word without losing a
+                    // conversion, so this bounded slice rejects overlaps.
+                    let mut argument_words = BTreeSet::new();
+                    for argument in &call.arguments {
+                        let width = if matches!(argument.descriptor.as_ref(), "J" | "D") {
+                            2
+                        } else {
+                            1
+                        };
+                        for word in
+                            usize::from(argument.register)..usize::from(argument.register) + width
+                        {
+                            if !argument_words.insert(word) {
+                                return None;
+                            }
+                        }
+                    }
+                    let argument_types: Vec<_> = call
+                        .arguments
+                        .iter()
+                        .map(|arg| arg.descriptor.clone())
+                        .collect();
+                    if let Some(types) = &common_argument_types {
+                        if types != &argument_types {
+                            return None;
+                        }
+                    } else {
+                        common_argument_types = Some(argument_types);
+                    }
+                    let raw_call = analysis.calls().calls.iter().find(|c| c.pc == at)?;
+                    for argument in &raw_call.arguments {
+                        for &id in &argument.words {
+                            if !proof.complete(id)
+                                || proof.may_alias_this(id, this, 0) != Some(false)
+                            {
+                                return None;
+                            }
+                        }
                     }
                     delegation = Some((at, at + instruction.width));
                     break;
@@ -324,6 +529,7 @@ pub(crate) fn select(class: &DexClass, method: &DexMethod, pc: usize) -> Option<
         let mut defined = HashSet::new();
         let mut needed = HashSet::new();
         let mut entries = Vec::new();
+        let mut field_writes = Vec::new();
         for step in 0..=256 {
             if step == 256 {
                 return None;
@@ -331,6 +537,18 @@ pub(crate) fn select(class: &DexClass, method: &DexMethod, pc: usize) -> Option<
             let instruction = *proof.ir.get(&at)?;
             if matches!(instruction.opcode, 0x0f..=0x11 | 0x1d..=0x1e | 0x26..=0x3d) {
                 return None;
+            }
+            if let Some(field) = final_write(&mut proof, class, instruction, this)?
+                && !final_writes.insert(field)
+            {
+                return None;
+            }
+            if matches!(instruction.opcode, 0x59..=0x5f | 0x67..=0x6d) {
+                let reference = instruction.reference?;
+                if reference.kind != PoolKind::Field {
+                    return None;
+                }
+                field_writes.push((instruction.opcode, reference.index));
             }
             let values = *proof.ssa.get(&at)?;
             for read in &values.reads {
@@ -351,6 +569,13 @@ pub(crate) fn select(class: &DexClass, method: &DexMethod, pc: usize) -> Option<
                 break;
             }
         }
+        if let Some(expected) = &common_field_writes {
+            if expected != &field_writes {
+                return None;
+            }
+        } else {
+            common_field_writes = Some(field_writes);
+        }
         let arm = Arm {
             start,
             delegation_start: delegation.0,
@@ -358,13 +583,21 @@ pub(crate) fn select(class: &DexClass, method: &DexMethod, pc: usize) -> Option<
             post_start: delegation.1,
             end: at,
             prefix_written_words: written.into_iter().collect(),
+            arguments: bound
+                .calls
+                .iter()
+                .find(|c| c.pc == delegation.0)?
+                .arguments
+                .clone(),
+            suffix_entries: entries.clone(),
+            needed_tail_words: entries.iter().map(|(word, _)| *word).collect(),
         };
         if let Some(first) = arms.first() {
             if code.instructions.get(first.post_start..first.end)?
                 != code.instructions.get(arm.post_start..arm.end)?
                 || common_entries.as_ref()? != &entries
             {
-                return None;
+                separate_suffixes = true;
             }
         } else {
             common_entries = Some(entries);
@@ -398,5 +631,103 @@ pub(crate) fn select(class: &DexClass, method: &DexMethod, pc: usize) -> Option<
         cases,
         arms,
         needed_tail_words: common_entries?.into_iter().map(|(word, _)| word).collect(),
+        separate_suffixes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_dex::{DexCode, DexSymbols};
+    use std::sync::Arc;
+
+    #[test]
+    fn receiver_exclusion_fails_closed_at_work_and_depth_limits() {
+        let method = DexMethod {
+            declaring_type: "Lsample/Proof;".into(),
+            name: "<init>".into(),
+            parameters: vec!["Ljava/lang/Object;".into()],
+            return_type: "V".into(),
+            thrown_types: vec![],
+            access_flags: 0x10001,
+            code: Some(DexCode {
+                registers: 3,
+                ins: 2,
+                outs: 0,
+                tries: 0,
+                try_regions: vec![],
+                instructions: vec![0x1007, 0x000e],
+                offset: 0,
+            }),
+        };
+        let class = DexClass {
+            descriptor: method.declaring_type.clone(),
+            superclass: Some("Ljava/lang/Object;".into()),
+            interfaces: vec![],
+            access_flags: 1,
+            annotations_offset: 0,
+            static_values_offset: 0,
+            static_values: vec![],
+            fields: vec![],
+            methods: vec![method],
+            symbols: Arc::new(DexSymbols::default()),
+        };
+        let analysis = MethodAnalysis::build(&class, &class.methods[0]).unwrap();
+        let types = analysis.infer_types().unwrap();
+        let receiver = analysis
+            .ssa()
+            .definitions
+            .iter()
+            .position(|definition| {
+                definition.kind == DefinitionKind::Parameter && definition.register == 1
+            })
+            .unwrap();
+        let input = analysis
+            .ssa()
+            .definitions
+            .iter()
+            .position(|definition| {
+                definition.kind == DefinitionKind::Parameter && definition.register == 2
+            })
+            .unwrap();
+        let alias = analysis
+            .ssa()
+            .definitions
+            .iter()
+            .position(|definition| {
+                matches!(
+                    definition.kind,
+                    DefinitionKind::Instruction { pc: 0, word: 0, .. }
+                )
+            })
+            .unwrap();
+        let mut proof = Proof {
+            analysis: &analysis,
+            types: &types,
+            ir: analysis
+                .instructions()
+                .instructions
+                .iter()
+                .map(|instruction| (instruction.pc, instruction))
+                .collect(),
+            ssa: analysis
+                .ssa()
+                .instructions
+                .iter()
+                .map(|instruction| (instruction.pc, instruction))
+                .collect(),
+            identities: HashMap::new(),
+            this_aliases: HashMap::new(),
+            work: 0,
+        };
+        assert_eq!(proof.may_alias_this(receiver, 1, 0), None);
+        assert_eq!(proof.may_alias_this(input, 1, 0), None);
+        proof.work = 32;
+        assert_eq!(proof.may_alias_this(receiver, 1, 0), Some(true));
+        assert_eq!(proof.may_alias_this(alias, 1, 0), Some(true));
+        assert_eq!(proof.may_alias_this(input, 1, 0), Some(false));
+        assert_eq!(proof.may_alias_this(input, 1, 33), None);
+        proof.work = 0;
+        assert_eq!(proof.may_alias_this(input, 1, 0), None);
+    }
 }

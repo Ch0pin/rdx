@@ -247,7 +247,13 @@ pub(super) fn filled(
         let value = register(regs, r)?;
         if reference(element) && value.literal != Some(0) {
             ensure!(
-                reference(&value.ty) && (value.ty == element || element == "Ljava/lang/Object;"),
+                reference(&value.ty)
+                    && (value.ty == element
+                        || element == "Ljava/lang/Object;"
+                        || class.symbols.hierarchy.get().is_some_and(|hierarchy| {
+                            hierarchy.assignable(&value.ty, element)
+                                == crate::native_hierarchy::Relation::Proven
+                        })),
                 "filled-array requires known assignable reference"
             );
             values.push(value.text);

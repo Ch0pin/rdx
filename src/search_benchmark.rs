@@ -22,6 +22,7 @@ fn run(
     );
     let started = Instant::now();
     let mut first_result_seconds = None;
+    let mut last_progress = Instant::now();
     let mut matched_texts = BTreeSet::new();
     let summary = search::run_search(
         engine,
@@ -32,6 +33,20 @@ fn run(
         query,
         &AtomicBool::new(false),
         |update| {
+            if let SearchUpdate::Progress {
+                scanned,
+                total,
+                hits,
+                ..
+            } = &update
+                && last_progress.elapsed().as_secs() >= 10
+            {
+                eprintln!(
+                    "Search: {scanned}/{total} classes, {hits} hits, {:.1}s",
+                    started.elapsed().as_secs_f64()
+                );
+                last_progress = Instant::now();
+            }
             if let SearchUpdate::Batch(batch) = update {
                 first_result_seconds.get_or_insert_with(|| started.elapsed().as_secs_f64());
                 for hit in &batch {
@@ -52,6 +67,7 @@ fn run(
             }
         },
     );
+    let (filter_entries, source_entries, metadata_bytes, disk_bytes) = cache.index_stats();
     (
         json!({
             "seconds": started.elapsed().as_secs_f64(), "scanned": summary.scanned,
@@ -62,6 +78,8 @@ fn run(
             "source_fetches": cache.source_fetches - before.3,
             "first_result_seconds": first_result_seconds,
             "matched_texts": matched_texts,
+            "index": {"filter_entries": filter_entries, "source_entries": source_entries,
+                "metadata_bytes": metadata_bytes, "disk_bytes": disk_bytes},
         }),
         hits,
     )
@@ -86,7 +104,12 @@ fn variant(
     } else {
         SearchCache::default()
     };
+    eprintln!("Cold search: {} classes", classes.len());
     let (cold, cold_hits) = run(&mut engine, &mut cache, &classes, query);
+    eprintln!(
+        "Cold search completed in {}s; starting repeat",
+        cold["seconds"]
+    );
     let (warm, warm_hits) = run(&mut engine, &mut cache, &classes, query);
     ensure!(cold_hits == warm_hits, "Cold/warm result parity failed");
     ensure!(

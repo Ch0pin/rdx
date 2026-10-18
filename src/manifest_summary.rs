@@ -415,6 +415,135 @@ pub fn components(xml: &str) -> Result<Vec<ManifestComponent>, String> {
     Ok(result)
 }
 
+/// Filter manifest declarations before pagination. Route predicates are evaluated
+/// within one intent-filter, while each original data element stays separate.
+pub fn query(xml: &str, args: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    use serde_json::json;
+    let nodes = parse(xml)?;
+    let components = components(xml)?;
+    let mut children_of = vec![Vec::new(); nodes.len()];
+    for (i, node) in nodes.iter().enumerate() {
+        if let Some(parent) = node.parent {
+            children_of[parent].push(i);
+        }
+    }
+    let mut records = Vec::new();
+    let component_only = ["component_type", "component", "host", "scheme", "path"]
+        .iter()
+        .any(|key| args.get(*key).is_some());
+    let has_routes = ["host", "scheme", "path"]
+        .iter()
+        .any(|key| args.get(*key).is_some());
+    let contains = |key: &str, value: &str| args[key].as_str().is_none_or(|q| value.contains(q));
+    let matches_query = |record: &serde_json::Value| {
+        args["query"].as_str().is_none_or(|q| {
+            record
+                .to_string()
+                .to_lowercase()
+                .contains(&q.to_lowercase())
+        })
+    };
+    let app = nodes
+        .iter()
+        .position(|n| n.parent == Some(0) && n.tag == "application");
+    let mut declarations = components.into_iter();
+    for (index, node) in nodes.iter().enumerate() {
+        if app.is_some()
+            && node.parent == app
+            && matches!(
+                node.tag.as_str(),
+                "activity" | "activity-alias" | "service" | "receiver" | "provider"
+            )
+        {
+            let c = declarations.next().ok_or("Component ordering mismatch")?;
+            if args["component_type"].as_str().is_some_and(|k| k != c.kind)
+                || !contains("component", &c.name)
+            {
+                continue;
+            }
+            if let Some(q) = args["permission"].as_str()
+                && !c
+                    .details
+                    .iter()
+                    .any(|(k, v)| k.to_lowercase().contains("permission") && v.contains(q))
+            {
+                continue;
+            }
+            let mut filters = Vec::new();
+            let mut matching_filter_indexes = Vec::new();
+            for fi in children_of[index]
+                .iter()
+                .copied()
+                .filter(|i| nodes[*i].tag == "intent-filter")
+            {
+                let filter = &nodes[fi];
+                let groups: Vec<_> = children_of[fi]
+                    .iter()
+                    .copied()
+                    .filter(|i| nodes[*i].tag == "uri-relative-filter-group")
+                    .collect();
+                let data: Vec<_> = children_of[fi]
+                    .iter()
+                    .copied()
+                    .chain(groups.iter().flat_map(|g| children_of[*g].iter().copied()))
+                    .map(|i| &nodes[i])
+                    .filter(|n| n.tag == "data")
+                    .collect();
+                let matches = ["host", "scheme", "path"].iter().all(|key| {
+                    args[*key].as_str().is_none_or(|q| {
+                        data.iter().any(|d| {
+                            if *key == "path" {
+                                d.attrs
+                                    .iter()
+                                    .any(|(k, v)| k.starts_with("path") && v.contains(q))
+                            } else {
+                                d.get(key) == Some(q)
+                            }
+                        })
+                    })
+                });
+                if matches {
+                    matching_filter_indexes.push(filters.len());
+                }
+                let elements: Vec<_> = children_of[fi].iter().map(|ci| {
+                    let n = &nodes[*ci];
+                    json!({"tag":n.tag,"attributes":n.attrs,
+                        "children":children_of[*ci].iter().map(|i| {
+                            let child = &nodes[*i]; json!({"tag":child.tag,"attributes":child.attrs})
+                        }).collect::<Vec<_>>()})
+                }).collect();
+                filters.push(json!({"attributes":filter.attrs,"elements":elements}));
+            }
+            if has_routes && matching_filter_indexes.is_empty() {
+                continue;
+            }
+            let record = json!({"record_type":"component","component_type":c.kind,"name":c.name,
+                "target":c.target,"exported":c.exported,"enabled":c.enabled,"launcher":c.launcher,
+                "details":c.details,"intent_filters":filters,"matching_filter_indexes":matching_filter_indexes});
+            if matches_query(&record) {
+                records.push(record);
+            }
+        } else if !component_only
+            && node.parent == Some(0)
+            && matches!(
+                node.tag.as_str(),
+                "uses-permission"
+                    | "uses-permission-sdk-23"
+                    | "permission"
+                    | "permission-group"
+                    | "permission-tree"
+            )
+        {
+            let name = node.get("name").unwrap_or_default();
+            let record = json!({"record_type":"permission","declaration":node.tag,"name":name,"attributes":node.attrs});
+            if contains("permission", name) && matches_query(&record) {
+                records.push(record);
+            }
+        }
+    }
+    Ok(records)
+}
+
 pub fn render(
     xml: &str,
     path: &Path,

@@ -182,3 +182,156 @@ fn default_arm_can_bypass_an_earlier_shared_case_return() {
     assert!(java.contains("return -1;"), "{java}");
     assert_eq!(java.matches("sample.Effects.first()").count(), 1, "{java}");
 }
+
+// The shared call overwrites v0 only on success. Its handler discards the
+// exception and returns the original v0 through the normal bare return.
+fn protected_shared_return_fixture() -> DexClass {
+    let (mut class, _) = fixture(false);
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols.protos[1] = ("I".into(), vec![]);
+    let method = &mut class.methods[0];
+    method.name = "protectedSelected".into();
+    method.return_type = "I".into();
+    let code = method.code.as_mut().unwrap();
+    code.instructions = vec![
+        0x7012, // 0: const/4 v0, 7 (handler snapshot)
+        0x012b, 17, 0,      // 1: packed-switch v1, payload at 18
+        0x0428, // 4: default -> shared call at 8
+        0x0071, 0, 0, // 5: first(), outside try
+        0x0071, 2, 0,      // 8: touch(), protected
+        0x000a, // 11: move-result v0, in the protected call/result pair
+        0x000f, // 12: normal and catch return v0, no move-exception
+        0x0071, 1, 0,      // 13: second(), outside try
+        0xf828, // 16: goto shared call at 8
+        0x0000, // 17: alignment
+        0x0100, 2, 0, 0, 4, 0, 12, 0,
+    ];
+    code.tries = 1;
+    code.try_regions = vec![DexTryRegion {
+        start: 8,
+        end: 12,
+        catches: vec![(Some(Arc::from("Ljava/lang/IllegalArgumentException;")), 12)].into(),
+    }];
+    class
+}
+
+#[test]
+fn bounded_shared_switch_try_preserves_bare_handler_and_result_snapshot() {
+    let java = source(&protected_shared_return_fixture()).unwrap();
+    assert!(java.contains("switch ("), "{java}");
+    assert_eq!(java.matches("sample.Effects.touch()").count(), 3, "{java}");
+    assert_eq!(
+        java.matches("catch (java.lang.IllegalArgumentException")
+            .count(),
+        3,
+        "{java}"
+    );
+    assert_eq!(java.matches("sample.Effects.first()").count(), 1, "{java}");
+    assert_eq!(java.matches("sample.Effects.second()").count(), 1, "{java}");
+}
+
+#[test]
+#[ignore = "requires javac and java on PATH"]
+fn bounded_shared_switch_try_jvm_matches_dex_effects_results_and_fault_identity() {
+    use std::{fs, process::Command};
+    let dir =
+        std::env::temp_dir().join(format!("rdx-protected-switch-tails-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let rendered = source(&protected_shared_return_fixture())
+        .unwrap()
+        .replace("sample.Effects", "Effects");
+    let java = format!(
+        r#"public class ProtectedSwitchTails {{
+        static class Effects {{
+            static int firstCount, secondCount, touches, fail;
+            static final IllegalArgumentException caught = new IllegalArgumentException("caught identity");
+            static final Error uncaught = new AssertionError("uncaught identity");
+            static void first() {{ firstCount++; if(fail==1) throw caught; }}
+            static void second() {{ secondCount++; if(fail==2) throw caught; }}
+            static int touch() {{ touches++; if(fail==3) throw caught; if(fail==4) throw uncaught; return 42; }}
+            static void reset(int failure) {{ firstCount=secondCount=touches=0; fail=failure; }}
+        }}
+        {rendered}
+        // Direct execution of the fixture's DEX control flow and try interval.
+        static int dex(int key) {{
+            int v0=7;
+            switch(key) {{ case 0: Effects.first(); break; case 1: Effects.second(); break; default: break; }}
+            try {{ v0=Effects.touch(); }} catch(IllegalArgumentException ignored) {{}}
+            return v0;
+        }}
+        static Object outcome(boolean nativeSource,int key) {{
+            try {{ return Integer.valueOf(nativeSource?protectedSelected(key):dex(key)); }}
+            catch(Throwable fault) {{ return fault; }}
+        }}
+        public static void main(String[] args) {{
+            for(int key:new int[]{{Integer.MIN_VALUE,-1,0,1,2,Integer.MAX_VALUE}})
+            for(int failure=0;failure<5;failure++) {{
+                Effects.reset(failure);
+                Object expected=outcome(false,key);
+                int first=Effects.firstCount,second=Effects.secondCount,touches=Effects.touches;
+                Effects.reset(failure);
+                Object actual=outcome(true,key);
+                if(expected instanceof Throwable ? actual!=expected : !expected.equals(actual))
+                    throw new AssertionError("result or identity key="+key+" failure="+failure);
+                boolean prefixFailure=(key==0&&failure==1)||(key==1&&failure==2);
+                if(Effects.firstCount!=first || Effects.secondCount!=second || Effects.touches!=touches
+                    ||first!=(key==0?1:0)||second!=(key==1?1:0)||touches!=(prefixFailure?0:1))
+                    throw new AssertionError("effects key="+key+" failure="+failure);
+                if(prefixFailure && actual!=Effects.caught) throw new AssertionError("prefix exception swallowed");
+                if(!prefixFailure && failure==3 && !Integer.valueOf(7).equals(actual))
+                    throw new AssertionError("handler lost entry snapshot");
+                if(!prefixFailure && failure==4 && actual!=Effects.uncaught)
+                    throw new AssertionError("uncaught exception identity");
+            }}
+        }}
+    }}"#
+    );
+    fs::write(dir.join("ProtectedSwitchTails.java"), &java).unwrap();
+    for (program, arg) in [
+        ("javac", "ProtectedSwitchTails.java"),
+        ("java", "ProtectedSwitchTails"),
+    ] {
+        let output = Command::new(program)
+            .arg(arg)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{program}: {}\n{java}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn shared_switch_try_rejects_entry_into_protected_interior() {
+    let mut class = protected_shared_return_fixture();
+    // The second case jumps to touch() at 8, bypassing first() at 5 inside
+    // the enlarged protected interval. Only the original start is admissible.
+    class.methods[0].code.as_mut().unwrap().try_regions[0].start = 5;
+    let error = source(&class).unwrap_err().to_string();
+    assert!(
+        error.contains("shared switch tail crosses protected region"),
+        "{error}"
+    );
+}
+
+#[test]
+fn shared_switch_try_rejects_handler_beyond_closed_arm_region() {
+    let mut class = protected_shared_return_fixture();
+    let code = class.methods[0].code.as_mut().unwrap();
+    let detached_handler = code.instructions.len() as u32;
+    code.instructions.push(0x000f);
+    code.try_regions[0].catches = vec![(
+        Some(Arc::from("Ljava/lang/IllegalArgumentException;")),
+        detached_handler,
+    )]
+    .into();
+    let error = source(&class).unwrap_err().to_string();
+    assert!(
+        error.contains("shared switch tail crosses protected region"),
+        "{error}"
+    );
+}

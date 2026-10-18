@@ -500,7 +500,7 @@ pub(super) fn emit(
     let mut body = Output {
         sequence: out.sequence,
         indent: out.indent + usize::from(!implicit),
-        ..Default::default()
+        ..out.empty_fork()
     };
     // Remove only the proven outer monitor cleanup from nested typed tries.
     // Java synchronized supplies that final catch-all on both body and typed
@@ -762,7 +762,7 @@ fn dispatch_body(
     let mut body = Output {
         sequence: out.sequence,
         indent: out.indent + 1,
-        ..Default::default()
+        ..out.empty_fork()
     };
     let rendered = render(
         class,
@@ -903,7 +903,7 @@ fn emit_dispatch(
         let mut tail = Output {
             sequence: out.sequence,
             indent: out.indent + 1,
-            ..Default::default()
+            ..out.empty_fork()
         };
         let (values, terminal) = render(
             class,

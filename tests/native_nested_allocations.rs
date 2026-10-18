@@ -48,6 +48,34 @@ fn fixture(words: Vec<u16>, outer: Vec<&str>, inner: Vec<&str>) -> DexClass {
     }
 }
 #[test]
+fn completed_nested_allocation_after_discarded_effect_stays_in_outer_argument_block() {
+    // The discarded call forces statement sequencing. The child allocation has
+    // no intervening effects, and its aliases remain live after the outer ctor.
+    let mut class = fixture(
+        vec![
+            0x0022, 0, 0x0071, 2, 0, 0x0122, 1, 0x1207, 0x1070, 1, 1, 0x3070, 0, 0x0210, 0x0211,
+        ],
+        vec!["Lsample/B;", "Lsample/B;"],
+        vec![],
+    );
+    Arc::get_mut(&mut class.symbols).unwrap().protos[2].0 = "V".into();
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(
+        code.source.contains("new sample.A(switch (0)"),
+        "{}",
+        code.source
+    );
+    let outer = code.source.find("new sample.A").unwrap();
+    let effect = code.source.find("sample.Source.f()").unwrap();
+    let inner = code.source.find("new sample.B").unwrap();
+    assert!(outer < effect && effect < inner, "{}", code.source);
+    assert_eq!(code.source.matches("new sample.B").count(), 1);
+    assert!(code.source.contains("return v1;"), "{}", code.source);
+    for link in &code.links {
+        assert!(link.start <= link.end && link.end <= code.source.chars().count());
+    }
+}
+#[test]
 fn nested_allocation_aliases_and_constructor_links_survive_java_emission() {
     // new A v0; new B v1; alias v2=v1; B.init; A.init(v1,v2); return v2.
     let class = fixture(
@@ -109,7 +137,7 @@ fn child_arguments_capture_call_after_child_allocation() {
     assert!(code.source.contains("return v1;"), "{}", code.source);
 }
 #[test]
-fn rejects_effect_before_child_with_live_parent_allocation() {
+fn effect_before_child_with_live_parent_allocation_retains_full_lifetime_order() {
     let class = fixture(
         vec![
             0x0022, 0, 0x0071, 2, 0, 0x020a, 0x0122, 1, 0x2070, 1, 0x0021, 0x2070, 0, 0x0010,
@@ -118,9 +146,18 @@ fn rejects_effect_before_child_with_live_parent_allocation() {
         vec!["Lsample/B;"],
         vec!["I"],
     );
-    // Keeping the earlier parent allocation cannot move this call into a later
-    // child's argument. Preserve rejection until complete lifetime ownership exists.
-    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(
+        code.source.find("new sample.A").unwrap() < code.source.find("sample.Source.f()").unwrap(),
+        "{}",
+        code.source
+    );
+    assert!(
+        code.source.find("sample.Source.f()").unwrap() < code.source.find("new sample.B").unwrap(),
+        "{}",
+        code.source
+    );
+    assert_eq!(code.source.matches("sample.Source.f()").count(), 1);
 }
 #[test]
 fn rejects_crossed_constructor_lifetimes() {
@@ -200,7 +237,19 @@ fn ignored_builder_appends_preserve_mutations_and_live_aliases() {
         1
     );
     assert_eq!(code.source.matches(".toString()").count(), 1);
-    assert!(code.source.contains("return v3;"), "{}", code.source);
+    let builder = code
+        .source
+        .split(" = new java.lang.StringBuilder()")
+        .next()
+        .unwrap()
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .next_back()
+        .unwrap();
+    assert!(
+        code.source.contains(&format!("return {builder};")),
+        "{}",
+        code.source
+    );
     let links: Vec<_> = code
         .links
         .iter()
@@ -466,35 +515,36 @@ fn completed_child_and_void_effects_keep_order_before_later_parent_allocation() 
     symbols.protos.push(("V".into(), vec![]));
     symbols.strings.push("effect".into());
     symbols.methods.push((2, 3, 2));
-    assert!(native_java::render_method("sample.Test", &class, &class.methods[0]).is_err());
-    // This is a DIFFERENT positive DEX fixture: the parent new-instance now
-    // occurs after the completed child and void effect, before its own ctor.
-    // The original nested lifetime above stays rejected.
+    class.methods[0].name = "makeOriginal".into();
+    let original = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    // A separate positive fixture places the parent allocation after the child.
+    // Fresh JVMs below distinguish the two original class-initialization orders.
     let words = &mut class.methods[0].code.as_mut().unwrap().instructions;
     let parent_allocation: Vec<_> = words.drain(..2).collect();
     words.splice(12..12, parent_allocation);
+    class.methods[0].name = "make".into();
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
     let dir = std::env::temp_dir().join(format!("rdx-staged-effects-{}", std::process::id()));
     fs::create_dir_all(dir.join("sample")).unwrap();
     let source = format!(
         r#"package sample;
 public class Test {{
-{}
+{} {}
 static String log = ""; static boolean fail;
 public static void main(String[] args) {{
- B b = make();
- if (!log.equals("fBeA") || b.value != 0x123456789abcdefL || A.saved != b) throw new AssertionError(log);
+ boolean original=args[0].equals("original");B b = original?makeOriginal():make();
+ if (!log.equals(original?"abfBeA":"bfBeaA") || b.value != 0x123456789abcdefL || A.saved != b) throw new AssertionError(log);
  log=""; fail=true;
- try {{ make(); throw new AssertionError("expected failure"); }} catch (IllegalStateException expected) {{}}
+ try {{ if(original)makeOriginal();else make(); throw new AssertionError("expected failure"); }} catch (IllegalStateException expected) {{}}
  if (!log.equals("fBe")) throw new AssertionError(log);
  System.out.print("ok");
 }}
 }}
 class Source {{ static long f() {{ Test.log += "f"; return 0x123456789abcdefL; }} static void effect() {{ Test.log += "e"; if (Test.fail) throw new IllegalStateException(); }} }}
-class B {{ final long value; B(long v) {{ Test.log += "B"; value=v; }} }}
-class A {{ static B saved; A(B b) {{ Test.log += "A"; saved=b; }} }}
+class B {{ static {{Test.log += "b";}} final long value; B(long v) {{ Test.log += "B"; value=v; }} }}
+class A {{ static {{Test.log += "a";}} static B saved; A(B b) {{ Test.log += "A"; saved=b; }} }}
 "#,
-        code.source
+        original.source, code.source
     );
     fs::write(dir.join("sample/Test.java"), source).unwrap();
     let result = Command::new("javac")
@@ -507,18 +557,21 @@ class A {{ static B saved; A(B b) {{ Test.log += "A"; saved=b; }} }}
         String::from_utf8_lossy(&result.stderr),
         code.source
     );
-    let result = Command::new("java")
-        .arg("-cp")
-        .arg(&dir)
-        .arg("sample.Test")
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    assert_eq!(result.stdout, b"ok");
+    for mode in ["original", "later"] {
+        let result = Command::new("java")
+            .arg("-cp")
+            .arg(&dir)
+            .arg("sample.Test")
+            .arg(mode)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout, b"ok");
+    }
     fs::remove_dir_all(dir).unwrap();
 }
 

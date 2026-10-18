@@ -1,6 +1,7 @@
 //! Bounded, selectable source previews. Original source is never normalized or edited.
 use crate::code_fonts::CodeFont;
 use rdx::engine::CodeLink;
+mod link_tooltip;
 mod metadata_fold;
 mod palettes;
 use metadata_fold::MetadataFolds;
@@ -242,6 +243,7 @@ struct FileFind {
 }
 
 pub struct CodeDocument {
+    link_tooltip: link_tooltip::LinkTooltip,
     selection_key: Option<(usize, usize, Option<Range<usize>>)>,
     selection_occurrences: Vec<Range<usize>>,
     clicked_word: Option<(usize, Range<usize>)>,
@@ -284,6 +286,7 @@ impl CodeDocument {
         let end = text.len();
         let metadata_fold = MetadataFolds::detect(&text, syntax);
         Self {
+            link_tooltip: link_tooltip::LinkTooltip::default(),
             selection_key: None,
             selection_occurrences: Vec::new(),
             clicked_word: None,
@@ -367,19 +370,41 @@ impl CodeDocument {
                 .build()
                 .ok()
         };
-        self.find.total = 0;
-        self.find.current = None;
-        if let Some(pattern) = &self.find.pattern {
-            // Scan the entire source, not just the bounded visible window. Keep
-            // only one result so a common letter cannot allocate millions of ranges.
-            for matched in pattern.find_iter(&self.source) {
-                if self.find.current.is_none() {
-                    self.find.current = Some((0, matched.range()));
-                }
-                self.find.total += 1;
+        let mut first = None;
+        let mut total = 0;
+        for matched in self.find_ranges() {
+            if first.is_none() {
+                first = Some((0, matched));
             }
+            total += 1;
         }
+        self.find.total = total;
+        self.find.current = first;
         self.reveal_find();
+    }
+
+    fn find_ranges(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        let mut text = self
+            .find
+            .pattern
+            .iter()
+            .flat_map(|pattern| pattern.find_iter(&self.source).map(|m| m.range()))
+            .peekable();
+        let mut aliases =
+            rdx::resource_search::byte_aliases(&self.source, &self.links, &self.find.query)
+                .into_iter()
+                .peekable();
+        std::iter::from_fn(move || match (text.peek(), aliases.peek()) {
+            (Some(a), Some(b)) if a == b => {
+                aliases.next();
+                text.next()
+            }
+            (Some(a), Some(b)) if (a.start, a.end) <= (b.start, b.end) => text.next(),
+            (Some(_), Some(_)) => aliases.next(),
+            (Some(_), None) => text.next(),
+            (None, Some(_)) => aliases.next(),
+            (None, None) => None,
+        })
     }
 
     fn reveal_find(&mut self) {
@@ -393,27 +418,27 @@ impl CodeDocument {
     }
 
     fn step_find(&mut self, backwards: bool) {
-        let (Some(pattern), Some((index, current))) = (&self.find.pattern, &self.find.current)
-        else {
+        let Some((index, current)) = &self.find.current else {
             return;
         };
         let next = if backwards {
-            pattern
-                .find_iter(&self.source)
-                .take_while(|m| m.start() < current.start)
+            self.find_ranges()
+                .take_while(|m| m.start < current.start)
                 .last()
-                .map(|m| (index.saturating_sub(1), m.range()))
-                .or_else(|| {
-                    pattern
-                        .find_iter(&self.source)
-                        .last()
-                        .map(|m| (self.find.total - 1, m.range()))
-                })
+                .map(|m| (index.saturating_sub(1), m))
+                .or_else(|| self.find_ranges().last().map(|m| (self.find.total - 1, m)))
+        } else if rdx::resource_search::query_id(&self.find.query).is_none() {
+            self.find.pattern.as_ref().and_then(|pattern| {
+                pattern
+                    .find_at(&self.source, current.end)
+                    .map(|m| (index + 1, m.range()))
+                    .or_else(|| pattern.find(&self.source).map(|m| (0, m.range())))
+            })
         } else {
-            pattern
-                .find_at(&self.source, current.end)
-                .map(|m| (index + 1, m.range()))
-                .or_else(|| pattern.find(&self.source).map(|m| (0, m.range())))
+            self.find_ranges()
+                .find(|m| m.start >= current.end)
+                .map(|m| (index + 1, m))
+                .or_else(|| self.find_ranges().next().map(|m| (0, m)))
         };
         self.find.current = next;
         self.reveal_find();
@@ -1365,6 +1390,7 @@ impl CodeDocument {
                         ui.painter()
                             .with_clip_rect(painter.clip_rect())
                             .set(highlight_layer, egui::Shape::Vec(highlight_shapes));
+                        let mut hovered_link = None;
                         if let Some(pointer) = ui.ctx().pointer_hover_pos()
                             && output.response.rect.contains(pointer)
                             && output.text_clip_rect.contains(pointer)
@@ -1396,10 +1422,16 @@ impl CodeDocument {
                             } else {
                                 link.label.split_once(" | ").map_or_else(|| link.label.clone(), |(_, preview)| preview.to_owned())
                             };
-                            output.response.on_hover_text(label);
+                            if link.label.starts_with(rdx::resource_table::PREFIX) {
+                                let token = egui::Rect::from_min_max(first.min, last.max)
+                                    .translate(output.galley_pos.to_vec2())
+                                    .intersect(output.text_clip_rect);
+                                hovered_link = Some((link.start, token, label));
+                            }
                         } else if hovered_exported {
-                            output.response.on_hover_text("Exported Android component");
+                            output.response.clone().on_hover_text_at_pointer("Exported Android component");
                         }
+                        self.link_tooltip.show(ui, editor_id, output.galley_pos, hovered_link);
                         if let Some(index) = fold_clicked && let Some(fold) = &mut self.metadata_fold {
                             let before = fold.clone();
                             fold.folds[index].expanded = !fold.folds[index].expanded;
@@ -2432,6 +2464,33 @@ mod tests {
         assert_eq!(doc.find.total, 0);
         assert!(doc.highlight.is_none());
         doc.step_find(true);
+    }
+
+    #[test]
+    fn file_find_numeric_resource_aliases_mix_with_literal_hashes() {
+        let mut doc =
+            super::CodeDocument::new("é 2130772070 R.anim.fade 2130772070".into(), "java");
+        doc.set_links(vec![rdx::engine::CodeLink {
+            start: 13,
+            end: 24,
+            label: "resource://7f010066/anim/fade".into(),
+        }]);
+        doc.find.query = "2130772070".into();
+        doc.update_find();
+        assert_eq!(doc.find.total, 3);
+        assert_eq!(doc.highlight, Some(2..12));
+        doc.step_find(false);
+        assert_eq!(doc.highlight, Some(13..24));
+        doc.step_find(false);
+        assert_eq!(doc.highlight, Some(25..35));
+        doc.step_find(false);
+        assert_eq!(doc.highlight, Some(2..12));
+        doc.step_find(true);
+        assert_eq!(doc.highlight, Some(25..35));
+        doc.find.query = "0X7F010066".into();
+        doc.update_find();
+        assert_eq!(doc.find.total, 1);
+        assert_eq!(doc.highlight, Some(13..24));
     }
 
     #[test]

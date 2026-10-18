@@ -1,3 +1,5 @@
+mod source_cache;
+
 use crate::native_engine::NativeDexEngine;
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -113,6 +115,7 @@ pub trait DecompilerEngine: Send {
 #[derive(Clone, Default)]
 pub struct NativeEngine {
     native: NativeDexEngine,
+    source_cache: source_cache::SourceCache,
     input: Option<PathBuf>,
     prepared: Option<std::sync::Arc<crate::package_container::PackageContainer>>,
     classes: std::sync::Arc<Vec<String>>,
@@ -144,6 +147,7 @@ impl NativeEngine {
         self.input = None;
         self.prepared = None;
         self.native = NativeDexEngine::default();
+        self.source_cache = Default::default();
         self.classes = Default::default();
         self.resources = Default::default();
         self.resource_error = None;
@@ -284,6 +288,21 @@ impl NativeEngine {
         }
         let id = u32::from_str_radix(target.split('/').next().unwrap(), 16)
             .context("Invalid resource ID")?;
+        if target
+            .split_once('/')
+            .is_some_and(|(_, suffix)| suffix == "unresolved")
+            && !self.resources.entries.contains_key(&id)
+        {
+            let source = format!(
+                "Resource ID {id} / 0x{id:08x}\n\nNo entry exists in the loaded APK's resource table.\nThe original numeric ID is preserved; its resource name and value are unavailable.\n"
+            );
+            return Ok(DecompiledCode {
+                source_hash: source_identity(&source),
+                source,
+                links: vec![],
+                definitions: vec![],
+            });
+        }
         self.resources.document(id)
     }
     pub fn start() -> Result<Self> {
@@ -293,6 +312,14 @@ impl NativeEngine {
         self.native.definition_names(classes)
     }
     pub fn decompile_with_metadata(&mut self, class: &str) -> Result<DecompiledCode> {
+        if let Some(code) = self.source_cache.get(class) {
+            return Ok((*code).clone());
+        }
+        let code = self.render_with_metadata(class)?;
+        self.source_cache.insert(class, &code);
+        Ok(code)
+    }
+    fn render_with_metadata(&mut self, class: &str) -> Result<DecompiledCode> {
         if class.starts_with(crate::resource_table::PREFIX) {
             return self.resource_document(class);
         }
@@ -303,27 +330,85 @@ impl NativeEngine {
             return Ok(code);
         }
         let mut code = self.native.render(class)?;
-        self.resources.decorate(&mut code, false);
+        self.resources
+            .decorate_java(&mut code, &self.native.shared_classes());
         code.source_hash = source_identity(&code.source);
         Ok(code)
     }
     pub fn decompile_for_search(&mut self, class: &str) -> Result<DecompiledCode> {
-        self.decompile_with_metadata(class)
+        self.render_with_metadata(class)
     }
     pub fn decompile_search_cancellable(
         &mut self,
         class: &str,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<DecompiledCode> {
+        self.decompile_search_until(class, &|| {
+            cancel.load(std::sync::atomic::Ordering::Relaxed)
+        })
+    }
+    /// Search workers combine user cancellation with local pool shutdown.
+    /// Interactive source caches remain untouched by bulk rendering.
+    pub fn decompile_search_until(
+        &mut self,
+        class: &str,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<DecompiledCode> {
         let mut code = self
             .native
-            .render_cancellable(class, &|| cancel.load(std::sync::atomic::Ordering::Relaxed))?;
+            .render_cancellable(class, cancelled)?;
+        ensure!(!cancelled(), "Search cancelled");
+        self.resources
+            .decorate_java(&mut code, &self.native.shared_classes());
+        Ok(code)
+    }
+    /// Render exactly one raw DEX method ID; offsets are method-local characters.
+    pub fn decompile_method_source(
+        &mut self,
+        id: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(DecompiledCode, Option<String>)> {
         ensure!(
             !cancel.load(std::sync::atomic::Ordering::Relaxed),
-            "Search cancelled"
+            "CANCELLED"
         );
-        self.resources.decorate(&mut code, false);
-        Ok(code)
+        let (head, _) = id
+            .split_once('(')
+            .context("Invalid method ID: missing descriptor")?;
+        let (owner, _) = head
+            .rsplit_once('.')
+            .context("Invalid method ID: missing owner")?;
+        let class = self
+            .native
+            .class(owner)
+            .with_context(|| format!("SYMBOL_NOT_FOUND: class_id={owner}"))?;
+        let mut matches = class
+            .methods
+            .iter()
+            .filter(|m| crate::native_engine::disassembly::method_id(m) == id);
+        let method = matches
+            .next()
+            .with_context(|| format!("SYMBOL_NOT_FOUND: method_id={id}"))?;
+        ensure!(matches.next().is_none(), "AMBIGUOUS_METHOD: {id}");
+        let (mut code, fallback) = match crate::native_java::render_method(owner, class, method) {
+            Ok(code) => (code, None),
+            Err(error) => (
+                crate::native_engine::disassembly::render_method(method, &class.symbols),
+                Some(error.to_string()),
+            ),
+        };
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "CANCELLED"
+        );
+        self.resources
+            .decorate_java(&mut code, &self.native.shared_classes());
+        code.source_hash = source_identity(&code.source);
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "CANCELLED"
+        );
+        Ok((code, fallback))
     }
     pub fn decompile_source(&mut self, class: &str) -> Result<DecompiledSource> {
         let code = self.decompile_with_metadata(class)?;
@@ -442,16 +527,15 @@ impl NativeEngine {
             .context("No native symbol at this position")
     }
     fn owner(&self, symbol: &str) -> Option<String> {
-        self.classes
-            .iter()
-            .filter(|name| {
-                symbol == name.as_str()
-                    || symbol
-                        .strip_prefix(name.as_str())
-                        .is_some_and(|s| s.starts_with('.'))
-            })
-            .max_by_key(|name| name.len())
-            .cloned()
+        // Probe exact class names from longest to shortest rather than scanning
+        // every class in the APK on each click. Descriptors may also contain dots.
+        let mut candidate = symbol;
+        loop {
+            if self.native.class(candidate).is_some() {
+                return Some(candidate.to_owned());
+            }
+            candidate = candidate.rsplit_once('.')?.0;
+        }
     }
     pub fn navigate(&mut self, class: &str, offset: usize, hash: &str) -> Result<NavigationResult> {
         let symbol = self.symbol(class, offset, hash)?;
@@ -1128,5 +1212,101 @@ mod inherited_navigation_tests {
                 .to_string()
                 .contains("superclass chain")
         );
+    }
+}
+
+#[cfg(test)]
+mod navigation_cache_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn opened() -> NativeEngine {
+        let mut engine = NativeEngine::default();
+        engine
+            .open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk"))
+            .unwrap();
+        engine
+    }
+
+    #[test]
+    fn navigation_reuses_source_and_destination_without_regenerating_metadata() {
+        let mut engine = opened();
+        let code = engine.decompile_with_metadata("sample.Caller").unwrap();
+        let original = engine.source_cache.get("sample.Caller").unwrap();
+        let link = code
+            .links
+            .iter()
+            .find(|link| link.label == "sample.Target.doubleValue(I)I")
+            .unwrap();
+        let first = engine
+            .navigate("sample.Caller", link.start, &code.source_hash)
+            .unwrap();
+        let destination = engine.source_cache.get("sample.Target").unwrap();
+        for _ in 0..3 {
+            let repeated = engine
+                .navigate("sample.Caller", link.start, &code.source_hash)
+                .unwrap();
+            assert_eq!(first.position, repeated.position);
+            assert_eq!(first.code.source_hash, repeated.code.source_hash);
+            assert!(Arc::ptr_eq(
+                &original,
+                &engine.source_cache.get("sample.Caller").unwrap()
+            ));
+            assert!(Arc::ptr_eq(
+                &destination,
+                &engine.source_cache.get("sample.Target").unwrap()
+            ));
+            let same = engine
+                .navigate("sample.Target", first.position, &first.code.source_hash)
+                .unwrap();
+            assert_eq!(same.position, first.position);
+        }
+        assert!(
+            engine
+                .navigate("sample.Caller", link.start, "stale")
+                .is_err()
+        );
+        // Searches cannot replace or evict interactive sources.
+        engine.decompile_for_search("sample.Target").unwrap();
+        assert!(Arc::ptr_eq(
+            &destination,
+            &engine.source_cache.get("sample.Target").unwrap()
+        ));
+        let dex = engine
+            .decompile_with_metadata("dex://sample.Caller")
+            .unwrap();
+        assert_ne!(dex.source_hash, code.source_hash);
+        assert!(Arc::ptr_eq(
+            &original,
+            &engine.source_cache.get("sample.Caller").unwrap()
+        ));
+    }
+
+    #[test]
+    fn reopening_detaches_project_cache_even_when_open_fails() {
+        let mut engine = opened();
+        engine.decompile_with_metadata("sample.Target").unwrap();
+        let original = engine.source_cache.get("sample.Target").unwrap();
+        let mut clone = engine.clone();
+        assert!(Arc::ptr_eq(
+            &original,
+            &clone.source_cache.get("sample.Target").unwrap()
+        ));
+        assert!(
+            engine
+                .open(Path::new("/nonexistent/rdx-cache-test.apk"))
+                .is_err()
+        );
+        assert!(engine.source_cache.get("sample.Target").is_none());
+        assert!(engine.decompile_with_metadata("sample.Target").is_err());
+        assert!(clone.decompile_with_metadata("sample.Target").is_ok());
+        engine
+            .open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk"))
+            .unwrap();
+        engine.decompile_with_metadata("sample.Target").unwrap();
+        assert!(!Arc::ptr_eq(
+            &original,
+            &engine.source_cache.get("sample.Target").unwrap()
+        ));
     }
 }

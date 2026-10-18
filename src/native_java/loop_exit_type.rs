@@ -14,6 +14,8 @@ pub(crate) fn exit_type(
     range: Range<usize>,
     exit: usize,
     register: usize,
+    detached_handler: Option<usize>,
+    hierarchy: Option<&crate::native_hierarchy::TypeHierarchy>,
 ) -> Option<String> {
     if range.start >= range.end
         || range.end != exit
@@ -27,10 +29,11 @@ pub(crate) fn exit_type(
     }
     if ssa.graph.blocks.iter().any(|block| {
         range.contains(&block.start)
-            && block
-                .successors
-                .iter()
-                .any(|edge| edge.kind == crate::native_cfg::EdgeKind::Exceptional)
+            && block.successors.iter().any(|edge| {
+                edge.kind == crate::native_cfg::EdgeKind::Exceptional
+                    && !(detached_handler == Some(ssa.graph.blocks[edge.target].start)
+                        && ssa.graph.blocks[edge.target].start >= range.end)
+            })
     }) {
         return None;
     }
@@ -130,7 +133,12 @@ pub(crate) fn exit_type(
     };
     if !domain(id)
         || !value.required_types.iter().all(|required| {
-            required == ty || (reference && required.as_ref() == "Ljava/lang/Object;")
+            required == ty
+                || (reference
+                    && (required.as_ref() == "Ljava/lang/Object;"
+                        || hierarchy.is_some_and(|h| {
+                            h.assignable(ty, required) == crate::native_hierarchy::Relation::Proven
+                        })))
         })
     {
         return None;

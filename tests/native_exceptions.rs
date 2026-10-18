@@ -1188,14 +1188,32 @@ fn return_only_try_exits_are_allowed_but_effectful_exits_are_not_widened() {
     ];
     effects.methods[0].code.as_mut().unwrap().try_regions[0].catches =
         vec![(Some("Ljava/lang/RuntimeException;".into()), 10)].into();
-    let error =
-        native_java::render_method("sample.Effects", &effects, &effects.methods[0]).unwrap_err();
+    let rendered =
+        native_java::render_method("sample.Effects", &effects, &effects.methods[0]).unwrap();
+    let source = &rendered.source;
+    let catch = source.find("catch (java.lang.RuntimeException").unwrap();
+    let effect = source.find("sample.Effects.touch()").unwrap();
+    assert!(source.find("sample.Effects.first()").unwrap() < catch);
+    // The final pure conditional may be split out of the protected interval;
+    // its effectful successor must retain its original uncaught ownership.
+    let catch_body = catch + source[catch..].find('{').unwrap();
+    let mut nesting = 0;
+    let catch_end = source[catch_body..]
+        .char_indices()
+        .find_map(|(offset, ch)| {
+            match ch {
+                '{' => nesting += 1,
+                '}' => nesting -= 1,
+                _ => {}
+            }
+            (nesting == 0).then_some(catch_body + offset)
+        })
+        .unwrap();
     assert!(
-        error
-            .to_string()
-            .contains("protected return tail crosses effectful continuation"),
-        "{error:#}"
+        catch_end < effect && !source[effect..].contains("catch ("),
+        "{source}"
     );
+    assert_eq!(source.matches("sample.Effects.touch()").count(), 1);
 }
 
 #[test]
@@ -1576,7 +1594,7 @@ fn shared_void_return_handler_keeps_normal_effects_outside_catch() {
 }
 
 #[test]
-fn wide_try_values_without_mutable_handler_snapshots() {
+fn wide_try_values_preserve_complete_handler_snapshots() {
     for ty in ["J", "D"] {
         // v0/v1 is established before try; the call cannot alter it. Both
         // normal and catch return the same value, including the upper word.
@@ -1606,8 +1624,8 @@ fn wide_try_values_without_mutable_handler_snapshots() {
         );
         assert_eq!(code.source.matches("sample.Effects.touch()").count(), 1);
 
-        // Writing either half makes the handler-visible value mutable. Keep
-        // rejecting it until wide exception snapshots themselves are supported.
+        // A complete protected wide write commits before touch. An overlapping
+        // write at its tail cannot represent a complete v0/v1 value.
         for write in [0x0016, 0x0116] {
             let original = class.methods[0].code.as_ref().unwrap().instructions.clone();
             let dex = class.methods[0].code.as_mut().unwrap();
@@ -1616,12 +1634,29 @@ fn wide_try_values_without_mutable_handler_snapshots() {
             dex.try_regions[0].end += 2;
             dex.try_regions[0].catches =
                 vec![(Some("Ljava/lang/RuntimeException;".into()), 11)].into();
-            let error = native_java::render_method("sample.Effects", &class, &class.methods[0])
-                .unwrap_err();
-            assert!(
-                error.to_string().contains("wide exception snapshots"),
-                "{error:#}"
-            );
+            let rendered = native_java::render_method("sample.Effects", &class, &class.methods[0]);
+            if write == 0x0016 && ty == "J" {
+                let source = rendered.unwrap().source;
+                assert!(
+                    source.find("try {").unwrap() < source.find("sample.Effects.touch()").unwrap(),
+                    "{source}"
+                );
+                assert!(
+                    source.find("sample.Effects.touch()").unwrap()
+                        < source.find("catch (").unwrap(),
+                    "{source}"
+                );
+                assert_eq!(
+                    source.matches("sample.Effects.touch()").count(),
+                    1,
+                    "{source}"
+                );
+            } else {
+                assert!(
+                    rendered.is_err(),
+                    "overlap or unproven J-to-D conversion must retain rejection"
+                );
+            }
             let dex = class.methods[0].code.as_mut().unwrap();
             dex.instructions = original;
             dex.try_regions[0].end -= 2;
@@ -2362,5 +2397,105 @@ public static void main(String[] args) {{
             );
         }
         fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+fn committed_wide_snapshot_fixture(ty: &str, mutable: bool, rethrow: bool) -> DexClass {
+    let mut class = fixture(
+        vec![
+            0x0018, 0x1234, 0x5678, 0x9abc, 0x3ff0, 0x0071, 2, 0, 0x0010, 0x020d, 0x0010,
+        ],
+        vec![(Some("Ljava/lang/RuntimeException;"), 9)],
+        5,
+        8,
+        ty,
+    );
+    if ty == "D" {
+        class.methods[0].parameters = vec!["D".into()];
+        let code = class.methods[0].code.as_mut().unwrap();
+        code.registers = 5;
+        code.ins = 2;
+        code.instructions.splice(0..5, [0x3004, 0, 0, 0, 0]);
+    }
+    if mutable {
+        let code = class.methods[0].code.as_mut().unwrap();
+        code.registers = 5;
+        code.instructions.splice(5..5, [0x0016, 42]);
+        code.try_regions[0].end += 2;
+        code.try_regions[0].catches =
+            vec![(Some("Ljava/lang/RuntimeException;".into()), 11)].into();
+    }
+    if rethrow {
+        let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+        symbols.strings.push("verifySnapshot".into());
+        symbols
+            .protos
+            .push(("V".into(), vec!["J".into(), "Ljava/lang/Throwable;".into()]));
+        symbols.methods.push((0, 2, 3));
+        let code = class.methods[0].code.as_mut().unwrap();
+        code.instructions.pop();
+        code.instructions.extend([0x3071, 3, 0x0210, 0x0227]);
+    }
+    class
+}
+
+#[test]
+#[ignore = "requires javac and java on PATH"]
+fn jvm_complete_wide_snapshot_commits_before_failure_and_keeps_exception_identity() {
+    for (ty, mutable, rethrow) in [
+        ("J", false, false),
+        ("J", true, false),
+        ("J", true, true),
+        ("D", false, false),
+    ] {
+        let class = committed_wide_snapshot_fixture(ty, mutable, rethrow);
+        let source = native_java::render_method("sample.Effects", &class, &class.methods[0])
+            .unwrap()
+            .source;
+        let invoke = if ty == "D" {
+            "double value=Double.longBitsToDouble(bits);double actual=test(value);if(Double.doubleToRawLongBits(actual)!=bits)throw new AssertionError(\"double bits\");"
+        } else if rethrow {
+            "try{long actual=test();if(fail||actual!=42L)throw new AssertionError(\"long value\");}catch(RuntimeException caught){if(!fail||caught!=original)throw new AssertionError(\"exception identity\");}"
+        } else if mutable {
+            "if(test()!=42L)throw new AssertionError(\"committed pair\");"
+        } else {
+            "if(test()!=0x3ff09abc56781234L)throw new AssertionError(\"unchanged pair\");"
+        };
+        let java = format!(
+            r#"package sample;public class Effects{{static boolean fail;static int calls,verified;static RuntimeException original=new RuntimeException();static void touch(){{calls++;if(fail)throw original;}}static void verifySnapshot(long value,Throwable caught){{verified++;if(value!=42L||caught!=original)throw new AssertionError("snapshot identity");}}{source}public static void main(String[]args){{for(long bits:new long[]{{0x8000000000000000L,0x7ff8000000000123L}})for(int mode=0;mode<2;mode++){{fail=mode==1;int before=calls;{invoke}if(calls!=before+1)throw new AssertionError("touch count");}}if({rethrow}&&verified!=2)throw new AssertionError("handler count");}}}}"#
+        );
+        let directory = std::env::temp_dir().join(format!(
+            "rdx-committed-wide-{}-{ty}-{mutable}-{rethrow}",
+            std::process::id()
+        ));
+        fs::create_dir_all(directory.join("sample")).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        fs::write(directory.join("sample/Effects.java"), java).unwrap();
+        let result = Command::new("javac")
+            .arg("sample/Effects.java")
+            .current_dir(&directory)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{source}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let result = Command::new("java")
+            .args(["-cp", ".", "sample.Effects"])
+            .current_dir(&directory)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 }

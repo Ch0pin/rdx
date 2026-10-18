@@ -169,99 +169,7 @@ fn render_with_header(name: &str, class: &DexClass, header: &str) -> DecompiledC
         out.push("\n");
     }
     for method in &class.methods {
-        out.push("\n.method ");
-        out.definition("method", &method.name, &method_id(method));
-        out.push(&format!(" // access=0x{:x}\n", method.access_flags));
-        for ty in &method.thrown_types {
-            out.push("    .throws ");
-            out.reference(&type_name(ty));
-            out.push("\n");
-        }
-        if let Some(code) = &method.code {
-            out.push(&format!(
-                "    .registers {} // inputs={}, outputs={}, try_blocks={}\n",
-                code.registers, code.ins, code.outs, code.tries
-            ));
-            let words = &code.instructions;
-            let mut pc = 0;
-            while pc < words.len() {
-                let w = words[pc];
-                let op = w as u8;
-                let Some(width) = width(words, pc) else {
-                    out.push(&format!("    {pc:04x}: .malformed 0x{w:04x} // truncated or invalid payload; remaining words follow\n"));
-                    for (i, word) in words[pc + 1..].iter().enumerate() {
-                        out.push(&format!("    {:04x}: .word 0x{word:04x}\n", pc + i + 1));
-                    }
-                    break;
-                };
-                let raw = words[pc..pc + width]
-                    .iter()
-                    .take(8)
-                    .map(|v| format!("{v:04x}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                out.push(&format!("    {pc:04x}: {:<24} ", mnemonic(op, w)));
-                if op == 0 && w != 0 {
-                    out.push(&format!("// {width} code units: {raw}"));
-                    for chunk in words[pc + width.min(8)..pc + width].chunks(16) {
-                        out.push("\n        .data ");
-                        for word in chunk {
-                            out.push(&format!("{word:04x} "));
-                        }
-                    }
-                } else {
-                    out.push(&operands(op, &words[pc..pc + width], pc));
-                    let reference = match op {
-                        0x1a => Some(('s', words[pc + 1] as usize)),
-                        0x1b => Some((
-                            's',
-                            (words[pc + 1] as u32 | (words[pc + 2] as u32) << 16) as usize,
-                        )),
-                        0x1c | 0x1f | 0x20 | 0x22..=0x25 => Some(('t', words[pc + 1] as usize)),
-                        0x52..=0x6d => Some(('f', words[pc + 1] as usize)),
-                        0x6e..=0x72 | 0x74..=0x78 | 0xfa | 0xfb => {
-                            Some(('m', words[pc + 1] as usize))
-                        }
-                        0xff => Some(('p', words[pc + 1] as usize)),
-                        _ => None,
-                    };
-                    if let Some((kind, index)) = reference {
-                        out.push(", ");
-                        if let Some(value) = symbol(&class.symbols, kind, index) {
-                            if kind == 's' || kind == 'p' {
-                                out.push(&value)
-                            } else {
-                                out.reference(&value)
-                            }
-                        } else {
-                            out.push(&format!("<invalid {kind} index {index}>"));
-                        }
-                    }
-                    out.push(&format!(" // [{raw}]"));
-                }
-                out.push("\n");
-                pc += width;
-            }
-            for region in &code.try_regions {
-                for (ty, handler) in region.catches.iter() {
-                    out.push("    ");
-                    if let Some(ty) = ty {
-                        out.push(".catch ");
-                        out.reference(&type_name(ty));
-                    } else {
-                        out.push(".catchall");
-                    }
-                    out.push(&format!(
-                        " {{ @{start:04x} .. @{end:04x} }} @{handler:04x}\n",
-                        start = region.start,
-                        end = region.end
-                    ));
-                }
-            }
-        } else {
-            out.push("    // No DEX code item (abstract/native declaration).\n");
-        }
-        out.push(".end method\n");
+        append_method(&mut out, method, &class.symbols);
     }
     let source_hash = crate::engine::source_identity(&out.text);
     DecompiledCode {
@@ -677,9 +585,147 @@ const BINARY_TWO: [&str; 32] = [
     "div-double/2addr",
     "rem-double/2addr",
 ];
+
+fn append_method(out: &mut Output, method: &DexMethod, symbols: &DexSymbols) {
+    out.push("\n.method ");
+    out.definition("method", &method.name, &method_id(method));
+    out.push(&format!(" // access=0x{:x}\n", method.access_flags));
+    for ty in &method.thrown_types {
+        out.push("    .throws ");
+        out.reference(&type_name(ty));
+        out.push("\n");
+    }
+    if let Some(code) = &method.code {
+        out.push(&format!(
+            "    .registers {} // inputs={}, outputs={}, try_blocks={}\n",
+            code.registers, code.ins, code.outs, code.tries
+        ));
+        let words = &code.instructions;
+        let mut pc = 0;
+        while pc < words.len() {
+            let w = words[pc];
+            let op = w as u8;
+            let Some(width) = width(words, pc) else {
+                out.push(&format!("    {pc:04x}: .malformed 0x{w:04x} // truncated or invalid payload; remaining words follow\n"));
+                for (i, word) in words[pc + 1..].iter().enumerate() {
+                    out.push(&format!("    {:04x}: .word 0x{word:04x}\n", pc + i + 1));
+                }
+                break;
+            };
+            let raw = words[pc..pc + width]
+                .iter()
+                .take(8)
+                .map(|v| format!("{v:04x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push(&format!("    {pc:04x}: {:<24} ", mnemonic(op, w)));
+            if op == 0 && w != 0 {
+                out.push(&format!("// {width} code units: {raw}"));
+                for chunk in words[pc + width.min(8)..pc + width].chunks(16) {
+                    out.push("\n        .data ");
+                    for word in chunk {
+                        out.push(&format!("{word:04x} "));
+                    }
+                }
+            } else {
+                out.push(&operands(op, &words[pc..pc + width], pc));
+                let reference = match op {
+                    0x1a => Some(('s', words[pc + 1] as usize)),
+                    0x1b => Some((
+                        's',
+                        (words[pc + 1] as u32 | (words[pc + 2] as u32) << 16) as usize,
+                    )),
+                    0x1c | 0x1f | 0x20 | 0x22..=0x25 => Some(('t', words[pc + 1] as usize)),
+                    0x52..=0x6d => Some(('f', words[pc + 1] as usize)),
+                    0x6e..=0x72 | 0x74..=0x78 | 0xfa | 0xfb => Some(('m', words[pc + 1] as usize)),
+                    0xff => Some(('p', words[pc + 1] as usize)),
+                    _ => None,
+                };
+                if let Some((kind, index)) = reference {
+                    out.push(", ");
+                    if let Some(value) = symbol(symbols, kind, index) {
+                        if kind == 's' || kind == 'p' {
+                            out.push(&value)
+                        } else {
+                            out.reference(&value)
+                        }
+                    } else {
+                        out.push(&format!("<invalid {kind} index {index}>"));
+                    }
+                }
+                out.push(&format!(" // [{raw}]"));
+            }
+            out.push("\n");
+            pc += width;
+        }
+        for region in &code.try_regions {
+            for (ty, handler) in region.catches.iter() {
+                out.push("    ");
+                if let Some(ty) = ty {
+                    out.push(".catch ");
+                    out.reference(&type_name(ty));
+                } else {
+                    out.push(".catchall");
+                }
+                out.push(&format!(
+                    " {{ @{start:04x} .. @{end:04x} }} @{handler:04x}\n",
+                    start = region.start,
+                    end = region.end
+                ));
+            }
+        }
+    } else {
+        out.push("    // No DEX code item (abstract/native declaration).\n");
+    }
+    out.push(".end method\n");
+}
+
+pub(crate) fn render_method(method: &DexMethod, symbols: &DexSymbols) -> DecompiledCode {
+    let mut out = Output::default();
+    append_method(&mut out, method, symbols);
+    DecompiledCode {
+        source_hash: crate::engine::source_identity(&out.text),
+        source: out.text,
+        links: out.links,
+        definitions: out.definitions,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn single_method_preserves_complete_body_and_local_navigation_offsets() {
+        let dex =
+            crate::native_dex::parse(include_bytes!("../tests/fixtures/navigation.dex")).unwrap();
+        let class = dex
+            .classes
+            .iter()
+            .find(|c| c.descriptor.as_ref() == "Lsample/Caller;")
+            .unwrap();
+        let full = render("sample.Caller", class);
+        for method in &class.methods {
+            let single = render_method(method, &class.symbols);
+            assert_eq!(single.source.matches("\n.method ").count(), 1);
+            assert_eq!(single.source.matches(".end method\n").count(), 1);
+            assert!(full.source.contains(&single.source));
+            assert_eq!(
+                single.source_hash,
+                crate::engine::source_identity(&single.source)
+            );
+            for link in single.links {
+                assert_eq!(
+                    single
+                        .source
+                        .chars()
+                        .skip(link.start)
+                        .take(link.end - link.start)
+                        .collect::<String>(),
+                    link.label
+                );
+            }
+        }
+    }
     #[test]
     fn payload_boundaries_and_signed_branches() {
         assert_eq!(width(&[0x0100, 1, 0, 0, 2, 0], 0), Some(6));

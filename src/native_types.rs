@@ -50,6 +50,8 @@ pub struct ValueType {
     pub active: bool,
     /// Bounded alternatives were exceeded. No retained subset is treated as complete.
     pub bounds_truncated: bool,
+    /// Raw assignment bounds overflowed, independently of use-requirement overflow.
+    pub assignment_bounds_truncated: bool,
 }
 #[derive(Debug)]
 pub struct InferredTypes {
@@ -98,8 +100,9 @@ impl Solver {
             return Ok(false);
         }
         if v.assignment.len() == ALTERNATIVES {
-            let changed = !v.bounds_truncated;
+            let changed = !v.bounds_truncated || !v.assignment_bounds_truncated;
             v.bounds_truncated = true;
+            v.assignment_bounds_truncated = true;
             return Ok(changed);
         }
         v.assignment.push(bound);
@@ -173,6 +176,7 @@ impl Solver {
             let assigned = self.values[value].assignment.clone();
             let required = self.values[value].required_types.clone();
             let truncated = self.values[value].bounds_truncated;
+            let assignment_truncated = self.values[value].assignment_bounds_truncated;
             // JADX TypeUpdate's array listeners: a changed array bound updates
             // the element result/use, rather than equating the array and element.
             for constraint in self.arrays[value].clone() {
@@ -221,6 +225,11 @@ impl Solver {
                             _ => {}
                         }
                     }
+                    if get && assignment_truncated && !self.values[word].assignment_bounds_truncated
+                    {
+                        self.values[word].assignment_bounds_truncated = true;
+                        changed = true;
+                    }
                     if truncated && !self.values[word].bounds_truncated {
                         self.values[word].bounds_truncated = true;
                         changed = true;
@@ -236,6 +245,10 @@ impl Solver {
                 let mut changed = false;
                 for bound in &assigned {
                     changed |= self.assigned(dst, bound.clone())?;
+                }
+                if assignment_truncated && !self.values[dst].assignment_bounds_truncated {
+                    self.values[dst].assignment_bounds_truncated = true;
+                    changed = true;
                 }
                 if truncated && !self.values[dst].bounds_truncated {
                     self.values[dst].bounds_truncated = true;
@@ -303,6 +316,7 @@ impl InferredTypes {
                     required_types: vec![],
                     resolution: TypeResolution::Unresolved("no assignment bound"),
                     active: false,
+                    assignment_bounds_truncated: false,
                     bounds_truncated: false
                 };
                 count

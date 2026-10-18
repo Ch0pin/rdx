@@ -1,4 +1,5 @@
 //! Exact forward iteration DAG and terminal edge copies, encoded DEX oracle.
+use rdx::native_ssa;
 use rdx::{
     native_cfg,
     native_dex::{self, DexClass, DexSymbols, DexTryRegion},
@@ -147,7 +148,7 @@ fn protected_cycles_pending_results_and_allocating_copies_reject() {
             10 => code.instructions[5] = ((49) - 4) as u16, // terminal move-result sideentry
             11 => {
                 code.instructions[50] = 0x0012;
-                code.instructions.extend(std::iter::repeat_n(0, 33));
+                code.instructions.extend(std::iter::repeat_n(0, 65));
                 code.instructions.push(0x0311);
             } // terminal overbudget
             _ => unreachable!(),

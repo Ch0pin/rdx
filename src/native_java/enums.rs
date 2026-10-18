@@ -12,11 +12,15 @@ enum Atom {
     Constant(usize),
     Array(Vec<Option<usize>>),
     Entries,
+    EntriesNew { site: usize, ty: String },
 }
 pub(super) struct Plan {
     constants: Vec<(String, String)>,
     array: String,
     entries: Option<String>,
+    entries_constructor: Option<(String, String)>,
+    tail: Option<DexMethod>,
+    tail_fields: Vec<usize>,
 }
 impl Plan {
     fn kotlin_constructor(class: &DexClass) -> Result<()> {
@@ -211,11 +215,12 @@ impl Plan {
             "not enum"
         );
         let kotlin = class.fields.iter().any(|f| f.name.as_ref() == "$ENTRIES");
+        let optimized = kotlin && !class.methods.iter().any(|m| m.name.as_ref() == "<init>");
         ensure!(
             class.fields.iter().all(|f| f.is_static),
             "enum instance state"
         );
-        if kotlin {
+        if kotlin && !optimized {
             Self::kotlin_constructor(class)?;
         } else {
             ensure!(
@@ -246,8 +251,11 @@ impl Plan {
         let mut entries = None;
         let mut helper_calls = 0usize;
         let mut entries_calls = 0usize;
+        let mut entries_constructor = None;
+        let mut entries_allocations = 0;
         let mut constructed = HashSet::new();
         let mut allocations = 0usize;
+        let mut tail_start = None;
         for (index, insn) in ir.instructions.iter().enumerate() {
             ensure!(
                 pending.is_none() || insn.opcode == 0x0c,
@@ -256,9 +264,21 @@ impl Plan {
             let pc = insn.pc;
             let w = code.instructions[pc];
             let a = (w >> 8) as usize;
+            if array.is_some()
+                && (!kotlin || entries.is_some())
+                && !matches!(insn.opcode, 0x00 | 0x0e)
+            {
+                ensure!(
+                    insn.opcode == 0x22,
+                    "enum postfix must begin with allocation"
+                );
+                tail_start = Some(pc);
+                break;
+            }
             ensure!(
                 array.is_none()
                     || matches!(insn.opcode, 0x00 | 0x0e)
+                    || (optimized && matches!(insn.opcode, 0x22 | 0x70))
                     || (kotlin && matches!(insn.opcode, 0x1f | 0x71 | 0x0c | 0x69)),
                 "enum instructions after values publication"
             );
@@ -284,6 +304,32 @@ impl Plan {
                     )
                 }
                 0x22 => {
+                    if optimized && array.is_some() {
+                        ensure!(
+                            entries_allocations == 0,
+                            "multiple enum entries allocations"
+                        );
+                        entries_allocations += 1;
+                        let ty = class
+                            .symbols
+                            .types
+                            .get(code.instructions[pc + 1] as usize)
+                            .ok_or_else(|| anyhow::anyhow!("enum entries allocation type"))?;
+                        ensure!(
+                            entries_constructor.is_none()
+                                && class
+                                    .symbols
+                                    .hierarchy
+                                    .get()
+                                    .is_some_and(|h| h.enum_array_retainer(ty)),
+                            "unproved enum entries array retainer"
+                        );
+                        regs[a] = Atom::EntriesNew {
+                            site: pc,
+                            ty: ty.to_string(),
+                        };
+                        continue;
+                    }
                     ensure!(array.is_none(), "enum allocation after values array");
                     allocations += 1;
                     ensure!(
@@ -294,6 +340,44 @@ impl Plan {
                     regs[a] = Atom::New(pc);
                 }
                 0x70 => {
+                    if optimized && array.is_some() {
+                        ensure!(a >> 4 == 2, "enum entries constructor argument count");
+                        let packed = code.instructions[pc + 2];
+                        let receiver = (packed & 15) as usize;
+                        let input = ((packed >> 4) & 15) as usize;
+                        let Atom::EntriesNew { site, ref ty } = regs[receiver] else {
+                            bail!("enum entries receiver identity");
+                        };
+                        let &(owner, proto, name) = class
+                            .symbols
+                            .methods
+                            .get(code.instructions[pc + 1] as usize)
+                            .ok_or_else(|| anyhow::anyhow!("enum entries constructor symbol"))?;
+                        ensure!(
+                            entries_constructor.is_none()
+                                && class
+                                    .symbols
+                                    .types
+                                    .get(owner as usize)
+                                    .is_some_and(|owner| owner.as_ref() == ty)
+                                && class
+                                    .symbols
+                                    .strings
+                                    .get(name as usize)
+                                    .is_some_and(|name| name == "<init>")
+                                && class.symbols.protos.get(proto as usize).is_some_and(
+                                    |(ret, args)| ret.as_ref() == "V"
+                                        && args.iter().map(AsRef::as_ref).eq(["[Ljava/lang/Enum;"])
+                                )
+                                && matches!(&regs[input],Atom::Array(values) if values.iter().copied().eq((0..constants.len()).map(Some)))
+                                && constructed.insert(site),
+                            "enum entries constructor identity or array"
+                        );
+                        entries_constructor = Some((ty.clone(), String::new()));
+                        entries_calls += 1;
+                        regs[receiver] = Atom::Entries;
+                        continue;
+                    }
                     ensure!(a >> 4 == 3, "enum constructor arguments");
                     let packed = code.instructions[pc + 2];
                     let rr = [
@@ -307,9 +391,11 @@ impl Plan {
                         .get(code.instructions[pc + 1] as usize)
                         .ok_or_else(|| anyhow::anyhow!("enum method"))?;
                     ensure!(
-                        ((!kotlin
+                        (((!kotlin || optimized)
                             && class.symbols.types[owner as usize].as_ref() == "Ljava/lang/Enum;")
-                            || (kotlin && class.symbols.types[owner as usize] == class.descriptor))
+                            || (kotlin
+                                && !optimized
+                                && class.symbols.types[owner as usize] == class.descriptor))
                             && class.symbols.strings[name as usize] == "<init>"
                             && class.symbols.protos[proto as usize].0.as_ref() == "V"
                             && class.symbols.protos[proto as usize]
@@ -376,15 +462,27 @@ impl Plan {
                             array = Some(field.clone());
                         }
                         Atom::Entries if kotlin => {
+                            let entry_type = &class.symbols.types[ty as usize];
                             ensure!(
                                 array.is_some()
                                     && entries.is_none()
                                     && field == "$ENTRIES"
-                                    && class.symbols.types[ty as usize].as_ref()
-                                        == "Lkotlin/enums/EnumEntries;",
+                                    && (if optimized {
+                                        entries_constructor.as_ref().is_some_and(|(owner, _)| {
+                                            class.symbols.hierarchy.get().is_some_and(|h| {
+                                                h.assignable(owner, entry_type)
+                                                    == crate::native_hierarchy::Relation::Proven
+                                            })
+                                        })
+                                    } else {
+                                        entry_type.as_ref() == "Lkotlin/enums/EnumEntries;"
+                                    }),
                                 "enum entries store"
                             );
                             entries = Some(field.clone());
+                            if let Some((_, ty)) = &mut entries_constructor {
+                                *ty = entry_type.to_string();
+                            }
                         }
                         _ => bail!("enum nonconstant store"),
                     }
@@ -519,7 +617,7 @@ impl Plan {
         );
         let array = array.ok_or_else(|| anyhow::anyhow!("enum array missing"))?;
         ensure!(
-            constructed.len() == allocations
+            constructed.len() == allocations + usize::from(optimized)
                 && constants
                     .iter()
                     .map(|(_, f)| f)
@@ -528,8 +626,25 @@ impl Plan {
                     == constants.len(),
             "enum unused allocation or repeated constant field"
         );
+        let core_fields: HashSet<&str> = constants
+            .iter()
+            .map(|(_, field)| field.as_str())
+            .chain(std::iter::once(array.as_str()))
+            .chain(entries.iter().map(String::as_str))
+            .collect();
+        let tail_fields: Vec<usize> = class
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| !core_fields.contains(field.name.as_ref()))
+            .map(|(index, _)| index)
+            .collect();
+        let tail = tail_start
+            .map(|start| Self::postfix(class, clinit, start, &core_fields, &tail_fields))
+            .transpose()?;
         ensure!(
-            class.fields.len() == constants.len() + 1 + usize::from(kotlin)
+            class.fields.len() == constants.len() + 1 + usize::from(kotlin) + tail_fields.len()
+                && (tail.is_some() || tail_fields.is_empty())
                 && class.static_values.is_empty()
                 && (class.annotations_offset == 0
                     || (kotlin && annotation_directory(class).is_some())),
@@ -537,7 +652,10 @@ impl Plan {
         );
         ensure!(kotlin == entries.is_some(), "enum entries missing");
         ensure!(
-            !kotlin || (helper_calls == 1 && entries_calls == 1),
+            !kotlin
+                || (helper_calls == usize::from(!optimized)
+                    && entries_calls == 1
+                    && entries_allocations == usize::from(optimized)),
             "enum Kotlin helper calls"
         );
         if let Some(ref entries) = entries {
@@ -546,15 +664,32 @@ impl Plan {
                     .fields
                     .iter()
                     .find(|f| f.name.as_ref() == entries)
-                    .is_some_and(|f| f.field_type.as_ref() == "Lkotlin/enums/EnumEntries;"
-                        && f.access_flags == 0x101a),
+                    .is_some_and(|f| (optimized
+                        || f.field_type.as_ref() == "Lkotlin/enums/EnumEntries;")
+                        && (if optimized {
+                            f.access_flags & 0x1f == 0x1a && f.access_flags & !0x101a == 0
+                        } else {
+                            f.access_flags == 0x101a
+                        })),
                 "enum entries field flags"
             );
         }
         if kotlin {
             if let Some(directory) = annotation_directory(class) {
                 ensure!(
-                    directory.fields.iter().all(Option::is_none),
+                    directory
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .all(|(index, set)| set.is_none()
+                            || class
+                                .fields
+                                .get(index)
+                                .is_some_and(|field| constants
+                                    .iter()
+                                    .any(|(name, alias)| name == alias
+                                        && field.name.as_ref() == alias)
+                                    || tail_fields.contains(&index))),
                     "enum suppressed field annotations"
                 );
                 for (index, method) in class.methods.iter().enumerate() {
@@ -636,7 +771,12 @@ impl Plan {
                             .ok_or_else(|| anyhow::anyhow!("enum field reference"))?;
                         ensure!(
                             class.symbols.types[owner as usize] != class.descriptor
-                                || class.symbols.strings[field as usize] != array,
+                                || (class.symbols.strings[field as usize] != array
+                                    && !(optimized
+                                        && entries
+                                            .as_ref()
+                                            .is_some_and(|entry| entry
+                                                == &class.symbols.strings[field as usize]))),
                             "enum backing array has nonstandard uses"
                         );
                     }
@@ -647,6 +787,9 @@ impl Plan {
             constants,
             array,
             entries,
+            entries_constructor,
+            tail,
+            tail_fields,
         };
         ensure!(
             class
@@ -664,8 +807,105 @@ impl Plan {
                 .all(|m| Self::standard_value_of(class, m)),
             "custom enum valueOf method"
         );
+        if let Some(tail) = &plan.tail {
+            render_initializer(
+                &names::label(&class.descriptor).ok_or_else(|| anyhow::anyhow!("enum owner"))?,
+                class,
+                tail,
+            )?;
+        }
         Ok(plan)
     }
+
+    fn postfix(
+        class: &DexClass,
+        original: &DexMethod,
+        start: usize,
+        core: &HashSet<&str>,
+        extra: &[usize],
+    ) -> Result<DexMethod> {
+        let code = original.code.as_ref().context("enum postfix code")?;
+        ensure!(
+            code.instructions.len() <= 4096 && extra.len() <= 32,
+            "enum postfix budget"
+        );
+        let ir = DecodedMethod::decode(code)?;
+        let mut assigned = HashSet::new();
+        for instruction in ir.instructions.iter().filter(|i| i.pc >= start) {
+            ensure!(
+                instruction.branch_target.is_none()
+                    && instruction.payload_target.is_none()
+                    && !matches!(instruction.opcode, 0x1d | 0x1e | 0x2b | 0x2c),
+                "enum postfix control flow"
+            );
+            if matches!(instruction.opcode, 0x52..=0x6d) {
+                let &(owner, _, field) = class
+                    .symbols
+                    .fields
+                    .get(code.instructions[instruction.pc + 1] as usize)
+                    .context("enum postfix field")?;
+                if class.symbols.types.get(owner as usize) == Some(&class.descriptor) {
+                    let name = class
+                        .symbols
+                        .strings
+                        .get(field as usize)
+                        .context("enum postfix field name")?;
+                    ensure!(
+                        !core.contains(name.as_str()),
+                        "enum postfix observes core storage"
+                    );
+                    if matches!(instruction.opcode, 0x67..=0x6d) {
+                        ensure!(
+                            assigned.insert(name.as_str()),
+                            "enum postfix repeated field assignment"
+                        );
+                    }
+                }
+            }
+        }
+        ensure!(
+            extra
+                .iter()
+                .all(|index| assigned.contains(class.fields[*index].name.as_ref()))
+                && assigned.len() == extra.len(),
+            "enum postfix field assignment coverage"
+        );
+        for index in extra {
+            let field = &class.fields[*index];
+            ensure!(
+                field.declaring_type == class.descriptor
+                    && field.is_static
+                    && field.access_flags & 8 != 0
+                    && field.access_flags & !0x10df == 0
+                    && field.access_flags & 0x50 != 0x50
+                    && field.field_type.as_ref() != "V",
+                "enum postfix field declaration"
+            );
+            access(field.access_flags)?;
+            names::member(&field.name)?;
+            java_type(&field.field_type)?;
+        }
+        let mut instructions = code.instructions.clone();
+        instructions[..start].fill(0);
+        Ok(DexMethod {
+            declaring_type: original.declaring_type.clone(),
+            name: original.name.clone(),
+            return_type: original.return_type.clone(),
+            parameters: original.parameters.clone(),
+            thrown_types: original.thrown_types.clone(),
+            access_flags: original.access_flags,
+            code: Some(crate::native_dex::DexCode {
+                registers: code.registers,
+                ins: code.ins,
+                outs: code.outs,
+                tries: 0,
+                try_regions: vec![],
+                offset: code.offset,
+                instructions,
+            }),
+        })
+    }
+
     fn implicit_values(&self, class: &DexClass, m: &DexMethod) -> bool {
         if m.access_flags & 9 != 9
             || !m.parameters.is_empty()
@@ -721,6 +961,13 @@ impl Plan {
     pub(super) fn initializer(&self, name: &str, class: &DexClass) -> Result<DecompiledCode> {
         let mut out = Output::default();
         for (i, (constant, field)) in self.constants.iter().enumerate() {
+            if let Some(index) = class.fields.iter().position(|f| f.name.as_ref() == field)
+                && let Some(set) = annotation_directory(class)
+                    .and_then(|d| d.fields.get(index))
+                    .and_then(Option::as_ref)
+            {
+                out.append(annotations::lines(class, Some(set), "    "));
+            }
             out.push("    ");
             out.definition(
                 constant,
@@ -748,7 +995,49 @@ impl Plan {
                 out.push(&format!(" = {constant};\n"));
             }
         }
-        if self.entries.is_some() {
+        if let Some((owner, entry_type)) = &self.entries_constructor {
+            // Retain the original explicit array identity passed to the loaded
+            // constructor. Java's implicit enum backing array receives a fresh
+            // compiler-generated name when this field occupies `$VALUES`.
+            out.push("    private static final ");
+            out.push(&java_type(&format!("[{}", class.descriptor))?);
+            out.push(" ");
+            out.definition(
+                &names::member(&self.array)?,
+                &self.array,
+                &format!("{name}.{}:[{}", self.array, class.descriptor),
+                "field",
+            );
+            out.push(&format!(" = new {}[] {{", java_type(&class.descriptor)?));
+            for (index, (constant, _)) in self.constants.iter().enumerate() {
+                if index > 0 {
+                    out.push(", ");
+                }
+                out.push(constant);
+            }
+            out.push("};\n    private static final ");
+            out.push(&java_type(entry_type)?);
+            out.push(" ");
+            let field = self
+                .entries
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("enum entries field missing"))?;
+            out.definition(
+                &names::member(field)?,
+                field,
+                &format!("{name}.{field}:{entry_type}"),
+                "field",
+            );
+            out.push(" = new ");
+            out.reference(
+                &java_type(owner)?,
+                &format!(
+                    "{}.<init>([Ljava/lang/Enum;)V",
+                    names::label(owner).unwrap()
+                ),
+            );
+            out.push(&format!("({});\n", names::member(&self.array)?));
+        } else if self.entries.is_some() {
             out.push("    private static final kotlin.enums.EnumEntries ");
             out.definition(
                 "$ENTRIES",
@@ -757,6 +1046,43 @@ impl Plan {
                 "field",
             );
             out.push(" = kotlin.enums.EnumEntriesKt.enumEntries(values());\n");
+        }
+        for index in &self.tail_fields {
+            let field = &class.fields[*index];
+            let annotations = annotation_directory(class)
+                .and_then(|d| d.fields.get(*index))
+                .and_then(Option::as_ref);
+            out.append(super::annotations::lines(class, annotations, "    "));
+            out.push("    ");
+            out.push(access(field.access_flags)?);
+            for (flag, keyword) in [
+                (8, "static "),
+                (0x10, "final "),
+                (0x40, "volatile "),
+                (0x80, "transient "),
+            ] {
+                if field.access_flags & flag != 0 {
+                    out.push(keyword);
+                }
+            }
+            let display = java_type(&field.field_type)?;
+            if let Some(label) = names::label(field.field_type.trim_start_matches('[')) {
+                out.reference(display.trim_end_matches("[]"), &label);
+                out.push(&"[]".repeat(field.field_type.bytes().take_while(|b| *b == b'[').count()));
+            } else {
+                out.push(&display);
+            }
+            out.push(" ");
+            out.definition(
+                &names::member(&field.name)?,
+                &field.name,
+                &format!("{name}.{}:{}", field.name, field.field_type),
+                "field",
+            );
+            out.push(";\n");
+        }
+        if let Some(tail) = &self.tail {
+            out.append(render_initializer(name, class, tail)?);
         }
         Ok(out.finish())
     }

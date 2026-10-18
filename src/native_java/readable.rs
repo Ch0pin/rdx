@@ -190,17 +190,22 @@ pub(super) fn apply(
     code
 }
 
-// Binary '$' is legal in top-level names, so only a proven member relationship
-// authorizes source nesting. Android's public API declares this exact type as
-// PackageInstaller.SessionInfo (API21+):
-// https://developer.android.com/reference/android/content/pm/PackageInstaller.SessionInfo
-fn platform_member_type(binary: &str) -> Option<(&'static str, &'static str)> {
-    match binary {
-        "android.content.pm.PackageInstaller$SessionInfo" => {
-            Some(("android.content.pm.PackageInstaller", "SessionInfo"))
+// Binary '$' remains legal in top-level names. Only SDK classfile membership
+// with an unshadowed complete enclosing chain authorizes canonical spelling.
+fn platform_member_type(binary: &str, class: &DexClass) -> Option<(&'static str, &'static str)> {
+    let (owner, member, chain) = crate::native_hierarchy::platform_member_type(binary)?;
+    for descriptor in chain {
+        if class.descriptor.as_ref() == descriptor
+            || class
+                .symbols
+                .hierarchy
+                .get()
+                .is_some_and(|h| !h.unshadowed_sdk_type(descriptor))
+        {
+            return None;
         }
-        _ => None,
     }
+    Some((owner, member))
 }
 
 pub(crate) fn shorten(name: &str, class: &DexClass, codes: Vec<DecompiledCode>) -> Shortened {
@@ -217,7 +222,9 @@ pub(crate) fn shorten(name: &str, class: &DexClass, codes: Vec<DecompiledCode>) 
     // unrelated PackageInstaller type or local prevents importing this owner.
     let owners: Vec<_> = candidates
         .iter()
-        .filter_map(|candidate| platform_member_type(candidate).map(|(owner, _)| owner.to_owned()))
+        .filter_map(|candidate| {
+            platform_member_type(candidate, class).map(|(owner, _)| owner.to_owned())
+        })
         .collect();
     candidates.extend(owners);
     let tokenized: Vec<_> = codes.iter().map(|code| tokens(&code.source)).collect();
@@ -323,7 +330,7 @@ pub(crate) fn shorten(name: &str, class: &DexClass, codes: Vec<DecompiledCode>) 
         })
         .collect();
     for qualified in &candidates {
-        if let Some((owner, member)) = platform_member_type(qualified) {
+        if let Some((owner, member)) = platform_member_type(qualified, class) {
             let short = allowed.get(owner).copied();
             displays.insert(
                 qualified,
@@ -769,6 +776,46 @@ mod nested_member_tests {
         );
         assert_eq!(result.codes[0].source, source);
         assert!(result.imports.is_empty());
+    }
+    #[test]
+    fn loaded_sdk_outer_or_member_declines_platform_canonical_mapping() {
+        for descriptor in ["Landroid/view/View;", "Landroid/view/View$BaseSavedState;"] {
+            let c = class();
+            let mut shadow = class();
+            shadow.descriptor = descriptor.into();
+            shadow.methods.clear();
+            shadow.fields.clear();
+            let h = crate::native_hierarchy::TypeHierarchy::from_classes([&c, &shadow]).unwrap();
+            c.symbols.hierarchy.set(std::sync::Arc::new(h)).unwrap();
+            assert!(platform_member_type("android.view.View$BaseSavedState", &c).is_none());
+            let source = "android.view.View$BaseSavedState state;\n";
+            let result = shorten(
+                "sample.Hello",
+                &c,
+                vec![document(source, &["android.view.View$BaseSavedState"])],
+            );
+            assert_eq!(result.codes[0].source, source);
+            assert!(result.imports.is_empty());
+        }
+    }
+
+    #[test]
+    fn actual_sdk_outer_collision_keeps_canonical_source_and_binary_link() {
+        let binary = "android.view.View$BaseSavedState";
+        let source = format!("int View = 0;\n{binary} state;\n");
+        let result = shorten("sample.Hello", &class(), vec![document(&source, &[binary])]);
+        assert!(result.imports.is_empty());
+        assert!(
+            result.codes[0]
+                .source
+                .contains("android.view.View.BaseSavedState state;")
+        );
+        assert!(
+            result.codes[0]
+                .links
+                .iter()
+                .any(|link| link.label == binary)
+        );
     }
 }
 

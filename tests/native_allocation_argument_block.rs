@@ -1,3 +1,4 @@
+use rdx::native_ssa;
 use rdx::{
     native_dex::{DexClass, DexCode, DexField, DexMethod, DexSymbols, DexTryRegion},
     native_hierarchy::TypeHierarchy,
@@ -613,9 +614,8 @@ fn final_public_renderer_preserves_new_argument_block_and_navigation() {
     }
 }
 #[test]
-fn unsafe_domains_and_nested_staging_outside_first_tranche_remain_blocked() {
+fn unsafe_domains_and_escaping_staging_remain_blocked() {
     for shape in [
-        Shape::Nested,
         Shape::Escape,
         Shape::AliasEscape,
         Shape::WideOverlap,
@@ -629,6 +629,31 @@ fn unsafe_domains_and_nested_staging_outside_first_tranche_remain_blocked() {
             "{shape:?}"
         );
     }
+}
+#[test]
+fn nested_argument_block_keeps_each_original_allocation_before_its_effects() {
+    let classes = fixture(Shape::Nested);
+    let rendered =
+        native_java::render_method("sample.Caller", &classes[0], &classes[0].methods[0]).unwrap();
+    assert_eq!(
+        rendered.source.matches("new sample.Target").count(),
+        2,
+        "{}",
+        rendered.source
+    );
+    assert!(
+        rendered.source.contains("switch (0)"),
+        "{}",
+        rendered.source
+    );
+    let first = rendered.source.find("new sample.Target").unwrap();
+    let second = rendered.source[first + 1..]
+        .find("new sample.Target")
+        .unwrap()
+        + first
+        + 1;
+    let wide = rendered.source.find("sample.Effects.wide()").unwrap();
+    assert!(first < second && second < wide, "{}", rendered.source);
 }
 #[test]
 fn partial_checked_handler_boundary_is_not_extended_by_argument_block() {
@@ -961,7 +986,7 @@ fn complete_original_interface_domains_allow_widened_storage_cast() {
     assert!(code.source.contains("switch (0)"));
 }
 #[test]
-fn truncated_original_domains_and_copied_loop_domains_do_not_authorize_narrowing() {
+fn truncated_original_domains_decline_but_complete_external_copy_inputs_are_safe() {
     let (c, pc) = marker_storage_fixture(9, false);
     let analysis = MethodAnalysis::build(&c[0], &c[0].methods[0]).unwrap();
     let types = analysis.infer_types().unwrap();
@@ -974,13 +999,212 @@ fn truncated_original_domains_and_copied_loop_domains_do_not_authorize_narrowing
         .arguments[0];
     assert!(types.values[arg.words[0]].bounds_truncated);
     assert!(native_java::render_method("sample.Caller", &c[0], &c[0].methods[0]).is_err());
-    let (c, _) = marker_storage_fixture(2, true);
-    MethodAnalysis::build(&c[0], &c[0].methods[0]).unwrap();
+    let (mut c, pc) = marker_storage_fixture(2, true);
+    let analysis = MethodAnalysis::build(&c[0], &c[0].methods[0]).unwrap();
+    let types = analysis.infer_types().unwrap();
+    let arg = &analysis
+        .calls()
+        .calls
+        .iter()
+        .find(|call| call.pc == pc)
+        .unwrap()
+        .arguments[0];
+    assert!(!types.values[arg.words[0]].assignment_bounds_truncated);
+    assert_eq!(types.values[arg.words[0]].assignment.len(), 2);
     let code = c[0].methods[0].code.as_ref().unwrap();
     let plan = original_loop_entry_copy::select(code)
         .expect("fixture must actually select copied loop proof");
     assert!(original_loop_entry_copy::validate(code, &plan));
+    assert!(
+        plan.copies
+            .iter()
+            .all(|copy| !copy.instructions.contains(&pc))
+    );
+    let rendered = native_java::render_method("sample.Caller", &c[0], &c[0].methods[0]);
+    let source = rendered.unwrap().source;
+    assert!(source.contains("sample.Effects.log(((sample.Marker) v3))"));
+    assert!(source.contains("while (true)"));
+    c[0].methods[0].parameters[1] = "Ljava/lang/Object;".into();
     assert!(native_java::render_method("sample.Caller", &c[0], &c[0].methods[0]).is_err());
+    let (mut undefined, pc) = marker_storage_fixture(2, true);
+    let words = &mut undefined[0].methods[0].code.as_mut().unwrap().instructions;
+    words[0] = 0;
+    words[1] = 0;
+    let analysis = MethodAnalysis::build(&undefined[0], &undefined[0].methods[0]).unwrap();
+    let types = analysis.infer_types().unwrap();
+    let arg = &analysis
+        .calls()
+        .calls
+        .iter()
+        .find(|call| call.pc == pc)
+        .unwrap()
+        .arguments[0];
+    assert!(
+        types.values[arg.words[0]]
+            .assignment
+            .iter()
+            .any(|bound| matches!(bound, rdx::native_types::AssignmentBound::Undefined))
+    );
+    assert!(
+        native_java::render_method("sample.Caller", &undefined[0], &undefined[0].methods[0])
+            .is_err()
+    );
+}
+
+#[test]
+#[ignore = "requires a local Java 22 or newer runtime"]
+fn copied_reference_input_matches_exact_raw_words_on_jvm() {
+    let (classes, _) = marker_storage_fixture(2, true);
+    let method = &classes[0].methods[0];
+    let code = method.code.as_ref().unwrap();
+    let emitted = native_java::render_method("sample.Caller", &classes[0], method).unwrap();
+    let words = code
+        .instructions
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let source = r#"package sample;
+interface Marker {}
+class Sub0 implements Marker {}
+class Sub1 implements Marker {}
+class Effects {
+ static String trace=""; static String fault=""; static int prefixCount=0;
+ static Object expected; static final RuntimeException failure=new RuntimeException("fault");
+ static void step(String s) {trace+=s; if (fault.equals(s)) throw failure;}
+ static void prefix() {prefixCount++; trace+="P"+prefixCount; if(fault.equals("P"+prefixCount)) throw failure;}
+ static void log(Marker m) {if(m!=expected) throw new AssertionError("log identity"); step("L");}
+ static long wide() {step("W"); return 9007199254740993L;}
+ static void observe(Object m,long w) {if(m!=expected || w!=9007199254740993L) throw new AssertionError("observe identity"); step("O");}
+}
+class Target {
+ static {Effects.step("I");}
+ Object value; long wide;
+ Target(Object o,long w) {Effects.step("C"); value=o; wide=w;}
+}
+public class Caller {
+EMITTED
+ static final int[] RAW = new int[]{WORDS};
+ static int signed16(int x) {return (short)x;}
+ static int signed4(int x) {return (x<<28)>>28;}
+ static int signed8(int x) {return (byte)x;}
+ static Target raw(Sub0 p0, Sub1 p1, boolean p2) throws Exception {
+  Object[] refs=new Object[10]; long[] nums=new long[10];
+  refs[7]=p0; refs[8]=p1; nums[9]=p2?1:0;
+  long lastWide=0; int pc=0; int steps=0;
+  while (true) {
+   if(++steps>100) throw new AssertionError("raw loop budget");
+   int word=RAW[pc], op=word&255, next=pc+1<RAW.length?RAW[pc+1]:0;
+   switch(op) {
+    case 0x08 -> {refs[(word>>8)&255]=refs[next]; pc+=2;}
+    case 0x12 -> {nums[(word>>8)&15]=signed4((word>>12)&15); pc++;}
+    case 0x38 -> {pc=nums[(word>>8)&255]==0?pc+signed16(next):pc+2;}
+    case 0x29 -> {pc+=signed16(next);}
+    case 0x35 -> {pc=nums[(word>>8)&15]>=nums[(word>>12)&15]?pc+signed16(next):pc+2;}
+    case 0xd8 -> {int args=next; nums[(word>>8)&255]=nums[args&255]+signed8((args>>8)&255); pc+=2;}
+    case 0x71 -> {
+     switch(next) {
+      case 1 -> Effects.prefix();
+      case 2 -> lastWide=Effects.wide();
+      case 6 -> Effects.observe(refs[1],nums[2]);
+      case 16 -> Effects.log((Marker)refs[4]);
+      default -> throw new AssertionError("unknown static call "+next);
+     }
+     pc+=3;
+    }
+    case 0x22 -> {Class.forName("sample.Target"); pc+=2;}
+    case 0x07 -> {refs[(word>>8)&15]=refs[(word>>12)&15];pc++;}
+    case 0x0b -> {nums[(word>>8)&255]=lastWide;pc++;}
+    case 0x70 -> {refs[0]=new Target(refs[1],nums[2]);pc+=3;}
+    case 0x11 -> {return (Target)refs[(word>>8)&255];}
+    default -> throw new AssertionError("unknown opcode "+op+" at "+pc);
+   }
+  }
+ }
+ public static void main(String[] args) throws Exception {
+  Effects.fault=args[1];
+  Sub0 p0=args[2].equals("null")?null:new Sub0();
+  Sub1 p1=args[3].equals("null")?null:new Sub1();
+  boolean flag=Boolean.parseBoolean(args[4]);
+  Effects.expected=flag?p1:p0;
+  try {
+   Target t=args[0].equals("raw")?raw(p0,p1,flag):run(p0,p1,flag);
+   System.out.print(Effects.trace+"|ok|"+(t.value==Effects.expected)+"|"+t.wide);
+  } catch(Throwable x) {
+   System.out.print(Effects.trace+"|"+x.getClass().getName()+"|"+(x==Effects.failure)+"|"+(x.getCause()==Effects.failure));
+  }
+ }
+}
+"#
+    .replace("EMITTED", &emitted.source)
+    .replace("WORDS", &words);
+    let root = std::env::temp_dir().join(format!(
+        "rdx-copied-marker-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let package = root.join("sample");
+    std::fs::create_dir_all(&package).unwrap();
+    let file = package.join("Caller.java");
+    std::fs::write(&file, source).unwrap();
+    let javac = std::env::var_os("RDX_JAVA25_HOME")
+        .map(|home| std::path::PathBuf::from(home).join("bin/javac"))
+        .unwrap_or_else(|| "javac".into());
+    let java = std::env::var_os("RDX_JAVA25_HOME")
+        .map(|home| std::path::PathBuf::from(home).join("bin/java"))
+        .unwrap_or_else(|| "java".into());
+    let compile = Command::new(javac).arg(&file).output().unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let mut compared = 0;
+    for fault in ["", "P1", "P2", "P3", "P4", "I", "L", "W", "C", "O"] {
+        for p0 in ["value", "null"] {
+            for p1 in ["value", "null"] {
+                for flag in ["false", "true"] {
+                    let run = |engine| {
+                        Command::new(&java)
+                            .args([
+                                "-Xverify:all",
+                                "-cp",
+                                root.to_str().unwrap(),
+                                "sample.Caller",
+                                engine,
+                                fault,
+                                p0,
+                                p1,
+                                flag,
+                            ])
+                            .output()
+                            .unwrap()
+                    };
+                    let raw = run("raw");
+                    let reconstructed = run("emitted");
+                    assert!(
+                        raw.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&raw.stderr)
+                    );
+                    assert!(
+                        reconstructed.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&reconstructed.stderr)
+                    );
+                    assert_eq!(
+                        raw.stdout, reconstructed.stdout,
+                        "fault={fault} p0={p0} p1={p1} flag={flag}"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(compared, 80);
 }
 
 #[test]

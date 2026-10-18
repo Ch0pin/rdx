@@ -6,7 +6,7 @@ use rdx::{
 use std::sync::Arc;
 #[path = "../src/native_java/loop_exit_type.rs"]
 mod proof;
-pub use rdx::{native_cfg, native_ssa, native_types};
+pub use rdx::{native_cfg, native_hierarchy, native_ssa, native_types};
 
 fn fixture() -> DexClass {
     DexClass {
@@ -55,7 +55,7 @@ fn source(class: &DexClass) -> anyhow::Result<String> {
 fn check(class: &DexClass) -> Option<String> {
     let a = MethodAnalysis::build(class, &class.methods[0]).unwrap();
     let t = a.infer_types().unwrap();
-    proof::exit_type(a.ssa(), &t, 5..17, 17, 1)
+    proof::exit_type(a.ssa(), &t, 5..17, 17, 1, None, None)
 }
 
 #[test]
@@ -161,13 +161,13 @@ fn cycles_without_an_established_root_and_truncated_domains_decline() {
     for (_, input) in &mut phi.incoming {
         *input = id;
     }
-    assert!(proof::exit_type(&ssa, &t, 5..17, 17, 1).is_none());
+    assert!(proof::exit_type(&ssa, &t, 5..17, 17, 1, None, None).is_none());
     let mut t = t;
     t.values[id].bounds_truncated = true;
-    assert!(proof::exit_type(a.ssa(), &t, 5..17, 17, 1).is_none());
+    assert!(proof::exit_type(a.ssa(), &t, 5..17, 17, 1, None, None).is_none());
     t.values[id].bounds_truncated = false;
     t.wide_pair_issues = 1;
-    assert!(proof::exit_type(a.ssa(), &t, 5..17, 17, 1).is_none());
+    assert!(proof::exit_type(a.ssa(), &t, 5..17, 17, 1, None, None).is_none());
 }
 
 #[test]
@@ -206,7 +206,7 @@ fn missing_duplicate_extra_and_virtual_phi_predecessors_decline() {
             }
         }
         assert!(
-            proof::exit_type(&ssa, &types, 5..17, 17, 1).is_none(),
+            proof::exit_type(&ssa, &types, 5..17, 17, 1, None, None).is_none(),
             "shape {shape}"
         );
     }
@@ -273,7 +273,7 @@ fn loop_carried_phi_cycles_and_parallel_swaps_keep_their_existing_values() {
     let a = MethodAnalysis::build(&class, &class.methods[0]).unwrap();
     let t = a.infer_types().unwrap();
     assert_eq!(
-        proof::exit_type(a.ssa(), &t, 9..27, 27, 1).as_deref(),
+        proof::exit_type(a.ssa(), &t, 9..27, 27, 1, None, None).as_deref(),
         Some("Ljava/lang/Object;")
     );
     source(&class).unwrap();

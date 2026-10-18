@@ -102,6 +102,28 @@ impl SsaMethod {
         input: &ControlFlowGraph,
         work_limit: usize,
     ) -> Result<Self> {
+        Self::build_with_limits(code, ir, input, work_limit, None)
+    }
+
+    /// Constructor recovery can reserve both analyses in its aggregate budget.
+    #[doc(hidden)]
+    pub fn build_with_local_and_dominator_limits(
+        code: &DexCode,
+        ir: &DecodedMethod,
+        input: &ControlFlowGraph,
+        work_limit: usize,
+        dominator_limit: usize,
+    ) -> Result<Self> {
+        Self::build_with_limits(code, ir, input, work_limit, Some(dominator_limit))
+    }
+
+    fn build_with_limits(
+        code: &DexCode,
+        ir: &DecodedMethod,
+        input: &ControlFlowGraph,
+        work_limit: usize,
+        dominator_limit: Option<usize>,
+    ) -> Result<Self> {
         ensure!(
             code.ins <= code.registers,
             "SSA input words exceed registers"
@@ -233,7 +255,10 @@ impl SsaMethod {
                 }]);
             }
         }
-        let dom = DominatorTree::compute(&graph)?;
+        let dom = match dominator_limit {
+            Some(limit) => DominatorTree::compute_with_work_limit(&graph, limit)?,
+            None => DominatorTree::compute(&graph)?,
+        };
         let n = graph.blocks.len();
         let mut assigned = vec![BTreeSet::new(); n];
         let mut live = vec![BTreeSet::new(); n];
@@ -447,5 +472,38 @@ fn read_operand(operand: &RegisterOperand, stacks: &[Vec<ValueId>]) -> SsaOperan
         words: (0..operand.kind.word_count())
             .map(|word| *stacks[usize::from(operand.register) + word].last().unwrap())
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod constructor_budget_tests {
+    use super::*;
+
+    #[test]
+    fn independent_dominator_budget_is_enforced_without_changing_public_defaults() {
+        let code = DexCode {
+            registers: 1,
+            ins: 0,
+            outs: 0,
+            tries: 0,
+            try_regions: vec![],
+            instructions: vec![0x0012, 0x000f],
+            offset: 0,
+        };
+        let ir = DecodedMethod::decode(&code).unwrap();
+        let cfg = ControlFlowGraph::build(&code).unwrap();
+        assert!(SsaMethod::build(&code, &ir, &cfg).is_ok());
+        assert!(SsaMethod::build_with_work_limit(&code, &ir, &cfg, 32_768).is_ok());
+        let error = SsaMethod::build_with_local_and_dominator_limits(&code, &ir, &cfg, 32_768, 0)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("dominator analysis exceeds work budget")
+        );
+        assert!(
+            SsaMethod::build_with_local_and_dominator_limits(&code, &ir, &cfg, 32_768, 32_768)
+                .is_ok()
+        );
     }
 }

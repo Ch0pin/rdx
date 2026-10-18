@@ -426,3 +426,217 @@ fn unresolved_receiver_compatibility_is_rejected_without_guessing() {
     ));
     assert!(prefix::select(&class, &class.methods[0], 2).is_none());
 }
+
+#[test]
+fn independent_suffixes_capture_selector_and_keep_distinct_frames() {
+    let mut class = fixture(false, [vec![], validation()], 0);
+    let code = class.methods[0].code.as_mut().unwrap();
+    code.instructions.splice(23..23, [0x02d8, 0xff02]);
+    code.instructions[3] += 2;
+    analyzed(&class);
+    let plan = prefix::select(&class, &class.methods[0], 2).unwrap();
+    assert!(plan.separate_suffixes);
+    assert_eq!(plan.arms[1].needed_tail_words, vec![0, 1, 2]);
+    let rendered =
+        native_java::render_method("sample.PrefixChild", &class, &class.methods[0]).unwrap();
+    assert_eq!(
+        rendered.source.matches("switch (").count(),
+        2,
+        "{}",
+        rendered.source
+    );
+    assert_eq!(rendered.source.matches("super();").count(), 1);
+    assert_eq!(rendered.source.matches("this.b =").count(), 2);
+}
+
+#[test]
+#[ignore = "requires Java25 flexible constructor bodies via RDX_JAVA25_HOME"]
+fn independent_suffix_jvm_preserves_parent_callback_and_exception_identity() {
+    use std::{fs, process::Command};
+    let home = std::env::var("RDX_JAVA25_HOME").expect("RDX_JAVA25_HOME");
+    let mut class = fixture(false, [vec![], validation()], 0);
+    let code = class.methods[0].code.as_mut().unwrap();
+    code.instructions.splice(23..23, [0x02d8, 0xff02]);
+    code.instructions[3] += 2;
+    let rendered =
+        native_java::render_method("sample.PrefixChild", &class, &class.methods[0]).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "rdx-different-constructor-suffix-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    let source = r#"package sample;
+class Validation { static String trace; static int fail; static final RuntimeException marker=new RuntimeException(); static void check(Object o,String s){trace+="V";if(o==null||fail==1)throw marker;} }
+class Base {Base(){Validation.trace+="B"+((PrefixChild)this).a;if(Validation.fail==2)throw Validation.marker;}}
+public class PrefixChild extends Base {public final int a;public final Object b;public final int c;
+METHOD
+public static void main(String[] args){for(int selector:new int[]{-1,0,1,2,17})for(int fail=0;fail<=2;fail++)for(boolean present:new boolean[]{false,true}){
+Object input=present?new Object():null;Validation.trace="";Validation.fail=fail;boolean chosen=selector==1||selector==2;boolean throwsExpected=chosen&&(!present||fail==1)||fail==2;
+String expected=chosen?"V":"";if(!(chosen&&(!present||fail==1)))expected+="B"+selector;
+try{PrefixChild value=new PrefixChild(input,7,selector);if(throwsExpected||value.a!=selector||value.b!=input||value.c!=(chosen?6:7))throw new AssertionError();}catch(RuntimeException actual){if(!throwsExpected||actual!=Validation.marker)throw new AssertionError();}
+if(!expected.equals(Validation.trace))throw new AssertionError(Validation.trace+" != "+expected);
+}}}"#;
+    fs::write(
+        dir.join("sample/PrefixChild.java"),
+        source.replace("METHOD", &rendered.source),
+    )
+    .unwrap();
+    for (program, args) in [
+        ("javac", vec!["sample/PrefixChild.java"]),
+        ("java", vec!["-cp", ".", "sample.PrefixChild"]),
+    ] {
+        let output = Command::new(format!("{home}/bin/{program}"))
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            rendered.source
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires Java25 flexible constructor bodies via RDX_JAVA25_HOME"]
+fn differing_literal_frames_jvm_preserves_sparse_and_packed_dispatch() {
+    use std::{fs, process::Command};
+    let home = std::env::var("RDX_JAVA25_HOME").expect("RDX_JAVA25_HOME");
+    for sparse in [false, true] {
+        let class = fixture(sparse, [vec![0x7212], vec![0x0213, 9]], 0);
+        analyzed(&class);
+        let plan = prefix::select(&class, &class.methods[0], 2).unwrap();
+        assert!(plan.separate_suffixes);
+        assert_ne!(plan.arms[0].suffix_entries, plan.arms[1].suffix_entries);
+        let rendered =
+            native_java::render_method("sample.PrefixChild", &class, &class.methods[0]).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "rdx-literal-constructor-suffix-{}-{sparse}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join("sample")).unwrap();
+        let source = r#"package sample;
+class Base {Base(){if(((PrefixChild)this).b!=null||((PrefixChild)this).c!=0)throw new AssertionError();}}
+public class PrefixChild extends Base {public final int a;public final Object b;public final int c;
+METHOD
+public static void main(String[] args){for(int selector:new int[]{-7,-1,0,1,2,17}){Object input=new Object();PrefixChild value=new PrefixChild(input,-4,selector);boolean chosen=SPARSE?(selector==-7||selector==17):(selector==1||selector==2);if(value.a!=selector||value.b!=input||value.c!=(chosen?9:7))throw new AssertionError();}}}"#;
+        fs::write(
+            dir.join("sample/PrefixChild.java"),
+            source
+                .replace("METHOD", &rendered.source)
+                .replace("SPARSE", if sparse { "true" } else { "false" }),
+        )
+        .unwrap();
+        for (program, args) in [
+            ("javac", vec!["sample/PrefixChild.java"]),
+            ("java", vec!["-cp", ".", "sample.PrefixChild"]),
+        ] {
+            let output = Command::new(format!("{home}/bin/{program}"))
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                rendered.source
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn both_suffixes_reassigning_the_pre_super_final_field_are_rejected() {
+    let mut class = fixture(false, [vec![], validation()], 0);
+    let code = class.methods[0].code.as_mut().unwrap();
+    code.instructions[11] = 0;
+    code.instructions[24] = 0;
+    analyzed(&class);
+    assert!(prefix::select(&class, &class.methods[0], 2).is_none());
+    assert!(native_java::render_method("sample.PrefixChild", &class, &class.methods[0]).is_err());
+}
+
+#[test]
+#[ignore = "requires Java25 flexible constructor bodies via RDX_JAVA25_HOME"]
+fn distinct_suffixes_overwrite_dispatch_register_after_capture() {
+    use std::{fs, process::Command};
+    let home = std::env::var("RDX_JAVA25_HOME").expect("RDX_JAVA25_HOME");
+    let mut class = fixture(false, [vec![], validation()], 0);
+    let code = class.methods[0].code.as_mut().unwrap();
+    code.instructions[23] = 0x0359;
+    code.instructions[10] = 0x0359;
+    code.instructions.splice(23..23, [0x0313, 9]);
+    code.instructions.splice(10..10, [0x7312]);
+    code.instructions.insert(29, 0);
+    code.instructions[3] = 28;
+    code.instructions[34] = 12;
+    code.instructions[36] = 12;
+    analyzed(&class);
+    let rendered =
+        native_java::render_method("sample.PrefixChild", &class, &class.methods[0]).unwrap();
+    assert_eq!(rendered.source.matches("switch (").count(), 2);
+    for label in [
+        "sample.Base.<init>()V",
+        "sample.Validation.check(Ljava/lang/Object;Ljava/lang/String;)V",
+        "sample.PrefixChild.c:I",
+    ] {
+        assert!(
+            rendered.links.iter().any(|link| link.label == label),
+            "missing {label}"
+        );
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "rdx-constructor-dispatch-overwrite-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    let source = r#"package sample;
+class Validation {static void check(Object o,String s){if(o==null)throw new IllegalArgumentException();}}
+class Base {Base(){}}
+public class PrefixChild extends Base {public final int a;public final Object b;public final int c;
+METHOD
+public static void main(String[] args){for(int selector:new int[]{-1,0,1,2,17}){Object input=new Object();PrefixChild value=new PrefixChild(input,123,selector);if(value.a!=selector||value.b!=input||value.c!=((selector==1||selector==2)?9:7))throw new AssertionError();}}}"#;
+    fs::write(
+        dir.join("sample/PrefixChild.java"),
+        source.replace("METHOD", &rendered.source),
+    )
+    .unwrap();
+    for (program, args) in [
+        ("javac", vec!["sample/PrefixChild.java"]),
+        ("java", vec!["-cp", ".", "sample.PrefixChild"]),
+    ] {
+        let output = Command::new(format!("{home}/bin/{program}"))
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            rendered.source
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn static_final_write_in_independent_prefix_is_rejected() {
+    let mut class = fixture(false, [vec![0x0267, 3], validation()], 0);
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols.fields.push((2, 3, 7));
+    class.fields.push(DexField {
+        declaring_type: class.descriptor.clone(),
+        name: "touch".into(),
+        field_type: "I".into(),
+        access_flags: 0x18,
+        is_static: true,
+    });
+    analyzed(&class);
+    assert!(prefix::select(&class, &class.methods[0], 2).is_none());
+}

@@ -101,9 +101,28 @@ fn initializer_allows_branches_that_share_one_terminal_return() {
 }
 
 #[test]
-fn initializer_rejects_early_return_regions_and_invalid_signatures() {
+fn initializer_accepts_proven_early_exits_and_rejects_invalid_signatures() {
     let class = fixture(vec![0x0012, 0x0038, 3, 0x000e, 0x000e]);
-    assert!(native_java::render_method("sample.Init", &class, &class.methods[0]).is_err());
+    let out = native_java::render_method("sample.Init", &class, &class.methods[0]).unwrap();
+    assert!(
+        out.source.contains("rdxInitializerExit: {"),
+        "{}",
+        out.source
+    );
+    assert!(
+        out.source.contains("break rdxInitializerExit;"),
+        "{}",
+        out.source
+    );
+    assert!(!out.source.contains("return;"), "{}", out.source);
+    assert!(
+        out.definitions
+            .iter()
+            .any(|definition| definition.name == "<clinit>")
+    );
+    // A target inside its own branch operand is not a canonical CFG edge.
+    let malformed = fixture(vec![0x0012, 0x0038, 1, 0x000e, 0x000e]);
+    assert!(native_java::render_method("sample.Init", &malformed, &malformed.methods[0]).is_err());
     for case in 0..7 {
         let mut class = fixture(vec![0x000e]);
         let method = &mut class.methods[0];
@@ -350,4 +369,94 @@ fn initializer_field_matching_generated_local_reserves_a_distinct_local() {
             .count(),
         2
     );
+}
+
+#[test]
+#[ignore = "requires javac and java on PATH; root runs serially"]
+fn initializer_early_exits_match_literal_dex_and_initialize_once() {
+    use std::{fs, process::Command};
+    let mut class = fixture(vec![
+        0x0060, 1, 0x0038, 6, 0x1012, 0x0067, 0, 0x000e, 0x000e,
+    ]);
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols.types.push("Lsample/Hooks;".into());
+    symbols.strings.push("input".into());
+    symbols.fields.push((2, 1, 1));
+    let code = native_java::render("sample.Init", &class).unwrap();
+    assert!(!code.source.contains("return;"));
+    let directory =
+        std::env::temp_dir().join(format!("rdx-clinit-early-exit-{}", std::process::id()));
+    fs::create_dir_all(directory.join("sample")).unwrap();
+    fs::write(directory.join("sample/Init.java"), code.source).unwrap();
+    fs::write(
+        directory.join("sample/Check.java"),
+        r#"package sample;
+class Hooks {static int input;}
+public class Check {public static void main(String[] args)throws Exception {
+Hooks.input=Integer.parseInt(args[0]);
+Class<?> first=Class.forName("sample.Init");
+if(Init.count!=Integer.parseInt(args[1]))throw new AssertionError("wrong exit");
+Init.count=7;Class<?> second=Class.forName("sample.Init");
+if(first!=second||Init.count!=7)throw new AssertionError("initialization repeated");
+System.out.print("ok");}}
+"#,
+    )
+    .unwrap();
+    let compile = Command::new("javac")
+        .args(["sample/Init.java", "sample/Check.java"])
+        .current_dir(&directory)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    for input in [-1_i32, 0, 1] {
+        // Interpret every raw opcode independently: sget input, if-eqz,
+        // const/4, sput count, return. Unsupported words fail the oracle.
+        let words = &class.methods[0].code.as_ref().unwrap().instructions;
+        let mut pc = 0_usize;
+        let mut register = 0_i32;
+        let mut count = 0_i32;
+        for _ in 0..16 {
+            match words[pc] as u8 {
+                0x60 => {
+                    assert_eq!(words[pc + 1], 1);
+                    register = input;
+                    pc += 2;
+                }
+                0x38 => {
+                    pc = if register == 0 {
+                        (pc as isize + words[pc + 1] as i16 as isize) as usize
+                    } else {
+                        pc + 2
+                    };
+                }
+                0x12 => {
+                    register = (words[pc] as i16 >> 12) as i32;
+                    pc += 1;
+                }
+                0x67 => {
+                    assert_eq!(words[pc + 1], 0);
+                    count = register;
+                    pc += 2;
+                }
+                0x0e => break,
+                opcode => panic!("unsupported raw opcode {opcode:x}"),
+            }
+        }
+        assert_eq!(words[pc] as u8, 0x0e);
+        let run = Command::new("java")
+            .args(["sample.Check", &input.to_string(), &count.to_string()])
+            .current_dir(&directory)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "input={input}: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(run.stdout, b"ok");
+    }
 }

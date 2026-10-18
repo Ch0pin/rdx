@@ -36,9 +36,16 @@ fn fixture(domain: Domain, a: u64, b: u64) -> DexClass {
     words.extend(constant(a));
     words.push(if wide { 0x0628 } else { 0x0428 });
     words.extend(constant(b));
-    words.push(if wide { 0x0010 } else { 0x000f });
+    words.push(if wide {
+        0x0010
+    } else if domain == Domain::NullZero {
+        0x0011
+    } else {
+        0x000f
+    });
     let ret = match domain {
         Domain::Boolean => "Z",
+        Domain::NullZero => "Ljava/lang/Object;",
         Domain::Raw32 => "F",
         Domain::Raw64 => "D",
     };
@@ -62,6 +69,7 @@ fn fixture(domain: Domain, a: u64, b: u64) -> DexClass {
             declaring_type: "Lsample/LiteralRead;".into(),
             name: match domain {
                 Domain::Boolean => "boolValue",
+                Domain::NullZero => "nullValue",
                 Domain::Raw32 => "floatValue",
                 Domain::Raw64 => "doubleValue",
             }
@@ -102,6 +110,7 @@ fn check(c: &DexClass, domain: Domain) -> bool {
 fn exact_branch_reads_prove_boolean_and_raw_float_double_constants() {
     for (domain, a, b) in [
         (Domain::Boolean, 0, 1),
+        (Domain::NullZero, 0, 0),
         (Domain::Raw32, 0x80000000, 0x7fc12345),
         (Domain::Raw64, 0x8000000000000000, 0x7ff8123456789abc),
     ] {

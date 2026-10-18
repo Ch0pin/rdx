@@ -375,7 +375,9 @@ pub(super) fn definitions(class: &DexClass, rendered: &str) -> Vec<String> {
     if !referenced(rendered, &name) {
         return vec![];
     }
-    vec![format!("\n    // Preserve an original handler throwable without changing the caller header.\n    @java.lang.SuppressWarnings(\"unchecked\")\n    private static <E extends java.lang.Throwable> java.lang.RuntimeException {name}(java.lang.Throwable failure) throws E {{\n        throw (E) failure;\n    }}\n")]
+    vec![format!(
+        "\n    // Preserve an original handler throwable without changing the caller header.\n    @java.lang.SuppressWarnings(\"unchecked\")\n    private static <E extends java.lang.Throwable> java.lang.RuntimeException {name}(java.lang.Throwable failure) throws E {{\n        throw (E) failure;\n    }}\n"
+    )]
 }
 #[cfg(test)]
 mod tests {
@@ -483,11 +485,13 @@ mod refusal_tests {
             "{}",
             output.source
         );
-        assert!(!output
-            .source
-            .lines()
-            .find(|line| line.contains(" run("))
-            .unwrap()
-            .contains("throws"));
+        assert!(
+            !output
+                .source
+                .lines()
+                .find(|line| line.contains(" run("))
+                .unwrap()
+                .contains("throws")
+        );
     }
 }

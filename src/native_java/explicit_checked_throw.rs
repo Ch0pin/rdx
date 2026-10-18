@@ -108,5 +108,7 @@ pub(super) fn definitions(class: &DexClass) -> Vec<String> {
     }) {
         return vec![];
     }
-    vec![format!("\n    // Preserve the original explicit checked throwable and caller header.\n    @java.lang.SuppressWarnings(\"unchecked\")\n    private static <E extends java.lang.Throwable> java.lang.RuntimeException {name}(java.lang.Throwable failure) throws E {{\n        throw (E) failure;\n    }}\n")]
+    vec![format!(
+        "\n    // Preserve the original explicit checked throwable and caller header.\n    @java.lang.SuppressWarnings(\"unchecked\")\n    private static <E extends java.lang.Throwable> java.lang.RuntimeException {name}(java.lang.Throwable failure) throws E {{\n        throw (E) failure;\n    }}\n"
+    )]
 }

@@ -80,11 +80,13 @@ fn install(classes: &mut [DexClass]) {
 fn install_metadata(classes: &mut [DexClass], generic: bool) {
     let mut symbols = DexSymbols {
         types: vec!["Lsample/Default;".into()],
-        strings: vec![classes
-            .get(1)
-            .and_then(|c| c.methods.first())
-            .map(|m| m.name.to_string())
-            .unwrap_or_else(|| "value".into())],
+        strings: vec![
+            classes
+                .get(1)
+                .and_then(|c| c.methods.first())
+                .map(|m| m.name.to_string())
+                .unwrap_or_else(|| "value".into()),
+        ],
         protos: vec![("I".into(), vec!["Ljava/lang/Object;".into()])],
         methods: vec![(0, 0, 0)],
         ..Default::default()
@@ -270,10 +272,12 @@ fn inherited_default_uses_direct_interface_qualifier_and_preserves_raw_owner_lin
         "{}",
         output.source
     );
-    assert!(output
-        .links
-        .iter()
-        .any(|link| link.label == "sample.Default.value(Ljava/lang/Object;)I"));
+    assert!(
+        output
+            .links
+            .iter()
+            .any(|link| link.label == "sample.Default.value(Ljava/lang/Object;)I")
+    );
 }
 
 #[test]

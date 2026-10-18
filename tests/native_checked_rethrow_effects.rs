@@ -426,11 +426,12 @@ fn loaded_empty_shadow_stops_inherited_checked_contract() {
 fn static_instance_contract_modes_remain_distinct() {
     let (c, _) = call_fixture(false, false);
     let h = c.symbols.hierarchy.get().unwrap();
-    assert!(h
-        .call_checked_effects("Lsample/Api;", "work", &[], "V", false)
-        .is_some_and(|types| types
-            .iter()
-            .all(|ty| ty.as_ref() == "Ljava/lang/Throwable;")));
+    assert!(
+        h.call_checked_effects("Lsample/Api;", "work", &[], "V", false)
+            .is_some_and(|types| types
+                .iter()
+                .all(|ty| ty.as_ref() == "Ljava/lang/Throwable;"))
+    );
     assert_eq!(
         h.call_checked_effects("Lsample/Api;", "work", &[], "V", true)
             .unwrap()
@@ -867,8 +868,8 @@ fn distinct_same_arity_overloads_retain_exact_checked_and_empty_contracts() {
         .unwrap(),
         vec![Arc::<str>::from("Ljava/io/IOException;")]
     );
-    assert!(h
-        .call_checked_effects(
+    assert!(
+        h.call_checked_effects(
             &c.descriptor,
             "work",
             &["Ljava/lang/Object;".into()],
@@ -876,7 +877,8 @@ fn distinct_same_arity_overloads_retain_exact_checked_and_empty_contracts() {
             true
         )
         .unwrap()
-        .is_empty());
+        .is_empty()
+    );
     assert_eq!(
         h.call_checked_effects(
             &c.descriptor,

@@ -1677,87 +1677,186 @@ impl RelationCache {
 }
 
 impl TypeHierarchy {
-    pub(crate) fn loaded_source_owner(&self, owner:&str)->bool {self.loaded_owners.contains(owner)&&!self.ambiguous.contains(owner)}
+    pub(crate) fn loaded_source_owner(&self, owner: &str) -> bool {
+        self.loaded_owners.contains(owner) && !self.ambiguous.contains(owner)
+    }
     /// Exact source declaration used only by the bounded precise-rethrow retry.
     /// Loaded methods require a closed source header, never an inferred runtime
     /// effect approximation. Missing/ambiguous declarations retain the refusal.
     pub(crate) fn exact_rethrow_source_declaration(
-        &self, caller: &str, owner: &str, name: &str, args: &[Arc<str>], ret: &str, opcode: u8,
+        &self,
+        caller: &str,
+        owner: &str,
+        name: &str,
+        args: &[Arc<str>],
+        ret: &str,
+        opcode: u8,
     ) -> Option<ExactSourceDeclaration> {
-        let kind=PlatformInvokeKind::from_opcode(opcode)?;
+        let kind = PlatformInvokeKind::from_opcode(opcode)?;
         if !self.loaded_owners.contains(owner) {
-            return self.exact_platform_source_declaration_for_invoke(caller,owner,name,args,ret,kind);
+            return self.exact_platform_source_declaration_for_invoke(
+                caller, owner, name, args, ret, kind,
+            );
         }
-        if self.ambiguous.contains(owner) || self.override_ambiguous_owners.contains(owner) {return None;}
-        let summary=self.loaded_call_families.get(owner)?;
-        let candidate=summary.methods.get(name)?.get(&args.len())?.as_ref()?;
-        let erased_abstract_interface = summary.erased_interface_source_header
-            && candidate.access_flags & 0x400 != 0;
+        if self.ambiguous.contains(owner) || self.override_ambiguous_owners.contains(owner) {
+            return None;
+        }
+        let summary = self.loaded_call_families.get(owner)?;
+        let candidate = summary.methods.get(name)?.get(&args.len())?.as_ref()?;
+        let erased_abstract_interface =
+            summary.erased_interface_source_header && candidate.access_flags & 0x400 != 0;
         if ((summary.generic_class || candidate.generic_method) && !erased_abstract_interface)
             || !candidate.legal_source_declaration
-            || candidate.parameters!=args || candidate.return_type.as_ref()!=ret
-            || !platform_source_accessible(caller,owner,summary.access_flags,candidate.access_flags)
-        {return None;}
-        let flags=candidate.access_flags;
-        let interface=summary.access_flags&0x200!=0;
-        let permitted=match kind {
-            PlatformInvokeKind::Static=>!name.starts_with('<') && flags&8!=0,
-            PlatformInvokeKind::Virtual=>!name.starts_with('<') && !interface && flags&(8|2)==0,
-            PlatformInvokeKind::Interface=>!name.starts_with('<') && interface && flags&(8|2)==0,
-            PlatformInvokeKind::Direct=>name=="<init>" && !interface && ret=="V" && flags&(8|0x400|0x100)==0,
-            PlatformInvokeKind::Super=>false,
+            || candidate.parameters != args
+            || candidate.return_type.as_ref() != ret
+            || !platform_source_accessible(
+                caller,
+                owner,
+                summary.access_flags,
+                candidate.access_flags,
+            )
+        {
+            return None;
+        }
+        let flags = candidate.access_flags;
+        let interface = summary.access_flags & 0x200 != 0;
+        let permitted = match kind {
+            PlatformInvokeKind::Static => !name.starts_with('<') && flags & 8 != 0,
+            PlatformInvokeKind::Virtual => {
+                !name.starts_with('<') && !interface && flags & (8 | 2) == 0
+            }
+            PlatformInvokeKind::Interface => {
+                !name.starts_with('<') && interface && flags & (8 | 2) == 0
+            }
+            PlatformInvokeKind::Direct => {
+                name == "<init>" && !interface && ret == "V" && flags & (8 | 0x400 | 0x100) == 0
+            }
+            PlatformInvokeKind::Super => false,
         };
-        if !permitted {return None;}
-        let mut thrown_types=if candidate.declared_throws_empty {
-            if candidate.may_infer_checked && !candidate.no_new_checked_header {return None;}
+        if !permitted {
+            return None;
+        }
+        let mut thrown_types = if candidate.declared_throws_empty {
+            if candidate.may_infer_checked && !candidate.no_new_checked_header {
+                return None;
+            }
             Vec::new()
-        }else{
-            let key=format!("{owner}->{name}({}){ret}",args.iter().map(AsRef::as_ref).collect::<String>());
-            let (is_static,types)=self.static_throws.get(&key)?;
-            if *is_static != (flags&8!=0) {return None;}
+        } else {
+            let key = format!(
+                "{owner}->{name}({}){ret}",
+                args.iter().map(AsRef::as_ref).collect::<String>()
+            );
+            let (is_static, types) = self.static_throws.get(&key)?;
+            if *is_static != (flags & 8 != 0) {
+                return None;
+            }
             types.to_vec()
         };
         // The ordinary writer also restores a bounded set of inherited source
         // contracts (IO/Future/Android callbacks). Reconstruct that declaration
         // view from the immutable owner index, rather than mistaking empty DEX
         // Throws metadata for an empty emitted Java header.
-        let entry=self.entries.get(owner)?;
-        let declaration_method=crate::native_dex::DexMethod{declaring_type:Arc::from(owner),name:Arc::from(name),return_type:Arc::from(ret),parameters:args.to_vec(),thrown_types:thrown_types.clone(),access_flags:flags,code:None};
-        let declaration_class=DexClass{descriptor:Arc::from(owner),superclass:entry.superclass.clone(),interfaces:entry.interfaces.to_vec(),access_flags:summary.access_flags,annotations_offset:0,static_values_offset:0,static_values:vec![],fields:vec![],methods:vec![],symbols:Arc::new(crate::native_dex::DexSymbols::default())};
-        thrown_types.extend(source_inherited_exceptions(&declaration_class,&declaration_method,Some(self)).into_iter().map(Arc::from));
-        Some(ExactSourceDeclaration{owner_access_flags:summary.access_flags,member_access_flags:flags,thrown_types})
+        let entry = self.entries.get(owner)?;
+        let declaration_method = crate::native_dex::DexMethod {
+            declaring_type: Arc::from(owner),
+            name: Arc::from(name),
+            return_type: Arc::from(ret),
+            parameters: args.to_vec(),
+            thrown_types: thrown_types.clone(),
+            access_flags: flags,
+            code: None,
+        };
+        let declaration_class = DexClass {
+            descriptor: Arc::from(owner),
+            superclass: entry.superclass.clone(),
+            interfaces: entry.interfaces.to_vec(),
+            access_flags: summary.access_flags,
+            annotations_offset: 0,
+            static_values_offset: 0,
+            static_values: vec![],
+            fields: vec![],
+            methods: vec![],
+            symbols: Arc::new(crate::native_dex::DexSymbols::default()),
+        };
+        thrown_types.extend(
+            source_inherited_exceptions(&declaration_class, &declaration_method, Some(self))
+                .into_iter()
+                .map(Arc::from),
+        );
+        Some(ExactSourceDeclaration {
+            owner_access_flags: summary.access_flags,
+            member_access_flags: flags,
+            thrown_types,
+        })
     }
 
     pub(crate) fn enum_array_retainer(&self, owner: &str) -> bool {
-        !self.ambiguous.contains(owner) && !self.loaded_owners.contains(OBJECT)
+        !self.ambiguous.contains(owner)
+            && !self.loaded_owners.contains(OBJECT)
             && self.enum_array_retainers.contains(owner)
     }
     /// A concrete superclass declaration usable from a private instance bridge.
     /// The bridge retains Java `super` dispatch and catches/rethrows the same
     /// Throwable, so this grants no inferred checked-exception contract.
     pub(crate) fn callable_super_declaration(
-        &self, caller: &str, owner: &str, name: &str, args: &[Arc<str>], ret: &str,
+        &self,
+        caller: &str,
+        owner: &str,
+        name: &str,
+        args: &[Arc<str>],
+        ret: &str,
     ) -> bool {
         if self.strict_superclass(caller, owner) != Relation::Proven
-            || name.starts_with('<') || self.ambiguous.contains(owner)
-        { return false; }
+            || name.starts_with('<')
+            || self.ambiguous.contains(owner)
+        {
+            return false;
+        }
         let flags = if self.loaded_owners.contains(owner) {
-            let Some(summary) = self.loaded_call_families.get(owner) else { return false; };
-            let Some(method) = summary.methods.get(name).and_then(|f| f.get(&args.len())).and_then(Option::as_ref) else { return false; };
-            if summary.access_flags & 0x200 != 0 || method.parameters != args
-                || method.return_type.as_ref() != ret || !method.legal_source_declaration
-            { return false; }
+            let Some(summary) = self.loaded_call_families.get(owner) else {
+                return false;
+            };
+            let Some(method) = summary
+                .methods
+                .get(name)
+                .and_then(|f| f.get(&args.len()))
+                .and_then(Option::as_ref)
+            else {
+                return false;
+            };
+            if summary.access_flags & 0x200 != 0
+                || method.parameters != args
+                || method.return_type.as_ref() != ret
+                || !method.legal_source_declaration
+            {
+                return false;
+            }
             method.access_flags
         } else {
             let facts = platform_source_declarations();
-            if !facts.complete || facts.schema != 1 || facts.android_jar_sha256 != platform_exceptions().sha256
-                || facts.class_count != facts.classes.len() || facts.method_count != facts.methods.len()
+            if !facts.complete
+                || facts.schema != 1
+                || facts.android_jar_sha256 != platform_exceptions().sha256
+                || facts.class_count != facts.classes.len()
+                || facts.method_count != facts.methods.len()
                 || facts.ambiguous_source_signature_count != facts.ambiguous_source_signatures.len()
-                || facts.classes.get(owner).is_none_or(|flags| flags & 0x200 != 0)
-            { return false; }
-            let source_key = format!("{owner}->{name}({})", args.iter().map(AsRef::as_ref).collect::<String>());
-            if facts.ambiguous_source_signatures.contains(&source_key) { return false; }
-            let Some(method) = facts.methods.get(&format!("{source_key}{ret}")) else { return false; };
+                || facts
+                    .classes
+                    .get(owner)
+                    .is_none_or(|flags| flags & 0x200 != 0)
+            {
+                return false;
+            }
+            let source_key = format!(
+                "{owner}->{name}({})",
+                args.iter().map(AsRef::as_ref).collect::<String>()
+            );
+            if facts.ambiguous_source_signatures.contains(&source_key) {
+                return false;
+            }
+            let Some(method) = facts.methods.get(&format!("{source_key}{ret}")) else {
+                return false;
+            };
             method.access_flags
         };
         let visibility = flags & 7;
@@ -4158,19 +4257,31 @@ impl TypeHierarchy {
         name: &str,
         args: &[Arc<str>],
     ) -> bool {
-        if self.ambiguous.contains(owner) { return false; }
-        let Some(summary) = self.loaded_call_families.get(owner) else { return false };
-        let method = summary.methods.get(name)
+        if self.ambiguous.contains(owner) {
+            return false;
+        }
+        let Some(summary) = self.loaded_call_families.get(owner) else {
+            return false;
+        };
+        let method = summary
+            .methods
+            .get(name)
             .and_then(|family| family.get(&args.len()))
             .and_then(Option::as_ref)
-            .or_else(|| summary.exact_overloads.as_ref()
-                .and_then(|overloads| overloads.get(name))
-                .and_then(|overloads| overloads.get(args))
-                .and_then(Option::as_ref));
-        method.is_some_and(|method| method.parameters.as_slice() == args
-            && method.return_type.as_ref() == "V"
-            && method.access_flags & 8 != 0
-            && method.static_no_return)
+            .or_else(|| {
+                summary
+                    .exact_overloads
+                    .as_ref()
+                    .and_then(|overloads| overloads.get(name))
+                    .and_then(|overloads| overloads.get(args))
+                    .and_then(Option::as_ref)
+            });
+        method.is_some_and(|method| {
+            method.parameters.as_slice() == args
+                && method.return_type.as_ref() == "V"
+                && method.access_flags & 8 != 0
+                && method.static_no_return
+        })
     }
 
     pub(crate) fn unambiguous_loaded_call(
@@ -4486,12 +4597,16 @@ fn platform_source_declarations() -> &'static PlatformSourceDeclarations {
 // Structural leaf authority only; loaded overrides always use loaded facts.
 fn platform_interface_leaf(owner: &str) -> bool {
     let facts = platform_source_declarations();
-    facts.complete && facts.schema == 1
+    facts.complete
+        && facts.schema == 1
         && facts.android_jar_sha256 == platform_exceptions().sha256
         && facts.class_count == facts.classes.len()
         && facts.method_count == facts.methods.len()
         && facts.ambiguous_source_signature_count == facts.ambiguous_source_signatures.len()
-        && facts.classes.get(owner).is_some_and(|flags| flags & 0x601 == 0x601)
+        && facts
+            .classes
+            .get(owner)
+            .is_some_and(|flags| flags & 0x601 == 0x601)
         && matches!(platform_exceptions().types.get(owner),
             Some((Some(parent), interfaces))
                 if parent == "Ljava/lang/Object;" && interfaces.is_empty())
@@ -5272,49 +5387,91 @@ pub(crate) fn valid_pinned_override_declaration(
     method: &crate::native_dex::DexMethod,
     hierarchy: Option<&TypeHierarchy>,
 ) -> bool {
-    let Some(parent) = class.superclass.as_deref() else { return true; };
-    if !matches!(parent, "Landroid/app/backup/BackupAgent;" | "Landroid/app/backup/BackupAgentHelper;"
-        | "Landroid/content/ContentProvider;" | "Landroid/provider/DocumentsProvider;")
-        || method.name.starts_with('<')
+    let Some(parent) = class.superclass.as_deref() else {
+        return true;
+    };
+    if !matches!(
+        parent,
+        "Landroid/app/backup/BackupAgent;"
+            | "Landroid/app/backup/BackupAgentHelper;"
+            | "Landroid/content/ContentProvider;"
+            | "Landroid/provider/DocumentsProvider;"
+    ) || method.name.starts_with('<')
         || hierarchy.is_some_and(|h| h.loaded_owners.contains(parent))
-    { return true; }
+    {
+        return true;
+    }
     type Members = HashMap<String, Option<(String, u32)>>;
     static MEMBERS: std::sync::OnceLock<Option<Members>> = std::sync::OnceLock::new();
     let members = MEMBERS.get_or_init(|| {
         let facts = platform_source_declarations();
-        if !facts.complete || facts.schema != 1
+        if !facts.complete
+            || facts.schema != 1
             || facts.android_jar_sha256 != platform_exceptions().sha256
-            || facts.class_count != facts.classes.len() || facts.method_count != facts.methods.len()
+            || facts.class_count != facts.classes.len()
+            || facts.method_count != facts.methods.len()
             || facts.ambiguous_source_signature_count != facts.ambiguous_source_signatures.len()
-        { return None; }
+        {
+            return None;
+        }
         let mut members = Members::new();
         for (key, member) in &facts.methods {
             let (owner, _) = key.split_once("->")?;
-            if !matches!(owner, "Landroid/app/backup/BackupAgent;" | "Landroid/app/backup/BackupAgentHelper;"
-                | "Landroid/content/ContentProvider;" | "Landroid/provider/DocumentsProvider;")
-                || member.access_flags & 5 == 0 { continue; }
+            if !matches!(
+                owner,
+                "Landroid/app/backup/BackupAgent;"
+                    | "Landroid/app/backup/BackupAgentHelper;"
+                    | "Landroid/content/ContentProvider;"
+                    | "Landroid/provider/DocumentsProvider;"
+            ) || member.access_flags & 5 == 0
+            {
+                continue;
+            }
             let end = key.find(')')? + 1;
             let signature = &key[..end];
-            let entry = if facts.ambiguous_source_signatures.contains(signature) { None }
-                else { Some((key[end..].to_owned(), member.access_flags)) };
-            if members.contains_key(signature) { members.insert(signature.to_owned(), None); }
-            else { members.insert(signature.to_owned(), entry); }
-            if members.len() > 2048 { return None; }
+            let entry = if facts.ambiguous_source_signatures.contains(signature) {
+                None
+            } else {
+                Some((key[end..].to_owned(), member.access_flags))
+            };
+            if members.contains_key(signature) {
+                members.insert(signature.to_owned(), None);
+            } else {
+                members.insert(signature.to_owned(), entry);
+            }
+            if members.len() > 2048 {
+                return None;
+            }
         }
         Some(members)
     });
-    let signature = format!("{parent}->{}({})", method.name,
-        method.parameters.iter().map(AsRef::as_ref).collect::<String>());
+    let signature = format!(
+        "{parent}->{}({})",
+        method.name,
+        method
+            .parameters
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<String>()
+    );
     let Some(Some((returns, flags))) = members.as_ref().and_then(|members| members.get(&signature))
-        else { return true; };
-    let visibility = if flags & 1 != 0 { method.access_flags & 7 == 1 }
-        else { matches!(method.access_flags & 7, 1 | 4) };
-    visibility && flags & 0x10 == 0 && (flags & 8 == method.access_flags & 8)
+    else {
+        return true;
+    };
+    let visibility = if flags & 1 != 0 {
+        method.access_flags & 7 == 1
+    } else {
+        matches!(method.access_flags & 7, 1 | 4)
+    };
+    visibility
+        && flags & 0x10 == 0
+        && (flags & 8 == method.access_flags & 8)
         && (method.return_type.as_ref() == returns
             || ((returns.starts_with('L') || returns.starts_with('['))
                 && (method.return_type.starts_with('L') || method.return_type.starts_with('['))
-                && hierarchy.is_some_and(|h|
-                    h.assignable(&method.return_type, returns) == Relation::Proven)))
+                && hierarchy.is_some_and(|h| {
+                    h.assignable(&method.return_type, returns) == Relation::Proven
+                })))
 }
 
 pub(crate) fn source_inherited_exceptions(

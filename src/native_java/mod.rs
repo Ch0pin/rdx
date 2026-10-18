@@ -3,16 +3,16 @@ mod annotations;
 pub(crate) mod anonymous;
 mod array_presentation;
 mod cast_cleanup;
-mod checked_call_bridge;
-mod explicit_checked_throw;
 mod caught_checked_throw;
-mod initializer_exits;
+mod checked_call_bridge;
 mod condition_cleanup;
-mod display_names;
 mod declaration_types;
-mod helper_type_names;
+mod display_names;
 mod enums;
+mod explicit_checked_throw;
 mod expression_cleanup;
+mod helper_type_names;
+mod initializer_exits;
 mod interface_default_bridge;
 mod liveness;
 mod method;
@@ -23,8 +23,8 @@ mod same_object_rethrow;
 mod source_layout;
 mod statement_cleanup;
 mod static_sneaky_rethrow;
-mod super_bridge;
 mod strings;
+mod super_bridge;
 mod varargs_cleanup;
 use crate::{
     engine::{CodeDefinition, CodeLink, DecompiledCode},
@@ -170,10 +170,13 @@ fn render_initializer(name: &str, class: &DexClass, method: &DexMethod) -> Resul
         body.text.as_str()
     } else {
         let terminal = "        return;\n";
-        let source = body.text.strip_suffix(terminal)
-            .ok_or_else(|| anyhow::anyhow!("Static initializer requires a single terminal return"))?;
-        ensure!(!source.lines().any(|line| line.trim() == "return;"),
-            "Static initializer early returns not reconstructed");
+        let source = body.text.strip_suffix(terminal).ok_or_else(|| {
+            anyhow::anyhow!("Static initializer requires a single terminal return")
+        })?;
+        ensure!(
+            !source.lines().any(|line| line.trim() == "return;"),
+            "Static initializer early returns not reconstructed"
+        );
         source
     };
     let chars = source.chars().count();
@@ -200,7 +203,9 @@ fn render_initializer(name: &str, class: &DexClass, method: &DexMethod) -> Resul
         link.end += offset;
         link
     }));
-    if labelled_exit { out.push("        }\n"); }
+    if labelled_exit {
+        out.push("        }\n");
+    }
     out.push("    }\n");
     Ok(out.finish())
 }
@@ -239,7 +244,9 @@ pub(super) fn render_method_without_same_object_retry(
 // source-only alternative can also render a method.
 #[cfg(test)]
 pub(super) fn render_method_without_caught_source_retry(
-    name: &str, class: &DexClass, method: &DexMethod,
+    name: &str,
+    class: &DexClass,
+    method: &DexMethod,
 ) -> Result<DecompiledCode> {
     render_method_inner(name, class, method, true, false)
 }
@@ -280,7 +287,9 @@ fn render_method_inner(
     );
     ensure!(
         crate::native_hierarchy::valid_pinned_override_declaration(
-            class, method, class.symbols.hierarchy.get().map(AsRef::as_ref),
+            class,
+            method,
+            class.symbols.hierarchy.get().map(AsRef::as_ref),
         ),
         "Method declaration conflicts with exact inherited SDK member"
     );
@@ -317,24 +326,41 @@ fn render_method_inner(
                             .downcast_ref::<method::PreciseRethrowFailure>()
                             .cloned()
                         {
-                            let established = same_object_rethrow::prove(name, class, method, &failure)
-                                .ok().and_then(|proof| {
-                                    method::reconstruct_same_object_rethrow(name, class, method, &proof.authorization)
-                                        .ok().map(|body| (body, proof.root_header))
-                                });
+                            let established =
+                                same_object_rethrow::prove(name, class, method, &failure)
+                                    .ok()
+                                    .and_then(|proof| {
+                                        method::reconstruct_same_object_rethrow(
+                                            name,
+                                            class,
+                                            method,
+                                            &proof.authorization,
+                                        )
+                                        .ok()
+                                        .map(|body| (body, proof.root_header))
+                                    });
                             if let Some((body, header)) = established {
-                                ensure!(body.inferred_throws.is_empty(),
-                                    "same-object retry cannot infer a root declaration");
+                                ensure!(
+                                    body.inferred_throws.is_empty(),
+                                    "same-object retry cannot infer a root declaration"
+                                );
                                 same_object_root_header = Some(header);
                                 body
                             } else {
-                                if !allow_caught_source_retry { return Err(baseline_error); }
+                                if !allow_caught_source_retry {
+                                    return Err(baseline_error);
+                                }
                                 // Preserve established precise rethrows first. A
                                 // final source-only retry changes only certified
                                 // throw actions and keeps the original header.
                                 let Ok(body) = method::reconstruct_caught_source(
-                                    name, class, method, failure.site.throw_pc,
-                                ) else { return Err(baseline_error); };
+                                    name,
+                                    class,
+                                    method,
+                                    failure.site.throw_pc,
+                                ) else {
+                                    return Err(baseline_error);
+                                };
                                 body
                             }
                         } else if let Some(failure) = baseline_error
@@ -1198,7 +1224,9 @@ pub fn source_header_authority(class: &DexClass) -> bool {
 pub fn ordinary_method_declaration_authority(class: &DexClass, method: &DexMethod) -> bool {
     method.declaring_type == class.descriptor
         && crate::native_hierarchy::valid_pinned_override_declaration(
-            class, method, class.symbols.hierarchy.get().map(AsRef::as_ref),
+            class,
+            method,
+            class.symbols.hierarchy.get().map(AsRef::as_ref),
         )
         && !matches!(method.name.as_ref(), "<init>" | "<clinit>")
         && method.access_flags & !0x31dff == 0
@@ -1261,10 +1289,18 @@ pub fn render(name: &str, class: &DexClass) -> Result<DecompiledCode> {
     for method in &class.methods {
         append_presented_method(&mut out, class, method, render_method(name, class, method)?)?;
     }
-    for helper in super_bridge::definitions(class) { out.push(&helper); }
-    for helper in checked_call_bridge::definitions(class) { out.push(&helper); }
-    for helper in explicit_checked_throw::definitions(class) { out.push(&helper); }
-    for helper in caught_checked_throw::definitions(class, &out.text) { out.push(&helper); }
+    for helper in super_bridge::definitions(class) {
+        out.push(&helper);
+    }
+    for helper in checked_call_bridge::definitions(class) {
+        out.push(&helper);
+    }
+    for helper in explicit_checked_throw::definitions(class) {
+        out.push(&helper);
+    }
+    for helper in caught_checked_throw::definitions(class, &out.text) {
+        out.push(&helper);
+    }
     Ok(finish_class(name, class, out))
 }
 
@@ -1354,10 +1390,18 @@ fn render_mixed_controlled(
                     .expect("validated interface method");
             }
             ensure!(!cancelled(), "decompilation cancelled");
-            for helper in super_bridge::definitions(class) { out.push(&helper); }
-            for helper in checked_call_bridge::definitions(class) { out.push(&helper); }
-    for helper in explicit_checked_throw::definitions(class) { out.push(&helper); }
-    for helper in caught_checked_throw::definitions(class, &out.text) { out.push(&helper); }
+            for helper in super_bridge::definitions(class) {
+                out.push(&helper);
+            }
+            for helper in checked_call_bridge::definitions(class) {
+                out.push(&helper);
+            }
+            for helper in explicit_checked_throw::definitions(class) {
+                out.push(&helper);
+            }
+            for helper in caught_checked_throw::definitions(class, &out.text) {
+                out.push(&helper);
+            }
             let nested_names =
                 anonymous::append_proven(&mut out, class, children, world, cancelled)?;
             return Ok(finish_class_nested(name, class, out, &nested_names));
@@ -1577,10 +1621,18 @@ fn upgrade_methods_controlled(
         Vec::new()
     };
     if java_header {
-        for helper in super_bridge::definitions(class) { out.push(&helper); }
-        for helper in checked_call_bridge::definitions(class) { out.push(&helper); }
-    for helper in explicit_checked_throw::definitions(class) { out.push(&helper); }
-    for helper in caught_checked_throw::definitions(class, &out.text) { out.push(&helper); }
+        for helper in super_bridge::definitions(class) {
+            out.push(&helper);
+        }
+        for helper in checked_call_bridge::definitions(class) {
+            out.push(&helper);
+        }
+        for helper in explicit_checked_throw::definitions(class) {
+            out.push(&helper);
+        }
+        for helper in caught_checked_throw::definitions(class, &out.text) {
+            out.push(&helper);
+        }
         out.push("}\n");
     }
     ensure!(!cancelled(), "decompilation cancelled");

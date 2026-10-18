@@ -1115,14 +1115,20 @@ fn normalize_nonreturning_null_tails(
     stop: usize,
 ) -> Option<Vec<u16>> {
     let code = method.code.as_ref()?;
-    if code.instructions != words { return None; }
+    if code.instructions != words {
+        return None;
+    }
     let hierarchy = class.symbols.hierarchy.get()?;
     let mut normalized = None;
     let mut cursor = allocation.checked_add(*graph.widths.get(allocation)?)?;
     for _ in 0..256 {
-        if cursor >= stop || cursor >= words.len() { break; }
+        if cursor >= stop || cursor >= words.len() {
+            break;
+        }
         let width = *graph.widths.get(cursor)?;
-        if width == 0 || graph.payloads[cursor] { return None; }
+        if width == 0 || graph.payloads[cursor] {
+            return None;
+        }
         let op = words[cursor] as u8;
         if matches!(op, 0x70 | 0x76)
             && graph.constructor_binding(class, method, cursor).is_some_and(|binding|
@@ -1134,20 +1140,35 @@ fn normalize_nonreturning_null_tails(
         if matches!(op, 0x71 | 0x77) && width == 3 {
             let constant = cursor + width;
             let terminal = constant + 1;
-            if terminal < stop && terminal < words.len()
-                && graph.widths[constant] == 1 && graph.widths[terminal] == 1
-                && words[constant] as u8 == 0x12 && words[constant] >> 12 == 0
+            if terminal < stop
+                && terminal < words.len()
+                && graph.widths[constant] == 1
+                && graph.widths[terminal] == 1
+                && words[constant] as u8 == 0x12
+                && words[constant] >> 12 == 0
                 && words[terminal] as u8 == 0x11
                 && words[terminal] >> 8 == (words[constant] >> 8) & 15
             {
-                let alternative_entry = graph.targets.iter().flatten().any(|target|
-                    *target == constant || *target == terminal)
-                    || graph.switches.iter().flatten().any(|switch| switch.cases.iter().any(|(_, target)|
-                        *target == constant || *target == terminal))
-                    || code.try_regions.iter().any(|region| region.catches.iter().any(|(_, handler)|
-                        *handler as usize == constant || *handler as usize == terminal));
-                let (owner, ret, args, name) = method_symbol(class, words[cursor + 1] as usize).ok()?;
-                if !alternative_entry && ret == "V"
+                let alternative_entry = graph
+                    .targets
+                    .iter()
+                    .flatten()
+                    .any(|target| *target == constant || *target == terminal)
+                    || graph.switches.iter().flatten().any(|switch| {
+                        switch
+                            .cases
+                            .iter()
+                            .any(|(_, target)| *target == constant || *target == terminal)
+                    })
+                    || code.try_regions.iter().any(|region| {
+                        region.catches.iter().any(|(_, handler)| {
+                            *handler as usize == constant || *handler as usize == terminal
+                        })
+                    });
+                let (owner, ret, args, name) =
+                    method_symbol(class, words[cursor + 1] as usize).ok()?;
+                if !alternative_entry
+                    && ret == "V"
                     && hierarchy.loaded_static_void_never_returns(owner, name, args)
                 {
                     let result = normalized.get_or_insert_with(|| words.to_vec());
@@ -1180,7 +1201,8 @@ pub(super) fn try_lower(
     // to a same-width throw, then run the ordinary exact argument-region proof.
     let has_projection = graph.argument_projection.borrow().is_some();
     if !has_projection
-        && let Some(normalized) = normalize_nonreturning_null_tails(class, method, graph, words, pc, stop)
+        && let Some(normalized) =
+            normalize_nonreturning_null_tails(class, method, graph, words, pc, stop)
     {
         let code = method.code.as_ref().context("allocation method code")?;
         let normalized_method = DexMethod {
@@ -1200,7 +1222,16 @@ pub(super) fn try_lower(
                 instructions: normalized.clone(),
             }),
         };
-        return try_lower(class, &normalized_method, graph, &normalized, pc, stop, caller_regs, caller_out);
+        return try_lower(
+            class,
+            &normalized_method,
+            graph,
+            &normalized,
+            pc,
+            stop,
+            caller_regs,
+            caller_out,
+        );
     }
     let attempt = || -> Result<Lowered> {
         // Large generated injection constructors can exceed 128 instructions.

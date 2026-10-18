@@ -165,10 +165,11 @@ fn fixture(variant: u8) -> (DexClass, DexClass, Arc<DexSymbols>) {
 fn exact_loaded_empty_static_call_proves_no_new_header() {
     let (agent, caller, symbols) = fixture(0);
     let h = symbols.hierarchy.get().unwrap();
-    assert!(h
-        .call_checked_effects(&agent.descriptor, "delegate", &[], "V", true)
-        .unwrap()
-        .is_empty());
+    assert!(
+        h.call_checked_effects(&agent.descriptor, "delegate", &[], "V", true)
+            .unwrap()
+            .is_empty()
+    );
     let declaration = native_java::render_method("sample.Agent", &agent, &agent.methods[0])
         .unwrap()
         .source;

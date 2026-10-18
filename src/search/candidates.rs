@@ -269,6 +269,7 @@ mod tests {
     #[test]
     fn instruction_hints_resolve_each_reference_kind_and_unicode() {
         let cancel = AtomicBool::new(false);
+        let absent = Regex::new("absent").unwrap();
         for (instructions, query) in [
             (vec![0x1a, 0, 0x0e], "needleString"),
             (vec![0x1b, 0, 0, 0x0e], "needleString"),
@@ -281,7 +282,6 @@ mod tests {
             let matcher = Regex::new(query).unwrap();
             let plan = Plan::new(&class.symbols, &matcher, &cancel).unwrap();
             assert!(plan.class_matches(&class, &matcher, &cancel), "{query}");
-            let absent = Regex::new("absent").unwrap();
             assert!(
                 !Plan::new(&class.symbols, &absent, &cancel)
                     .unwrap()

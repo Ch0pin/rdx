@@ -553,13 +553,13 @@ fn static_terminal_with_unrelated_catch() -> DexClass {
     code.registers = 4;
     code.ins = 2;
     code.instructions = vec![
-        0x0012, 0x0339, 13, 0x0071, 0, 0, 0x010a, 0x2035, 11,
-        0x0138, 5, 0x00d8, 0x0100, 0x0428, 0x0160, 0, 0x010f,
-        0xf628, 0x000f, 0x010d, 0xf112, 0x010f,
+        0x0012, 0x0339, 13, 0x0071, 0, 0, 0x010a, 0x2035, 11, 0x0138, 5, 0x00d8, 0x0100, 0x0428,
+        0x0160, 0, 0x010f, 0xf628, 0x000f, 0x010d, 0xf112, 0x010f,
     ];
     code.tries = 1;
     code.try_regions = vec![DexTryRegion {
-        start: 3, end: 7,
+        start: 3,
+        end: 7,
         catches: vec![(Some("Ljava/lang/RuntimeException;".into()), 19)].into(),
     }];
     class
@@ -574,10 +574,22 @@ fn terminal_static_read_outside_unrelated_try_keeps_exact_original_edge() {
     assert!(proof.live_in_registers.is_empty());
     assert!(shared_terminal_exit::validate(code, &proof));
     let source = native_java::render_method("sample.TerminalTail", &class, &class.methods[0])
-        .unwrap().source;
-    assert_eq!(source.matches("sample.Effects.value").count(), 2, "{source}");
-    assert_eq!(source.matches("sample.Effects.touch()").count(), 1, "{source}");
-    assert!(source.find("sample.Effects.value").unwrap() < source.find("try {").unwrap(), "{source}");
+        .unwrap()
+        .source;
+    assert_eq!(
+        source.matches("sample.Effects.value").count(),
+        2,
+        "{source}"
+    );
+    assert_eq!(
+        source.matches("sample.Effects.touch()").count(),
+        1,
+        "{source}"
+    );
+    assert!(
+        source.find("sample.Effects.value").unwrap() < source.find("try {").unwrap(),
+        "{source}"
+    );
 }
 
 #[test]
@@ -586,7 +598,9 @@ fn terminal_static_read_rejects_protection_at_source_target_or_handler_entry() {
         let mut class = static_terminal_with_unrelated_catch();
         let code = class.methods[0].code.as_mut().unwrap();
         code.try_regions[0] = DexTryRegion {
-            start, end, catches: vec![(Some("Ljava/lang/RuntimeException;".into()), handler)].into(),
+            start,
+            end,
+            catches: vec![(Some("Ljava/lang/RuntimeException;".into()), handler)].into(),
         };
         assert!(shared_terminal_exit::prove(code, 1, 14, 7..18).is_none());
     }

@@ -185,8 +185,8 @@ fn backup_prototype_access_static_and_indirect_parent_do_not_gain_header() {
             _ => agent.superclass = Some("Lsample/Middle;".into()),
         }
         let h = TypeHierarchy::from_classes([&agent]).unwrap();
-        assert!(h
-            .call_checked_effects(
+        assert!(
+            h.call_checked_effects(
                 &agent.descriptor,
                 "onBackup",
                 &agent.methods[0].parameters,
@@ -194,7 +194,8 @@ fn backup_prototype_access_static_and_indirect_parent_do_not_gain_header() {
                 variant == 2
             )
             .unwrap()
-            .is_empty());
+            .is_empty()
+        );
     }
 }
 

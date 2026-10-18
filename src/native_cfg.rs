@@ -56,7 +56,10 @@ impl ControlFlowGraph {
     /// Build the bounded forward-only graph directly from canonical decoded
     /// instructions. A separate decoded builder admits selected natural loops;
     /// handlers, payloads and other loop shapes retain the raw CFG builder.
-    pub(crate) fn from_decoded(ir: &crate::native_ir::DecodedMethod, len: usize) -> Result<Self> {
+    // Source-inclusion integration tests share this exact validated builder
+    // with the linked library rather than approximating its graph rules.
+    #[doc(hidden)]
+    pub fn from_decoded(ir: &crate::native_ir::DecodedMethod, len: usize) -> Result<Self> {
         Self::decoded_impl(ir, len, false)
     }
     pub(crate) fn from_decoded_loop(

@@ -343,9 +343,7 @@ impl NativeEngine {
         class: &str,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<DecompiledCode> {
-        self.decompile_search_until(class, &|| {
-            cancel.load(std::sync::atomic::Ordering::Relaxed)
-        })
+        self.decompile_search_until(class, &|| cancel.load(std::sync::atomic::Ordering::Relaxed))
     }
     /// Search workers combine user cancellation with local pool shutdown.
     /// Interactive source caches remain untouched by bulk rendering.
@@ -354,9 +352,7 @@ impl NativeEngine {
         class: &str,
         cancelled: &impl Fn() -> bool,
     ) -> Result<DecompiledCode> {
-        let mut code = self
-            .native
-            .render_cancellable(class, cancelled)?;
+        let mut code = self.native.render_cancellable(class, cancelled)?;
         ensure!(!cancelled(), "Search cancelled");
         self.resources
             .decorate_java(&mut code, &self.native.shared_classes());

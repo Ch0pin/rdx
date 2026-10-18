@@ -26,11 +26,18 @@ pub(super) fn prove(
     failure: &method::PreciseRethrowFailure,
 ) -> Result<Proof> {
     let first = prove_first_shape(class_name, class, root, failure);
-    if first.is_ok() { return first; }
+    if first.is_ok() {
+        return first;
+    }
     let closed = prove_closed_catches(class_name, class, root, failure);
     if std::env::var_os("RDX_RETHROW_DIAG").is_some() && closed.is_err() {
-        eprintln!("RDX_RETHROW_DIAG {}.{} first={} closed={:#}", class_name, root.name,
-            first.err().unwrap(), closed.as_ref().err().unwrap());
+        eprintln!(
+            "RDX_RETHROW_DIAG {}.{} first={} closed={:#}",
+            class_name,
+            root.name,
+            first.err().unwrap(),
+            closed.as_ref().err().unwrap()
+        );
     }
     closed
 }
@@ -512,7 +519,16 @@ fn prove_closed_catches(
                     ret,
                     operation.opcode,
                 )
-                .with_context(|| format!("closed-catch exact source header unavailable at {:04x}: {}.{}({}){}", operation.pc, owner, name, args.iter().map(AsRef::as_ref).collect::<String>(), ret))?;
+                .with_context(|| {
+                    format!(
+                        "closed-catch exact source header unavailable at {:04x}: {}.{}({}){}",
+                        operation.pc,
+                        owner,
+                        name,
+                        args.iter().map(AsRef::as_ref).collect::<String>(),
+                        ret
+                    )
+                })?;
             loaded_external |= class
                 .symbols
                 .hierarchy
@@ -891,11 +907,13 @@ fn ensure_source_throw_is_covered(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{method as renderer, render_method_without_caught_source_retry as render_method};
+    use super::super::{
+        method as renderer, render_method_without_caught_source_retry as render_method,
+    };
     use super::{
         established_same_class_header, exact_terminal_caught_use, exception_only_handler_entry,
-        original_ir_has_no_normal_handler_entry, prove, prove_first_shape, unsupported_extended_invoke,
-        writes_external_state,
+        original_ir_has_no_normal_handler_entry, prove, prove_first_shape,
+        unsupported_extended_invoke, writes_external_state,
     };
     use crate::{
         native_cfg::ControlFlowGraph,
@@ -949,8 +967,16 @@ mod tests {
         // A trivial throw-null body has a closed header. A non-null allocation
         // remains conservative in the index, while exact source rendering proves
         // the RuntimeException throw needs no checked declaration.
-        let mut target = method(&owner, "f", 0x11, vec![], 1, 1, 1,
-            vec![0x0022, 1, 0x1070, 2, 0, 0x0027]);
+        let mut target = method(
+            &owner,
+            "f",
+            0x11,
+            vec![],
+            1,
+            1,
+            1,
+            vec![0x0022, 1, 0x1070, 2, 0, 0x0027],
+        );
         if checked_callee {
             target.thrown_types.push("Ljava/io/IOException;".into());
         }
@@ -1028,13 +1054,30 @@ mod tests {
     #[test]
     fn fixture_has_uncertain_index_effect_and_exact_empty_source_header() {
         let class = fixture(false, false);
-        let effects = class.symbols.hierarchy.get().unwrap()
-            .call_checked_effects(&class.descriptor, "f", &[], "V", false).unwrap();
-        assert_eq!(effects.iter().map(AsRef::as_ref).collect::<Vec<_>>(), ["Ljava/lang/Throwable;"]);
+        let effects = class
+            .symbols
+            .hierarchy
+            .get()
+            .unwrap()
+            .call_checked_effects(&class.descriptor, "f", &[], "V", false)
+            .unwrap();
+        assert_eq!(
+            effects.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+            ["Ljava/lang/Throwable;"]
+        );
         let failure = baseline_failure(&class);
         assert_eq!(failure.effect, "Ljava/lang/Throwable;");
         let mut work = 0;
-        let header = established_same_class_header("sample.Example", &class, "f", &[], "V", false, &mut work).unwrap();
+        let header = established_same_class_header(
+            "sample.Example",
+            &class,
+            "f",
+            &[],
+            "V",
+            false,
+            &mut work,
+        )
+        .unwrap();
         assert!(header.is_empty());
         assert!(prove("sample.Example", &class, &class.methods[2], &failure).is_ok());
     }
@@ -1262,8 +1305,16 @@ mod tests {
                 .contains("same-object handler has normal entry"),
             "{error:#}"
         );
-        assert!(prove("sample.Example", &normal_entry, &normal_entry.methods[2], &failure).is_err(),
-            "general retry granted normal handler entry");
+        assert!(
+            prove(
+                "sample.Example",
+                &normal_entry,
+                &normal_entry.methods[2],
+                &failure
+            )
+            .is_err(),
+            "general retry granted normal handler entry"
+        );
 
         let mut method_entry = fixture(false, false);
         method_entry.methods[2].code.as_mut().unwrap().instructions = vec![
@@ -1298,8 +1349,16 @@ mod tests {
                 .contains("same-object handler has normal entry"),
             "{error:#}"
         );
-        assert!(prove("sample.Example", &method_entry, &method_entry.methods[2], &entry_failure).is_err(),
-            "general retry granted method-entry handler authority");
+        assert!(
+            prove(
+                "sample.Example",
+                &method_entry,
+                &method_entry.methods[2],
+                &entry_failure
+            )
+            .is_err(),
+            "general retry granted method-entry handler authority"
+        );
     }
 
     #[test]
@@ -1344,8 +1403,16 @@ mod tests {
                 .contains("same-object handler has normal entry"),
             "{error:#}"
         );
-        assert!(prove("sample.Example", &dead_entry, &dead_entry.methods[2], &failure).is_err(),
-            "general retry granted normal handler entry");
+        assert!(
+            prove(
+                "sample.Example",
+                &dead_entry,
+                &dead_entry.methods[2],
+                &failure
+            )
+            .is_err(),
+            "general retry granted normal handler entry"
+        );
     }
 
     #[test]
@@ -1426,7 +1493,8 @@ mod tests {
         let symbols = Arc::get_mut(&mut duplicate_name.symbols).unwrap();
         let long_index = u16::try_from(symbols.types.len()).unwrap();
         symbols.types.push("J".into());
-        let x_name = u32::try_from(symbols.strings.iter().position(|name| name == "x").unwrap()).unwrap();
+        let x_name =
+            u32::try_from(symbols.strings.iter().position(|name| name == "x").unwrap()).unwrap();
         symbols.fields.push((0, long_index, x_name));
         duplicate_name.fields.push(DexField {
             declaring_type: duplicate_name.descriptor.clone(),
@@ -1569,32 +1637,61 @@ mod tests {
         native_body.methods[0].access_flags = 0x109;
         native_body.methods[2].code.as_mut().unwrap().instructions[0] = 0x0071;
         native_body.methods[2].code.as_mut().unwrap().instructions[2] = 0;
-        assert!(super::super::render_method("sample.Example", &native_body, &native_body.methods[2]).is_err());
+        assert!(
+            super::super::render_method("sample.Example", &native_body, &native_body.methods[2])
+                .is_err()
+        );
         let mut varargs = fixture(false, false);
         varargs.methods[1].access_flags = 0x89;
-        assert!(super::super::render_method("sample.Example", &varargs, &varargs.methods[2]).is_err());
+        assert!(
+            super::super::render_method("sample.Example", &varargs, &varargs.methods[2]).is_err()
+        );
         let mut field = fixture(false, false);
         add_int_field(&mut field, 1, false);
-        field.methods[2].code.as_mut().unwrap().instructions[7..11].copy_from_slice(&[0x0160, 0, 0, 0x0027]);
+        field.methods[2].code.as_mut().unwrap().instructions[7..11]
+            .copy_from_slice(&[0x0160, 0, 0, 0x0027]);
         assert!(super::super::render_method("sample.Example", &field, &field.methods[2]).is_err());
     }
 
     #[test]
     fn public_source_alternative_rejects_ambiguous_members_and_wrong_dispatch() {
         let mut ambiguous = fixture(false, false);
-        let mut duplicate = method(&ambiguous.descriptor, "f", 0x11, vec![], 1, 1, 0, vec![0x0012, 0x0027]);
+        let mut duplicate = method(
+            &ambiguous.descriptor,
+            "f",
+            0x11,
+            vec![],
+            1,
+            1,
+            0,
+            vec![0x0012, 0x0027],
+        );
         duplicate.return_type = "Ljava/lang/Object;".into();
         ambiguous.methods.push(duplicate);
-        assert!(super::super::render_method("sample.Example", &ambiguous, &ambiguous.methods[2]).is_err());
+        assert!(
+            super::super::render_method("sample.Example", &ambiguous, &ambiguous.methods[2])
+                .is_err()
+        );
         let mut fields = fixture(false, false);
         add_int_field(&mut fields, 1, false);
-        fields.fields.push(DexField {declaring_type:fields.descriptor.clone(), name:"x".into(),field_type:"J".into(),access_flags:1,is_static:false});
-        fields.methods[2].code.as_mut().unwrap().instructions[7..11].copy_from_slice(&[0x1152,0,0,0x0027]);
-        assert!(super::super::render_method("sample.Example", &fields, &fields.methods[2]).is_err());
+        fields.fields.push(DexField {
+            declaring_type: fields.descriptor.clone(),
+            name: "x".into(),
+            field_type: "J".into(),
+            access_flags: 1,
+            is_static: false,
+        });
+        fields.methods[2].code.as_mut().unwrap().instructions[7..11]
+            .copy_from_slice(&[0x1152, 0, 0, 0x0027]);
+        assert!(
+            super::super::render_method("sample.Example", &fields, &fields.methods[2]).is_err()
+        );
         let mut dispatch = fixture(false, false);
         dispatch.methods[2].code.as_mut().unwrap().instructions[0] = 0x0071;
         dispatch.methods[2].code.as_mut().unwrap().instructions[2] = 0;
-        assert!(super::super::render_method("sample.Example", &dispatch, &dispatch.methods[2]).is_err());
+        assert!(
+            super::super::render_method("sample.Example", &dispatch, &dispatch.methods[2]).is_err()
+        );
     }
 
     #[test]
@@ -1603,9 +1700,17 @@ mod tests {
             let class = fixture(copied, checked);
             let failure = baseline_failure(&class);
             assert!(prove("sample.Example", &class, &class.methods[2], &failure).is_err());
-            let source = super::super::render_method("sample.Example", &class, &class.methods[2]).unwrap().source;
+            let source = super::super::render_method("sample.Example", &class, &class.methods[2])
+                .unwrap()
+                .source;
             assert!(source.contains("throw _rdx_caught_throw_"), "{source}");
-            assert!(!source.lines().find(|line| line.contains(" root(")).unwrap().contains("throws"));
+            assert!(
+                !source
+                    .lines()
+                    .find(|line| line.contains(" root("))
+                    .unwrap()
+                    .contains("throws")
+            );
         }
     }
 

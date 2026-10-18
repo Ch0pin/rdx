@@ -324,7 +324,9 @@ fn linked_name(display: &str, raw: &str) -> bool {
         return false;
     }
     hex.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .zip(raw.bytes())
         .all(|(pair, byte)| {
             let digit = |v: u8| match v {

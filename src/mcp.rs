@@ -321,14 +321,22 @@ impl Server {
                             "PROJECT_CHANGED"
                         );
                         validate(name, args)?;
-                        ensure!(
-                            slots
-                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
-                                    (active < 8).then_some(active + 1)
-                                })
-                                .is_ok(),
-                            "INSTANCE_BUSY: 8 active operations; retry the query"
-                        );
+                        let mut active = slots.load(Ordering::Relaxed);
+                        loop {
+                            ensure!(
+                                active < 8,
+                                "INSTANCE_BUSY: 8 active operations; retry the query"
+                            );
+                            match slots.compare_exchange_weak(
+                                active,
+                                active + 1,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => break,
+                                Err(current) => active = current,
+                            }
+                        }
                         {
                             let mut s = status.lock().unwrap();
                             s.active_requests += 1;

@@ -5084,7 +5084,7 @@ fn null_writing_object_constructor(class: &DexClass) -> bool {
             return None;
         }
         let mut written = HashSet::new();
-        for store in words[4..words.len() - 1].chunks_exact(2) {
+        for store in words[4..words.len() - 1].as_chunks::<2>().0 {
             if store[0] != 0x105b {
                 return None;
             }

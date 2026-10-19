@@ -8,11 +8,11 @@ use std::{
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 const INSTANCE: &str = "stdio-index-fixture";
@@ -23,6 +23,22 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 // Measure responsiveness only after that startup work has finished.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 
+fn fixture_home() -> PathBuf {
+    static NEXT_HOME: AtomicUsize = AtomicUsize::new(0);
+    loop {
+        let sequence = NEXT_HOME.fetch_add(1, Ordering::Relaxed);
+        let home =
+            std::env::temp_dir().join(format!("rdx-stdio-index-{}-{sequence}", std::process::id()));
+        // Reserve the directory atomically. Concurrent tests must never share
+        // registrations, and stale directories from a reused PID stay intact.
+        match fs::create_dir(&home) {
+            Ok(()) => return home,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("reserve fixture directory {}: {error}", home.display()),
+        }
+    }
+}
+
 struct Gui {
     home: PathBuf,
     stop: Arc<AtomicBool>,
@@ -31,12 +47,7 @@ struct Gui {
 }
 impl Gui {
     fn start() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let home =
-            std::env::temp_dir().join(format!("rdx-stdio-index-{}-{nonce}", std::process::id()));
+        let home = fixture_home();
         let registry = home.join(".rdx/mcp");
         fs::create_dir_all(&registry).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -261,6 +272,32 @@ impl Drop for Gateway {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
+    }
+}
+
+#[test]
+fn fixture_homes_are_isolated_under_concurrent_allocation() {
+    let barrier = Arc::new(std::sync::Barrier::new(16));
+    let workers: Vec<_> = (0..16)
+        .map(|index| {
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                let home = fixture_home();
+                fs::write(home.join("owner"), index.to_string()).unwrap();
+                (home, index)
+            })
+        })
+        .collect();
+    let homes: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+    let distinct: std::collections::HashSet<_> = homes.iter().map(|(home, _)| home).collect();
+    assert_eq!(distinct.len(), homes.len());
+    for (home, index) in homes {
+        assert_eq!(
+            fs::read_to_string(home.join("owner")).unwrap(),
+            index.to_string()
+        );
+        fs::remove_dir_all(home).unwrap();
     }
 }
 

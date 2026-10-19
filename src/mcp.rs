@@ -471,6 +471,7 @@ fn project_request(
         "get_android_manifest"
             | "get_resource_file"
             | "get_manifest_summary"
+            | "get_manifest_components"
             | "find_string_references"
     ) {
         check_project_file(project)?;
@@ -490,7 +491,24 @@ fn project_request(
             }
         }
     };
-    if name == "get_manifest_summary" {
+    if name == "get_manifest_components" {
+        let xml = engine
+            .read_resource_with_metadata("AndroidManifest.xml")?
+            .source;
+        let records =
+            crate::manifest_summary::query_components(&xml, args).map_err(anyhow::Error::msg)?;
+        ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+        check_project_file(project)?;
+        let hash = crate::engine::source_identity(&serde_json::to_string(&records)?);
+        let mut result = page(records, args)?;
+        result["format"] = json!("records");
+        result["source_hash"] = json!(hash);
+        result["offset_unit"] = json!("matching component records");
+        result["analysis"] = json!(
+            "Decoded manifest declarations; exported state and intent filters describe configuration, not runtime authorization or callback reachability."
+        );
+        Ok(result)
+    } else if name == "get_manifest_summary" {
         let xml = engine
             .read_resource_with_metadata("AndroidManifest.xml")?
             .source;
@@ -863,6 +881,10 @@ fn dispatch_resolved(
     }
     match name {
         "get_call_graph" => {
+            if ["direct_only", "projection", "package_prefix", "class_name", "annotation", "component_type", "offset", "limit"]
+                .iter().any(|key| args.get(key).is_some()) {
+                return engine.call_graph_query_by_id(required(args, "method_id")?, args, cancel);
+            }
             let direction = args["direction"].as_str().unwrap_or("callees");
             let depth = args["depth"].as_u64().unwrap_or(20) as usize;
             let graph = engine.call_graph_by_id(required(args,"method_id")?, depth, direction, cancel)?;
@@ -1026,7 +1048,7 @@ fn tools_list() -> Value {
         ),
         (
             "get_call_graph",
-            "Build a static method call graph with component-path highlights. Direction: callers, callees (default), or both. Depth defaults to 20; capped at 5000 nodes/20000 edges. Returns full graph, not paginated.",
+            "Query static DEX calls. Direction: callers, callees (default), or both. direct_only selects depth 1. projection=call_sites returns paginated exact caller IDs/signatures and DEX code-unit offsets without graph payload or graph-size caps (limit <=500). Optional package_prefix, exact class_name, class/method annotation and component_type filters select neighboring declarations after traversal. Default graph has component-path highlights and a 5000-node/20000-edge cap.",
             vec!["method_id"],
             true,
         ),
@@ -1051,6 +1073,12 @@ fn tools_list() -> Value {
         (
             "get_manifest_summary",
             "Read manifest Markdown (character offsets), or format=records for structured components and permissions (record offsets, limit <=500). Any filter selects records. component and permission are literal substrings; component_type is exact. host/scheme are exact declarations, path is a substring of declared path attributes. Route filters must match the same intent-filter. query is a case-insensitive substring. Declarations do not prove runtime reachability.",
+            vec![],
+            true,
+        ),
+        (
+            "get_manifest_components",
+            "Look up components in the decoded manifest. class_name uses match_mode=contains (default) or exact (relative/simple names normalized against manifest package). Includes matching aliases, declared/effective exported state and permissions, and original intent filters. component_type is exact; permission is a substring; query is case-insensitive. host/scheme are exact declarations and path is a declared-attribute substring, within one intent-filter. Paginated matching records, limit <=500.",
             vec![],
             true,
         ),
@@ -1131,7 +1159,7 @@ fn tools_list() -> Value {
         if scoped{required.extend(["instance_id","project_id"])}
         let mut properties=serde_json::Map::new();
         for key in &required{properties.insert((*key).into(),json!({"type":"string","minLength":1}));}
-        if (scoped && name!="get_call_graph")||["list_instances","get_health"].contains(&name){
+        if scoped||["list_instances","get_health"].contains(&name){
             properties.insert("offset".into(),json!({"type":"integer","minimum":0}));
             properties.insert("limit".into(),json!({"type":"integer","minimum":1,"maximum":if ["get_method_source","get_class_source","get_class_disassembly","get_android_manifest","get_resource_file","get_manifest_summary"].contains(&name){128000}else{500}}));
         }
@@ -1144,6 +1172,11 @@ fn tools_list() -> Value {
             properties.insert("component_type".into(),json!({"type":"string","enum":["activity","activity-alias","service","receiver","provider"]}));
             properties.insert("format".into(),json!({"type":"string","enum":["markdown","records"]}));
         }
+        if name=="get_manifest_components" {
+            for key in ["class_name", "host", "scheme", "path", "permission", "query"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
+            properties.insert("match_mode".into(),json!({"type":"string","enum":["exact","contains"],"default":"contains"}));
+            properties.insert("component_type".into(),json!({"type":"string","enum":["activity","activity-alias","service","receiver","provider"]}));
+        }
         if name=="find_string_references" {
             properties.insert("match_mode".into(),json!({"type":"string","enum":["exact","contains"],"default":"contains"}));
             properties.insert("package_prefix".into(),json!({"type":"string"}));
@@ -1153,6 +1186,10 @@ fn tools_list() -> Value {
             properties.insert("source_offset".into(),json!({"type":"integer","minimum":0}));
         }
         if name=="get_call_graph" {
+            properties.insert("direct_only".into(),json!({"type":"boolean","default":false}));
+            properties.insert("projection".into(),json!({"type":"string","enum":["graph","call_sites"],"default":"graph"}));
+            for key in ["package_prefix", "class_name", "annotation"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
+            properties.insert("component_type".into(),json!({"type":"string","enum":["activity","service","receiver","provider"]}));
             properties.insert("depth".into(),json!({"type":"integer","minimum":1,"maximum":100,"default":20}));
             properties.insert("direction".into(),json!({"type":"string","enum":["callers","callees","both"],"default":"callees"}));
         }
@@ -1187,6 +1224,8 @@ fn validate(name: &str, args: &Value) -> Result<()> {
                     "{key} must not be empty"
                 );
             }
+        } else if property["type"] == "boolean" {
+            ensure!(value.is_boolean(), "{key} must be a boolean");
         } else {
             let number = value.as_u64().context("Expected a nonnegative integer")?;
             ensure!(
@@ -1200,6 +1239,17 @@ fn validate(name: &str, args: &Value) -> Result<()> {
         ensure!(
             args["limit"].as_u64().unwrap_or(100) <= 500,
             "Filtered manifest record limit must be <=500"
+        );
+    }
+    if name == "get_call_graph" {
+        ensure!(
+            args["direct_only"] != true || args["depth"].as_u64().unwrap_or(1) == 1,
+            "direct_only requires depth=1 when depth is supplied"
+        );
+        ensure!(
+            args["projection"] == "call_sites"
+                || (args.get("offset").is_none() && args.get("limit").is_none()),
+            "offset and limit require projection=call_sites"
         );
     }
     Ok(())
@@ -1556,6 +1606,250 @@ mod tests {
             drop(server);
         }
     }
+    #[test]
+    fn projected_call_sites_roundtrip_with_identity_and_filters() {
+        let dir = TestDir::new();
+        let (_server, record, mut args) = start(&dir, "navigation.apk");
+        args["method_id"] = json!("sample.Target.doubleValue(I)I");
+        args["direction"] = json!("callers");
+        args["direct_only"] = json!(true);
+        args["projection"] = json!("call_sites");
+        args["limit"] = json!(1);
+        validate("get_call_graph", &args).unwrap();
+        let first = remote(&record, "get_call_graph", &args).unwrap();
+        assert_eq!(first["identity"]["project_id"], args["project_id"]);
+        assert!(first["identity"]["apk_sha256"].as_str().is_some());
+        let data = &first["data"];
+        assert!(data.get("nodes").is_none());
+        assert_eq!(data["depth"], 1);
+        assert_eq!(data["truncated"], false);
+        assert!(data["matching_total"].as_u64().unwrap() > 0);
+        let site = &data["call_sites"][0];
+        assert!(
+            site["caller_method_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("sample.Caller.compute(")
+        );
+        assert_eq!(site["caller_signature"], site["caller_method_id"]);
+        assert!(site["call_site_offset"].as_u64().is_some());
+        let mut engine = NativeEngine::start().unwrap();
+        engine.open(&fixture("navigation.apk")).unwrap();
+        let class = engine.dex_class("sample.Caller").unwrap();
+        let sites = crate::native_xrefs::call_sites(class, None, &AtomicBool::new(false)).unwrap();
+        assert!(
+            sites
+                .iter()
+                .any(|call| site["caller_method_id"] == call.caller
+                    && site["callee_method_id"] == call.callee
+                    && site["call_site_offset"] == call.pc)
+        );
+        args["offset"] = data["matching_total"].clone();
+        let end = remote(&record, "get_call_graph", &args).unwrap();
+        assert_eq!(end["data"]["source_hash"], data["source_hash"]);
+        assert_eq!(end["data"]["call_sites"], json!([]));
+        assert!(end["data"]["next_offset"].is_null());
+        args["offset"] = json!(0);
+        args["class_name"] = json!("sample.Unrelated");
+        let empty = remote(&record, "get_call_graph", &args).unwrap();
+        assert_eq!(empty["data"]["matching_total"], 0);
+        for (key, value) in [
+            ("direct_only", json!("true")),
+            ("direct_only", Value::Null),
+            ("depth", json!(2)),
+            ("limit", json!(501)),
+            ("annotation", json!([])),
+        ] {
+            let mut invalid = args.clone();
+            invalid[key] = value;
+            assert!(validate("get_call_graph", &invalid).is_err(), "{invalid}");
+        }
+        args["projection"] = json!("graph");
+        assert!(validate("get_call_graph", &args).is_err());
+    }
+
+    // A compiled XML fixture verifies the endpoint decodes the archive itself.
+    fn component_manifest_binary() -> Vec<u8> {
+        fn words(values: &[u32]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+        fn chunk(kind: u16, header: u16, body: &[u8]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            bytes.extend(kind.to_le_bytes());
+            bytes.extend(header.to_le_bytes());
+            bytes.extend(((body.len() + 8) as u32).to_le_bytes());
+            bytes.extend(body);
+            bytes
+        }
+        fn start(tag: u32, attrs: &[[u32; 5]]) -> Vec<u8> {
+            let mut bytes = words(&[1, u32::MAX, u32::MAX, tag]);
+            for value in [20u16, 20, attrs.len() as u16, 0, 0, 0] {
+                bytes.extend(value.to_le_bytes());
+            }
+            for attr in attrs {
+                bytes.extend(words(attr));
+            }
+            chunk(0x102, 16, &bytes)
+        }
+        fn end(tag: u32) -> Vec<u8> {
+            chunk(0x103, 16, &words(&[1, u32::MAX, u32::MAX, tag]))
+        }
+        let strings = [
+            "android",
+            "http://schemas.android.com/apk/res/android",
+            "manifest",
+            "package",
+            "sample",
+            "application",
+            "activity",
+            "name",
+            ".Entry",
+            "exported",
+            "permission",
+            "sample.ACCESS",
+            "activity-alias",
+            ".Link",
+            "targetActivity",
+            "intent-filter",
+            "data",
+            "scheme",
+            "https",
+            "host",
+            "example.com",
+            "pathPrefix",
+            "/open",
+        ];
+        let mut offsets = Vec::new();
+        let mut data = Vec::new();
+        for value in strings {
+            offsets.extend((data.len() as u32).to_le_bytes());
+            data.extend([value.len() as u8, value.len() as u8]);
+            data.extend(value.bytes());
+            data.push(0);
+        }
+        let mut pool = words(&[
+            strings.len() as u32,
+            0,
+            256,
+            28 + 4 * strings.len() as u32,
+            0,
+        ]);
+        pool.extend(offsets);
+        pool.extend(data);
+        let mut chunks = chunk(1, 28, &pool);
+        chunks.extend(chunk(0x100, 16, &words(&[1, u32::MAX, 0, 1])));
+        chunks.extend(start(2, &[[u32::MAX, 3, 4, 0x03000008, 4]]));
+        chunks.extend(start(5, &[[1, 10, 11, 0x03000008, 11]]));
+        chunks.extend(start(
+            6,
+            &[[1, 7, 8, 0x03000008, 8], [1, 9, u32::MAX, 0x12000008, 0]],
+        ));
+        chunks.extend(end(6));
+        chunks.extend(start(
+            12,
+            &[
+                [1, 7, 13, 0x03000008, 13],
+                [1, 14, 8, 0x03000008, 8],
+                [1, 9, u32::MAX, 0x12000008, 1],
+            ],
+        ));
+        chunks.extend(start(15, &[]));
+        chunks.extend(start(
+            16,
+            &[
+                [1, 17, 18, 0x03000008, 18],
+                [1, 19, 20, 0x03000008, 20],
+                [1, 21, 22, 0x03000008, 22],
+            ],
+        ));
+        for tag in [16, 15, 12, 5, 2] {
+            chunks.extend(end(tag));
+        }
+        chunks.extend(chunk(0x101, 16, &words(&[1, u32::MAX, 0, 1])));
+        chunk(3, 8, &chunks)
+    }
+
+    #[test]
+    fn decoded_component_lookup_roundtrip_pages_aliases_and_routes() {
+        use std::io::Write;
+        let dir = TestDir::new();
+        let path = dir.0.join("components.apk");
+        let mut archive = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        archive
+            .start_file(
+                "AndroidManifest.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(&component_manifest_binary()).unwrap();
+        archive
+            .start_file("classes.dex", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive
+            .write_all(include_bytes!("../tests/fixtures/hello.dex"))
+            .unwrap();
+        archive.finish().unwrap();
+        let (_server, record, mut args) = start_path(&dir, path);
+        args["class_name"] = json!(".Entry");
+        args["match_mode"] = json!("exact");
+        args["limit"] = json!(1);
+        validate("get_manifest_components", &args).unwrap();
+        let first = remote(&record, "get_manifest_components", &args).unwrap();
+        assert_eq!(first["identity"]["project_id"], args["project_id"]);
+        assert_eq!(first["data"]["total"], 2);
+        assert_eq!(first["data"]["next_offset"], 1);
+        assert_eq!(first["data"]["items"][0]["name"], "sample.Entry");
+        assert_eq!(
+            first["data"]["items"][0]["exported_state"]["effective"],
+            false
+        );
+        assert_eq!(
+            first["data"]["items"][0]["aliases"][0]["name"],
+            "sample.Link"
+        );
+        args["offset"] = json!(1);
+        let second = remote(&record, "get_manifest_components", &args).unwrap();
+        assert_eq!(second["identity"], first["identity"]);
+        assert_eq!(second["data"]["source_hash"], first["data"]["source_hash"]);
+        assert!(second["data"]["next_offset"].is_null());
+        assert_eq!(
+            second["data"]["items"][0]["permission"]["effective"],
+            "sample.ACCESS"
+        );
+        assert_eq!(
+            second["data"]["items"][0]["permission"]["source"],
+            "target_activity"
+        );
+        args["offset"] = json!(0);
+        args["host"] = json!("example.com");
+        args["scheme"] = json!("https");
+        args["path"] = json!("/open");
+        let route = remote(&record, "get_manifest_components", &args).unwrap();
+        assert_eq!(route["data"]["total"], 1);
+        assert_eq!(route["data"]["items"][0]["name"], "sample.Link");
+        assert_eq!(
+            route["data"]["items"][0]["matching_filter_indexes"],
+            json!([0])
+        );
+        assert_eq!(
+            route["data"]["items"][0]["exported_state"]["effective"],
+            true
+        );
+        for (key, value) in [
+            ("class_name", Value::Null),
+            ("match_mode", json!("regex")),
+            ("limit", json!(501)),
+            ("component_type", json!("application")),
+        ] {
+            let mut invalid = args.clone();
+            invalid[key] = value;
+            assert!(
+                validate("get_manifest_components", &invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
     #[test]
     fn call_graph_tool_roundtrip() {
         let dir = TestDir::new();

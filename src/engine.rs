@@ -668,6 +668,16 @@ impl NativeEngine {
         crate::call_graph::build_direction(&self.native, method, depth, direction, cancel)
     }
 
+    /// Query DEX call sites and filtered graphs without Java reconstruction.
+    pub fn call_graph_query_by_id(
+        &self,
+        method: &str,
+        args: &serde_json::Value,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<serde_json::Value> {
+        crate::call_graph::query(&self.native, method, args, cancel)
+    }
+
     pub fn call_graph_at(
         &mut self,
         class: &str,

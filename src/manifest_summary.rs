@@ -33,6 +33,9 @@ fn parse(xml: &str) -> Result<Vec<Node>, String> {
     loop {
         match reader.read_event().map_err(|e| e.to_string())? {
             event @ (Event::Start(_) | Event::Empty(_)) => {
+                if stack.is_empty() && !nodes.is_empty() {
+                    return Err("Invalid manifest structure: multiple root elements".into());
+                }
                 let empty = matches!(event, Event::Empty(_));
                 let element = match event {
                     Event::Start(e) | Event::Empty(e) => e,
@@ -77,6 +80,12 @@ fn parse(xml: &str) -> Result<Vec<Node>, String> {
             }
             Event::DocType(_) | Event::GeneralRef(_) => {
                 return Err("DTD/entity declarations are unsupported".into());
+            }
+            Event::Text(text)
+                if stack.is_empty()
+                    && !text.as_ref().as_bytes().iter().all(u8::is_ascii_whitespace) =>
+            {
+                return Err("Invalid manifest structure: text outside root element".into());
             }
             Event::Eof => break,
             _ => {}
@@ -303,8 +312,23 @@ impl ManifestComponent {
 /// Structured declarations; unresolved resource flags stay explicitly unknown.
 pub fn components(xml: &str) -> Result<Vec<ManifestComponent>, String> {
     let nodes = parse(xml)?;
+    let children_of = children_index(&nodes);
+    Ok(components_from_nodes(&nodes, &children_of))
+}
+
+fn children_index(nodes: &[Node]) -> Vec<Vec<usize>> {
+    let mut children_of = vec![Vec::new(); nodes.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        if let Some(parent) = node.parent {
+            children_of[parent].push(index);
+        }
+    }
+    children_of
+}
+
+fn components_from_nodes(nodes: &[Node], children_of: &[Vec<usize>]) -> Vec<ManifestComponent> {
     let package = nodes[0].get("raw:package").unwrap_or_default();
-    let sdk = child(&nodes, 0, "uses-sdk");
+    let sdk = child(nodes, 0, "uses-sdk");
     let target = sdk
         .and_then(|n| n.get("targetSdkVersion"))
         .or_else(|| sdk.and_then(|n| n.get("minSdkVersion")))
@@ -315,7 +339,7 @@ pub fn components(xml: &str) -> Result<Vec<ManifestComponent>, String> {
         .iter()
         .position(|n| n.parent == Some(0) && n.tag == "application")
     else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let app = &nodes[app_index];
     let mut result = Vec::new();
@@ -329,14 +353,15 @@ pub fn components(xml: &str) -> Result<Vec<ManifestComponent>, String> {
         let name = class_name(package, node.get("name").unwrap_or("Not declared"));
         let mut launcher = false;
         let mut filters = Vec::new();
-        for (filter_index, filter) in nodes
+        for filter_index in children_of[index]
             .iter()
-            .enumerate()
-            .filter(|(_, n)| n.parent == Some(index) && n.tag == "intent-filter")
+            .copied()
+            .filter(|i| nodes[*i].tag == "intent-filter")
         {
-            let children: Vec<_> = nodes
+            let filter = &nodes[filter_index];
+            let children: Vec<_> = children_of[filter_index]
                 .iter()
-                .filter(|n| n.parent == Some(filter_index))
+                .map(|i| &nodes[*i])
                 .collect();
             if matches!(node.tag.as_str(), "activity" | "activity-alias") {
                 launcher |= children.iter().any(|n| {
@@ -411,6 +436,256 @@ pub fn components(xml: &str) -> Result<Vec<ManifestComponent>, String> {
             filters,
             details,
         });
+    }
+    result
+}
+
+fn permission_state(
+    declared: Option<&str>,
+    inherited: Option<&str>,
+    source: &str,
+) -> serde_json::Value {
+    use serde_json::json;
+    let effective = declared.or(inherited);
+    let resolved = effective.is_none_or(|value| !value.starts_with(['@', '?']));
+    json!({
+        "declared": declared,
+        "effective": effective.filter(|value| !value.is_empty() && resolved),
+        "source": source,
+        "resolved": resolved,
+        "unresolved_value": effective.filter(|_| !resolved),
+    })
+}
+
+fn component_permission(node: &Node, app: &Node) -> serde_json::Value {
+    let source = if node.get("permission").is_some() {
+        "component"
+    } else if app.get("permission").is_some() {
+        "application"
+    } else {
+        "none"
+    };
+    permission_state(node.get("permission"), app.get("permission"), source)
+}
+
+/// Look up decoded-manifest component declarations. `class_name` contains matches
+/// are literal and case-sensitive; exact matches expand relative and unqualified
+/// names using the manifest package. Aliases also match their target activity.
+/// Route predicates select declarations within one intent-filter; they do not
+/// simulate Android URI matching or combine an activity's routes with its aliases.
+pub fn query_components(
+    xml: &str,
+    args: &serde_json::Value,
+) -> Result<Vec<serde_json::Value>, String> {
+    use serde_json::json;
+    let mode = args["match_mode"].as_str().unwrap_or("contains");
+    if !matches!(mode, "exact" | "contains") {
+        return Err("match_mode must be exact or contains".into());
+    }
+    let nodes = parse(xml)?;
+    let children_of = children_index(&nodes);
+    let declarations = components_from_nodes(&nodes, &children_of);
+    let package = nodes[0].get("raw:package").unwrap_or_default();
+    let Some(app_index) = children_of[0]
+        .iter()
+        .copied()
+        .find(|i| nodes[*i].tag == "application")
+    else {
+        return Ok(Vec::new());
+    };
+    let app = &nodes[app_index];
+    let component_indexes: Vec<_> = children_of[app_index]
+        .iter()
+        .copied()
+        .filter(|i| {
+            matches!(
+                nodes[*i].tag.as_str(),
+                "activity" | "activity-alias" | "service" | "receiver" | "provider"
+            )
+        })
+        .collect();
+    let mut activities: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut aliases: std::collections::HashMap<&str, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+    for (position, component) in declarations.iter().enumerate() {
+        if component.kind == "activity" {
+            activities
+                .entry(&component.name)
+                .or_default()
+                .push(position);
+        } else if component.kind == "activity-alias" {
+            aliases
+                .entry(&component.target)
+                .or_default()
+                .push(json!({"name":component.name,"target":component.target}));
+        }
+    }
+    let class_query = args["class_name"].as_str().map(|name| {
+        if mode == "exact" {
+            class_name(package, name)
+        } else {
+            name.to_owned()
+        }
+    });
+    let matches_class = |name: &str| {
+        class_query.as_ref().is_none_or(|q| {
+            if mode == "exact" {
+                name == q
+            } else {
+                name.contains(q)
+            }
+        })
+    };
+    let has_routes = ["host", "scheme", "path"]
+        .iter()
+        .any(|key| args[*key].as_str().is_some());
+    let query_lower = args["query"].as_str().map(str::to_lowercase);
+    let mut result = Vec::new();
+    for (component, index) in declarations.iter().zip(component_indexes.iter().copied()) {
+        let node = &nodes[index];
+        if args["component_type"]
+            .as_str()
+            .is_some_and(|kind| kind != component.kind)
+            || args["component"]
+                .as_str()
+                .is_some_and(|q| !component.name.contains(q))
+            || !(matches_class(&component.name)
+                || (component.kind == "activity-alias" && matches_class(&component.target)))
+        {
+            continue;
+        }
+        let permission = if component.kind == "activity-alias" && node.get("permission").is_none() {
+            if let Some(targets) = activities
+                .get(component.target.as_str())
+                .filter(|targets| targets.len() == 1)
+            {
+                let target = &nodes[component_indexes[targets[0]]];
+                let mut inherited = component_permission(target, app);
+                inherited["declared"] = serde_json::Value::Null;
+                inherited["inherited_source"] = inherited["source"].clone();
+                inherited["source"] = json!("target_activity");
+                inherited["inherited_from"] = json!(component.target);
+                inherited
+            } else {
+                json!({"declared":null,"effective":null,"source":"unresolved_target_activity","resolved":false})
+            }
+        } else {
+            component_permission(node, app)
+        };
+        let provider_permission = |key: &str| {
+            let source = if node.get(key).is_some() {
+                "component"
+            } else if node.get("permission").is_some() {
+                "component_permission"
+            } else if app.get("permission").is_some() {
+                "application"
+            } else {
+                "none"
+            };
+            permission_state(
+                node.get(key),
+                node.get("permission").or_else(|| app.get("permission")),
+                source,
+            )
+        };
+        let read_permission =
+            (component.kind == "provider").then(|| provider_permission("readPermission"));
+        let write_permission =
+            (component.kind == "provider").then(|| provider_permission("writePermission"));
+        if args["permission"].as_str().is_some_and(|q| {
+            ![
+                Some(&permission),
+                read_permission.as_ref(),
+                write_permission.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|state| {
+                ["declared", "effective", "unresolved_value"]
+                    .iter()
+                    .any(|key| state[*key].as_str().is_some_and(|value| value.contains(q)))
+            })
+        }) {
+            continue;
+        }
+        let mut filters = Vec::new();
+        let mut matching_filter_indexes = Vec::new();
+        for fi in children_of[index]
+            .iter()
+            .copied()
+            .filter(|i| nodes[*i].tag == "intent-filter")
+        {
+            let groups: Vec<_> = children_of[fi]
+                .iter()
+                .copied()
+                .filter(|i| nodes[*i].tag == "uri-relative-filter-group")
+                .collect();
+            let data: Vec<_> = children_of[fi]
+                .iter()
+                .copied()
+                .chain(groups.iter().flat_map(|i| children_of[*i].iter().copied()))
+                .map(|i| &nodes[i])
+                .filter(|n| n.tag == "data")
+                .collect();
+            let matches = ["host", "scheme", "path"].iter().all(|key| {
+                args[*key].as_str().is_none_or(|q| {
+                    data.iter().any(|data| {
+                        if *key == "path" {
+                            data.attrs
+                                .iter()
+                                .any(|(key, value)| key.starts_with("path") && value.contains(q))
+                        } else {
+                            data.get(key) == Some(q)
+                        }
+                    })
+                })
+            });
+            if matches {
+                matching_filter_indexes.push(filters.len());
+            }
+            let elements: Vec<_> = children_of[fi].iter().map(|ci| {
+                let child = &nodes[*ci];
+                json!({"tag":child.tag,"attributes":child.attrs,"children":children_of[*ci].iter().map(|i| {
+                    let nested = &nodes[*i]; json!({"tag":nested.tag,"attributes":nested.attrs})
+                }).collect::<Vec<_>>()})
+            }).collect();
+            filters.push(json!({"attributes":nodes[fi].attrs,"elements":elements}));
+        }
+        if has_routes && matching_filter_indexes.is_empty() {
+            continue;
+        }
+        let effective_exported = match node.get("exported") {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            Some(_) => None,
+            None if component.exported.starts_with("true") => Some(true),
+            None if component.exported.starts_with("false") => Some(false),
+            None => None,
+        };
+        let reason = match node.get("exported") {
+            Some("true" | "false") => "explicit",
+            Some(_) => "unresolved_declaration",
+            None if component.exported.contains("missing exported") => {
+                "missing_exported_target_sdk_31_plus"
+            }
+            None if component.exported.starts_with("Unresolved") => "unresolved_target_sdk",
+            None if component.kind == "provider" => "target_sdk_default",
+            None => "intent_filter_default",
+        };
+        let record = json!({"record_type":"component","component_type":component.kind,"name":component.name,
+            "target":component.target,"exported":component.exported,
+            "exported_state":{"declared":node.get("exported"),"effective":effective_exported,"reason":reason},
+            "enabled":component.enabled,"launcher":component.launcher,"permission":permission,
+            "read_permission":read_permission,"write_permission":write_permission,
+            "aliases":aliases.get(component.name.as_str()).filter(|_| component.kind == "activity").cloned().unwrap_or_default(),
+            "details":component.details,"intent_filters":filters,"matching_filter_indexes":matching_filter_indexes});
+        if query_lower
+            .as_ref()
+            .is_none_or(|query| record.to_string().to_lowercase().contains(query))
+        {
+            result.push(record);
+        }
     }
     Ok(result)
 }
@@ -959,5 +1234,162 @@ mod component_table_tests {
         assert_eq!(row.enabled, "unresolved");
         assert!(row.exported.contains("missing exported"));
         assert!(components("<manifest><application>").is_err());
+    }
+}
+
+#[cfg(test)]
+mod component_lookup_tests {
+    use super::*;
+    use serde_json::json;
+
+    const XML: &str = r#"<manifest xmlns:a="http://schemas.android.com/apk/res/android" package="demo.app"><uses-sdk a:targetSdkVersion="30"/><application a:permission="demo.APP"><activity a:name=".Main" a:permission="demo.MAIN" a:exported="false"><intent-filter><data a:scheme="https" a:host="main.test"/></intent-filter></activity><activity-alias a:name="Alias" a:targetActivity=".Main" a:exported="true"><intent-filter><data a:scheme="demo" a:host="alias.test"/></intent-filter></activity-alias><activity a:name="MainOther"/><service a:name=".Worker"/><provider a:name=".Provider" a:readPermission="demo.READ"/></application></manifest>"#;
+
+    #[test]
+    fn exact_names_normalize_and_include_target_aliases() {
+        for name in ["demo.app.Main", ".Main", "Main"] {
+            let records =
+                query_components(XML, &json!({"class_name":name,"match_mode":"exact"})).unwrap();
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0]["name"], "demo.app.Main");
+            assert_eq!(
+                records[0]["aliases"],
+                json!([{"name":"demo.app.Alias","target":"demo.app.Main"}])
+            );
+            assert_eq!(records[0]["exported_state"]["effective"], false);
+            assert_eq!(records[1]["name"], "demo.app.Alias");
+            assert_eq!(records[1]["exported_state"]["effective"], true);
+            assert_eq!(records[1]["permission"]["effective"], "demo.MAIN");
+            assert_eq!(records[1]["permission"]["source"], "target_activity");
+        }
+        let alias =
+            query_components(XML, &json!({"class_name":"Alias","match_mode":"exact"})).unwrap();
+        assert_eq!(alias.len(), 1);
+        assert_eq!(
+            alias[0]["intent_filters"][0]["elements"][0]["attributes"],
+            json!([["scheme", "demo"], ["host", "alias.test"]])
+        );
+        assert_eq!(
+            query_components(XML, &json!({"class_name":"Main"}))
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(
+            query_components(XML, &json!({"class_name":"main"}))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(query_components(XML, &json!({"match_mode":"regex"})).is_err());
+    }
+
+    #[test]
+    fn permissions_preserve_inheritance_clearing_and_unknown_targets() {
+        let xml = r#"<manifest xmlns:a="http://schemas.android.com/apk/res/android" package="demo"><application a:permission="demo.APP"><activity a:name=".Inherited"/><activity a:name=".Cleared" a:permission=""/><activity a:name=".Resource" a:permission="@string/permission"/><activity-alias a:name=".Inherit" a:targetActivity=".Inherited"/><activity-alias a:name=".Clear" a:targetActivity=".Inherited" a:permission=""/><activity-alias a:name=".TargetCleared" a:targetActivity=".Cleared"/><activity-alias a:name=".Missing" a:targetActivity=".Absent"/><activity-alias a:name=".NoTarget"/><provider a:name=".Provider" a:permission="" a:readPermission="demo.READ"/><service a:name=".Worker"/></application></manifest>"#;
+        let rows = query_components(xml, &json!({})).unwrap();
+        assert_eq!(rows[0]["permission"]["source"], "application");
+        assert_eq!(rows[0]["permission"]["effective"], "demo.APP");
+        for position in [1, 4, 5] {
+            assert!(rows[position]["permission"]["effective"].is_null());
+            assert_eq!(rows[position]["permission"]["resolved"], true);
+        }
+        assert_eq!(rows[4]["permission"]["declared"], "");
+        assert_eq!(rows[2]["permission"]["declared"], "@string/permission");
+        assert!(rows[2]["permission"]["effective"].is_null());
+        assert_eq!(rows[2]["permission"]["resolved"], false);
+        assert_eq!(rows[3]["permission"]["effective"], "demo.APP");
+        for position in [6, 7] {
+            assert_eq!(
+                rows[position]["permission"]["source"],
+                "unresolved_target_activity"
+            );
+            assert_eq!(rows[position]["permission"]["resolved"], false);
+        }
+        assert_eq!(rows[8]["read_permission"]["effective"], "demo.READ");
+        assert!(rows[8]["write_permission"]["effective"].is_null());
+        assert_eq!(
+            rows[8]["write_permission"]["source"],
+            "component_permission"
+        );
+        assert_eq!(rows[9]["permission"]["effective"], "demo.APP");
+        let inherited = query_components(
+            xml,
+            &json!({"component_type":"activity-alias","permission":"demo.APP"}),
+        )
+        .unwrap();
+        assert_eq!(inherited.len(), 1);
+        let provider = query_components(XML, &json!({"component_type":"provider"})).unwrap();
+        assert_eq!(provider[0]["read_permission"]["effective"], "demo.READ");
+        assert_eq!(provider[0]["write_permission"]["effective"], "demo.APP");
+    }
+
+    #[test]
+    fn exported_unknown_is_machine_readable_and_namespaces_are_respected() {
+        let xml = r#"<manifest xmlns:a="http://schemas.android.com/apk/res/android" xmlns:fake="urn:fake" package="demo"><uses-sdk a:targetSdkVersion="31"/><application><activity a:name=".Missing"><intent-filter/></activity><receiver a:name=".Resource" a:exported="@bool/exported"/><service a:name=".Namespaced" fake:exported="true" exported="true"/><provider a:name=".Provider"/><fake:activity a:name=".Fake"/></application></manifest>"#;
+        let rows = query_components(xml, &json!({})).unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(rows[0]["exported_state"]["effective"].is_null());
+        assert_eq!(
+            rows[0]["exported_state"]["reason"],
+            "missing_exported_target_sdk_31_plus"
+        );
+        assert!(rows[1]["exported_state"]["effective"].is_null());
+        assert_eq!(rows[1]["exported_state"]["declared"], "@bool/exported");
+        assert_eq!(rows[2]["exported_state"]["effective"], false);
+        assert_eq!(rows[3]["exported_state"]["effective"], false);
+        for malformed in [
+            "<manifest><application>",
+            "<manifest/><manifest/>",
+            "outside<manifest/>",
+            "<manifest><application></manifest>",
+        ] {
+            assert!(
+                query_components(malformed, &json!({})).is_err(),
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn routes_stay_in_one_filter_and_alias_routes_are_independent() {
+        let xml = r#"<manifest xmlns:a="http://schemas.android.com/apk/res/android" package="demo"><application><activity a:name=".Routes"><intent-filter><data a:scheme="https" a:host="first.test"/></intent-filter><intent-filter><data a:scheme="demo" a:host="second.test"/><uri-relative-filter-group a:allow="false"><data a:pathPrefix="/private"/></uri-relative-filter-group></intent-filter></activity><activity-alias a:name=".Alias" a:targetActivity=".Routes"><intent-filter><data a:scheme="https" a:host="alias.test"/></intent-filter></activity-alias></application></manifest>"#;
+        assert!(
+            query_components(xml, &json!({"host":"first.test","scheme":"demo"}))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            query_components(xml, &json!({"host":"first.test","path":"private"}))
+                .unwrap()
+                .is_empty()
+        );
+        let rows = query_components(
+            xml,
+            &json!({"class_name":"Routes","match_mode":"exact","host":"alias.test"}),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "demo.Alias");
+        let rows = query_components(
+            xml,
+            &json!({"host":"second.test","scheme":"demo","path":"private"}),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["matching_filter_indexes"], json!([1]));
+        let group = &rows[0]["intent_filters"][1]["elements"][1];
+        assert_eq!(group["attributes"], json!([["allow", "false"]]));
+        assert_eq!(
+            group["children"][0]["attributes"],
+            json!([["pathPrefix", "/private"]])
+        );
+        assert_eq!(
+            query_components(
+                XML,
+                &json!({"component_type":"service","permission":"APP","query":"wOrKeR"})
+            )
+            .unwrap()
+            .len(),
+            1
+        );
     }
 }

@@ -1,6 +1,9 @@
 //! Bounded static call graph. Component classification follows DEX ancestry.
+#[path = "call_graph_query.rs"]
+mod query;
 use crate::{native_engine::NativeDexEngine, native_xrefs};
 use anyhow::{Context, Result, ensure};
+pub use query::query;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicBool, Ordering},

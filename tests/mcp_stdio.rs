@@ -40,7 +40,7 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     assert_eq!(replies[0]["error"]["code"], -32600);
     assert_eq!(replies[1]["result"]["protocolVersion"], "2025-06-18");
     let tools = replies[2]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 22);
+    assert_eq!(tools.len(), 23);
     let schema = |name: &str| {
         &tools
             .iter()
@@ -104,6 +104,38 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         assert_eq!(manifest["properties"][key]["minLength"], 1);
     }
     assert_eq!(manifest["additionalProperties"], false);
+    let components = schema("get_manifest_components");
+    assert_eq!(
+        components["properties"]["match_mode"]["enum"],
+        json!(["exact", "contains"])
+    );
+    assert_eq!(components["properties"]["limit"]["maximum"], 500);
+    for key in [
+        "class_name",
+        "component_type",
+        "permission",
+        "host",
+        "scheme",
+        "path",
+        "query",
+    ] {
+        assert_eq!(components["properties"][key]["type"], "string");
+    }
+    let graph = schema("get_call_graph");
+    assert_eq!(graph["properties"]["direct_only"]["type"], "boolean");
+    assert_eq!(
+        graph["properties"]["projection"]["enum"],
+        json!(["graph", "call_sites"])
+    );
+    assert_eq!(graph["properties"]["limit"]["maximum"], 500);
+    for key in [
+        "package_prefix",
+        "class_name",
+        "annotation",
+        "component_type",
+    ] {
+        assert_eq!(graph["properties"][key]["type"], "string");
+    }
     let implementations = tools
         .iter()
         .find(|tool| tool["name"] == "find_implementations")

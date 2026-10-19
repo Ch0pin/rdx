@@ -28,7 +28,7 @@ memory while enabled. Opening/reloading a GUI project stops that service.
    require a fully qualified ID. Restarting the server changes project identity;
    stale project requests are rejected.
 
-## Currently available (22 tools)
+## Currently available (23 tools)
 
 | Area | Tools |
 | --- | --- |
@@ -36,7 +36,7 @@ memory while enabled. Opening/reloading a GUI project stops that service.
 | Classes | `get_all_classes`, `search_classes_by_keyword`, `find_direct_subclasses`, `find_implementations` |
 | Code search | `search_code` |
 | Source and metadata | `get_class_source`, `get_method_source`, `get_class_disassembly`, `get_methods_of_class`, `get_fields_of_class` |
-| Resources | `get_all_resource_file_names`, `get_android_manifest`, `get_manifest_summary`, `get_resource_file`, `get_strings` |
+| Resources | `get_all_resource_file_names`, `get_android_manifest`, `get_manifest_summary`, `get_manifest_components`, `get_resource_file`, `get_strings` |
 | Call graphs | `get_call_graph` (exact `method_id`, `direction`: `callers` / `callees` / `both`, `depth`: 1–100, default 20) |
 | DEX strings | `get_dex_strings` (strings from the DEX containing `class_id`), `find_string_references` |
 
@@ -84,6 +84,40 @@ component-path highlights. `truncated` reports the 5,000-node/20,000-edge cap;
 `depth_boundary_reached` reports that nodes reached the requested depth.
 The graph is returned as one response, without pagination. Caller queries scan
 the loaded DEX call sites and may take longer than outgoing queries.
+
+Use `direct_only: true` for immediate neighbors (effective depth 1). An explicit
+`depth` greater than 1 conflicts with this option. To retrieve complete caller
+IDs and offsets without the node/edge payload, use:
+
+```json
+{
+  "instance_id": "<instance>",
+  "project_id": "<project>",
+  "method_id": "sample.Target.doubleValue(I)I",
+  "direction": "callers",
+  "direct_only": true,
+  "projection": "call_sites",
+  "limit": 100
+}
+```
+
+The compact projection returns one record per DEX call site, including
+`caller_method_id`, `caller_signature`, `callee_method_id`, and
+`call_site_offset` in DEX code units. Multiple calls in the same caller remain
+separate. `matching_total` counts all matching records; follow `next_offset`
+until null. `source_hash` identifies the complete ordered matching record set
+and stays stable across pages. Compact enumeration is independent of the graph node/edge caps.
+`offset` and `limit` apply only to `projection: "call_sites"` (maximum 500).
+
+Optional filters combine with AND: `package_prefix` matches package boundaries,
+`class_name` is an exact FQCN, `annotation` matches a method or class annotation
+by descriptor or FQCN, and `component_type` is `activity`, `service`, `receiver`,
+or `provider`, based on known DEX ancestry. Filters select neighboring method
+declarations after depth-bounded traversal; intermediate methods remain
+traversable. Filtered graphs retain the root and edges between retained nodes.
+For direct caller queries, filters apply to callers. Compact records preserve
+the callee operand declared at the DEX instruction even when hierarchy lookup
+resolves it to an inherited implementation.
 
 This is a static graph. It resolves inherited aliases through known superclass
 metadata, but does not infer runtime virtual targets, reflection or Intent
@@ -174,6 +208,33 @@ within the same intent-filter. Records preserve separate data elements and
 relative-filter groups, including their declared allow/block attributes.
 `matching_filter_indexes` identifies matching filters. These are declaration
 queries; runtime route delivery and callback reachability require separate proof.
+
+### Component lookup
+
+`get_manifest_components` reads the decoded manifest directly, including binary
+Android XML in the APK. It returns component records with the same project/APK
+identity and matching-record pagination (`limit` defaults to 100, maximum 500).
+`source_hash` covers the full filtered record set and remains stable across pages.
+
+Use `class_name: "DeepLinkEntryActivity"` for a case-sensitive substring search.
+For exact lookup, set `match_mode: "exact"` and supply an FQCN, `.RelativeName`,
+or a simple name relative to the manifest package. Exact target lookup also
+returns aliases targeting that activity. Each activity lists its `aliases`;
+each alias retains its own permissions, flags and intent filters.
+
+Optional `component_type`, `permission`, `query`, `host`, `scheme`, and `path`
+filters combine with AND. Route filters use the same declaration semantics as
+`get_manifest_summary` above. For example, `scheme: "https"` and
+`host: "www.example.com"` find components declaring both in one intent-filter.
+
+Records include `exported_state` with declared value, effective boolean (or null
+when unresolved), and reason. `permission`, `read_permission`, and
+`write_permission` describe declared/effective values, inheritance source, and
+`resolved` status; read/write fields apply to providers. Alias permission
+inheritance follows its target activity. An explicit empty permission clears
+inheritance. `effective: null` with `resolved: true` means no permission is
+required by that declaration; `resolved: false` means the value or target could
+not be resolved. These fields describe manifest configuration.
 
 ## DEX literal owners
 

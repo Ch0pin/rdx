@@ -90,6 +90,16 @@ fn nested_switch_certificate_rejects_irreducible_entry_second_exit_and_protectio
 }
 
 #[test]
+fn nested_switch_certificate_counts_returning_error_island_as_second_normal_exit() {
+    let mut class = fixture();
+    let code = class.methods[0].code.as_mut().unwrap();
+    // The failure call still runs, but its island now returns the initialized
+    // accumulator instead of throwing. Both @34 and @35 are normal exits.
+    code.instructions[39] = 0x000f;
+    assert!(proof::select_all(code).is_empty());
+}
+
+#[test]
 fn nested_switch_certificate_proves_outlined_terminal_inputs_and_exact_identity() {
     let mut class = fixture();
     let code = class.methods[0].code.as_ref().unwrap();

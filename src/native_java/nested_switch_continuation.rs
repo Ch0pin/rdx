@@ -161,8 +161,17 @@ fn select(code: &DexCode) -> Option<Vec<Plan>> {
                 work = work.checked_sub(1)?;
                 if !natural.contains(&edge.target) {
                     let target = cfg.blocks[edge.target].start;
-                    if target >= natural_end && !linear_terminal(target, &at, &mut work)? {
-                        exits.insert(target);
+                    // A return can be the loop's ordinary continuation. Only
+                    // throw-ending islands are abrupt alternatives to that
+                    // continuation; excluding all terminal paths loses loops
+                    // whose guard exits directly to a return instruction.
+                    if target >= natural_end {
+                        let abrupt = terminal_path(target, &at, &mut work)?.is_some_and(|path| {
+                            path.last().is_some_and(|pc| at[pc].opcode == 0x27)
+                        });
+                        if !abrupt {
+                            exits.insert(target);
+                        }
                     }
                 }
             }

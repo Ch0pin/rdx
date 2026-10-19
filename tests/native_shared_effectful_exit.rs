@@ -58,7 +58,7 @@ fn shared_exit_jvm() {
         .unwrap();
     assert!(r.status.success());
     assert_eq!(
-        String::from_utf8_lossy(&r.stdout),
+        String::from_utf8_lossy(&r.stdout).replace("\r\n", "\n"),
         "0:-1:1:after0,\n0:0:1:after0,\n0:1:2:exit1,log1,after1,\n0:4:2:exit1,log1,after1,\n1:-1:fault=true:exit-1,\n1:0:1:exit0,after0,\n1:1:2:exit1,log1,after1,\n1:4:5:exit4,log4,after4,\n"
     );
 }

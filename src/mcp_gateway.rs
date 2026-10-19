@@ -18,6 +18,16 @@ impl RequestControl {
         *connection = Some(stream.try_clone()?);
         Ok(())
     }
+    pub(super) fn read_response(&self, stream: TcpStream) -> Result<Option<Value>> {
+        let reader = ControlledReader {
+            stream,
+            control: self,
+            deadline: Instant::now() + Duration::from_secs(120),
+        };
+        // Keep one frame parser and buffer across idle readiness probes: a
+        // partial JSON response must survive until completion or cancellation.
+        read_frame(&mut BufReader::new(reader))
+    }
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         if let Some(stream) = self.connection.lock().unwrap().as_ref() {
@@ -25,6 +35,61 @@ impl RequestControl {
         }
     }
 }
+struct ControlledReader<'a> {
+    stream: TcpStream,
+    control: &'a RequestControl,
+    deadline: Instant,
+}
+impl Read for ControlledReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            self.check()?;
+            match socket::readable(&self.stream) {
+                Ok(true) => {
+                    self.check()?;
+                    // This is the only reader of the socket. Available data
+                    // cannot be consumed between the readiness check and read.
+                    let result = self.stream.read(bytes);
+                    self.check()?;
+                    return result;
+                }
+                Ok(false) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    self.check()?;
+                    return Err(error);
+                }
+            }
+            thread::sleep(
+                Duration::from_millis(5)
+                    .min(self.deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+}
+impl ControlledReader<'_> {
+    fn check(&self) -> std::io::Result<()> {
+        if self.control.cancelled.load(Ordering::Acquire) {
+            // Interrupted is automatically retried by read_line, so use a
+            // terminal read error to deliver cancellation to the frame parser.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "CANCELLED: request cancelled",
+            ));
+        }
+        if Instant::now() >= self.deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "GUI response exceeded 120 seconds",
+            ));
+        }
+        Ok(())
+    }
+}
+
 struct Job {
     id: Value,
     control: Arc<RequestControl>,
@@ -220,4 +285,97 @@ pub(super) fn run() -> Result<()> {
         write_response(&mut *output.lock().unwrap(), &response)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod controlled_reader_tests {
+    use super::*;
+
+    fn connected() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(120)))
+            .unwrap();
+        (client, peer)
+    }
+
+    #[test]
+    fn cancelled_partial_gui_response_finishes_while_peer_stays_open() {
+        let (stream, mut peer) = connected();
+        let control = Arc::new(RequestControl::default());
+        control.attach(&stream).unwrap();
+        let worker_control = control.clone();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            struct Observed<'a>(ControlledReader<'a>, std::sync::mpsc::Sender<usize>);
+            impl Read for Observed<'_> {
+                fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                    let count = self.0.read(bytes)?;
+                    if count > 0 {
+                        let _ = self.1.send(count);
+                    }
+                    Ok(count)
+                }
+            }
+            let reader = ControlledReader {
+                stream,
+                control: &worker_control,
+                deadline: Instant::now() + Duration::from_secs(120),
+            };
+            let result = read_frame(&mut BufReader::new(Observed(reader, progress_tx)));
+            result_tx.send(result).unwrap();
+        });
+        peer.write_all(b"{\"result\":").unwrap();
+        progress_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        control.cancel();
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancellation waited for the GUI to close its socket")
+            .unwrap_err();
+        assert!(error.to_string().contains("CANCELLED"), "{error:#}");
+        worker.join().unwrap();
+        // The peer is deliberately retained until the cancelled reader returns.
+        drop(peer);
+    }
+
+    #[test]
+    fn gui_frame_survives_idle_intervals_between_fragments() {
+        let (stream, mut peer) = connected();
+        let worker = thread::spawn(move || {
+            RequestControl::default()
+                .read_response(stream)
+                .unwrap()
+                .unwrap()
+        });
+        for fragment in [
+            b"{\"result\":".as_slice(),
+            b"{\"items\":[",
+            b"1,2],\"complete\":true}}\n",
+        ] {
+            peer.write_all(fragment).unwrap();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            worker.join().unwrap(),
+            json!({"result":{"items":[1,2],"complete":true}})
+        );
+    }
+
+    #[test]
+    fn controlled_reader_enforces_absolute_deadline_without_waiting_for_data() {
+        let (stream, _peer) = connected();
+        let control = RequestControl::default();
+        let mut reader = ControlledReader {
+            stream,
+            control: &control,
+            deadline: Instant::now(),
+        };
+        assert_eq!(
+            reader.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
 }

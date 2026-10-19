@@ -28,7 +28,7 @@ fn class(words: &[u16], registers: u16, ins: u16, init: bool) -> DexClass {
             declaring_type: Arc::from("LTarget;"),
             name: Arc::from(if init { "<init>" } else { "test" }),
             return_type: Arc::from("V"),
-            parameters: vec![],
+            parameters: vec![Arc::from("I"); usize::from(ins.saturating_sub(u16::from(init)))],
             thrown_types: vec![],
             access_flags: if init { 0 } else { 8 },
             code: Some(DexCode {
@@ -57,7 +57,15 @@ fn analyze(class: &DexClass) -> ConstructorAnalysis {
     assert_eq!(format!("{independent:?}"), format!("{shared:?}"));
     let expected = rdx::native_types::InferredTypes::infer(m, &ir, &ssa, &calls, &class.symbols);
     let actual = context.infer_types();
-    assert_eq!(format!("{expected:?}"), format!("{actual:?}"));
+    // Compare inference results, not the call-site-specific anyhow backtraces.
+    assert_eq!(
+        expected
+            .map(|types| format!("{types:?}"))
+            .map_err(|error| format!("{error:#}")),
+        actual
+            .map(|types| format!("{types:?}"))
+            .map_err(|error| format!("{error:#}")),
+    );
     shared
 }
 #[test]

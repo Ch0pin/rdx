@@ -976,9 +976,12 @@ fn remote_controlled(
         &mut stream,
         &json!({"token":entry.token,"instance_id":entry.instance_id,"name":name,"arguments":args}),
     )?;
-    let reply = read_frame(&mut BufReader::new(stream))
-        .context("INSTANCE_TRANSPORT_ERROR: GUI read failed; retry the read-only query")?
-        .context("INSTANCE_DISCONNECTED: GUI closed the connection; rediscover instances")?;
+    let reply = match control {
+        Some(control) => control.read_response(stream),
+        None => read_frame(&mut BufReader::new(stream)),
+    }
+    .context("INSTANCE_TRANSPORT_ERROR: GUI read failed; retry the read-only query")?
+    .context("INSTANCE_DISCONNECTED: GUI closed the connection; rediscover instances")?;
     if let Some(error) = reply["error"].as_str() {
         bail!("{error}")
     }

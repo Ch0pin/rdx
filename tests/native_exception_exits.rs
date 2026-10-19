@@ -77,9 +77,8 @@ fn pure_early_return_keeps_effectful_continuation_outside_try() {
     assert_eq!(source.matches(".second()").count(), 1, "{source}");
     assert_eq!(source.matches(".first()").count(), 1, "{source}");
 }
-#[test]
-fn distinct_effectful_frontiers_remain_rejected() {
-    let class = fixture(
+fn distinct_frontiers_fixture() -> DexClass {
+    fixture(
         vec![
             0x0071, 0, 0, 0x000a, 0x0038, 6, 0x0071, 1, 0, 0x000f, 0x0071, 1, 0, 0x000f, 0x010d,
             0xf012, 0x000f,
@@ -88,13 +87,77 @@ fn distinct_effectful_frontiers_remain_rejected() {
         0,
         6,
         "I",
-    );
-    let error =
-        native_java::render_method("sample.Effects", &class, &class.methods[0]).unwrap_err();
+    )
+}
+#[test]
+fn distinct_effectful_frontiers_keep_both_effects_outside_try() {
+    let class = distinct_frontiers_fixture();
+    let source = native_java::render_method("sample.Effects", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    let catch = source.find("catch (").unwrap();
+    assert!(source.find(".first()").unwrap() < catch, "{source}");
+    assert_eq!(source.matches(".first()").count(), 1, "{source}");
+    assert_eq!(source.matches(".second()").count(), 2, "{source}");
     assert!(
-        error.to_string().contains("distinct effectful exits"),
-        "{error:#}"
+        source
+            .match_indices(".second()")
+            .all(|(offset, _)| offset > catch),
+        "outside effects moved inside try: {source}"
     );
+    assert!(source.find("if (").unwrap() > catch, "{source}");
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn distinct_frontiers_preserve_values_effects_and_exception_identity() {
+    let class = distinct_frontiers_fixture();
+    let source = native_java::render_method("sample.Effects", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    let dir = std::env::temp_dir().join(format!("rdx-distinct-frontiers-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("sample")).unwrap();
+    std::fs::write(
+        dir.join("sample/Effects.java"),
+        format!(r#"package sample;
+public class Effects {{
+ static int value; static boolean failFirst, failSecond; static String trace;
+ static final RuntimeException inside = new IllegalArgumentException("inside");
+ static final RuntimeException outside = new IllegalStateException("outside");
+ static int first() {{trace += "F"; if(failFirst)throw inside; return value;}}
+ static int second() {{trace += "S"; if(failSecond)throw outside; return 42;}}
+ {source}
+ public static void main(String[] args) {{
+  for(int input:new int[]{{0,7}}) for(int mask=0;mask<4;mask++) {{
+   value=input; failFirst=(mask&1)!=0; failSecond=(mask&2)!=0; trace="";
+   try {{
+    int actual=test();
+    if(!failFirst&&failSecond)throw new AssertionError("outside exception lost");
+    if(actual!=(failFirst?-1:value))throw new AssertionError("return value changed");
+   }} catch(RuntimeException actual) {{
+    if(failFirst||!failSecond||actual!=outside)throw new AssertionError("exception boundary",actual);
+   }}
+   if(!trace.equals(failFirst?"F":"FS"))throw new AssertionError("effect order/count: "+trace);
+  }}
+ }}
+}}"#),
+    ).unwrap();
+    for (command, args) in [
+        ("javac", vec!["sample/Effects.java"]),
+        ("java", vec!["-cp", ".", "sample.Effects"]),
+    ] {
+        let result = std::process::Command::new(command)
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }
 #[test]
 #[ignore = "requires javac and java"]

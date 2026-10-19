@@ -26,5 +26,7 @@ jobs:
           python-version: '3.12'
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo test --locked --no-fail-fast
+        env:
+          RUST_BACKTRACE: '1'
       # Ignored corpus tests require locally supplied APKs; never publish those inputs.

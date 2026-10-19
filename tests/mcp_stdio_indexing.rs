@@ -216,10 +216,20 @@ impl Gateway {
         );
     }
     fn receive(&self, id: u64) -> Value {
-        let response = self
-            .replies
-            .recv_timeout(TIMEOUT)
-            .expect("stdio response blocked behind literal indexing");
+        let response = self.replies.recv_timeout(TIMEOUT).unwrap_or_else(|error| {
+            panic!(
+                "stdio response id={id} timed out after {}s while waiting for {}: {error}",
+                TIMEOUT.as_secs(),
+                match id {
+                    11 => "instance health during a held literal request",
+                    12 => "gateway discovery health during a held literal request",
+                    13 => "ping during a held literal request",
+                    10 => "cancelled literal worker response",
+                    14 => "successful literal retry worker response",
+                    _ => "gateway operation response",
+                }
+            )
+        });
         assert_eq!(
             response["id"], id,
             "unexpected or premature response: {response}"

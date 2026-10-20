@@ -229,6 +229,7 @@ fn protection_level(raw: &str) -> String {
         1 => "dangerous",
         2 => "signature",
         3 => "signatureOrSystem",
+        4 => "internal",
         _ => "unknown base",
     };
     let mut names = vec![base];
@@ -245,12 +246,29 @@ fn protection_level(raw: &str) -> String {
         (0x2000, "runtimeOnly"),
         (0x4000, "oem"),
         (0x8000, "vendorPrivileged"),
+        (0x10000, "textClassifier"),
+        (0x20000, "wellbeing"),
+        (0x40000, "documenter"),
+        (0x80000, "configurator"),
+        (0x100000, "incidentReportApprover"),
+        (0x200000, "appPredictor"),
+        (0x800000, "companion"),
+        (0x1000000, "retailDemo"),
+        (0x2000000, "recents"),
+        (0x4000000, "role"),
+        (0x8000000, "knownSigner"),
+        (0x400000, "module"),
     ] {
         if bits & mask != 0 {
             names.push(name);
         }
     }
-    format!("{} ({raw})", names.join(" | "))
+    let unknown = bits & !0x0fff_ffff;
+    let mut decoded = names.join(" | ");
+    if unknown != 0 {
+        decoded.push_str(&format!(" | unknown(0x{unknown:x})"));
+    }
+    format!("{decoded} ({raw})")
 }
 
 pub fn sha256(path: &Path) -> Result<String, String> {
@@ -468,6 +486,135 @@ fn component_permission(node: &Node, app: &Node) -> serde_json::Value {
     permission_state(node.get("permission"), app.get("permission"), source)
 }
 
+/// Catalog snapshot, independent of the analyzed app's target SDK or device OS.
+const PLATFORM_PERMISSION_SOURCE: &str = "https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r1/core/res/AndroidManifest.xml";
+fn permission_protection(permission: &serde_json::Value, nodes: &[Node]) -> serde_json::Value {
+    use serde_json::json;
+    let Some(name) = permission["effective"].as_str() else {
+        return json!({"status": if permission["resolved"] == true {"none"} else {"unresolved"}});
+    };
+    let declared: Vec<_> = nodes
+        .iter()
+        .filter(|n| n.parent == Some(0) && n.tag == "permission" && n.get("name") == Some(name))
+        .collect();
+    let catalog = || {
+        static CATALOG: std::sync::OnceLock<std::collections::BTreeMap<String, String>> =
+            std::sync::OnceLock::new();
+        CATALOG.get_or_init(|| {
+            serde_json::from_str(include_str!("platform_permissions_android16.json"))
+                .expect("checked-in platform permission catalog")
+        })
+    };
+    let normalize = |raw: &str| {
+        let decoded = protection_level(raw);
+        let expression = decoded.split(" (").next().unwrap_or(&decoded);
+        let mut parts: Vec<_> = expression
+            .split('|')
+            .map(str::trim)
+            .map(|p| match p {
+                "system" => "privileged",
+                "runtime" => "runtimeOnly",
+                other => other,
+            })
+            .collect();
+        parts.sort_unstable();
+        parts.join("|")
+    };
+    let (raw, source) = if let Some(platform) = catalog().get(name) {
+        if declared.iter().any(|node| {
+            normalize(node.get("protectionLevel").unwrap_or("normal")) != normalize(platform)
+        }) {
+            return json!({"status":"unresolved","reason":"platform_permission_declaration_conflict", "platform_protection_level":platform,"app_protection_levels":declared.iter().map(|n| n.get("protectionLevel").unwrap_or("normal")).collect::<Vec<_>>(),"catalog":{"tag":"android-16.0.0_r1","source_url":PLATFORM_PERMISSION_SOURCE}});
+        }
+        (platform.as_str(), "platform_catalog")
+    } else {
+        match declared.as_slice() {
+            [node] => (
+                node.get("protectionLevel").unwrap_or("normal"),
+                "app_manifest",
+            ),
+            [] => {
+                return json!({"status":"unresolved", "reason":"permission_definition_unavailable"});
+            }
+            _ => return json!({"status":"unresolved", "reason":"duplicate_permission_definitions"}),
+        }
+    };
+    let bits = raw
+        .strip_prefix("0x")
+        .and_then(|n| u32::from_str_radix(n, 16).ok())
+        .or_else(|| raw.parse::<u32>().ok());
+    let decoded = if bits.is_some() {
+        protection_level(raw)
+    } else {
+        raw.to_owned()
+    };
+    let expression = decoded.split(" (").next().unwrap_or(&decoded);
+    let mut parts = expression.split('|').map(str::trim);
+    let base = parts.next().unwrap_or_default();
+    let flags: Vec<_> = parts.collect();
+    let known_flags = flags.iter().all(|flag| {
+        matches!(
+            *flag,
+            "privileged"
+                | "system"
+                | "runtime"
+                | "development"
+                | "appop"
+                | "pre23"
+                | "installer"
+                | "verifier"
+                | "preinstalled"
+                | "setup"
+                | "instant"
+                | "runtimeOnly"
+                | "oem"
+                | "vendorPrivileged"
+                | "textClassifier"
+                | "wellbeing"
+                | "documenter"
+                | "configurator"
+                | "incidentReportApprover"
+                | "appPredictor"
+                | "module"
+                | "companion"
+                | "retailDemo"
+                | "recents"
+                | "role"
+                | "knownSigner"
+        )
+    });
+    let known_base = matches!(
+        base,
+        "normal" | "dangerous" | "signature" | "signatureOrSystem" | "internal"
+    );
+    let mut result = json!({"status":if known_base && known_flags {"resolved"} else {"unresolved"},"source":source,"raw":raw,"base":base,"flags":flags});
+    if source == "platform_catalog" {
+        result["catalog"] = json!({"android_version":"16", "api_level":36, "tag":"android-16.0.0_r1", "source_url":PLATFORM_PERMISSION_SOURCE, "source_sha256":"69ce991d47d0cc259c16c2f51933cd658ec5371bdb6c22dde7ca21376312fe5e"});
+    }
+    result
+}
+
+/// Unfiltered declaration counts; exported state does not establish runtime reachability.
+pub fn component_coverage(xml: &str) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let rows = components(xml)?;
+    let mut by_kind = std::collections::BTreeMap::<String, usize>::new();
+    let (mut exported, mut non_exported, mut unresolved) = (0, 0, 0);
+    for row in &rows {
+        *by_kind.entry(row.kind.clone()).or_default() += 1;
+        if row.exported.starts_with("true") {
+            exported += 1;
+        } else if row.exported.starts_with("false") {
+            non_exported += 1;
+        } else {
+            unresolved += 1;
+        }
+    }
+    Ok(
+        json!({"total":rows.len(),"by_kind":by_kind,"exported":exported,"non_exported":non_exported,"unresolved_exported":unresolved,"scope":"all_manifest_component_declarations"}),
+    )
+}
+
 /// Look up decoded-manifest component declarations. `class_name` contains matches
 /// are literal and case-sensitive; exact matches expand relative and unqualified
 /// names using the manifest package. Aliases also match their target activity.
@@ -555,7 +702,9 @@ pub fn query_components(
         {
             continue;
         }
-        let permission = if component.kind == "activity-alias" && node.get("permission").is_none() {
+        let mut permission = if component.kind == "activity-alias"
+            && node.get("permission").is_none()
+        {
             if let Some(targets) = activities
                 .get(component.target.as_str())
                 .filter(|targets| targets.len() == 1)
@@ -589,10 +738,17 @@ pub fn query_components(
                 source,
             )
         };
-        let read_permission =
+        permission["protection_level"] = permission_protection(&permission, &nodes);
+        let mut read_permission =
             (component.kind == "provider").then(|| provider_permission("readPermission"));
-        let write_permission =
+        let mut write_permission =
             (component.kind == "provider").then(|| provider_permission("writePermission"));
+        for state in [&mut read_permission, &mut write_permission]
+            .into_iter()
+            .flatten()
+        {
+            state["protection_level"] = permission_protection(state, &nodes);
+        }
         if args["permission"].as_str().is_some_and(|q| {
             ![
                 Some(&permission),
@@ -1391,5 +1547,95 @@ mod component_lookup_tests {
             .len(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod protection_resolution_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn resolves_app_platform_provider_and_explicit_none() {
+        let xml = r#"<manifest xmlns:a="http://schemas.android.com/apk/res/android" package="demo"><permission a:name="demo.GATE" a:protectionLevel="0x8000012"/><application><service a:name=".App" a:permission="demo.GATE"/><receiver a:name=".Platform" a:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"/><provider a:name=".Provider" a:readPermission="android.permission.CAMERA" a:writePermission="other.UNKNOWN"/><activity a:name=".None" a:permission=""/><activity a:name=".Resource" a:permission="@string/gate"/></application></manifest>"#;
+        let rows = query_components(xml, &json!({})).unwrap();
+        assert_eq!(
+            rows[0]["permission"]["protection_level"]["base"],
+            "signature"
+        );
+        assert_eq!(
+            rows[0]["permission"]["protection_level"]["flags"],
+            json!(["privileged", "knownSigner"])
+        );
+        assert_eq!(
+            rows[1]["permission"]["protection_level"]["source"],
+            "platform_catalog"
+        );
+        assert_eq!(
+            rows[1]["permission"]["protection_level"]["catalog"]["tag"],
+            "android-16.0.0_r1"
+        );
+        assert_eq!(
+            rows[2]["read_permission"]["protection_level"]["base"],
+            "dangerous"
+        );
+        assert_eq!(
+            rows[2]["write_permission"]["protection_level"]["status"],
+            "unresolved"
+        );
+        assert_eq!(rows[3]["permission"]["protection_level"]["status"], "none");
+        assert_eq!(
+            rows[4]["permission"]["protection_level"]["status"],
+            "unresolved"
+        );
+    }
+
+    #[test]
+    fn app_cannot_downgrade_platform_permission_classification() {
+        let xml = r#"<manifest xmlns:a="http://schemas.android.com/apk/res/android"><permission a:name="android.permission.BIND_ACCESSIBILITY_SERVICE" a:protectionLevel="normal"/><application><service a:name="Gate" a:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"/></application></manifest>"#;
+        let rows = query_components(xml, &json!({})).unwrap();
+        assert_eq!(
+            rows[0]["permission"]["protection_level"]["reason"],
+            "platform_permission_declaration_conflict"
+        );
+        let matched = xml.replace(
+            "protectionLevel=\"normal\"",
+            "protectionLevel=\"signature\"",
+        );
+        let rows = query_components(&matched, &json!({})).unwrap();
+        assert_eq!(
+            rows[0]["permission"]["protection_level"]["source"],
+            "platform_catalog"
+        );
+        assert_eq!(
+            rows[0]["permission"]["protection_level"]["base"],
+            "signature"
+        );
+    }
+
+    #[test]
+    fn defaults_duplicates_unknown_flags_and_coverage_are_explicit() {
+        let xml = r#"<manifest xmlns:a="http://schemas.android.com/apk/res/android"><permission a:name="DEFAULT"/><permission a:name="DUP"/><permission a:name="DUP" a:protectionLevel="signature"/><permission a:name="UNKNOWN" a:protectionLevel="0x10000002"/><application><service a:name="A" a:permission="DEFAULT" a:exported="true"/><receiver a:name="B" a:permission="DUP" a:exported="false"/><activity a:name="C" a:permission="UNKNOWN" a:exported="@bool/exported"/></application></manifest>"#;
+        let rows = query_components(xml, &json!({})).unwrap();
+        assert_eq!(rows[0]["permission"]["protection_level"]["base"], "normal");
+        assert_eq!(
+            rows[1]["permission"]["protection_level"]["reason"],
+            "duplicate_permission_definitions"
+        );
+        assert_eq!(
+            rows[2]["permission"]["protection_level"]["status"],
+            "unresolved"
+        );
+        assert!(
+            rows[2]["permission"]["protection_level"]["flags"][0]
+                .as_str()
+                .unwrap()
+                .contains("0x10000000")
+        );
+        let coverage = component_coverage(xml).unwrap();
+        assert_eq!(coverage["total"], 3);
+        assert_eq!(coverage["exported"], 1);
+        assert_eq!(coverage["non_exported"], 1);
+        assert_eq!(coverage["unresolved_exported"], 1);
     }
 }

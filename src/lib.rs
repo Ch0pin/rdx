@@ -33,4 +33,7 @@ pub mod mcp;
 
 pub mod call_graph;
 
+mod field_references;
+mod lambda_branch;
 pub mod manifest_summary;
+mod source_coverage;

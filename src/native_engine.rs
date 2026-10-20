@@ -85,6 +85,23 @@ impl NativeDexEngine {
             cancelled,
         )
     }
+    pub(crate) fn render_reported(
+        &self,
+        name: &str,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<(DecompiledCode, serde_json::Value)> {
+        let class = self
+            .classes
+            .get(name)
+            .with_context(|| format!("Unknown class: {name}"))?;
+        crate::native_java::render_mixed_reported_with_nested(
+            name,
+            class,
+            &self.nested_children(name),
+            Some(&self.classes),
+            cancelled,
+        )
+    }
     fn render_class(&self, name: &str, class: &DexClass) -> Result<DecompiledCode> {
         Ok(crate::native_java::render_mixed_with_nested(
             name,

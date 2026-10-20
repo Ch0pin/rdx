@@ -25,10 +25,16 @@ memory while enabled. Opening/reloading a GUI project stops that service.
 3. Get classes, then supply the exact returned `class_id` to source/metadata tools.
    A short class name also resolves when exactly one class matches; responses
    include both `requested_class_id` and the resolved `class_id`. Ambiguous names
-   require a fully qualified ID. Restarting the server changes project identity;
+   require a fully qualified ID. Class-scoped tools also accept `class_name` as an
+   alias for `class_id`: `get_class_source`, `get_class_disassembly`,
+   `get_methods_of_class`, `get_fields_of_class`, `find_direct_subclasses`,
+   `find_implementations`, and `get_dex_strings`. Supplying both requires them to
+   resolve to the same class; conflicts return `CONFLICTING_CLASS_SELECTORS`.
+   This alias differs from the component-name and call-graph filters also named
+   `class_name`. Restarting the server changes project identity;
    stale project requests are rejected.
 
-## Currently available (23 tools)
+## Currently available (25 tools)
 
 | Area | Tools |
 | --- | --- |
@@ -38,6 +44,7 @@ memory while enabled. Opening/reloading a GUI project stops that service.
 | Source and metadata | `get_class_source`, `get_method_source`, `get_class_disassembly`, `get_methods_of_class`, `get_fields_of_class` |
 | Resources | `get_all_resource_file_names`, `get_android_manifest`, `get_manifest_summary`, `get_manifest_components`, `get_resource_file`, `get_strings` |
 | Call graphs | `get_call_graph` (exact `method_id`, `direction`: `callers` / `callees` / `both`, `depth`: 1–100, default 20) |
+| DEX analysis | `find_field_references`, `get_lambda_branch` |
 | DEX strings | `get_dex_strings` (strings from the DEX containing `class_id`), `find_string_references` |
 
 `search_classes_by_keyword` searches literal class-name substrings only.
@@ -59,7 +66,7 @@ filter.
 
 The broader [v1 design](/Users/ch0pin/Desktop/Git-Projects/rdx/docs/mcp-v1.md) includes tools not implemented yet: method
 search by method metadata, general X-Refs, main-application helpers,
-resource resolution, GUI selection and coverage. Those tools
+resource resolution and GUI selection. Those tools
 are deliberately absent from `tools/list`. Renaming and debugging are excluded.
 The gateway runs up to eight `find_string_references` calls in the background,
 so the same MCP connection can send health checks and
@@ -125,6 +132,23 @@ routing. External method bodies cannot be expanded. The GUI graph continues
 to follow outgoing calls; direction selection is currently an MCP feature.
 
 `find_direct_subclasses` follows immediate superclass edges. Use `find_implementations` with `class_id` to list concrete direct and indirect implementations of an interface or class; it supports the same instance/project scope and offset/limit pagination.
+
+### Class source coverage
+
+`get_class_source` returns `coverage` for the entire class on every page.
+`total_methods`, `counts`, and `methods` account for each exact method ID as
+`decompiled`, `dex-fallback`, or `omitted`, with `representation` and `reason`.
+`omitted_methods` identifies absent standalone declarations. Proven enum sugar
+can appear as `source_sugar`; abstract/native declarations can appear as
+`declaration_only`. `source_complete` means no methods are omitted;
+`java_complete` also requires no DEX fallbacks. This measures declaration presence;
+semantic equivalence requires separate verification.
+
+For paged text, `returned_chars`, `page_end`, `has_more`, and
+`full_text_in_response` describe the returned slice. `full_text_in_response: true`
+means this response contains the complete document. Follow `next_offset` until
+null and retain `source_hash`; a terminal page starting after zero is still a
+slice. Coverage remains class-wide even when only a small source slice is returned.
 
 ### Method source
 
@@ -192,6 +216,11 @@ under `last_request_error`, with `tool` and `requested_class_id`; `error` is
 reserved for a failed project load. The next successful project request clears
 the request diagnostic. Discovery preserves it until then and continues to
 report the available project.
+For legacy GUI builds that report `Unknown class: ...` in `error` while the
+project is `Running`, the gateway preserves it as `selection_diagnostic` with
+`source: "legacy_gui"`, clears that stale project error, and supplies reload
+instructions. Use the diagnostic and executable/build identities to select the
+current GUI instance.
 A closed client transport requires reconnecting or restarting the MCP connector
 before `get_health` can run. An unreachable registration calls for checking the
 GUI MCP panel and retrying discovery; it alone does not establish process state.
@@ -235,6 +264,103 @@ inheritance follows its target activity. An explicit empty permission clears
 inheritance. `effective: null` with `resolved: true` means no permission is
 required by that declaration; `resolved: false` means the value or target could
 not be resolved. These fields describe manifest configuration.
+
+### Permission protection levels and component coverage
+
+Component permission states include `protection_level` with `status`, `source`,
+`raw`, `base`, and `flags` when available. App-defined permissions use their
+manifest definition, including the `normal` default when `protectionLevel` is
+omitted. Platform permissions use the checked-in Android 16 / API 36 catalog,
+tag `android-16.0.0_r1`; catalog metadata includes source URL and SHA-256.
+Unknown definitions, resource references, duplicate definitions, conflicting
+platform redeclarations, and unknown protection bits remain unresolved.
+The catalog describes that pinned platform declaration set; actual device/OEM
+policy, grants, signing identity, AppOps, and runtime authorization need separate
+verification.
+
+Both manifest tools include `coverage`: unfiltered `total`, `by_kind`, `exported`,
+`non_exported`, and `unresolved_exported` counts, with
+`scope: "all_manifest_component_declarations"` and `excludes_non_exported: false`.
+Non-exported declarations participate in queries. Active `filters` describe any
+narrowing; component lookup also reports `matching_components` and `page_complete`.
+Exhaust `next_offset` with unchanged filters to retrieve the matching declaration
+set. Exported counts describe configuration; callback execution requires runtime
+proof.
+
+## DEX field reads and writes
+
+`find_field_references` takes the exact `field_id` returned by
+`get_fields_of_class`, retaining its owner, name, and DEX type descriptor.
+For example, supply the returned ID in this template:
+
+```json
+{
+  "instance_id": "<instance_id>",
+  "project_id": "<project_id>",
+  "field_id": "<field_id_from_get_fields_of_class>",
+  "access": "read",
+  "offset": 0,
+  "limit": 100
+}
+```
+
+`access` accepts `all` (default), `read`, or `write`. The scan covers original
+DEX `iget`/`iput`/`sget`/`sput` variants without Java reconstruction, resolving
+provable inherited-owner aliases through loaded declarations and hierarchy.
+Each record in `items` includes `method_id`, `symbolic_field_id`, `access`, opcode name
+and value, `code_unit_offset` in 16-bit DEX code units, and
+`byte_offset_in_method`. `read_count` and `write_count` count confirmed accesses
+before the access filter; `counts_complete` covers both counts and
+`unresolved_all_access_count` counts relevant unresolved accesses across both
+kinds. `source_hash` identifies the full ordered matching reference set and stays
+stable across pages. `total` counts filtered occurrences; follow
+`next_offset` with unchanged arguments (`limit` maximum 500).
+
+`scan_complete` describes traversal. `complete` additionally requires a unique
+loaded query declaration and no unresolved relevant accesses for the selected
+filter. Check `declaration_resolved`, `identity_scope`,
+`unresolved_access_count`, and bounded `unresolved_examples`: missing, cyclic,
+ambiguous, or overly deep hierarchy information can leave relevant operands
+unresolved. A symbolic-only query retains exact operand matches with
+`complete: false`. Zero confirmed reads establishes absence only within that
+reported static scope; reflection, native code, and generated accesses require
+runtime analysis. Each page performs a cancellable scan, sharing operand match
+tables across classes in the same DEX during that scan.
+
+## Merged lambda branch analysis
+
+Use `get_lambda_branch` for a constructor call of an R8 merged lambda. First
+obtain the exact caller ID and constructor `invoke-direct` offset from DEX
+call-site records or disassembly. This template uses `0` as an offset placeholder;
+replace it with the actual constructor instruction offset in 16-bit code units:
+
+```json
+{
+  "instance_id": "<instance_id>",
+  "project_id": "<project_id>",
+  "caller_method_id": "<exact_caller_method_id>",
+  "call_site_offset": 0
+}
+```
+
+A `status: "resolved"` response connects caller constant/move dataflow to the
+constructor argument, constructor parameter/move dataflow to a field store,
+and dispatcher field/move dataflow to a validated switch. Results include
+`constructor_method_id`, allocation offset, dispatcher `method_id`,
+`discriminator`, `field_id`, constructor argument/store offsets, selected switch
+target, and `provenance`. DEX `blocks` include successor closure, shared
+continuations (`shared_with_other_case`), exception edges, and referenced helper
+method IDs. Prelude instructions and their exception blocks remain visible.
+Each returned DEX instruction includes readable native disassembly text alongside
+its code-unit offset and raw words. Selected branch blocks, the executed prelude,
+and the prelude exception closure are reported separately.
+
+The proof assumes normal constructor completion, verified DEX final-field
+semantics, and no reflective/native field writes. Unsupported or ambiguous
+control/dataflow returns `status: "unresolved"` with a reason. A selected static
+branch establishes the documented discriminator path; active route registration,
+callback execution, attacker-controlled delivery, and runtime impact need
+separate evidence.
 
 ## DEX literal owners
 

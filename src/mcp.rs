@@ -315,7 +315,11 @@ impl Server {
                         let args = &request["arguments"];
                         context = Some((
                             name.to_owned(),
-                            args["class_id"].as_str().unwrap_or("").to_owned(),
+                            args["class_id"]
+                                .as_str()
+                                .or_else(|| args["class_name"].as_str())
+                                .unwrap_or("")
+                                .to_owned(),
                         ));
                         ensure!(
                             args["project_id"].as_str() == Some(&project.project_id),
@@ -473,6 +477,8 @@ fn project_request(
             | "get_manifest_summary"
             | "get_manifest_components"
             | "find_string_references"
+            | "find_field_references"
+            | "get_lambda_branch"
     ) {
         check_project_file(project)?;
     }
@@ -491,6 +497,15 @@ fn project_request(
             }
         }
     };
+    // These DEX-only queries use shared immutable class data. Do not hold the
+    // interactive engine lock while scanning the project.
+    if matches!(name, "find_field_references" | "get_lambda_branch") {
+        let mut snapshot = engine.clone();
+        drop(engine);
+        let result = dispatch(&mut snapshot, &project.project, name, args, cancel)?;
+        check_project_file(project)?;
+        return Ok(result);
+    }
     if name == "get_manifest_components" {
         let xml = engine
             .read_resource_with_metadata("AndroidManifest.xml")?
@@ -504,6 +519,12 @@ fn project_request(
         result["format"] = json!("records");
         result["source_hash"] = json!(hash);
         result["offset_unit"] = json!("matching component records");
+        result["coverage"] =
+            crate::manifest_summary::component_coverage(&xml).map_err(anyhow::Error::msg)?;
+        result["coverage"]["excludes_non_exported"] = json!(false);
+        result["coverage"]["filters"] = component_filters(args);
+        result["coverage"]["matching_components"] = result["total"].clone();
+        result["coverage"]["page_complete"] = json!(result["next_offset"].is_null());
         result["analysis"] = json!(
             "Decoded manifest declarations; exported state and intent filters describe configuration, not runtime authorization or callback reachability."
         );
@@ -533,10 +554,33 @@ fn project_request(
         result["analysis"] = json!(
             "Manifest declarations only; exported does not establish runtime callback reachability or authorization."
         );
+        result["coverage"] =
+            crate::manifest_summary::component_coverage(&xml).map_err(anyhow::Error::msg)?;
+        result["coverage"]["excludes_non_exported"] = json!(false);
+        result["coverage"]["filters"] = component_filters(args);
         Ok(result)
     } else {
         dispatch(&mut engine, &project.project, name, args, cancel)
     }
+}
+fn component_filters(args: &Value) -> Value {
+    let mut filters = serde_json::Map::new();
+    for key in [
+        "class_name",
+        "match_mode",
+        "component",
+        "component_type",
+        "permission",
+        "query",
+        "host",
+        "scheme",
+        "path",
+    ] {
+        if let Some(value) = args.get(key) {
+            filters.insert(key.into(), value.clone());
+        }
+    }
+    Value::Object(filters)
 }
 
 fn check_project_file(project: &LoadedProject) -> Result<()> {
@@ -631,7 +675,9 @@ fn text_page(text: String, args: &Value, format: &str) -> Result<Value> {
     let end = start.saturating_add(limit).min(total);
     let hash = crate::engine::source_identity(&text);
     Ok(
-        json!({"text":text.chars().skip(start).take(limit).collect::<String>(),"format":format,"source_hash":hash,"offset":start,"total_chars":total,"next_offset":(end<total).then_some(end)}),
+        json!({"text":text.chars().skip(start).take(limit).collect::<String>(),"format":format,"source_hash":hash,"offset":start,"total_chars":total,"next_offset":(end<total).then_some(end),
+            "returned_chars":end-start,"page_end":end,"has_more":end<total,"full_text_in_response":start==0 && end==total,
+            "offset_unit":"Unicode scalar characters","pagination_note":if start!=0 || end<total {Some("This is a source slice. Follow next_offset with the same source_hash; absence from this page does not establish absence from the class.")} else {None}}),
     )
 }
 /// Pin executable identity before an on-disk application update can replace it.
@@ -707,7 +753,7 @@ fn discover(entries: &[Registration], args: &Value) -> Result<Value> {
     let mut diagnostics = Vec::new();
     for entry in &entries[start..end] {
         match remote(entry, "get_instance_info", &json!({})) {
-            Ok(info) => { if instance_matches(&info,args) { items.push(info); } },
+            Ok(info) => { let info = normalize_instance_info(info); if instance_matches(&info,args) { items.push(info); } },
             Err(error) => diagnostics.push(json!({"instance_id":entry.instance_id,
                 "status":"instance_unreachable", "error":format!("{error:#}"),
                 "action":"Check the GUI MCP status and retry. If the GUI has closed, reopen it; an unreachable registration alone does not prove a stale process."})),
@@ -719,6 +765,22 @@ fn discover(entries: &[Registration], args: &Value) -> Result<Value> {
     result["next_registration_offset"] = json!((end < entries.len()).then_some(end));
     result["registered_instances"] = json!(entries.len());
     Ok(result)
+}
+
+fn normalize_instance_info(mut info: Value) -> Value {
+    // Older GUI builds put a failed class selection into the project error.
+    // Preserve the diagnosis while keeping a usable project's health explicit.
+    if info["state"] == "Running"
+        && let Some(message) = info["error"].as_str()
+        && let Some(class_id) = message.strip_prefix("Unknown class: ")
+    {
+        info["selection_diagnostic"] = json!({
+            "requested_class_id":class_id,"message":message,
+            "source":"legacy_gui","action":"Reload the GUI with the current RDX build to reset its stale selection."
+        });
+        info["error"] = json!("");
+    }
+    info
 }
 
 fn search_code(
@@ -839,15 +901,40 @@ fn dispatch(
     cancel: &AtomicBool,
 ) -> Result<Value> {
     let mut normalized = args.clone();
-    if let Some(requested) = args["class_id"].as_str() {
-        normalized["class_id"] = json!(resolve_class_id(project, requested)?);
+    if class_scoped(name) {
+        let requested = args["class_id"].as_str().or_else(|| args["class_name"].as_str())
+            .context("Missing class selector: accepted parameters are class_id or class_name (FQCN or unique short name)")?;
+        let resolved = resolve_class_id(project, requested)?;
+        if let Some(alias) = args["class_name"].as_str() {
+            ensure!(
+                resolve_class_id(project, alias)? == resolved,
+                "CONFLICTING_CLASS_SELECTORS: class_id and class_name resolve to different classes"
+            );
+        }
+        normalized["class_id"] = json!(resolved);
     }
     let mut result = dispatch_resolved(engine, project, name, &normalized, cancel)?;
-    if args["class_id"].is_string() {
+    if class_scoped(name) {
         result["class_id"] = normalized["class_id"].clone();
-        result["requested_class_id"] = args["class_id"].clone();
+        result["requested_class_id"] = args
+            .get("class_id")
+            .or_else(|| args.get("class_name"))
+            .cloned()
+            .unwrap_or(Value::Null);
     }
     Ok(result)
+}
+fn class_scoped(name: &str) -> bool {
+    matches!(
+        name,
+        "get_class_source"
+            | "get_class_disassembly"
+            | "get_methods_of_class"
+            | "get_fields_of_class"
+            | "find_implementations"
+            | "find_direct_subclasses"
+            | "get_dex_strings"
+    )
 }
 fn method_source_page(text: String, args: &Value, format: &str) -> Result<Value> {
     if args.get("limit").is_some() {
@@ -880,6 +967,21 @@ fn dispatch_resolved(
         );
     }
     match name {
+        "find_field_references" => crate::field_references::search(
+            engine, project, required(args, "field_id")?,
+            args["access"].as_str().unwrap_or("all"),
+            args["offset"].as_u64().unwrap_or(0) as usize,
+            args["limit"].as_u64().unwrap_or(100) as usize, cancel),
+        "get_lambda_branch" => {
+            let classes: Vec<_> = project.classes.iter().filter_map(|name| engine.dex_class(name)).collect();
+            ensure!(classes.len() == project.classes.len(), "INCOMPLETE_PROJECT: missing DEX classes");
+            let result = crate::lambda_branch::analyze(&classes,
+                required(args, "caller_method_id")?,
+                args["call_site_offset"].as_u64().context("Missing call_site_offset (DEX code units)")? as usize,
+                &|| cancel.load(Ordering::Relaxed));
+            ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+            Ok(result)
+        },
         "get_call_graph" => {
             if ["direct_only", "projection", "package_prefix", "class_name", "annotation", "component_type", "offset", "limit"]
                 .iter().any(|key| args.get(key).is_some()) {
@@ -915,7 +1017,12 @@ fn dispatch_resolved(
         },
         "search_code" => search_code(engine, project, args, cancel),
         "get_all_classes" | "search_classes_by_keyword" => page(project.classes.iter().filter(|c|c.contains(query)).map(|c|json!({"class_id":c,"name":c})).collect(),args),
-        "get_class_source"=>text_page(engine.decompile_search_cancellable(required(args,"class_id")?,cancel)?.source,args,"java-or-mixed-dex"),
+        "get_class_source" => {
+            let (code, coverage) = engine.decompile_class_source_report(required(args,"class_id")?, cancel)?;
+            let mut result = text_page(code.source, args, "java-or-mixed-dex")?;
+            result["coverage"] = coverage;
+            Ok(result)
+        },
         "get_class_disassembly"=> {let name=required(args,"class_id")?; let class=engine.dex_class(name).context("SYMBOL_NOT_FOUND")?; text_page(crate::native_engine::disassembly::render(name,class).source,args,"rdx-dex")},
         "get_methods_of_class"|"get_fields_of_class"=>{
             let owner=required(args,"class_id")?;
@@ -1007,7 +1114,11 @@ fn remote_controlled(
     if let Some(error) = reply["error"].as_str() {
         bail!("{error}")
     }
-    Ok(reply["result"].clone())
+    Ok(if name == "get_instance_info" {
+        normalize_instance_info(reply["result"].clone())
+    } else {
+        reply["result"].clone()
+    })
 }
 pub fn client_config() -> Result<String> {
     Ok(serde_json::to_string_pretty(
@@ -1026,6 +1137,18 @@ fn tools_list() -> Value {
             "find_string_references",
             "Search a cached DEX literal-owner index without Java decompilation. Includes const-string/jumbo instructions, encoded static values and annotation values. Excludes unreferenced strings and dynamically constructed values. Returns exact class/member IDs and code-unit offsets; literal previews are capped at 4096 characters. Pagination is by matching occurrences. The first query shares a cancellable background build; get_instance_info.literal_index reports progress. Failed or cancelled builds retry on the next query.",
             vec!["query"],
+            true,
+        ),
+        (
+            "find_field_references",
+            "Find DEX iget/iput/sget/sput accesses by exact field_id from get_fields_of_class, including provable inherited owner aliases. access=all/read/write; returns method IDs, opcodes, read/write counts and code-unit offsets. Scans original DEX without decompilation; complete=false identifies unresolved relevant hierarchy accesses. No inference about reflection/native consumers. Pagination limit <=500.",
+            vec!["field_id"],
+            true,
+        ),
+        (
+            "get_lambda_branch",
+            "Resolve an R8 merged lambda constructor call site to its discriminator switch branches. Supply exact caller_method_id and call_site_offset in 16-bit DEX code units at invoke-direct. Returns proven discriminator, dispatcher method IDs, reachable DEX blocks including shared continuations and exception edges, and helper call IDs. Unsupported or ambiguous dataflow returns unresolved.",
+            vec!["caller_method_id"],
             true,
         ),
         (
@@ -1090,7 +1213,7 @@ fn tools_list() -> Value {
         ),
         (
             "get_class_source",
-            "Read Java or mixed Java/DEX source. All text is available through offset pagination.",
+            "Read Java or mixed Java/DEX source with per-method decompiled/dex-fallback/omitted status and reasons. class_id or class_name accepts FQCN or unique short name. Follow next_offset until null; full_text_in_response distinguishes a whole document from a slice. Coverage describes the entire class, not just this page; decompiled status is not a proof of semantic equivalence.",
             vec!["class_id"],
             true,
         ),
@@ -1159,7 +1282,18 @@ fn tools_list() -> Value {
         if scoped{required.extend(["instance_id","project_id"])}
         let mut properties=serde_json::Map::new();
         for key in &required{properties.insert((*key).into(),json!({"type":"string","minLength":1}));}
-        if scoped||["list_instances","get_health"].contains(&name){
+        if class_scoped(name) {
+            required.retain(|key| *key != "class_id");
+            properties.insert("class_name".into(),json!({"type":"string","minLength":1,"description":"Alias for class_id: exact FQCN or unique short name"}));
+        }
+        if name=="find_field_references" {
+            properties.insert("access".into(),json!({"type":"string","enum":["all","read","write"],"default":"all"}));
+        }
+        if name=="get_lambda_branch" {
+            required.push("call_site_offset");
+            properties.insert("call_site_offset".into(),json!({"type":"integer","minimum":0,"description":"Offset of invoke-direct in caller, in 16-bit DEX code units"}));
+        }
+        if (scoped && name != "get_lambda_branch")||["list_instances","get_health"].contains(&name){
             properties.insert("offset".into(),json!({"type":"integer","minimum":0}));
             properties.insert("limit".into(),json!({"type":"integer","minimum":1,"maximum":if ["get_method_source","get_class_source","get_class_disassembly","get_android_manifest","get_resource_file","get_manifest_summary"].contains(&name){128000}else{500}}));
         }
@@ -1194,7 +1328,9 @@ fn tools_list() -> Value {
             properties.insert("direction".into(),json!({"type":"string","enum":["callers","callees","both"],"default":"callees"}));
         }
         if ["get_all_classes","get_all_resource_file_names","get_strings","get_dex_strings"].contains(&name){properties.insert("query".into(),json!({"type":"string"}));}
-        json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":name!="open_apk","destructiveHint":false,"openWorldHint":false}})
+        let mut schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
+        if class_scoped(name) { schema["anyOf"] = json!([{"required":["class_id"]},{"required":["class_name"]}]); }
+        json!({"name":name,"description":description,"inputSchema":schema,"annotations":{"readOnlyHint":name!="open_apk","destructiveHint":false,"openWorldHint":false}})
     }).collect::<Vec<_>>()})
 }
 fn validate(name: &str, args: &Value) -> Result<()> {
@@ -1208,7 +1344,14 @@ fn validate(name: &str, args: &Value) -> Result<()> {
     let schema = &tool["inputSchema"];
     let object = args.as_object().context("Arguments must be an object")?;
     for key in schema["required"].as_array().unwrap() {
-        required(args, key.as_str().unwrap())?;
+        let key = key.as_str().unwrap();
+        ensure!(object.contains_key(key), "Missing {key}");
+    }
+    if class_scoped(name) {
+        ensure!(
+            object.contains_key("class_id") || object.contains_key("class_name"),
+            "Missing class selector: accepted parameters are class_id or class_name (FQCN or unique short name)"
+        );
     }
     for (key, value) in object {
         let property = &schema["properties"][key];
@@ -2066,3 +2209,7 @@ mod corpus_review_tests {
 #[cfg(test)]
 #[path = "mcp_indexing_tests.rs"]
 mod indexing_tests;
+
+#[cfg(test)]
+#[path = "mcp_analysis_tests.rs"]
+mod analysis_tests;

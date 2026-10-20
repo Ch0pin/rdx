@@ -1086,6 +1086,22 @@ impl Plan {
         }
         Ok(out.finish())
     }
+    pub(super) fn folded_methods(
+        &self,
+        name: &str,
+        class: &DexClass,
+    ) -> std::collections::BTreeSet<String> {
+        class
+            .methods
+            .iter()
+            .filter(|m| {
+                matches!(m.name.as_ref(), "<clinit>" | "values" | "valueOf")
+                    || (self.entries.is_some() && matches!(m.name.as_ref(), "<init>" | "$values"))
+            })
+            .map(|m| crate::source_coverage::method_id(name, m))
+            .collect()
+    }
+
     pub(super) fn render(&self, name: &str, class: &DexClass) -> Result<DecompiledCode> {
         let display = names::qualified(name, '.')?;
         let (package, simple) = display.rsplit_once('.').unwrap_or(("", &display));

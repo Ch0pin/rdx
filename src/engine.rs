@@ -358,6 +358,21 @@ impl NativeEngine {
             .decorate_java(&mut code, &self.native.shared_classes());
         Ok(code)
     }
+    /// Render a class once with whole-class representation coverage.
+    pub fn decompile_class_source_report(
+        &mut self,
+        class: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(DecompiledCode, serde_json::Value)> {
+        let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+        let (mut code, mut coverage) = self.native.render_reported(class, &cancelled)?;
+        ensure!(!cancelled(), "CANCELLED");
+        self.resources
+            .decorate_java(&mut code, &self.native.shared_classes());
+        crate::source_coverage::refresh_offsets(&mut coverage, &code);
+        code.source_hash = source_identity(&code.source);
+        Ok((code, coverage))
+    }
     /// Render exactly one raw DEX method ID; offsets are method-local characters.
     pub fn decompile_method_source(
         &mut self,

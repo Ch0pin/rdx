@@ -1353,18 +1353,64 @@ pub(crate) fn render_mixed_cancellable_with_nested(
     )
 }
 
+pub(crate) fn render_mixed_reported_with_nested(
+    name: &str,
+    class: &DexClass,
+    children: &[&DexClass],
+    world: Option<&std::collections::BTreeMap<String, DexClass>>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<(DecompiledCode, serde_json::Value)> {
+    let mut errors = std::collections::BTreeMap::new();
+    let mut folded = std::collections::BTreeSet::new();
+    let code = render_mixed_controlled_reported(
+        name,
+        class,
+        |method| {
+            let result = render_method(name, class, method);
+            if let Err(error) = &result {
+                errors.insert(
+                    crate::source_coverage::method_id(name, method),
+                    format!("{error:#}"),
+                );
+            }
+            result
+        },
+        children,
+        world,
+        cancelled,
+        Some(&mut folded),
+    )?;
+    let coverage = crate::source_coverage::report(name, class, &code, &errors, &folded);
+    Ok((code, coverage))
+}
+
 fn render_mixed_controlled(
+    name: &str,
+    class: &DexClass,
+    render_member: impl FnMut(&DexMethod) -> Result<DecompiledCode>,
+    children: &[&DexClass],
+    world: Option<&std::collections::BTreeMap<String, DexClass>>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<DecompiledCode> {
+    render_mixed_controlled_reported(name, class, render_member, children, world, cancelled, None)
+}
+
+fn render_mixed_controlled_reported(
     name: &str,
     class: &DexClass,
     mut render_member: impl FnMut(&DexMethod) -> Result<DecompiledCode>,
     children: &[&DexClass],
     world: Option<&std::collections::BTreeMap<String, DexClass>>,
     cancelled: &impl Fn() -> bool,
+    folded: Option<&mut std::collections::BTreeSet<String>>,
 ) -> Result<DecompiledCode> {
     ensure!(!cancelled(), "decompilation cancelled");
     if let Ok(plan) = enums::Plan::analyze(class)
         && let Ok(code) = plan.render(name, class)
     {
+        if let Some(folded) = folded {
+            *folded = plan.folded_methods(name, class);
+        }
         return Ok(code);
     }
     let mut attempted = Vec::new();
@@ -2206,6 +2252,34 @@ mod single_pass_tests {
                 .collect::<Vec<_>>()
         );
     }
+    #[test]
+    fn reported_render_tracks_supported_and_actual_fallback_errors() {
+        for failure in [None, Some(1)] {
+            let class = fixture(failure);
+            let (code, coverage) =
+                render_mixed_reported_with_nested("sample.Hello", &class, &[], None, &|| false)
+                    .unwrap();
+            assert!(!code.source.is_empty());
+            assert_eq!(coverage["total_methods"], class.methods.len());
+            assert_eq!(coverage["counts"]["omitted"], 0);
+            if failure.is_some() {
+                assert_eq!(coverage["counts"]["dex-fallback"], 1);
+                assert!(
+                    coverage["methods"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|method| method["status"] == "dex-fallback"
+                            && method["reason"]
+                                .as_str()
+                                .is_some_and(|reason| !reason.is_empty()))
+                );
+            } else {
+                assert_eq!(coverage["java_complete"], true);
+            }
+        }
+    }
+
     fn fixture(failure: Option<usize>) -> DexClass {
         let mut class = crate::native_dex::parse(include_bytes!("../../tests/fixtures/hello.dex"))
             .unwrap()

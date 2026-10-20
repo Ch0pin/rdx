@@ -40,7 +40,7 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     assert_eq!(replies[0]["error"]["code"], -32600);
     assert_eq!(replies[1]["result"]["protocolVersion"], "2025-06-18");
     let tools = replies[2]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 23);
+    assert_eq!(tools.len(), 25);
     let schema = |name: &str| {
         &tools
             .iter()
@@ -48,6 +48,20 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
             .unwrap_or_else(|| panic!("{name} must be advertised over stdio"))["inputSchema"]
     };
     let health = schema("get_health");
+    let class_source = schema("get_class_source");
+    assert!(class_source["properties"]["class_name"].is_object());
+    assert_eq!(
+        class_source["anyOf"],
+        json!([{"required":["class_id"]},{"required":["class_name"]}])
+    );
+    assert_eq!(
+        schema("get_lambda_branch")["properties"]["call_site_offset"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        schema("find_field_references")["properties"]["access"]["enum"],
+        json!(["all", "read", "write"])
+    );
     let method_source = schema("get_method_source");
     for key in ["method_id", "instance_id", "project_id"] {
         assert!(
@@ -143,9 +157,13 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     let required = implementations["inputSchema"]["required"]
         .as_array()
         .unwrap();
-    for key in ["class_id", "instance_id", "project_id"] {
+    for key in ["instance_id", "project_id"] {
         assert!(required.contains(&json!(key)));
     }
+    assert_eq!(
+        implementations["inputSchema"]["anyOf"],
+        json!([{"required":["class_id"]},{"required":["class_name"]}])
+    );
     assert!(tools.iter().any(|t| t["name"] == "get_call_graph"));
     assert!(tools.iter().any(|t| t["name"] == "open_apk"));
     assert!(

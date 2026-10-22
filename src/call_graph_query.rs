@@ -61,7 +61,12 @@ impl<'a> Options<'a> {
             .map(|v| v.as_bool().context("direct_only must be a boolean"))
             .transpose()?
             .unwrap_or(false);
-        let requested_depth = integer_option(args, "depth", 20)?;
+        let projection = string_option(args, "projection")?.unwrap_or("graph");
+        let requested_depth = integer_option(
+            args,
+            "depth",
+            if projection == "call_sites" { 1 } else { 20 },
+        )?;
         ensure!(
             (1..=100).contains(&requested_depth),
             "Call graph depth must be 1–100"
@@ -70,7 +75,6 @@ impl<'a> Options<'a> {
             !direct_only || args.get("depth").is_none_or(|_| requested_depth <= 1),
             "direct_only conflicts with depth greater than 1"
         );
-        let projection = string_option(args, "projection")?.unwrap_or("graph");
         ensure!(
             ["graph", "call_sites"].contains(&projection),
             "Invalid projection"
@@ -161,7 +165,7 @@ impl<'a> Catalog<'a> {
         cache.get(name)?.get(method).copied()
     }
 
-    /// Matches the legacy graph's superclass-alias resolution, including external parents.
+    /// Resolve aliases only when a matching declaration is present in a known ancestor.
     fn canonical(&self, method: &str) -> String {
         let Some(original) = owner(method) else {
             return method.into();
@@ -188,7 +192,7 @@ impl<'a> Catalog<'a> {
                 None => break,
             }
         }
-        format!("{name}.{member}")
+        method.into()
     }
 
     fn available(&self, method: &str) -> bool {
@@ -313,7 +317,8 @@ fn callee_sites(
 }
 
 fn record(site: &native_xrefs::CallSite, depth: usize) -> Value {
-    json!({"caller_method_id":site.caller,"caller_signature":site.caller,"callee_method_id":site.callee,"call_site_offset":site.pc,"depth":depth})
+    json!({"caller_method_id":site.caller,"caller_signature":site.caller,"callee_method_id":site.callee,"raw_callee_method_id":site.callee,"call_site_offset":site.pc,"depth":depth,
+        "invoke_instruction":crate::native_engine::disassembly::invoke_text(&site.words, site.pc, &site.callee),"dex_entry":site.dex_entry,"method_index":site.method_index,"invoke_opcode":site.opcode,"invoke_words":site.words,"caller_code_offset_bytes":site.code_offset,"dispatch":site.dispatch})
 }
 
 fn query_catalog(
@@ -323,10 +328,8 @@ fn query_catalog(
     cancel: &AtomicBool,
 ) -> Result<Value> {
     let options = Options::parse(args)?;
-    ensure!(
-        owner(root).is_some() && root.contains(')'),
-        "Expected exact DEX method signature"
-    );
+    let normalized_root = crate::method_lookup::graph_selector(root, |name| catalog.class(name))?;
+    let root = normalized_root.as_str();
     check_cancel(cancel)?;
     let root_key = catalog.canonical(root);
     // Outgoing queries scan only reachable bodies. Reverse traversal needs the
@@ -417,6 +420,11 @@ fn query_catalog(
     let mut result = metadata;
     if options.projection == "call_sites" {
         let total = selected_sites.len();
+        result["direct_matching_total"] =
+            json!(selected_sites.values().filter(|&&depth| depth == 1).count());
+        result["call_site_semantics"] = json!(
+            "Each record is one raw DEX invoke to callee_method_id. depth is traversal distance from the query root; only depth=1 records are direct root neighbors. call_sites defaults to depth=1; explicit depth includes transitive sites."
+        );
         let mut hash = Sha256::new();
         for (&i, &depth) in &selected_sites {
             check_cancel(cancel)?;
@@ -929,6 +937,132 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn compact_defaults_are_direct_and_explicit_depth_preserves_transitive_sites() {
+        let classes = vec![
+            class("app.Root", None, vec![("run", vec![], vec![])]),
+            class(
+                "app.Middle",
+                None,
+                vec![("run", vec![], vec!["app.Root.run()V"])],
+            ),
+            class(
+                "app.Outer",
+                None,
+                vec![("run", vec![], vec!["app.Middle.run()V"])],
+            ),
+        ];
+        let direct = run(
+            &classes,
+            "Lapp/Root;->run()V",
+            json!({"projection":"call_sites","direction":"callers"}),
+        );
+        assert_eq!(direct["root_method_id"], "app.Root.run()V");
+        assert_eq!(direct["matching_total"], 1);
+        assert_eq!(direct["depth"], 1);
+        assert_eq!(
+            direct["call_sites"][0]["callee_method_id"],
+            "app.Root.run()V"
+        );
+        let transitive = run(
+            &classes,
+            "app.Root.run()V",
+            json!({"projection":"call_sites","direction":"callers","depth":2}),
+        );
+        assert_eq!(transitive["matching_total"], 2);
+        assert_eq!(transitive["direct_matching_total"], 1);
+        assert_eq!(
+            transitive["call_sites"][1]["callee_method_id"],
+            "app.Middle.run()V"
+        );
+        assert_eq!(transitive["call_sites"][1]["depth"], 2);
+        assert_eq!(Options::parse(&json!({})).unwrap().depth, 20);
+    }
+
+    #[test]
+    fn dex_local_method_indexes_keep_raw_target_and_container_provenance() {
+        // Both independent symbol tables assign index 0 to different methods.
+        let first = class(
+            "app.First",
+            None,
+            vec![("run", vec![], vec!["target.Right.run()V"])],
+        );
+        first.symbols.origin.set("classes.dex".into()).unwrap();
+        let second = class(
+            "app.Second",
+            None,
+            vec![("run", vec![], vec!["target.Wrong.run()V"])],
+        );
+        second.symbols.origin.set("classes2.dex".into()).unwrap();
+        let classes = vec![first, second];
+        let args = json!({"projection":"call_sites","direction":"callers"});
+        let right = run(&classes, "target.Right.run()V", args.clone());
+        let wrong = run(&classes, "target.Wrong.run()V", args);
+        for (result, caller, entry, callee) in [
+            (
+                right,
+                "app.First.run()V",
+                "classes.dex",
+                "target.Right.run()V",
+            ),
+            (
+                wrong,
+                "app.Second.run()V",
+                "classes2.dex",
+                "target.Wrong.run()V",
+            ),
+        ] {
+            assert_eq!(result["matching_total"], 1);
+            let site = &result["call_sites"][0];
+            assert_eq!(site["caller_method_id"], caller);
+            assert_eq!(site["raw_callee_method_id"], callee);
+            assert_eq!(site["dex_entry"], entry);
+            assert_eq!(site["method_index"], 0);
+            assert_eq!(site["invoke_opcode"], 0x71);
+            assert_eq!(site["invoke_words"], json!([0x71, 0, 0]));
+            assert!(
+                site["invoke_instruction"]
+                    .as_str()
+                    .unwrap()
+                    .contains("invoke-static {}")
+            );
+            assert!(
+                site["invoke_instruction"]
+                    .as_str()
+                    .unwrap()
+                    .contains(callee)
+            );
+            assert_eq!(site["call_site_offset"], 1);
+        }
+    }
+
+    #[test]
+    fn unresolved_sibling_methods_do_not_alias_through_external_parent() {
+        let classes = vec![
+            class("app.Left", Some("external.Parent"), vec![]),
+            class("app.Right", Some("external.Parent"), vec![]),
+            class(
+                "app.Caller",
+                None,
+                vec![(
+                    "run",
+                    vec![],
+                    vec!["app.Left.missing()V", "app.Right.missing()V"],
+                )],
+            ),
+        ];
+        let result = run(
+            &classes,
+            "app.Left.missing()V",
+            json!({"projection":"call_sites","direction":"callers"}),
+        );
+        assert_eq!(result["matching_total"], 1);
+        assert_eq!(
+            result["call_sites"][0]["callee_method_id"],
+            "app.Left.missing()V"
+        );
     }
 
     #[test]

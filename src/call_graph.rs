@@ -129,7 +129,7 @@ fn canonical(engine: &NativeDexEngine, target: &str) -> String {
             None => break,
         }
     }
-    format!("{name}.{member}")
+    target.into()
 }
 
 /// Ancestor declarations are possible dispatch entry points, not proven callers.

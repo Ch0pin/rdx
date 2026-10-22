@@ -12,6 +12,11 @@ pub struct CallSite {
     pub callee: String,
     pub pc: usize,
     pub dispatch: &'static str,
+    pub dex_entry: Option<String>,
+    pub method_index: usize,
+    pub opcode: u8,
+    pub words: Vec<u16>,
+    pub code_offset: u32,
 }
 
 pub fn call_sites(
@@ -103,6 +108,11 @@ pub fn method_call_sites(
                 ),
                 pc,
                 dispatch,
+                dex_entry: class.symbols.origin.get().cloned(),
+                method_index: index,
+                opcode: op,
+                words: code.instructions[pc..pc + width].to_vec(),
+                code_offset: code.offset,
             });
         }
         pc += width;

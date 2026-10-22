@@ -2233,13 +2233,104 @@ fn handler_join_bypass_preserves_effects_and_exception_ownership_on_jvm() {
     }
 }
 
-#[test]
-fn handler_join_does_not_move_effectful_bypass_into_try() {
+fn effectful_bypassed_handler_join_fixture() -> DexClass {
     let mut class = bypassed_handler_join_fixture();
     let words = &mut class.methods[0].code.as_mut().unwrap().instructions;
     words[7] = 0x0a28;
     words.extend([0x0071, 2, 0, 0x020f]);
-    assert!(native_java::render("sample.Effects", &class).is_err());
+    class
+}
+
+#[test]
+fn handler_join_does_not_move_effectful_bypass_into_try() {
+    let class = effectful_bypassed_handler_join_fixture();
+    let original = class.methods[0].code.as_ref().unwrap().instructions.clone();
+    let code = native_java::render("sample.Effects", &class)
+        .expect("closure-valid join keeps each effectful continuation outside the original catch");
+    let before_catch = &code.source[..code.source.find("catch (").unwrap()];
+    assert_eq!(code.source.matches("first()").count(), 1, "{}", code.source);
+    assert!(!before_catch.contains("touch()"), "{}", code.source);
+    assert!(!before_catch.contains("second()"), "{}", code.source);
+    assert_eq!(
+        class.methods[0].code.as_ref().unwrap().instructions,
+        original
+    );
+}
+
+#[test]
+#[ignore = "requires javac/java; effectful-bypass method compiled unchanged"]
+fn effectful_handler_join_bypass_keeps_independent_faults_and_original_dispatch_on_jvm() {
+    let class = effectful_bypassed_handler_join_fixture();
+    let method = native_java::render_method("sample.Effects", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    let java = format!(
+        r#"package sample;
+public class Effects {{
+{method}
+static int firstValue,bodyFailure,touchFailure,secondFailure;static String trace;
+static final RuntimeException BODY=new RuntimeException("body"),TOUCH=new RuntimeException("touch"),SECOND=new RuntimeException("second");
+static final Error BODY_ERROR=new AssertionError("body"),TOUCH_ERROR=new AssertionError("touch"),SECOND_ERROR=new AssertionError("second");
+static final java.io.IOException BODY_CHECKED=new java.io.IOException("body"),TOUCH_CHECKED=new java.io.IOException("touch"),SECOND_CHECKED=new java.io.IOException("second");
+@SuppressWarnings("unchecked")static<T extends Throwable>void raise(Throwable fault)throws T{{throw(T)fault;}}
+static void fail(int kind,RuntimeException runtime,Error error,java.io.IOException checked){{
+ if(kind==1)throw runtime;if(kind==2)throw error;if(kind==3)Effects.<RuntimeException>raise(checked);
+}}
+static int first(){{trace+="A";fail(bodyFailure,BODY,BODY_ERROR,BODY_CHECKED);return firstValue;}}
+static void touch(){{trace+="R";fail(touchFailure,TOUCH,TOUCH_ERROR,TOUCH_CHECKED);}}
+static int second(){{trace+="B";fail(secondFailure,SECOND,SECOND_ERROR,SECOND_CHECKED);return 7;}}
+static int reference(){{
+ int value;
+ try{{value=first();}}catch(RuntimeException ignored){{touch();return second();}}
+ if(value!=0)return second();
+ touch();return -1;
+}}
+public static void main(String[]args){{
+ int checks=0;
+ for(int value:new int[]{{0,1,-7,Integer.MAX_VALUE}})for(int body=0;body<=3;body++)for(int touch=0;touch<=3;touch++)for(int second=0;second<=3;second++){{
+  firstValue=value;bodyFailure=body;touchFailure=touch;secondFailure=second;
+  int[] result={{99,99}};Throwable[] fault=new Throwable[2];String[] traces=new String[2];
+  for(int side=0;side<2;side++){{
+   trace="";try{{result[side]=side==0?test():reference();}}catch(Throwable caught){{fault[side]=caught;}}traces[side]=trace;
+  }}
+  if(result[0]!=result[1]||fault[0]!=fault[1]||!traces[0].equals(traces[1]))
+   throw new AssertionError(value+":"+body+":"+touch+":"+second+":"+traces[0]+"/"+traces[1],fault[0]);
+  checks++;
+ }}
+ System.out.println("checks="+checks);
+}}
+}}"#
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "rdx-effectful-handler-bypass-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    let file = dir.join("sample/Effects.java");
+    fs::write(&file, java).unwrap();
+    let home = std::env::var("RDX_JAVA25_HOME").ok();
+    let executable = |name: &str| {
+        home.as_ref()
+            .map_or_else(|| name.to_string(), |home| format!("{home}/bin/{name}"))
+    };
+    let compile = Command::new(executable("javac"))
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}\n{method}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(executable("java"))
+        .args(["-cp", dir.to_str().unwrap(), "sample.Effects"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}\n{method}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 }
 
 fn comparison_return_tail_fixture(op: u16) -> DexClass {

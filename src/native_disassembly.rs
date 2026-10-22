@@ -273,6 +273,21 @@ pub(crate) fn width(words: &[u16], pc: usize) -> Option<usize> {
     };
     (pc.checked_add(size)? <= words.len()).then_some(size)
 }
+/// Format an already validated invoke instruction using its raw DEX target.
+pub(crate) fn invoke_text(words: &[u16], pc: usize, target: &str) -> String {
+    let op = words[0] as u8;
+    let raw = words
+        .iter()
+        .map(|word| format!("{word:04x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "{pc:04x}: {} {}, {target} // [{raw}]",
+        mnemonic(op, words[0]),
+        operands(op, words, pc)
+    )
+}
+
 fn operands(op: u8, w: &[u16], pc: usize) -> String {
     let a = w[0] >> 8;
     let lo = a & 15;

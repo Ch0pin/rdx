@@ -75,6 +75,38 @@ pub struct DecompiledCode {
     pub source_hash: String,
 }
 
+/// Requested representation for one exact method; Auto preserves Java-first recovery.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MethodSourceFormat {
+    #[default]
+    Auto,
+    Dex,
+}
+impl MethodSourceFormat {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "dex" => Ok(Self::Dex),
+            _ => anyhow::bail!("Invalid method source format: expected auto or dex"),
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Dex => "dex",
+        }
+    }
+}
+
+/// One method's representation and whether Java reconstruction was attempted.
+#[derive(Clone, Debug)]
+pub struct MethodSource {
+    pub code: DecompiledCode,
+    pub format: &'static str,
+    pub reconstruction_attempted: bool,
+    pub fallback_reason: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct NavigationResult {
     pub class: String,
@@ -122,6 +154,7 @@ pub struct NativeEngine {
     resources: std::sync::Arc<crate::resource_table::ResourceTable>,
     resource_error: Option<String>,
     usage_index: Option<crate::usage_index::UsageIndexHandle>,
+    identifier_index: crate::identifier_search::Cache,
 }
 
 /// A deterministic identity for locally generated source, not a security digest.
@@ -148,6 +181,7 @@ impl NativeEngine {
         self.prepared = None;
         self.native = NativeDexEngine::default();
         self.source_cache = Default::default();
+        self.identifier_index = Default::default();
         self.classes = Default::default();
         self.resources = Default::default();
         self.resource_error = None;
@@ -243,6 +277,22 @@ impl NativeEngine {
     }
     pub fn dex_class(&self, name: &str) -> Option<&crate::native_dex::DexClass> {
         self.native.class(name)
+    }
+
+    pub fn search_identifiers(
+        &self,
+        args: &serde_json::Value,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<serde_json::Value> {
+        self.identifier_index
+            .search(self.native.shared_classes(), args, cancel)
+    }
+
+    pub fn hierarchy_name_candidates(&self, short: &str) -> Vec<String> {
+        self.native.hierarchy_name_candidates(short)
+    }
+    pub fn references_supertype(&self, name: &str) -> bool {
+        self.native.references_supertype(name)
     }
 
     pub fn direct_subclass_names(&self, name: &str) -> Vec<String> {
@@ -373,53 +423,78 @@ impl NativeEngine {
         code.source_hash = source_identity(&code.source);
         Ok((code, coverage))
     }
-    /// Render exactly one raw DEX method ID; offsets are method-local characters.
+    /// Render exactly one method using the existing Java-first representation.
     pub fn decompile_method_source(
         &mut self,
         id: &str,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(DecompiledCode, Option<String>)> {
+        let report = self.method_source(id, MethodSourceFormat::Auto, cancel)?;
+        Ok((report.code, report.fallback_reason))
+    }
+    /// Render one exact DEX method ID; Dex bypasses Java reconstruction entirely.
+    /// Offsets are method-local characters. Neither mode populates class caches.
+    pub fn method_source(
+        &mut self,
+        id: &str,
+        format: MethodSourceFormat,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<MethodSource> {
         ensure!(
             !cancel.load(std::sync::atomic::Ordering::Relaxed),
             "CANCELLED"
         );
-        let (head, _) = id
-            .split_once('(')
-            .context("Invalid method ID: missing descriptor")?;
-        let (owner, _) = head
-            .rsplit_once('.')
-            .context("Invalid method ID: missing owner")?;
+        let normalized = crate::method_lookup::normalize(id)?;
+        let id = normalized.as_str();
+        let owner = crate::method_lookup::owner(id)?;
         let class = self
             .native
             .class(owner)
             .with_context(|| format!("SYMBOL_NOT_FOUND: class_id={owner}"))?;
-        let mut matches = class
-            .methods
-            .iter()
-            .filter(|m| crate::native_engine::disassembly::method_id(m) == id);
-        let method = matches
-            .next()
-            .with_context(|| format!("SYMBOL_NOT_FOUND: method_id={id}"))?;
-        ensure!(matches.next().is_none(), "AMBIGUOUS_METHOD: {id}");
-        let (mut code, fallback) = match crate::native_java::render_method(owner, class, method) {
-            Ok(code) => (code, None),
-            Err(error) => (
+        let method = crate::method_lookup::resolve(class, id)?;
+        let (mut code, fallback) = if format == MethodSourceFormat::Dex {
+            (
                 crate::native_engine::disassembly::render_method(method, &class.symbols),
-                Some(error.to_string()),
-            ),
+                None,
+            )
+        } else {
+            match crate::native_java::render_method(owner, class, method) {
+                Ok(code) => (
+                    crate::native_java::present_method_source_types(class, code),
+                    None,
+                ),
+                Err(error) => (
+                    crate::native_engine::disassembly::render_method(method, &class.symbols),
+                    Some(error.to_string()),
+                ),
+            }
         };
+        if let Some(reason) = &fallback {
+            crate::source_coverage::prepend_method_fallback_header(&mut code, id, reason);
+        }
         ensure!(
             !cancel.load(std::sync::atomic::Ordering::Relaxed),
             "CANCELLED"
         );
-        self.resources
-            .decorate_java(&mut code, &self.native.shared_classes());
+        if format == MethodSourceFormat::Auto {
+            self.resources
+                .decorate_java(&mut code, &self.native.shared_classes());
+        }
         code.source_hash = source_identity(&code.source);
         ensure!(
             !cancel.load(std::sync::atomic::Ordering::Relaxed),
             "CANCELLED"
         );
-        Ok((code, fallback))
+        Ok(MethodSource {
+            code,
+            format: if format == MethodSourceFormat::Dex || fallback.is_some() {
+                "rdx-dex"
+            } else {
+                "java"
+            },
+            reconstruction_attempted: format == MethodSourceFormat::Auto,
+            fallback_reason: fallback,
+        })
     }
     pub fn decompile_source(&mut self, class: &str) -> Result<DecompiledSource> {
         let code = self.decompile_with_metadata(class)?;
@@ -468,14 +543,25 @@ impl NativeEngine {
         def: &CodeDefinition,
     ) -> Option<String> {
         let class = class.strip_prefix("dex://").unwrap_or(class);
-        if def.kind == "method" && code.source.starts_with("// Native DEX disassembly.") {
-            return Some(
-                code.source
-                    .chars()
-                    .skip(def.start)
-                    .take(def.end - def.start)
-                    .collect(),
-            );
+        if def.kind == "method" {
+            let declaration_byte = code
+                .source
+                .char_indices()
+                .nth(def.start)
+                .map_or(code.source.len(), |(byte, _)| byte);
+            let declaration_prefix = code.source[..declaration_byte]
+                .rsplit('\n')
+                .next()
+                .unwrap_or("");
+            if declaration_prefix.trim_start() == ".method " {
+                return Some(
+                    code.source
+                        .chars()
+                        .skip(def.start)
+                        .take(def.end - def.start)
+                        .collect(),
+                );
+            }
         }
         if def.kind == "class" {
             return Some(class.into());
@@ -676,11 +762,8 @@ impl NativeEngine {
         direction: &str,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<crate::call_graph::CallGraph> {
-        anyhow::ensure!(
-            method.contains('(') && method.contains(')'),
-            "Expected exact DEX method signature"
-        );
-        crate::call_graph::build_direction(&self.native, method, depth, direction, cancel)
+        let method = crate::method_lookup::graph_selector(method, |name| self.dex_class(name))?;
+        crate::call_graph::build_direction(&self.native, &method, depth, direction, cancel)
     }
 
     /// Query DEX call sites and filtered graphs without Java reconstruction.
@@ -886,7 +969,10 @@ impl NativeEngine {
         class: &str,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<String>> {
-        ensure!(self.native.class(class).is_some(), "SYMBOL_NOT_FOUND");
+        ensure!(
+            self.native.class(class).is_some() || self.native.references_supertype(class),
+            "SYMBOL_NOT_FOUND: no loaded definition or app-declared superclass/interface edge; framework definitions may be absent from the APK; use an exact referenced FQCN or DEX descriptor"
+        );
         self.native.implementations(class, None, cancel)
     }
 
@@ -1241,6 +1327,34 @@ mod navigation_cache_tests {
     use super::*;
     use std::sync::Arc;
 
+    #[test]
+    fn raw_method_identity_uses_declaration_line_after_diagnostic_header() {
+        let id = "sample.Caller.f()V";
+        let source = format!(
+            "// RDX Java reconstruction incomplete: 1 DEX fallback method(s).\n// Native DEX disassembly.\n.method {id}\n.end method\n"
+        );
+        let byte = source.find(id).unwrap();
+        let start = source[..byte].chars().count();
+        let definition = CodeDefinition {
+            start,
+            end: start + id.chars().count(),
+            kind: "method".into(),
+            name: "f".into(),
+        };
+        let code = DecompiledCode {
+            source_hash: source_identity(&source),
+            source,
+            links: vec![],
+            definitions: vec![definition],
+        };
+        assert_eq!(
+            NativeEngine::default()
+                .definition_symbol("sample.Caller", &code, &code.definitions[0])
+                .as_deref(),
+            Some(id)
+        );
+    }
+
     fn opened() -> NativeEngine {
         let mut engine = NativeEngine::default();
         engine
@@ -1301,6 +1415,30 @@ mod navigation_cache_tests {
             &original,
             &engine.source_cache.get("sample.Caller").unwrap()
         ));
+    }
+
+    #[test]
+    fn method_source_formats_preserve_interactive_class_cache() {
+        let mut engine = opened();
+        engine.decompile_with_metadata("sample.Target").unwrap();
+        let original = engine.source_cache.get("sample.Target").unwrap();
+        for format in [MethodSourceFormat::Dex, MethodSourceFormat::Auto] {
+            let report = engine
+                .method_source(
+                    "sample.Target.doubleValue(I)I",
+                    format,
+                    &std::sync::atomic::AtomicBool::new(false),
+                )
+                .unwrap();
+            assert_eq!(
+                report.reconstruction_attempted,
+                format == MethodSourceFormat::Auto
+            );
+            assert!(Arc::ptr_eq(
+                &original,
+                &engine.source_cache.get("sample.Target").unwrap()
+            ));
+        }
     }
 
     #[test]

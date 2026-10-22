@@ -31,6 +31,13 @@ impl Asm {
 fn fixture() -> (DexClass, DexMethod) {
     fixture_with_parent(false)
 }
+fn fixture_with_join_assignment() -> (DexClass, DexMethod) {
+    let (class, mut method) = fixture();
+    let code = method.code.as_mut().unwrap();
+    let handler = code.try_regions[0].catches[0].1 as usize;
+    code.instructions[handler..handler + 3].copy_from_slice(&[0x1012, 0, 0]);
+    (class, method)
+}
 fn fixture_with_parent(parent: bool) -> (DexClass, DexMethod) {
     let symbols = Arc::new(DexSymbols {
         types: [
@@ -196,6 +203,11 @@ fn jvm_shared_failure_runs_once_and_escapes_its_own_faults() {
         .unwrap()
         .source
         .replacen("run(", "early(", 1);
+    let (assigned_c, mut assigned_m) = fixture_with_join_assignment();
+    assigned_m.name = "assigned".into();
+    let assigned_source = native_java::render_method("sample.Example", &assigned_c, &assigned_m)
+        .unwrap()
+        .source;
     let java = format!(
         r#"package sample;
 class Api {{
@@ -207,7 +219,7 @@ class Api {{
  static void failure() {{ trace+="F";if(mode==5)throw handlerFailure; }}
 }}
 class Holder {{ int mResources; }} class Leaf extends Holder {{ int other; }} class Missing {{ int other; }}
-class Example {{ {source} {parent_source} {early_source} }}
+class Example {{ {source} {parent_source} {early_source} {assigned_source} }}
 public class Runner {{
  static boolean reference(Class<?> type) {{
   boolean result=false;
@@ -216,6 +228,15 @@ public class Runner {{
    if(found!=null) {{ Api.install(found);result=true;break; }} type=type.getSuperclass();
   }} }} catch(Throwable caught) {{}}
   if(!result)Api.failure(); return result;
+ }}
+ static boolean assignedReference(Class<?> type) {{
+  try {{ Api.start(); while(type!=null) {{ java.lang.reflect.Field found=null;
+   for(java.lang.reflect.Field field:type.getDeclaredFields()) {{ if(field.getName().equals("mResources")) {{ found=field;break; }} }}
+   if(found!=null) {{ Api.install(found);break; }} type=type.getSuperclass();
+  }} }} catch(Throwable caught) {{}}
+  // The original shared handler writes true on exhausted normal flow and on
+  // every exception. It has no failure callback or old-entry snapshot read.
+  return true;
  }}
  public static void main(String[] args) throws Throwable {{
   Api.mode=0;
@@ -231,6 +252,12 @@ public class Runner {{
     try{{actual=parent?Example.parent(type):Example.run(type);}}catch(Throwable t){{actualFailure=t;}}
     if(actual!=expected||actualFailure!=expectedFailure||!trace.equals(Api.trace))throw new AssertionError(mode+":"+type+":"+Api.trace+" expected "+trace);
    }}
+   Api.trace="";boolean assignedExpected=false;Throwable assignedExpectedFailure=null;
+   try{{assignedExpected=assignedReference(type);}}catch(Throwable t){{assignedExpectedFailure=t;}}String assignedTrace=Api.trace;
+   Api.trace="";boolean assignedActual=false;Throwable assignedActualFailure=null;
+   try{{assignedActual=Example.assigned(type);}}catch(Throwable t){{assignedActualFailure=t;}}
+   if(assignedActual!=assignedExpected||assignedActualFailure!=assignedExpectedFailure||!assignedTrace.equals(Api.trace))
+    throw new AssertionError("assigned "+mode+":"+type+":"+Api.trace+" expected "+assignedTrace);
   }}
  }}
 }}"#
@@ -271,12 +298,17 @@ fn changed_failure_inputs_reject_invariant_projection() {
     assert!(native_java::render_method("sample.Example", &c, &m).is_err());
 }
 #[test]
-fn handler_write_observed_at_join_rejects_projection() {
-    let (c, mut m) = fixture();
-    let code = m.code.as_mut().unwrap();
-    let handler = code.try_regions[0].catches[0].1 as usize;
-    code.instructions[handler..handler + 3].copy_from_slice(&[0x1012, 0, 0]);
-    assert!(native_java::render_method("sample.Example", &c, &m).is_err());
+fn pure_shared_handler_preserves_its_actual_assignment_at_the_join() {
+    let (class, method) = fixture_with_join_assignment();
+    let original = method.code.as_ref().unwrap().instructions.clone();
+    let source = native_java::render_method("sample.Example", &class, &method)
+        .expect("original pure handler assignment has a complete exit lifetime")
+        .source;
+    assert!(source.contains("catch"), "{source}");
+    assert_eq!(source.matches("Api.start(").count(), 1, "{source}");
+    assert_eq!(source.matches("Api.install(").count(), 1, "{source}");
+    assert!(!source.contains("Api.failure("), "{source}");
+    assert_eq!(method.code.as_ref().unwrap().instructions, original);
 }
 #[test]
 fn changed_join_value_before_throw_rejects_entry_snapshot() {

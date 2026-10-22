@@ -14,7 +14,7 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::Path,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 const MAX_DEX_BYTES: u64 = 256 * 1024 * 1024;
@@ -37,10 +37,17 @@ fn unsupported<T>(reason: impl Into<String>) -> Result<T> {
     Err(UnsupportedNative(reason.into()).into())
 }
 
+#[derive(Default)]
+struct HierarchyIndex {
+    children: BTreeMap<String, Vec<String>>,
+    direct: BTreeMap<String, Vec<String>>,
+    names: BTreeMap<String, String>,
+}
 #[derive(Clone, Default)]
 pub struct NativeDexEngine {
     classes: Arc<BTreeMap<String, DexClass>>,
     nested_children: Arc<BTreeMap<String, Vec<String>>>,
+    hierarchy_index: Arc<OnceLock<HierarchyIndex>>,
     opened: bool,
 }
 impl NativeDexEngine {
@@ -62,28 +69,14 @@ impl NativeDexEngine {
         Arc::clone(&self.nested_children)
     }
     pub fn render(&self, name: &str) -> Result<DecompiledCode> {
-        let class = self
-            .classes
-            .get(name)
-            .with_context(|| format!("Unknown class: {name}"))?;
-        self.render_class(name, class)
+        self.render_reported(name, &|| false).map(|(code, _)| code)
     }
     pub fn render_cancellable(
         &self,
         name: &str,
         cancelled: &impl Fn() -> bool,
     ) -> Result<DecompiledCode> {
-        let class = self
-            .classes
-            .get(name)
-            .with_context(|| format!("Unknown class: {name}"))?;
-        crate::native_java::render_mixed_cancellable_with_nested(
-            name,
-            class,
-            &self.nested_children(name),
-            Some(&self.classes),
-            cancelled,
-        )
+        self.render_reported(name, cancelled).map(|(code, _)| code)
     }
     pub(crate) fn render_reported(
         &self,
@@ -94,21 +87,18 @@ impl NativeDexEngine {
             .classes
             .get(name)
             .with_context(|| format!("Unknown class: {name}"))?;
-        crate::native_java::render_mixed_reported_with_nested(
+        let (mut code, mut coverage) = crate::native_java::render_mixed_reported_with_nested(
             name,
             class,
             &self.nested_children(name),
             Some(&self.classes),
             cancelled,
-        )
+        )?;
+        crate::source_coverage::prepend_incomplete_header(&mut code, &mut coverage);
+        Ok((code, coverage))
     }
-    fn render_class(&self, name: &str, class: &DexClass) -> Result<DecompiledCode> {
-        Ok(crate::native_java::render_mixed_with_nested(
-            name,
-            class,
-            &self.nested_children(name),
-            Some(&self.classes),
-        ))
+    fn render_class(&self, name: &str, _class: &DexClass) -> Result<DecompiledCode> {
+        self.render(name)
     }
 
     pub fn definition_names(&self, names: &[String]) -> Result<DefinitionNameIndex> {
@@ -142,19 +132,63 @@ impl NativeDexEngine {
     pub fn class(&self, name: &str) -> Option<&DexClass> {
         self.classes.get(name)
     }
+    fn hierarchy_index(&self) -> &HierarchyIndex {
+        self.hierarchy_index.get_or_init(|| {
+            let mut index = HierarchyIndex::default();
+            for (name, class) in self.classes.iter() {
+                index
+                    .names
+                    .insert(class.descriptor.to_string(), name.clone());
+                for parent in class.superclass.iter().chain(class.interfaces.iter()) {
+                    index
+                        .children
+                        .entry(parent.to_string())
+                        .or_default()
+                        .push(class.descriptor.to_string());
+                }
+                if class.access_flags & 0x200 == 0
+                    && let Some(parent) = &class.superclass
+                    && parent != &class.descriptor
+                {
+                    index
+                        .direct
+                        .entry(parent.to_string())
+                        .or_default()
+                        .push(name.clone());
+                }
+            }
+            index
+        })
+    }
+    /// Exact DEX declaration edges establish external hierarchy query roots.
+    pub fn references_supertype(&self, name: &str) -> bool {
+        let descriptor = format!("L{};", name.replace('.', "/"));
+        self.hierarchy_index().children.contains_key(&descriptor)
+    }
+
+    /// Loaded classes and referenced external hierarchy roots sharing a short name.
+    pub fn hierarchy_name_candidates(&self, short: &str) -> Vec<String> {
+        let index = self.hierarchy_index();
+        index
+            .names
+            .keys()
+            .chain(index.children.keys())
+            .map(|descriptor| disassembly::type_name(descriptor))
+            .filter(|name| name.rsplit('.').next() == Some(short))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// Immediate superclass edges only, including references to external parents.
     /// Uses original DEX identity, independently of source reconstruction/aliases.
     pub fn direct_subclasses(&self, name: &str) -> Vec<String> {
         let descriptor = format!("L{};", name.replace('.', "/"));
-        self.classes
-            .iter()
-            .filter(|(_, class)| {
-                class.access_flags & 0x200 == 0
-                    && class.superclass.as_deref() == Some(descriptor.as_str())
-                    && class.descriptor.as_ref() != descriptor
-            })
-            .map(|(name, _)| name.clone())
-            .collect()
+        self.hierarchy_index()
+            .direct
+            .get(&descriptor)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -256,6 +290,7 @@ impl NativeDexEngine {
     ) -> Result<Project> {
         // Clear stale state even if the replacement input fails.
         self.classes = Arc::default();
+        self.hierarchy_index = Arc::default();
         self.nested_children = Arc::default();
         self.opened = false;
         let mut classes = BTreeMap::new();
@@ -271,6 +306,7 @@ impl NativeDexEngine {
                 }
             })?;
             for class in dex.classes {
+                class.symbols.origin.get_or_init(|| origin.to_owned());
                 let name = class
                     .descriptor
                     .strip_prefix('L')
@@ -364,6 +400,7 @@ impl NativeDexEngine {
         };
         self.nested_children = Arc::new(crate::native_java::anonymous::index(&classes));
         self.classes = Arc::new(classes);
+        self.hierarchy_index();
         self.opened = true;
         Ok(project)
     }
@@ -372,6 +409,60 @@ impl NativeDexEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_render_paths_share_explicit_fallback_header_and_offsets() {
+        let mut class = crate::native_dex::parse(include_bytes!("../tests/fixtures/hello.dex"))
+            .unwrap()
+            .classes
+            .remove(0);
+        let method = &mut class.methods[0];
+        method.code.as_mut().unwrap().instructions = vec![0x001d, 0x000e];
+        let name = disassembly::type_name(&class.descriptor);
+        let engine = NativeDexEngine {
+            classes: Arc::new(BTreeMap::from([(name.clone(), class)])),
+            ..Default::default()
+        };
+        let (reported, coverage) = engine.render_reported(&name, &|| false).unwrap();
+        assert!(
+            reported
+                .source
+                .starts_with("// RDX Java reconstruction incomplete:")
+        );
+        assert!(coverage["counts"]["dex-fallback"].as_u64().unwrap() > 0);
+        for code in [
+            engine.render(&name).unwrap(),
+            engine.render_cancellable(&name, &|| false).unwrap(),
+        ] {
+            assert_eq!(code.source, reported.source);
+            assert_eq!(
+                code.source_hash,
+                crate::engine::source_identity(&code.source)
+            );
+            for method in coverage["methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["status"] == "dex-fallback")
+            {
+                if let Some(start) = method["declaration_offset"]["start"].as_u64() {
+                    let definition = code
+                        .definitions
+                        .iter()
+                        .find(|d| d.start == start as usize)
+                        .unwrap();
+                    assert_eq!(
+                        code.source
+                            .chars()
+                            .skip(definition.start)
+                            .take(definition.end - definition.start)
+                            .collect::<String>(),
+                        method["method_id"].as_str().unwrap()
+                    );
+                }
+            }
+        }
+        assert!(engine.render_cancellable(&name, &|| true).is_err());
+    }
     #[test]
     fn direct_subclasses_use_exact_immediate_superclass_metadata() {
         let mut engine = NativeDexEngine::default();
@@ -405,6 +496,15 @@ mod tests {
             ["sample.Implementer"]
         );
         assert!(engine.direct_subclasses("sample.Missing").is_empty());
+        assert_eq!(
+            engine.hierarchy_name_candidates("Parent"),
+            ["other.Parent", "sample.Parent"]
+        );
+        assert_eq!(
+            engine.hierarchy_name_candidates("Object"),
+            ["java.lang.Object"]
+        );
+        assert_eq!(engine.hierarchy_name_candidates("Child"), ["sample.Child"]);
     }
     fn fixture(name: &str) -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))

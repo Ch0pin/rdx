@@ -6,7 +6,7 @@ use rdx::{
 use std::sync::Arc;
 #[path = "../src/native_java/loop_exit_type.rs"]
 mod proof;
-pub use rdx::{native_cfg, native_hierarchy, native_ssa, native_types};
+pub use rdx::{native_cfg, native_dex, native_hierarchy, native_ir, native_ssa, native_types};
 
 fn fixture() -> DexClass {
     DexClass {

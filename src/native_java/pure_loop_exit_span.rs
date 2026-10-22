@@ -10,9 +10,16 @@ pub(crate) fn admits(code: &DexCode, header: usize, tail: usize, exit: usize) ->
     prove(code, header, tail, exit).is_some()
 }
 fn prove(code: &DexCode, header: usize, tail: usize, exit: usize) -> Option<()> {
-    if code.tries != 0
-        || !code.try_regions.is_empty()
-        || code.instructions.len() > 4096
+    if code.instructions.len() > 4096
+        || code.registers > 256
+        || usize::from(code.tries) != code.try_regions.len()
+        || code.try_regions.len() > 16
+        || code
+            .try_regions
+            .iter()
+            .map(|region| region.catches.len())
+            .sum::<usize>()
+            > 64
         || !(header < tail && tail < exit && exit < code.instructions.len())
         || exit - tail > 64
     {
@@ -20,8 +27,9 @@ fn prove(code: &DexCode, header: usize, tail: usize, exit: usize) -> Option<()> 
     }
     let ir = DecodedMethod::decode(code).ok()?;
     let cfg = ControlFlowGraph::build(code).ok()?;
-    if cfg.blocks.len() > 256
+    if cfg.blocks.len() > 512
         || cfg.blocks[*cfg.block_at.get(&header)?].start != header
+        || (!code.try_regions.is_empty() && cfg.blocks[*cfg.block_at.get(&tail)?].start != tail)
         || cfg.blocks[*cfg.block_at.get(&exit)?].start != exit
     {
         return None;
@@ -53,11 +61,31 @@ fn prove(code: &DexCode, header: usize, tail: usize, exit: usize) -> Option<()> 
         let actual = if end < b.end {
             vec![end]
         } else {
-            if b.successors.iter().any(|e| e.kind != EdgeKind::Normal) {
-                return None;
+            // DEX CFG conservatively retains protection on pure instructions.
+            // Check those original dispatch edges without projecting a new CFG;
+            // the independently decoded nonthrowing span uses its normal edge.
+            for edge in b
+                .successors
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::Exceptional)
+            {
+                let handler = cfg.blocks[edge.target].start;
+                if (tail..=exit).contains(&handler)
+                    || !code.try_regions.iter().any(|region| {
+                        region.start as usize <= i.pc
+                            && i.pc < region.end as usize
+                            && region
+                                .catches
+                                .iter()
+                                .any(|(_, target)| *target as usize == handler)
+                    })
+                {
+                    return None;
+                }
             }
             b.successors
                 .iter()
+                .filter(|edge| edge.kind == EdgeKind::Normal)
                 .map(|e| cfg.blocks[e.target].start)
                 .collect()
         };

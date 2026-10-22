@@ -58,9 +58,7 @@ pub(super) fn prove(
                 || r.catches.iter().any(|(_, handler)| *handler as usize == pc)
         })
     };
-    if protected(from) {
-        return None;
-    }
+    let protected_source = protected(from);
     let source = by_pc.get(&from)?;
     if !matches!(source.opcode, 0x28..=0x2a | 0x32..=0x3d) || source.branch_target != Some(target) {
         return None;
@@ -89,6 +87,12 @@ pub(super) fn prove(
         }
     }
     if !matches!(by_pc.get(nodes.last()?)?.opcode, 0x0e..=0x11) {
+        return None;
+    }
+    // A protected predecessor may share an unprotected pure return leaf.
+    // Copying a static read into that predecessor would change its handler
+    // set; moves, numeric constants and returns have no exceptional edge.
+    if protected_source && nodes.iter().any(|pc| by_pc[pc].may_throw) {
         return None;
     }
     let owned: BTreeSet<_> = nodes.iter().copied().collect();

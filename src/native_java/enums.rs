@@ -284,6 +284,35 @@ impl Plan {
             );
             match insn.opcode {
                 0x00 => ensure!(w == 0, "enum payload"),
+                0x01..=0x03 | 0x07..=0x09 => {
+                    let (destination, source) = match insn.opcode {
+                        0x01 | 0x07 => (a & 15, a >> 4),
+                        0x02 | 0x08 => (a, code.instructions[pc + 1] as usize),
+                        _ => (
+                            code.instructions[pc + 1] as usize,
+                            code.instructions[pc + 2] as usize,
+                        ),
+                    };
+                    let value = regs.get(source).context("enum move source register")?;
+                    // Only already initialized values may acquire aliases. In
+                    // particular, a copied allocation would require updating
+                    // every alias at its constructor, which this plan does not
+                    // model. Array atoms own mutable symbolic contents, so
+                    // cloning one would lose mutation through aliases. Wide
+                    // words and unknown values also remain unsupported.
+                    ensure!(
+                        if insn.opcode <= 0x03 {
+                            matches!(value, Atom::Int(_))
+                        } else {
+                            matches!(value, Atom::Text(_) | Atom::Constant(_) | Atom::Entries)
+                        },
+                        "enum move value kind"
+                    );
+                    let value = value.clone();
+                    *regs
+                        .get_mut(destination)
+                        .context("enum move destination register")? = value;
+                }
                 0x12 => regs[a & 15] = Atom::Int(((w as i16) >> 12) as i32),
                 0x13 => regs[a] = Atom::Int(code.instructions[pc + 1] as i16 as i32),
                 0x14 => {

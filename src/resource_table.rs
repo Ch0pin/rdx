@@ -312,6 +312,146 @@ impl ResourceTable {
         table.retained_bytes = retained;
         Ok(table)
     }
+    /// Resolve a scalar using an explicit configuration, falling back only to default.
+    pub fn resolve_scalar(&self, raw: &str, package: &str) -> serde_json::Value {
+        use serde_json::json;
+        let Some(reference) = raw.strip_prefix('@') else {
+            return json!({"raw":raw,"status":"literal","value":raw,"variants":[]});
+        };
+        let id = if let Some(hex) = reference.strip_prefix("0x") {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            reference.rsplit_once('/').and_then(|(kind, name)| {
+                let (owner, kind) = kind.split_once(':').unwrap_or((package, kind));
+                self.entries
+                    .values()
+                    .find(|r| r.package == owner && r.kind == kind && r.name == name)
+                    .map(|r| r.id)
+            })
+        };
+        let Some(id) = id else {
+            return json!({"raw":raw,"status":"missing_resource","value":null,"variants":[]});
+        };
+        if self.entries.get(&id).is_some_and(|resource| {
+            !matches!(resource.kind.as_str(), "string" | "integer" | "bool")
+        }) {
+            return json!({"raw":raw,"resource_id":format!("0x{id:08x}"),"status":"unsupported_type","value":null,"variants":[]});
+        }
+        fn qualifier(configuration: &str) -> &str {
+            configuration
+                .rsplit_once(" [")
+                .filter(|(_, origin)| origin.ends_with(']'))
+                .map(|(qualifier, _)| qualifier)
+                .unwrap_or(configuration)
+        }
+        fn walk(
+            table: &ResourceTable,
+            id: u32,
+            configuration: &str,
+            seen: &mut Vec<u32>,
+        ) -> (Option<String>, &'static str) {
+            if seen.contains(&id) {
+                return (None, "alias_cycle");
+            }
+            if seen.len() >= 32 {
+                return (None, "alias_depth_limit");
+            }
+            seen.push(id);
+            let Some(resource) = table.entries.get(&id) else {
+                return (None, "missing_resource");
+            };
+            if !matches!(resource.kind.as_str(), "string" | "integer" | "bool") {
+                return (None, "unsupported_type");
+            }
+            let exact: Vec<_> = resource
+                .variants
+                .iter()
+                .filter(|v| qualifier(&v.configuration) == qualifier(configuration))
+                .collect();
+            let candidates: Vec<_> = if exact.is_empty() {
+                resource
+                    .variants
+                    .iter()
+                    .filter(|v| qualifier(&v.configuration) == "default")
+                    .collect()
+            } else {
+                exact
+            };
+            let Some(variant) = candidates.first().copied() else {
+                return (None, "missing_default");
+            };
+            if candidates.iter().any(|candidate| {
+                candidate.reference != variant.reference || candidate.value != variant.value
+            }) {
+                return (None, "ambiguous_configuration");
+            }
+            if let Some(next) = variant.reference {
+                return walk(table, next, configuration, seen);
+            }
+            if resource.kind == "integer"
+                && let Some(hex) = variant.value.strip_prefix("0x")
+            {
+                return match u32::from_str_radix(hex, 16) {
+                    Ok(value) => (Some((value as i32).to_string()), "resolved"),
+                    Err(_) => (None, "invalid_integer"),
+                };
+            }
+            (Some(variant.value.clone()), "resolved")
+        }
+        // Alias targets can introduce qualifiers that the referring resource lacks.
+        const MAX_CONFIGS: usize = 4096;
+        let mut configs = std::collections::BTreeSet::from(["default".to_owned()]);
+        let mut pending = vec![id];
+        let mut scheduled = std::collections::BTreeSet::from([id]);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut inventory_truncated = false;
+        let mut declared_variants = Vec::new();
+        while let Some(next) = pending.pop() {
+            if !seen.insert(next) {
+                continue;
+            }
+            if let Some(r) = self.entries.get(&next) {
+                if !matches!(r.kind.as_str(), "string" | "integer" | "bool") {
+                    continue;
+                }
+                for v in &r.variants {
+                    let configuration = qualifier(&v.configuration).to_owned();
+                    if configs.len() < MAX_CONFIGS {
+                        configs.insert(configuration);
+                    } else if !configs.contains(&configuration) {
+                        inventory_truncated = true;
+                    }
+                    if declared_variants.len() < MAX_CONFIGS {
+                        declared_variants.push(json!({"resource_id":format!("0x{:08x}", r.id),"configuration":v.configuration,"raw":v.value,"reference":v.reference}));
+                    } else {
+                        inventory_truncated = true;
+                    }
+                    if let Some(target) = v.reference
+                        && !scheduled.contains(&target)
+                    {
+                        if scheduled.len() < 32 {
+                            scheduled.insert(target);
+                            pending.push(target);
+                        } else {
+                            inventory_truncated = true;
+                        }
+                    }
+                }
+            }
+        }
+        let variants: Vec<_> = configs
+            .into_iter()
+            .map(|configuration| {
+                let (value, status) = walk(self, id, &configuration, &mut Vec::new());
+                json!({"configuration":configuration,"value":value,"status":status})
+            })
+            .collect();
+        let default = variants
+            .iter()
+            .find(|v| v["configuration"] == "default")
+            .unwrap();
+        json!({"raw":raw,"resource_id":format!("0x{id:08x}"),"status":default["status"],"value":default["value"],"variants":variants,"declared_variants":declared_variants,"configuration_inventory_truncated":inventory_truncated})
+    }
     pub fn label(&self, id: u32) -> Option<String> {
         let r = self.entries.get(&id)?;
         let first = r.variants.first()?;

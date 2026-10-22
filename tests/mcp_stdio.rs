@@ -40,7 +40,7 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     assert_eq!(replies[0]["error"]["code"], -32600);
     assert_eq!(replies[1]["result"]["protocolVersion"], "2025-06-18");
     let tools = replies[2]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 25);
+    assert_eq!(tools.len(), 30);
     let schema = |name: &str| {
         &tools
             .iter()
@@ -48,6 +48,48 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
             .unwrap_or_else(|| panic!("{name} must be advertised over stdio"))["inputSchema"]
     };
     let health = schema("get_health");
+    let search = schema("search_code");
+    assert_eq!(
+        search["properties"]["mode"]["enum"],
+        json!(["source", "identifiers"])
+    );
+    assert_eq!(
+        search["properties"]["symbol_kind"]["enum"],
+        json!(["all", "class", "method", "field"])
+    );
+    assert_eq!(search["properties"]["case_sensitive"]["type"], "boolean");
+
+    let integers = schema("find_integer_references");
+    for key in ["values", "instance_id", "project_id"] {
+        assert!(
+            integers["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(key))
+        );
+    }
+    assert_eq!(integers["properties"]["values"]["maxItems"], 64);
+    assert_eq!(integers["properties"]["bit_width"]["enum"], json!([32, 64]));
+    assert_eq!(integers["properties"]["limit"]["maximum"], 500);
+
+    assert_eq!(
+        schema("find_instantiations")["anyOf"],
+        json!([{"required":["class_id"]},{"required":["class_name"]}])
+    );
+    assert_eq!(
+        schema("find_instantiations")["properties"]["limit"]["maximum"],
+        500
+    );
+    let config = schema("find_config_key_consumers");
+    for key in ["key", "instance_id", "project_id"] {
+        assert!(config["required"].as_array().unwrap().contains(&json!(key)));
+    }
+    assert_eq!(config["properties"]["limit"]["maximum"], 100);
+    assert_eq!(
+        schema("get_class_hierarchy")["anyOf"],
+        json!([{"required":["class_id"]},{"required":["class_name"]}])
+    );
+    assert!(schema("forget_instance")["properties"]["instance_id"].is_object());
     let class_source = schema("get_class_source");
     assert!(class_source["properties"]["class_name"].is_object());
     assert_eq!(
@@ -73,6 +115,11 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     }
     assert_eq!(method_source["properties"]["limit"]["maximum"], 128000);
     assert_eq!(method_source["properties"]["offset"]["minimum"], 0);
+    assert_eq!(
+        method_source["properties"]["format"]["enum"],
+        json!(["auto", "dex"])
+    );
+    assert_eq!(method_source["properties"]["format"]["default"], "auto");
     assert_eq!(method_source["additionalProperties"], false);
     assert_eq!(health["required"], json!([]));
     assert_eq!(health["additionalProperties"], false);
@@ -101,7 +148,7 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     let manifest = schema("get_manifest_summary");
     assert_eq!(
         manifest["properties"]["format"]["enum"],
-        json!(["markdown", "records"])
+        json!(["markdown", "records", "exposure"])
     );
     assert_eq!(
         manifest["properties"]["component_type"]["enum"],
@@ -174,4 +221,70 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     assert_eq!(replies[3]["result"], json!({}));
     assert_eq!(replies[4]["error"]["code"], -32601);
     assert_eq!(replies[5]["result"]["isError"], true);
+}
+
+#[test]
+fn invalid_limits_return_structured_bounds_and_gateway_stays_responsive() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rdx"))
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    writeln!(input, "{}", json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"bounds-test","version":"1"}}})).unwrap();
+    writeln!(
+        input,
+        "{}",
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+    )
+    .unwrap();
+    let invalid = [json!(501), json!(0), json!(-1), json!(1.5), json!("500")];
+    for (i, limit) in invalid.iter().enumerate() {
+        writeln!(
+            input,
+            "{}",
+            json!({"jsonrpc":"2.0","id":i+2,"method":"tools/call","params":{
+            "name":"get_call_graph","arguments":{"instance_id":"unused","project_id":"unused",
+            "method_id":"sample.Target.run()V","projection":"call_sites","limit":limit}}})
+        )
+        .unwrap();
+    }
+    writeln!(
+        input,
+        "{}",
+        json!({"jsonrpc":"2.0","id":99,"method":"ping"})
+    )
+    .unwrap();
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let replies: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 7);
+    for (i, received) in invalid.iter().enumerate() {
+        let result = &replies[i + 1]["result"];
+        assert_eq!(result["isError"], true);
+        let data = &result["structuredContent"];
+        assert_eq!(data["error"]["code"], "INVALID_ARGUMENT");
+        assert_eq!(data["error"]["details"]["parameter"], "limit");
+        assert_eq!(data["error"]["details"]["received"], *received);
+        assert_eq!(data["error"]["details"]["minimum"], 1);
+        assert_eq!(data["error"]["details"]["maximum"], 500);
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+            *data
+        );
+    }
+    assert_eq!(replies.last().unwrap()["id"], 99);
+    assert_eq!(replies.last().unwrap()["result"], json!({}));
 }

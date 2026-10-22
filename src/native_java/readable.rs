@@ -208,6 +208,37 @@ fn platform_member_type(binary: &str, class: &DexClass) -> Option<(&'static str,
     Some((owner, member))
 }
 
+/// Standalone methods have no import section. Canonicalize only SDK member
+/// types proven by classfile membership and the loaded project hierarchy.
+pub(crate) fn canonical_platform_members(class: &DexClass, code: DecompiledCode) -> DecompiledCode {
+    let displays: BTreeMap<_, _> = candidates(class, std::slice::from_ref(&code))
+        .into_iter()
+        .filter_map(|binary| {
+            platform_member_type(&binary, class)
+                .map(|(owner, member)| (binary, format!("{owner}.{member}")))
+        })
+        .collect();
+    if displays.is_empty() {
+        return code;
+    }
+    let edits = tokens(&code.source)
+        .into_iter()
+        .filter_map(|(start, end, token)| {
+            displays
+                .get(&token)
+                .map(|display| (start, end, display.clone()))
+                .or_else(|| {
+                    token.match_indices('.').rev().find_map(|(at, _)| {
+                        displays.get(&token[..at]).map(|display| {
+                            (start, start + token[..at].chars().count(), display.clone())
+                        })
+                    })
+                })
+        })
+        .collect();
+    apply(code, edits)
+}
+
 pub(crate) fn shorten(name: &str, class: &DexClass, codes: Vec<DecompiledCode>) -> Shortened {
     let display_name = super::names::qualified(name, '.').unwrap_or_else(|_| name.to_owned());
     let name = display_name.as_str();
@@ -682,6 +713,84 @@ mod nested_member_tests {
             definitions: vec![],
             source_hash: crate::engine::source_identity(source),
         }
+    }
+    #[test]
+    fn standalone_map_entry_method_uses_proven_canonical_sdk_type() {
+        use crate::native_dex::{DexCode, DexMethod, DexSymbols};
+        let mut class = class();
+        class.symbols = std::sync::Arc::new(DexSymbols {
+            types: vec!["Ljava/util/Map$Entry;".into()],
+            ..Default::default()
+        });
+        class.annotations_offset = 0;
+        class.methods = vec![DexMethod {
+            declaring_type: class.descriptor.clone(),
+            name: "entry".into(),
+            return_type: "Ljava/util/Map$Entry;".into(),
+            parameters: vec!["Ljava/lang/Object;".into()],
+            thrown_types: vec![],
+            access_flags: 9,
+            code: Some(DexCode {
+                registers: 1,
+                ins: 1,
+                outs: 0,
+                tries: 0,
+                try_regions: vec![],
+                instructions: vec![0x001f, 0, 0x0011],
+                offset: 0,
+            }),
+        }];
+        let raw = super::super::render_method("sample.Hello", &class, &class.methods[0]).unwrap();
+        assert!(raw.source.contains("java.util.Map$Entry"));
+        let code = super::super::present_method_source_types(&class, raw);
+        assert!(code.source.contains("java.util.Map.Entry"));
+        assert!(!code.source.contains("java.util.Map$Entry"));
+        assert!(!code.source.contains("import "));
+        assert!(
+            code.links
+                .iter()
+                .any(|link| link.label == "java.util.Map$Entry")
+        );
+        assert_eq!(
+            code.source_hash,
+            crate::engine::source_identity(&code.source)
+        );
+        let complete = super::super::render_mixed_with_nested("sample.Hello", &class, &[], None);
+        assert!(complete.source.contains("Map.Entry"));
+        assert!(!complete.source.contains("Map$Entry"));
+    }
+
+    #[test]
+    fn standalone_sdk_member_canonicalization_preserves_literals_app_types_and_shadows() {
+        let binary = "java.util.Map$Entry";
+        let source = format!(
+            "{binary} entry; example.Price$Tag tag;\nString name = \"{binary}\"; // {binary}\n"
+        );
+        let code =
+            canonical_platform_members(&class(), document(&source, &[binary, "example.Price$Tag"]));
+        assert!(
+            code.source
+                .starts_with("java.util.Map.Entry entry; example.Price$Tag tag;")
+        );
+        assert!(code.source.contains(&format!("\"{binary}\"; // {binary}")));
+        assert!(
+            code.links
+                .iter()
+                .any(|link| link.label == "example.Price$Tag")
+        );
+        let c = class();
+        let mut shadow = class();
+        shadow.descriptor = "Ljava/util/Map;".into();
+        shadow.methods.clear();
+        shadow.fields.clear();
+        c.symbols
+            .hierarchy
+            .set(std::sync::Arc::new(
+                crate::native_hierarchy::TypeHierarchy::from_classes([&c, &shadow]).unwrap(),
+            ))
+            .unwrap();
+        let code = canonical_platform_members(&c, document(&source, &[binary]));
+        assert_eq!(code.source, source);
     }
     #[test]
     fn documented_member_imports_outer_owner_and_keeps_binary_navigation() {

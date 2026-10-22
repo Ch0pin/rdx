@@ -195,8 +195,8 @@ fn conditional_child_feedback_preserves_distinct_guard_and_success_frames() {
 }
 
 #[test]
-fn success_tail_cross_entry_reentry_and_terminal_ownership_decline() {
-    for shape in 0..3 {
+fn success_tail_cross_entry_and_reentry_decline() {
+    for shape in 0..2 {
         let mut class = success_tail_fixture(0);
         let code = class.methods[0].code.as_mut().unwrap();
         let p = sole_plan(code).unwrap();
@@ -207,10 +207,29 @@ fn success_tail_cross_entry_reentry_and_terminal_ownership_decline() {
                 code.instructions[last] =
                     (((p.parent_guard as isize - last as isize) as i8 as u8 as u16) << 8) | 0x28
             }
-            _ => code.instructions[last] = 0x020f,
+            _ => unreachable!(),
         }
         assert!(plan::select_all(code).is_none(), "shape {shape}");
     }
+}
+
+fn terminal_success_fixture() -> DexClass {
+    let mut class = success_tail_fixture(0);
+    let code = class.methods[0].code.as_mut().unwrap();
+    let previous = sole_plan(code).unwrap();
+    code.instructions[*previous.success_tail.last().unwrap()] = 0x020f;
+    class
+}
+
+#[test]
+fn successful_child_may_return_its_actual_completed_result() {
+    let class = terminal_success_fixture();
+    let code = class.methods[0].code.as_ref().unwrap();
+    let selected = sole_plan(code).expect("certified terminal success");
+    assert_eq!(selected.terminal_success, Some(selected.child_latch + 2));
+    assert!(selected.success_tail.is_empty());
+    assert!(plan::validate(code, &selected));
+    native_java::render_method("sample.Entry", &class, &class.methods[0]).unwrap();
 }
 
 #[test]
@@ -486,21 +505,43 @@ fn ordinary_loops_and_pair_boundaries_remain_owned() {
             code.instructions[guard + 1] =
                 (plans[0].parent as isize - guard as isize) as i16 as u16;
         } else {
-            code.instructions.pop();
-            code.instructions.extend(
-                fixture().methods[0]
-                    .code
-                    .as_ref()
-                    .unwrap()
-                    .instructions
-                    .clone(),
-            );
+            // The terminal-success family supports up to four disjoint
+            // pairs. A fifth pair still exceeds the explicit plan budget.
+            for _ in 0..3 {
+                code.instructions.pop();
+                code.instructions.extend(
+                    fixture().methods[0]
+                        .code
+                        .as_ref()
+                        .unwrap()
+                        .instructions
+                        .clone(),
+                );
+            }
         }
         assert!(
             plan::select_all(code).is_none(),
             "cross-entry/overlap/budget kind{kind}"
         );
     }
+}
+
+#[test]
+fn four_independent_pairs_fit_the_explicit_plan_limit() {
+    let mut class = fixture();
+    let code = class.methods[0].code.as_mut().unwrap();
+    let original = code.instructions.clone();
+    for _ in 0..3 {
+        code.instructions.pop();
+        code.instructions.extend_from_slice(&original);
+    }
+    let plans = plan::select_all(code).unwrap();
+    assert_eq!(plans.len(), 4);
+    assert!(plan::validate_all(code, &plans));
+    let source = native_java::render_method("sample.Entry", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    assert_eq!(source.matches("while (true)").count(), 8, "{source}");
 }
 #[test]
 fn sequential_disjoint_pairs_preserve_external_frames_and_raw_edges() {
@@ -648,7 +689,7 @@ impl Drop for Temp {
 #[test]
 #[ignore = "requires javac/java; emitted source compiled unchanged"]
 fn exact_register_oracle_preserves_wide_swaps_guards_exits_and_faults() {
-    for kind in 0..28 {
+    for kind in 0..29 {
         let c = if kind < 6 {
             variant(kind)
         } else if kind < 11 {
@@ -663,8 +704,10 @@ fn exact_register_oracle_preserves_wide_swaps_guards_exits_and_faults() {
             reference_feedback_fixture()
         } else if kind == 25 {
             sibling_loop_fixture(2)
-        } else {
+        } else if kind < 28 {
             success_tail_fixture(if kind == 26 { 0 } else { 2 })
+        } else {
+            terminal_success_fixture()
         };
         let code = c.methods[0].code.as_ref().unwrap();
         let source = native_java::render_method("sample.Entry", &c, &c.methods[0])

@@ -37,3 +37,11 @@ mod field_references;
 mod lambda_branch;
 pub mod manifest_summary;
 mod source_coverage;
+
+pub mod allocation_references;
+pub mod config_consumers;
+mod method_lookup;
+
+pub mod integer_references;
+
+mod identifier_search;

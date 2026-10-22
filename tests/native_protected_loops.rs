@@ -1,4 +1,4 @@
-//! Wholly enclosed loops with invariant catch inputs.
+//! Protected loops retain invariant catch inputs across nonthrowing suffixes.
 use rdx::{
     native_dex::{self, DexClass, DexSymbols, DexTryRegion},
     native_java,
@@ -60,9 +60,17 @@ fn changing_handler_input_is_rejected() {
     assert!(source(&c).is_err());
 }
 #[test]
-fn partial_protected_loop_is_rejected() {
+fn nonthrowing_loop_suffix_retains_enclosing_catch() {
     let mut c = fixture();
     c.methods[0].code.as_mut().unwrap().try_regions[0].end = 11;
+    let s = source(&c).unwrap();
+    assert_eq!(s.matches("while (true)").count(), 2, "{s}");
+    assert!(s.contains("catch (java.lang.RuntimeException"), "{s}");
+}
+#[test]
+fn newly_covered_throwing_call_remains_rejected() {
+    let mut c = fixture();
+    c.methods[0].code.as_mut().unwrap().try_regions[0].end = 6;
     assert!(source(&c).is_err());
 }
 #[test]
@@ -70,6 +78,16 @@ fn partial_protected_loop_is_rejected() {
 fn protected_loop_jvm_preserves_effects_and_exception_identity() {
     let dir = std::env::temp_dir().join(format!("rdx-protected-loop-{}", std::process::id()));
     fs::create_dir_all(dir.join("sample")).unwrap();
+    let methods = [15, 11]
+        .into_iter()
+        .map(|end| {
+            let mut c = fixture();
+            c.methods[0].name = format!("test{end}").into();
+            c.methods[0].code.as_mut().unwrap().try_regions[0].end = end;
+            source(&c).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let java = format!(
         r#"package sample;
 public class Protected {{
@@ -78,10 +96,10 @@ public class Protected {{
  static void touch(int i,int j){{if(i!=calls/limit||j!=calls%limit)throw new AssertionError("order");int n=calls++;if(n==fail){{if(error)throw fatal;throw sentinel;}}}}
  static int caught(RuntimeException e,int tag){{if(e!=sentinel)throw new AssertionError("identity");catches++;return tag;}}
  {}
- public static void main(String[] args){{for(limit=0;limit<5;limit++)for(fail=-1;fail<=limit*limit;fail++)for(int mode=0;mode<2;mode++){{error=mode==1;calls=0;catches=0;boolean hit=fail>=0&&fail<limit*limit;try{{int r=test(limit,73);if(hit&&error||r!=(hit?73:limit))throw new AssertionError("result");}}catch(Error e){{if(!hit||!error||e!=fatal)throw new AssertionError("unexpected",e);}}if(calls!=(hit?fail+1:limit*limit)||catches!=(hit&&!error?1:0))throw new AssertionError("effects");}}}}
+ public static void main(String[] args){{for(int variant=0;variant<2;variant++)for(limit=0;limit<5;limit++)for(fail=-1;fail<=limit*limit;fail++)for(int mode=0;mode<2;mode++){{error=mode==1;calls=0;catches=0;boolean hit=fail>=0&&fail<limit*limit;try{{int r=variant==0?test15(limit,73):test11(limit,73);if(hit&&error||r!=(hit?73:limit))throw new AssertionError("result");}}catch(Error e){{if(!hit||!error||e!=fatal)throw new AssertionError("unexpected",e);}}if(calls!=(hit?fail+1:limit*limit)||catches!=(hit&&!error?1:0))throw new AssertionError("effects");}}}}
 }}
 "#,
-        source(&fixture()).unwrap()
+        methods
     );
     fs::write(dir.join("sample/Protected.java"), &java).unwrap();
     for (p, a) in [

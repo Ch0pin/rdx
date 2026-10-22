@@ -169,51 +169,16 @@ fn code_block(out: &mut String, content: &str) {
 }
 
 fn resolve_label(raw: &str, package: &str, table: &ResourceTable) -> String {
-    let Some(reference) = raw.strip_prefix('@') else {
-        return raw.into();
-    };
-    let resource = if let Some(hex) = reference.strip_prefix("0x") {
-        u32::from_str_radix(hex, 16)
-            .ok()
-            .and_then(|id| table.entries.get(&id))
-    } else if let Some((type_part, name)) = reference.rsplit_once('/') {
-        let (owner, kind) = type_part.split_once(':').unwrap_or((package, type_part));
-        table
-            .entries
-            .values()
-            .find(|r| r.package == owner && r.kind == kind && r.name == name)
-    } else {
-        None
-    };
-    let Some(resource) = resource else {
-        return format!("{raw} (unresolved)");
-    };
-    let mut seen = std::collections::HashSet::new();
-    let mut current = resource.id;
-    for _ in 0..8 {
-        if !seen.insert(current) {
-            break;
-        }
-        let Some(entry) = table.entries.get(&current) else {
-            break;
-        };
-        let Some(variant) = entry.variants.iter().find(|v| v.configuration == "default") else {
-            return format!("{raw} (no default resource value)");
-        };
-        if let Some(next) = variant.reference {
-            current = next;
-            continue;
-        }
-        return if entry.variants.len() > 1 {
+    let resolved = table.resolve_scalar(raw, package);
+    resolved["value"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
             format!(
-                "{} (default resource value; other configurations exist)",
-                variant.value
+                "{raw} ({})",
+                resolved["status"].as_str().unwrap_or("unresolved")
             )
-        } else {
-            variant.value.clone()
-        };
-    }
-    format!("{raw} (unresolved reference)")
+        })
 }
 
 fn protection_level(raw: &str) -> String {
@@ -975,13 +940,449 @@ pub fn query(xml: &str, args: &serde_json::Value) -> Result<Vec<serde_json::Valu
     Ok(records)
 }
 
+/// Construct one literal witness from Android's combined direct data declarations.
+/// Host/port remain paired; pattern-only routes and relative groups need separate matching.
+fn literal_uri(data: &[&Node]) -> Option<String> {
+    let scheme = data.iter().filter_map(|n| n.get("scheme")).find(|s| {
+        s.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && s.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c))
+    })?;
+    if !data.iter().any(|n| n.get("host").is_some()) {
+        // With no authority Android ignores path declarations; opaque SSP is unrestricted
+        // unless an explicit scheme-specific-part matcher exists.
+        if data
+            .iter()
+            .any(|n| n.attrs.iter().any(|(k, _)| k.starts_with("ssp")))
+        {
+            return None;
+        }
+        return Some(format!("{scheme}:example"));
+    }
+    let authority = data.iter().find(|n| {
+        n.get("host").is_some_and(|host| {
+            !host.is_empty()
+                && host
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b".-".contains(&c))
+        }) && n.get("port").is_none_or(|p| p.parse::<u16>().is_ok())
+    })?;
+    let path_nodes: Vec<_> = data
+        .iter()
+        .filter(|n| n.attrs.iter().any(|(k, _)| k.starts_with("path")))
+        .collect();
+    let path = if path_nodes.is_empty() {
+        "/"
+    } else {
+        path_nodes
+            .iter()
+            .find_map(|n| n.get("path").or_else(|| n.get("pathPrefix")))?
+    };
+    if !path.starts_with('/')
+        || path
+            .bytes()
+            .any(|c| c <= 32 || c >= 127 || b"?#%@\\<>\"{}|^`".contains(&c))
+    {
+        return None;
+    }
+    Some(format!(
+        "{scheme}://{}{}{path}",
+        authority.get("host")?,
+        authority
+            .get("port")
+            .map(|p| format!(":{p}"))
+            .unwrap_or_default()
+    ))
+}
+
+/// Rebuild the parsed declaration tree after scalar resolution; unknown values retain raw references.
+pub fn resolved_xml(
+    xml: &str,
+    table: &ResourceTable,
+) -> Result<(String, Vec<serde_json::Value>), String> {
+    let mut nodes = parse(xml)?;
+    let package = nodes[0].get("raw:package").unwrap_or_default().to_owned();
+    let mut resolutions = Vec::new();
+    for (index, node) in nodes.iter_mut().enumerate() {
+        for (key, value) in &mut node.attrs {
+            if value.starts_with('@') {
+                let mut resolution = table.resolve_scalar(value, &package);
+                resolution["node_index"] = serde_json::json!(index);
+                resolution["attribute"] = serde_json::json!(key);
+                if let Some(resolved) = resolution["value"].as_str() {
+                    *value = resolved.to_owned();
+                }
+                resolutions.push(resolution);
+            }
+        }
+    }
+    let children = children_index(&nodes);
+    let mut out = String::new();
+    let mut indices = vec![None; nodes.len()];
+    let mut next = 0;
+    let mut pending = vec![(0, false)];
+    while let Some((index, closing)) = pending.pop() {
+        let node = &nodes[index];
+        if node.tag.is_empty() {
+            continue;
+        }
+        if closing {
+            out.push_str(&format!("</{}>", node.tag));
+            continue;
+        }
+        indices[index] = Some(next);
+        next += 1;
+        out.push_str(&format!("<{}", node.tag));
+        if index == 0 {
+            out.push_str(" xmlns:android=\"http://schemas.android.com/apk/res/android\"");
+        }
+        for (key, value) in &node.attrs {
+            let key = key
+                .strip_prefix("raw:")
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("android:{key}"));
+            if key == "xmlns" || key.starts_with("xmlns:") {
+                continue;
+            }
+            out.push_str(&format!(" {key}=\"{}\"", quick_xml::escape::escape(value)));
+        }
+        out.push('>');
+        pending.push((index, true));
+        pending.extend(children[index].iter().rev().map(|child| (*child, false)));
+    }
+    resolutions.retain_mut(|resolution| {
+        let original = resolution["node_index"].as_u64().unwrap() as usize;
+        if let Some(rebased) = indices[original] {
+            resolution["node_index"] = serde_json::json!(rebased);
+            true
+        } else {
+            false
+        }
+    });
+    Ok((out, resolutions))
+}
+
+pub fn query_resolved(
+    xml: &str,
+    args: &serde_json::Value,
+    table: &ResourceTable,
+    component_mode: bool,
+) -> Result<Vec<serde_json::Value>, String> {
+    let (resolved, resolutions) = resolved_xml(xml, table)?;
+    let mut records = if component_mode {
+        query_components(&resolved, args)?
+    } else {
+        query(&resolved, args)?
+    };
+    if !component_mode {
+        let complete = query_components(&resolved, &serde_json::json!({}))?;
+        for record in &mut records {
+            if record["record_type"] == "component"
+                && let Some(full) = complete.iter().find(|full| {
+                    full["name"] == record["name"]
+                        && full["component_type"] == record["component_type"]
+                })
+            {
+                for field in [
+                    "permission",
+                    "read_permission",
+                    "write_permission",
+                    "exported_state",
+                ] {
+                    record[field] = full[field].clone();
+                }
+            }
+        }
+    }
+    let nodes = parse(&resolved)?;
+    let package = nodes[0].get("raw:package").unwrap_or_default();
+    for record in &mut records {
+        let component = nodes.iter().position(|n| {
+            n.tag == record["component_type"].as_str().unwrap_or_default()
+                && n.get("name").is_some_and(|name| {
+                    class_name(package, name) == record["name"].as_str().unwrap_or_default()
+                })
+        });
+        let declaration = component.or_else(|| {
+            nodes.iter().position(|node| {
+                node.tag == record["declaration"].as_str().unwrap_or_default()
+                    && node.get("name") == record["name"].as_str()
+            })
+        });
+        let alias_permission_target = (record["component_type"] == "activity-alias")
+            .then(|| {
+                nodes.iter().position(|node| {
+                    node.tag == "activity"
+                        && node.get("name").is_some_and(|name| {
+                            class_name(package, name)
+                                == record["target"].as_str().unwrap_or_default()
+                        })
+                })
+            })
+            .flatten();
+        let selected: Vec<_> = resolutions
+            .iter()
+            .filter(|resolution| {
+                let Some(original) = resolution["node_index"].as_u64().map(|n| n as usize) else {
+                    return false;
+                };
+                let Some(source) = nodes.get(original) else {
+                    return false;
+                };
+                let attribute = resolution["attribute"].as_str().unwrap_or_default();
+                // Shared configuration contributes only attributes actually inherited by
+                // component reachability/permission state. Sibling metadata is unrelated.
+                if component.is_some() {
+                    if source.tag == "application" {
+                        return matches!(
+                            attribute,
+                            "enabled"
+                                | "permission"
+                                | "directBootAware"
+                                | "defaultToDeviceProtectedStorage"
+                        );
+                    }
+                    if source.tag == "uses-sdk" {
+                        return matches!(
+                            attribute,
+                            "minSdkVersion" | "targetSdkVersion" | "maxSdkVersion"
+                        );
+                    }
+                    if original == 0 {
+                        return matches!(attribute, "sharedUserId" | "sharedUserMaxSdkVersion");
+                    }
+                    if Some(original) == alias_permission_target && attribute == "permission" {
+                        return true;
+                    }
+                }
+                let mut current = Some(original);
+                while let Some(index) = current {
+                    if Some(index) == declaration {
+                        return true;
+                    }
+                    let Some(node) = nodes.get(index) else {
+                        return false;
+                    };
+                    current = node.parent;
+                }
+                false
+            })
+            .cloned()
+            .collect();
+        record["resource_resolution"] = serde_json::json!({"selection":"default; per-configuration values retained; device configuration not selected","attributes":selected});
+    }
+    Ok(records)
+}
+
+fn exposure_attribute(attribute: &str) -> bool {
+    matches!(
+        attribute,
+        "scheme"
+            | "host"
+            | "port"
+            | "name"
+            | "authorities"
+            | "enabled"
+            | "exported"
+            | "permission"
+            | "readPermission"
+            | "writePermission"
+            | "targetActivity"
+            | "targetSdkVersion"
+            | "minSdkVersion"
+            | "maxSdkVersion"
+            | "sharedUserId"
+            | "directBootAware"
+            | "protectionLevel"
+            | "autoVerify"
+            | "allow"
+    ) || attribute.starts_with("path")
+        || attribute.starts_with("ssp")
+}
+
+/// Apply a validated presentation projection after filtering and before pagination.
+pub fn project_records(records: &mut [serde_json::Value], args: &serde_json::Value) {
+    let fields = args["fields"]
+        .as_str()
+        .map(|v| v.split(',').map(str::trim).collect::<Vec<_>>());
+    let compact = [
+        "record_type",
+        "component_type",
+        "name",
+        "target",
+        "exported",
+        "enabled",
+        "permission",
+        "read_permission",
+        "write_permission",
+        "authorities",
+        "intent_filters",
+        "attributes",
+        "matching_filter_indexes",
+        "resource_resolution",
+    ];
+    for record in records {
+        if let Some(details) = record["details"].as_array() {
+            let authorities = details
+                .iter()
+                .find(|pair| pair[0] == "authorities")
+                .map(|pair| pair[1].clone())
+                .unwrap_or(serde_json::Value::Null);
+            record["authorities"] = authorities;
+        }
+        if let Some(object) = record.as_object_mut() {
+            if let Some(fields) = &fields {
+                object.retain(|key, _| fields.contains(&key.as_str()));
+            } else if args["projection"] == "compact" {
+                if let Some(resolution) = object.get_mut("resource_resolution") {
+                    let attributes: Vec<_> = resolution["attributes"].as_array().into_iter().flatten().filter(|entry| {
+                        entry["attribute"].as_str().is_some_and(exposure_attribute)
+                    }).map(|entry| {
+                        let overrides: Vec<_> = entry["variants"].as_array().into_iter().flatten().filter(|variant| variant["configuration"] != "default").cloned().collect();
+                        let mut compact = serde_json::json!({"attribute":entry["attribute"],"raw":entry["raw"],"status":entry["status"],"value":entry["value"]});
+                        if entry["configuration_inventory_truncated"] == true { compact["configuration_inventory_truncated"] = serde_json::json!(true); }
+                        if !overrides.is_empty() { compact["overrides"] = serde_json::json!(overrides); }
+                        compact
+                    }).collect();
+                    *resolution =
+                        serde_json::json!({"selection":"default","attributes":attributes});
+                    if resolution["attributes"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty)
+                    {
+                        object.remove("resource_resolution");
+                    }
+                }
+                if let Some(filters) = object
+                    .get_mut("intent_filters")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for filter in filters {
+                        if let Some(elements) = filter["elements"].as_array_mut() {
+                            elements.retain(|element| {
+                                matches!(
+                                    element["tag"].as_str(),
+                                    Some(
+                                        "action"
+                                            | "category"
+                                            | "data"
+                                            | "uri-relative-filter-group"
+                                    )
+                                )
+                            });
+                            for element in elements {
+                                if element["children"].as_array().is_some_and(Vec::is_empty) {
+                                    element.as_object_mut().unwrap().remove("children");
+                                }
+                            }
+                        }
+                    }
+                }
+                object.retain(|key, _| compact.contains(&key.as_str()));
+                if object.get("target") == object.get("name") {
+                    object.remove("target");
+                }
+                for key in ["permission", "read_permission", "write_permission"] {
+                    if let Some(permission) = object
+                        .get_mut(key)
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        let effective = permission
+                            .get("effective")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        permission.retain(|field, value| {
+                            matches!(
+                                field.as_str(),
+                                "effective"
+                                    | "source"
+                                    | "resolved"
+                                    | "protection_level"
+                                    | "unresolved_value"
+                            ) && (!value.is_null() || field == "effective")
+                        });
+                        if let Some(level) = permission
+                            .get_mut("protection_level")
+                            .and_then(serde_json::Value::as_object_mut)
+                        {
+                            level.retain(|field, _| {
+                                matches!(
+                                    field.as_str(),
+                                    "status" | "base" | "flags" | "raw" | "source"
+                                )
+                            });
+                        }
+                        if effective.is_null()
+                            && permission.get("resolved") == Some(&serde_json::json!(true))
+                        {
+                            permission.retain(|field, _| {
+                                matches!(field.as_str(), "effective" | "resolved")
+                            });
+                        }
+                    }
+                }
+                object.retain(|_, value| {
+                    !value.is_null() && !value.as_array().is_some_and(Vec::is_empty)
+                });
+            }
+        }
+    }
+}
+
+pub fn exposure(xml: &str, table: &ResourceTable, summary: &str) -> Result<String, String> {
+    let records = query_resolved(xml, &serde_json::json!({}), table, false)?;
+    let mut identities = std::collections::BTreeSet::new();
+    let resolutions: Vec<_> = records
+        .iter()
+        .flat_map(|record| {
+            record["resource_resolution"]["attributes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .filter(|resolution| {
+            resolution["attribute"]
+                .as_str()
+                .is_some_and(exposure_attribute)
+                && identities.insert((
+                    resolution["node_index"].as_u64(),
+                    resolution["attribute"].as_str(),
+                    resolution["raw"].as_str(),
+                ))
+        })
+        .collect();
+    let mut out = String::from("# Manifest exposure\n");
+    if !resolutions.is_empty() {
+        out.push_str("\nResource defaults and configuration overrides:\n");
+        for resolution in resolutions {
+            out.push_str(&format!(
+                "- {}: {} ({}) ; configurations: {}\n",
+                resolution["raw"].as_str().unwrap_or_default(),
+                resolution["value"],
+                resolution["status"].as_str().unwrap_or_default(),
+                resolution["variants"]
+            ));
+            if resolution["configuration_inventory_truncated"] == true {
+                out.push_str(
+                    "  configuration inventory truncated at resource/configuration budget\n",
+                );
+            }
+        }
+    }
+    if let Some(start) = summary.find("\n## Exported activities and aliases") {
+        out.push_str(&summary[start..]);
+    }
+    Ok(out)
+}
+
 pub fn render(
     xml: &str,
     path: &Path,
     digest: &str,
     table: &ResourceTable,
 ) -> Result<String, String> {
-    let nodes = parse(xml)?;
+    let (resolved, resolutions) = resolved_xml(xml, table)?;
+    let nodes = parse(&resolved)?;
     let manifest = &nodes[0];
     let package = raw(manifest, "package");
     let app_index = nodes
@@ -1040,6 +1441,14 @@ pub fn render(
         app.map(|a| bool_value(a, "enabled", Some(true)))
             .unwrap_or_else(|| "Not declared".into()),
     );
+    if !resolutions.is_empty() {
+        out.push_str(
+            "\nResource resolution (default selection; configuration overrides retained):\n",
+        );
+        for resolution in &resolutions {
+            out.push_str(&format!("\n- `{resolution}`\n"));
+        }
+    }
     let mut groups = [String::new(), String::new(), String::new(), String::new()];
     let mut deep_links = String::new();
     let mut unresolved = Vec::new();
@@ -1170,7 +1579,7 @@ pub fn render(
                     if data.is_empty() {
                         continue;
                     }
-                    let single_data = data.len() == 1;
+
                     deep_links.push_str(&format!("\n{} — filter {}\n  VIEW/DEFAULT/BROWSABLE: {browser_filter}; link-launchable by declared flags: {launchable}; exported: {exported}; enabled: {enabled}; application enabled: {app_enabled}; autoVerify: {} (declaration only)\n", name,number+1,value(&nodes[*filter],"autoVerify")));
                     if component.tag == "activity-alias" {
                         deep_links.push_str(&format!(
@@ -1186,6 +1595,20 @@ pub fn render(
                         actions.join(", "),
                         categories.join(", ")
                     ));
+                    if browser_filter
+                        && !children_index(&nodes)[*filter]
+                            .iter()
+                            .any(|i| nodes[*i].tag == "uri-relative-filter-group")
+                    {
+                        if let Some(uri) = literal_uri(&data) {
+                            deep_links.push_str(&format!("  literal example: {uri}\n"));
+                            if uri.ends_with(":example") {
+                                deep_links.push_str("  scheme-only example: arbitrary opaque scheme-specific part allowed by these declarations\n");
+                            }
+                        } else {
+                            deep_links.push_str("  URI template: see declared data constraints; no literal witness generated\n");
+                        }
+                    }
                     for datum in data {
                         let properties: Vec<String> = datum
                             .attrs
@@ -1193,36 +1616,6 @@ pub fn render(
                             .map(|(k, v)| format!("{k}={v}"))
                             .collect();
                         deep_links.push_str(&format!("  data: {}\n", properties.join(", ")));
-                        if single_data
-                            && browser_filter
-                            && let (Some(scheme), Some(host)) =
-                                (datum.get("scheme"), datum.get("host"))
-                            && !host.contains('*')
-                            && !scheme.contains(['@', '?', '*'])
-                            && datum
-                                .get("port")
-                                .is_none_or(|port| port.bytes().all(|c| c.is_ascii_digit()))
-                            && datum
-                                .get("path")
-                                .is_none_or(|path| !path.contains(['*', '@', '?']))
-                            && ![
-                                "pathPrefix",
-                                "pathPattern",
-                                "pathSuffix",
-                                "pathAdvancedPattern",
-                            ]
-                            .iter()
-                            .any(|key| datum.get(key).is_some())
-                        {
-                            deep_links.push_str(&format!(
-                                "  literal example: {scheme}://{host}{}{}\n",
-                                datum
-                                    .get("port")
-                                    .map(|p| format!(":{p}"))
-                                    .unwrap_or_default(),
-                                datum.get("path").unwrap_or("/")
-                            ));
-                        }
                     }
                 }
             }
@@ -1250,7 +1643,7 @@ pub fn render(
     } else {
         code_block(&mut out, &deep_links);
     }
-    out.push_str("\nData attributes within an intent filter combine under Android matching rules. Literal examples show only unambiguous single-element declarations; App Link verification is not asserted.\n");
+    out.push_str("\nData attributes within an intent filter combine under Android matching rules. Literal examples combine direct data declarations and preserve host/port pairing; App Link verification is not asserted.\n");
     out.push_str("\n## Custom permissions\n\n");
     for permission in nodes
         .iter()
@@ -1322,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_permission_fallback_and_separate_data_do_not_invent_uri() {
+    fn provider_permission_fallback_and_combined_data_uri() {
         let xml = r#"<manifest xmlns:a="http://schemas.android.com/apk/res/android" package="sample.app"><uses-sdk a:targetSdkVersion="30"/><application a:permission="sample.ACCESS"><provider a:name=".P" a:exported="true"/><activity a:name=".A" a:exported="true"><intent-filter><action a:name="android.intent.action.VIEW"/><category a:name="android.intent.category.DEFAULT"/><category a:name="android.intent.category.BROWSABLE"/><data a:scheme="demo" a:host="example.test"/><data a:path="/other"/></intent-filter></activity></application></manifest>"#;
         let text = render(
             xml,
@@ -1333,7 +1726,7 @@ mod tests {
         .unwrap();
         assert!(text.contains("readPermission: sample.ACCESS (provider permission fallback)"));
         assert!(text.contains("writePermission: sample.ACCESS (provider permission fallback)"));
-        assert!(!text.contains("literal example:"));
+        assert!(text.contains("literal example: demo://example.test/other"));
     }
 
     #[test]
@@ -1637,5 +2030,327 @@ mod protection_resolution_tests {
         assert_eq!(coverage["exported"], 1);
         assert_eq!(coverage["non_exported"], 1);
         assert_eq!(coverage["unresolved_exported"], 1);
+    }
+}
+
+#[cfg(test)]
+mod resource_resolution_tests {
+    use super::*;
+    use crate::resource_table::{Resource, Variant};
+    use serde_json::json;
+    fn table() -> ResourceTable {
+        let mut table = ResourceTable::default();
+        for (id, kind, name, values) in [
+            (
+                1,
+                "string",
+                "scheme",
+                vec![("default", "demo", None), ("fr", "demofr", None)],
+            ),
+            (2, "integer", "port", vec![("default", "8443", None)]),
+            (
+                3,
+                "string",
+                "alias",
+                vec![("default", "@0x00000001", Some(1))],
+            ),
+            (
+                4,
+                "string",
+                "cycle",
+                vec![("default", "@0x00000004", Some(4))],
+            ),
+            (5, "string", "localized", vec![("fr", "bonjour", None)]),
+        ] {
+            table.entries.insert(
+                id,
+                Resource {
+                    id,
+                    package: "demo.app".into(),
+                    kind: kind.into(),
+                    name: name.into(),
+                    variants: values
+                        .into_iter()
+                        .map(|(configuration, value, reference)| Variant {
+                            configuration: configuration.into(),
+                            value: value.into(),
+                            reference,
+                            file: None,
+                        })
+                        .collect(),
+                },
+            );
+        }
+        table
+    }
+    #[test]
+    fn aliases_configuration_cycles_and_missing_default_are_explicit() {
+        let table = table();
+        let alias = table.resolve_scalar("@demo.app:string/alias", "demo.app");
+        assert_eq!(alias["value"], "demo");
+        assert!(
+            alias["variants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["configuration"] == "fr" && v["value"] == "demofr")
+        );
+        assert_eq!(
+            table.resolve_scalar("@string/cycle", "demo.app")["status"],
+            "alias_cycle"
+        );
+        assert_eq!(
+            table.resolve_scalar("@string/localized", "demo.app")["status"],
+            "missing_default"
+        );
+    }
+    #[test]
+    fn component_metadata_excludes_application_cosmetics_and_sibling_metadata() {
+        let mut table = table();
+        table.entries.insert(
+            6,
+            Resource {
+                id: 6,
+                package: "demo.app".into(),
+                kind: "style".into(),
+                name: "Theme".into(),
+                variants: (0..100)
+                    .map(|n| Variant {
+                        configuration: format!("config-{n}"),
+                        value: "style bag should stay outside scalar metadata".repeat(30),
+                        reference: None,
+                        file: None,
+                    })
+                    .collect(),
+            },
+        );
+        let xml = r#"<manifest xmlns:a="http://schemas.android.com/apk/res/android" package="demo.app"><application a:theme="@style/Theme" a:label="@string/localized" a:icon="@style/Theme" a:permission="@string/scheme"><meta-data a:name="sibling" a:resource="@style/Theme"/><activity a:name=".A" a:exported="true" a:label="@string/alias"><intent-filter><data a:scheme="@string/scheme"/></intent-filter></activity><activity a:name=".B" a:exported="false"/></application></manifest>"#;
+        for mode in [false, true] {
+            let records = query_resolved(xml, &serde_json::json!({}), &table, mode).unwrap();
+            let first = records
+                .iter()
+                .find(|record| record["name"] == "demo.app.A")
+                .unwrap();
+            let attrs = first["resource_resolution"]["attributes"]
+                .as_array()
+                .unwrap();
+            assert_eq!(attrs.len(), 3); // inherited permission, own label and own route
+            assert!(
+                attrs
+                    .iter()
+                    .any(|a| a["attribute"] == "label" && a["raw"] == "@string/alias")
+            );
+            assert!(attrs.iter().any(
+                |a| a["attribute"] == "scheme" && a["variants"].as_array().unwrap().len() == 2
+            ));
+            let second = records
+                .iter()
+                .find(|record| record["name"] == "demo.app.B")
+                .unwrap();
+            assert_eq!(
+                second["resource_resolution"]["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(!records.iter().any(|record| {
+                record["resource_resolution"]
+                    .to_string()
+                    .contains("@style/Theme")
+            }));
+        }
+        let unsupported = table.resolve_scalar("@style/Theme", "demo.app");
+        assert_eq!(unsupported["status"], "unsupported_type");
+        assert!(unsupported["variants"].as_array().unwrap().is_empty());
+        assert!(unsupported.get("declared_variants").is_none());
+        assert!(unsupported.to_string().len() < 200);
+        let rendered = render(xml, Path::new("/tmp/fixture.apk"), "fixture", &table).unwrap();
+        let exposure = exposure(xml, &table, &rendered).unwrap();
+        assert!(!exposure.contains("@style/Theme"));
+        assert!(!exposure.contains("@string/localized"));
+        assert!(exposure.contains("@string/scheme"));
+        assert_eq!(exposure.matches("- @string/scheme:").count(), 2); // permission source + route; shared inheritance deduplicated
+        let mut compact = query_resolved(xml, &serde_json::json!({}), &table, true).unwrap();
+        project_records(&mut compact, &serde_json::json!({"projection":"compact"}));
+        let second = compact.iter().find(|r| r["name"] == "demo.app.B").unwrap();
+        for omitted in [
+            "target",
+            "intent_filters",
+            "matching_filter_indexes",
+            "authorities",
+            "read_permission",
+            "write_permission",
+        ] {
+            assert!(second.get(omitted).is_none(), "{omitted}");
+        }
+        assert_eq!(second["permission"]["effective"], "demo");
+    }
+
+    #[test]
+    fn hexadecimal_integers_and_split_defaults_resolve_explicitly() {
+        let mut table = table();
+        table.entries.get_mut(&2).unwrap().variants[0].value = "0x20fb".into();
+        assert_eq!(
+            table.resolve_scalar("@integer/port", "demo.app")["value"],
+            "8443"
+        );
+        assert_eq!(
+            table.resolve_scalar("@integer/port", "demo.app")["declared_variants"][0]["raw"],
+            "0x20fb"
+        );
+        table.entries.get_mut(&2).unwrap().variants[0].value = "0xffffffff".into();
+        assert_eq!(
+            table.resolve_scalar("@integer/port", "demo.app")["value"],
+            "-1"
+        );
+        let port = table.entries.get_mut(&2).unwrap();
+        port.variants[0].configuration = "default [feature.apk]".into();
+        port.variants[0].value = "0x20fb".into();
+        assert_eq!(
+            table.resolve_scalar("@integer/port", "demo.app")["value"],
+            "8443"
+        );
+        let mut conflicting = table.entries[&2].variants[0].clone();
+        conflicting.configuration = "default [other.apk]".into();
+        conflicting.value = "9000".into();
+        table
+            .entries
+            .get_mut(&2)
+            .unwrap()
+            .variants
+            .push(conflicting);
+        assert_eq!(
+            table.resolve_scalar("@integer/port", "demo.app")["status"],
+            "ambiguous_configuration"
+        );
+    }
+
+    #[test]
+    fn configuration_inventory_bounds_alias_fanout() {
+        let mut table = table();
+        let variants = (10..80)
+            .map(|id| Variant {
+                configuration: format!("config-{id}"),
+                value: format!("@0x{id:08x}"),
+                reference: Some(id),
+                file: None,
+            })
+            .collect();
+        table.entries.get_mut(&3).unwrap().variants = variants;
+        for id in 10..80 {
+            table.entries.insert(
+                id,
+                Resource {
+                    id,
+                    package: "demo.app".into(),
+                    kind: "string".into(),
+                    name: format!("target{id}"),
+                    variants: vec![Variant {
+                        configuration: "default".into(),
+                        value: id.to_string(),
+                        file: None,
+                        reference: None,
+                    }],
+                },
+            );
+        }
+        let result = table.resolve_scalar("@string/alias", "demo.app");
+        assert_eq!(result["configuration_inventory_truncated"], true);
+        let retained: std::collections::BTreeSet<_> = result["declared_variants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["resource_id"].as_str().unwrap())
+            .collect();
+        assert!(retained.len() <= 32);
+    }
+
+    #[test]
+    fn resource_rebuild_handles_deep_nesting_iteratively() {
+        let depth = 4096;
+        let xml = format!(
+            "<manifest package=\"demo\">{}{}</manifest>",
+            "<nested>".repeat(depth),
+            "</nested>".repeat(depth)
+        );
+        let (resolved, metadata) = resolved_xml(&xml, &ResourceTable::default()).unwrap();
+        assert!(metadata.is_empty());
+        assert_eq!(parse(&resolved).unwrap().len(), depth + 1);
+    }
+
+    #[test]
+    fn compact_resource_metadata_removes_cosmetic_values_and_duplicate_variants() {
+        let mut rows = vec![
+            serde_json::json!({"name":"demo.Main","record_type":"component","resource_resolution":{"attributes":[
+                {"attribute":"icon","raw":"@drawable/icon","status":"unsupported_type","value":null,"declared_variants":[{"configuration":"default","raw":"very large cosmetic value"}]},
+                {"attribute":"scheme","raw":"@string/alias","status":"resolved","value":"demo","declared_variants":[{"raw":"@string/scheme"}],"variants":[{"configuration":"default","status":"resolved","value":"demo"},{"configuration":"fr","status":"resolved","value":"demofr"}]}
+            ]}}),
+        ];
+        let full_size = rows[0].to_string().len();
+        project_records(&mut rows, &serde_json::json!({"projection":"compact"}));
+        assert!(rows[0].to_string().len() < full_size);
+        let attrs = rows[0]["resource_resolution"]["attributes"]
+            .as_array()
+            .unwrap();
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0]["raw"], "@string/alias");
+        assert_eq!(attrs[0]["overrides"][0]["value"], "demofr");
+        assert!(attrs[0].get("declared_variants").is_none());
+    }
+
+    #[test]
+    fn compact_retains_provider_routes_and_rebased_metadata() {
+        let xml = r#"<manifest xmlns:a="http://schemas.android.com/apk/res/android" xmlns:x="urn:foreign" package="demo.app"><x:ignored a:name="@string/cycle"><x:nested/></x:ignored><permission a:name="demo.READ" a:protectionLevel="signature"/><application><activity a:name=".Login" a:exported="true"><intent-filter><action a:name="android.intent.action.VIEW"/><category a:name="android.intent.category.DEFAULT"/><category a:name="android.intent.category.BROWSABLE"/><data a:scheme="@string/alias"/></intent-filter></activity><provider a:name=".P" a:exported="true" a:authorities="demo.provider" a:readPermission="demo.READ" a:writePermission="demo.WRITE"/></application></manifest>"#;
+        for component_mode in [false, true] {
+            let mut records =
+                query_resolved(xml, &serde_json::json!({}), &table(), component_mode).unwrap();
+            project_records(&mut records, &serde_json::json!({"projection":"compact"}));
+            let provider = records.iter().find(|r| r["name"] == "demo.app.P").unwrap();
+            assert_eq!(provider["authorities"], "demo.provider");
+            assert_eq!(provider["read_permission"]["effective"], "demo.READ");
+            assert_eq!(
+                provider["read_permission"]["protection_level"]["base"],
+                "signature"
+            );
+            let login = records
+                .iter()
+                .find(|r| r["name"] == "demo.app.Login")
+                .unwrap();
+            assert_eq!(
+                login["resource_resolution"]["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(login["intent_filters"].to_string().contains("demo"));
+        }
+        let rendered = render(xml, Path::new("/tmp/fixture.apk"), "fixture", &table()).unwrap();
+        assert!(rendered.contains("literal example: demo:example"));
+        let exposure = exposure(xml, &table(), &rendered).unwrap();
+        assert!(exposure.contains("demofr"));
+        assert!(exposure.contains("@string/alias"));
+    }
+
+    #[test]
+    fn shared_resolution_precedes_filters_and_projection() {
+        let xml = r#"<manifest xmlns:a="http://schemas.android.com/apk/res/android" package="demo.app"><application><activity a:name=".Main" a:exported="true"><intent-filter><action a:name="android.intent.action.VIEW"/><category a:name="android.intent.category.DEFAULT"/><category a:name="android.intent.category.BROWSABLE"/><data a:scheme="@string/alias"/><data a:host="example.test" a:port="@integer/port"/><data a:path="/open"/></intent-filter></activity><activity a:name=".Other" a:exported="false"/></application></manifest>"#;
+        let args = json!({"scheme":"demo", "host":"example.test"});
+        for component_mode in [false, true] {
+            let mut records = query_resolved(xml, &args, &table(), component_mode).unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["name"], "demo.app.Main");
+            assert!(
+                records[0]["resource_resolution"]
+                    .to_string()
+                    .contains("@integer/port")
+            );
+            project_records(&mut records, &json!({"projection":"compact"}));
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["intent_filters"].as_array().unwrap().len(), 1);
+        }
+        let rendered = render(xml, Path::new("/tmp/fixture.apk"), "fixture", &table()).unwrap();
+        assert!(rendered.contains("literal example: demo://example.test:8443/open"));
     }
 }

@@ -33,6 +33,10 @@ pub(super) struct Plan {
     /// A conditional child feedback edge may fall through to one original
     /// straight-line success suffix before continuing the parent.
     pub success_tail: Vec<usize>,
+    /// Conditional feedback fallthrough that completes the method through its
+    /// original normal/exception CFG, rather than continuing the parent.
+    pub terminal_success: Option<usize>,
+    pub success_terminal_nodes: Vec<usize>,
     pub siblings: Vec<Sibling>,
     pub child_feedback: Vec<Feedback>,
     pub parent_nodes: Vec<usize>,
@@ -47,6 +51,8 @@ pub(super) struct Plan {
     pub registers: u16,
     pub ins: u16,
     pub outs: u16,
+    pub tries: u16,
+    pub try_regions: Vec<crate::native_dex::DexTryRegion>,
 }
 pub(super) fn validate(code: &DexCode, plan: &Plan) -> bool {
     select_all(code).is_some_and(|plans| plans.contains(plan))
@@ -55,7 +61,16 @@ pub(super) fn validate_all(code: &DexCode, plans: &[Plan]) -> bool {
     select_all(code).as_deref() == Some(plans)
 }
 pub(super) fn select_all(code: &DexCode) -> Option<Vec<Plan>> {
-    if code.tries != 0 || !code.try_regions.is_empty() || code.instructions.len() > 2048 {
+    if usize::from(code.tries) != code.try_regions.len()
+        || code.try_regions.len() > 4
+        || code
+            .try_regions
+            .iter()
+            .map(|region| region.catches.len())
+            .sum::<usize>()
+            > 16
+        || code.instructions.len() > 2048
+    {
         return None;
     }
     // Width-aware negative filter; only the canonical CFG proof admits edges.
@@ -70,21 +85,30 @@ pub(super) fn select_all(code: &DexCode) -> Option<Vec<Plan>> {
     let ins: BTreeMap<_, _> = ir.instructions.iter().map(|i| (i.pc, i)).collect();
     let payloads = switch_payload_layout(code, &ir)?;
     let mut edges = BTreeMap::new();
+    let mut exceptional = Vec::new();
     for b in &cfg.blocks {
         for (index, pc) in b.instructions.iter().enumerate() {
             let next = if let Some(next) = b.instructions.get(index + 1) {
                 vec![*next]
             } else {
-                if b.successors.iter().any(|e| e.kind != EdgeKind::Normal) {
-                    return None;
-                }
+                exceptional.extend(
+                    b.successors
+                        .iter()
+                        .filter(|edge| edge.kind == EdgeKind::Exceptional)
+                        .map(|edge| (*pc, cfg.blocks[edge.target].start)),
+                );
                 b.successors
                     .iter()
+                    .filter(|edge| edge.kind == EdgeKind::Normal)
                     .map(|e| cfg.blocks[e.target].start)
                     .collect()
             };
             edges.insert(*pc, next);
         }
+    }
+    let mut all_edges = edges.clone();
+    for &(from, to) in &exceptional {
+        all_edges.get_mut(&from)?.push(to);
     }
     if edges.len() != ins.len()
         && ins.iter().any(|(pc, instruction)| {
@@ -178,18 +202,41 @@ pub(super) fn select_all(code: &DexCode) -> Option<Vec<Plan>> {
         if parent_block.instructions.len() > 8 {
             return None;
         }
-        let parent_guard = *parent_block.instructions.last()?;
-        let pg = ins[&parent_guard];
+        let first_guard = *parent_block.instructions.last()?;
+        let pg = ins[&first_guard];
         if !matches!(pg.opcode, 0x32..=0x3d) {
             return None;
         }
-        let exit = pg.branch_target?;
-        if exit <= child_latch {
-            return None;
-        }
-        let success_tail = child_success_tail(child_latch, parent, exit, &ins, &edges)?;
+        let (parent_guard, exit, natural_parent) =
+            if let Some(exit) = pg.branch_target.filter(|exit| *exit > child_latch) {
+                (first_guard, exit, None)
+            } else {
+                // A dispatch loop can put its only exit test after several
+                // handlers. Prove membership independently from its first
+                // internal branch before selecting the actual exit.
+                let (guard, exit, nodes) =
+                    natural_parent_exit(parent, &backward, &ins, &edges, &cfg, &dom)?;
+                if exit <= child_latch {
+                    return None;
+                }
+                (guard, exit, Some(nodes))
+            };
+        let (success_tail, terminal_success, success_terminal_nodes) =
+            if let Some(tail) = child_success_tail(child_latch, parent, exit, &ins, &edges) {
+                (tail, None, BTreeSet::new())
+            } else {
+                let latch = ins[&child_latch];
+                if !matches!(latch.opcode, 0x32..=0x3d) || latch.branch_target != Some(child) {
+                    return None;
+                }
+                let start = latch.pc + latch.width;
+                let nodes = terminal_success_closure(start, child_latch, &ins, &all_edges)?;
+                (vec![], Some(start), nodes)
+            };
         let child_bound = success_tail.last().copied().unwrap_or(child_latch);
-        let child_nodes = reachable(child, &edges, &BTreeSet::from([parent]))?;
+        let mut child_stops = BTreeSet::from([parent]);
+        child_stops.extend(terminal_success);
+        let child_nodes = reachable(child, &edges, &child_stops)?;
         if child_nodes.len() > 64
             || child_nodes
                 .iter()
@@ -216,6 +263,9 @@ pub(super) fn select_all(code: &DexCode) -> Option<Vec<Plan>> {
         if let Some(&last) = success_tail.last() {
             expected_exits.push((last, parent));
         }
+        if let Some(start) = terminal_success {
+            expected_exits.push((child_latch, start));
+        }
         if child_exits != expected_exits {
             return None;
         }
@@ -226,8 +276,13 @@ pub(super) fn select_all(code: &DexCode) -> Option<Vec<Plan>> {
         if !dag(&child_nodes, &child_dag) {
             return None;
         }
-        let parent_nodes = reachable(parent, &edges, &BTreeSet::from([exit]))?;
+        let mut parent_stops = BTreeSet::from([exit]);
+        parent_stops.extend(terminal_success);
+        let parent_nodes = reachable(parent, &edges, &parent_stops)?;
         if parent_nodes.len() > 256
+            || natural_parent
+                .as_ref()
+                .is_some_and(|owned| owned != &parent_nodes)
             || (!payloads.is_empty()
                 && (parent_nodes
                     .iter()
@@ -261,7 +316,11 @@ pub(super) fn select_all(code: &DexCode) -> Option<Vec<Plan>> {
                     .map(move |t| (*f, *t))
             })
             .collect();
-        if exits != vec![(parent_guard, exit)] {
+        let mut expected_parent_exits = vec![(parent_guard, exit)];
+        if let Some(start) = terminal_success {
+            expected_parent_exits.push((child_latch, start));
+        }
+        if exits != expected_parent_exits {
             return None;
         }
         let siblings = independent_siblings(
@@ -283,7 +342,10 @@ pub(super) fn select_all(code: &DexCode) -> Option<Vec<Plan>> {
             return None;
         }
         let bound = *parent_nodes.last()?;
-        if !matches!(ins[&bound].opcode, 0x28..=0x2a)
+        if !(matches!(ins[&bound].opcode, 0x28..=0x2a)
+            || (terminal_success.is_some()
+                && bound == child_latch
+                && matches!(ins[&bound].opcode, 0x32..=0x3d)))
             || !matches!(ins[&bound].branch_target,Some(t)if t==parent||t==child)
         {
             return None;
@@ -473,6 +535,8 @@ pub(super) fn select_all(code: &DexCode) -> Option<Vec<Plan>> {
             child_guard,
             child_latch,
             success_tail,
+            terminal_success,
+            success_terminal_nodes: success_terminal_nodes.into_iter().collect(),
             siblings,
             child_feedback,
             parent_nodes: parent_nodes.into_iter().collect(),
@@ -494,12 +558,14 @@ pub(super) fn select_all(code: &DexCode) -> Option<Vec<Plan>> {
             registers: code.registers,
             ins: code.ins,
             outs: code.outs,
+            tries: code.tries,
+            try_regions: code.try_regions.clone(),
         })
     };
     let mut plans = Vec::new();
     for (parent, child) in candidates {
         if let Some(plan) = prove(parent, child, &mut ssa_work) {
-            if plans.len() >= 2
+            if plans.len() >= 4
                 || plans
                     .iter()
                     .map(|p: &Plan| p.parent_nodes.len())
@@ -522,7 +588,121 @@ pub(super) fn select_all(code: &DexCode) -> Option<Vec<Plan>> {
             return None;
         }
     }
+    // The normal projection is authority only for the selected unprotected
+    // loops. Every protected instruction and handler remains in a certified
+    // terminal continuation, with its original exception edges retained for
+    // ordinary emission. Neither a suffix nor a handler can feed any loop.
+    let loop_nodes: BTreeSet<_> = plans
+        .iter()
+        .flat_map(|plan| plan.parent_nodes.iter().copied())
+        .collect();
+    let terminal_nodes: BTreeSet<_> = plans
+        .iter()
+        .flat_map(|plan| plan.success_terminal_nodes.iter().copied())
+        .collect();
+    if !loop_nodes.is_disjoint(&terminal_nodes)
+        || exceptional
+            .iter()
+            .any(|(from, to)| loop_nodes.contains(from) || loop_nodes.contains(to))
+        || code.try_regions.iter().any(|region| {
+            region.start >= region.end
+                || !ins.contains_key(&(region.start as usize))
+                || !ins.contains_key(&(region.end as usize))
+                || ins
+                    .keys()
+                    .filter(|pc| region.start as usize <= **pc && **pc < region.end as usize)
+                    .any(|pc| !terminal_nodes.contains(pc))
+                || region
+                    .catches
+                    .iter()
+                    .any(|(_, handler)| !terminal_nodes.contains(&(*handler as usize)))
+        })
+    {
+        return None;
+    }
     (!plans.is_empty()).then_some(plans)
+}
+
+fn terminal_success_closure(
+    start: usize,
+    latch: usize,
+    instructions: &BTreeMap<usize, &crate::native_ir::Instruction>,
+    edges: &BTreeMap<usize, Vec<usize>>,
+) -> Option<BTreeSet<usize>> {
+    let nodes = reachable(start, edges, &BTreeSet::new())?;
+    if nodes.is_empty()
+        || nodes.len() > 128
+        || nodes.iter().any(|pc| {
+            *pc <= latch
+                || matches!(instructions[pc].opcode, 0x1d | 0x1e | 0x22 | 0x2b | 0x2c)
+                || (edges[pc].is_empty() && !matches!(instructions[pc].opcode, 0x0e..=0x11 | 0x27))
+        })
+        || !dag(&nodes, edges)
+    {
+        return None;
+    }
+    Some(nodes)
+}
+
+/// Reverse closure of all parent feedback sources stops at the dominating
+/// header. Its sole outward edge must be an original conditional branch.
+/// Forward reachability and all existing ownership/SSA checks remain separate.
+fn natural_parent_exit(
+    parent: usize,
+    backward: &[(usize, usize)],
+    instructions: &BTreeMap<usize, &crate::native_ir::Instruction>,
+    edges: &BTreeMap<usize, Vec<usize>>,
+    cfg: &ControlFlowGraph,
+    dom: &DominatorTree,
+) -> Option<(usize, usize, BTreeSet<usize>)> {
+    let parent_block = *cfg.block_at.get(&parent)?;
+    let mut predecessors: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (from, targets) in edges {
+        for to in targets {
+            predecessors.entry(*to).or_default().push(*from);
+        }
+    }
+    let mut pending: Vec<_> = backward
+        .iter()
+        .filter(|(_, to)| *to == parent)
+        .map(|(from, _)| *from)
+        .collect();
+    if pending.is_empty() || pending.len() > 32 {
+        return None;
+    }
+    let mut nodes = BTreeSet::from([parent]);
+    let mut work = 0usize;
+    while let Some(pc) = pending.pop() {
+        work += 1;
+        if work > 65_536 || !dom.dominates(parent_block, *cfg.block_at.get(&pc)?) {
+            return None;
+        }
+        if !nodes.insert(pc) {
+            continue;
+        }
+        if nodes.len() > 256 || pc < parent {
+            return None;
+        }
+        pending.extend(predecessors.get(&pc)?.iter().copied());
+    }
+    let mut exits = nodes.iter().flat_map(|from| {
+        edges[from]
+            .iter()
+            .filter(|to| !nodes.contains(to))
+            .map(move |to| (*from, *to))
+    });
+    let (guard, exit) = exits.next()?;
+    if exits.next().is_some() || exit <= *nodes.last()? {
+        return None;
+    }
+    let instruction = instructions.get(&guard)?;
+    if !matches!(instruction.opcode, 0x32..=0x3d)
+        || instruction.branch_target != Some(exit)
+        || !nodes.contains(&(guard + instruction.width))
+    {
+        return None;
+    }
+    Some((guard, exit, nodes))
 }
 
 fn child_success_tail(
@@ -708,7 +888,6 @@ fn has_candidate(words: &[u16]) -> bool {
     let mut pc = 0usize;
     let mut backedges = 0;
     let mut conditional = false;
-    let mut feedback = false;
     while pc < words.len() {
         if matches!(words[pc], 0x0100 | 0x0200) {
             let Some(count) = words.get(pc + 1).copied().map(usize::from) else {
@@ -776,11 +955,10 @@ fn has_candidate(words: &[u16]) -> bool {
         {
             backedges += 1;
             conditional |= matches!(op, 0x32..=0x3d);
-            feedback |= matches!(op, 0x28..=0x2a);
         }
         pc += width;
     }
-    backedges >= 2 && conditional && feedback
+    backedges >= 2 && conditional
 }
 
 // Exactly one narrow numeric field read feeds its following guard. Rendering

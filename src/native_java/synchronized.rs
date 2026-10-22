@@ -17,6 +17,7 @@ pub(super) struct Region {
     pub inner_tries: Vec<usize>,
     pub releases: HashSet<usize>,
     pub dispatch_join: Option<usize>,
+    pub owned: HashSet<usize>,
 }
 
 fn successors(graph: &Graph, words: &[u16], pc: usize) -> Vec<usize> {
@@ -32,6 +33,121 @@ fn successors(graph: &Graph, words: &[u16], pc: usize) -> Vec<usize> {
             edges
         }
     }
+}
+
+// Optimizers can place a shared pure release suffix before the final release.
+// Prove the real instruction paths, rather than treating the address gap as
+// code executed under the lock. Every later release has only a control bridge
+// to the identical shared suffix; its writes execute after Java releases it.
+fn shared_post_release_tail(
+    code: &DexCode,
+    graph: &Graph,
+    releases: &HashSet<usize>,
+    join: usize,
+    body: &HashSet<usize>,
+    cleanup: &HashSet<usize>,
+) -> bool {
+    use crate::native_cfg::{ControlFlowGraph, EdgeKind};
+    let prove = || -> Option<()> {
+        if code.instructions.len() > 4096
+            || code.registers > 256
+            || usize::from(code.tries) != code.try_regions.len()
+            || code.try_regions.len() > 16
+            || !(2..=16).contains(&releases.len())
+            || code
+                .try_regions
+                .iter()
+                .map(|r| r.catches.len())
+                .sum::<usize>()
+                > 64
+        {
+            return None;
+        }
+        let ir = DecodedMethod::decode(code).ok()?;
+        let at: HashMap<_, _> = ir.instructions.iter().map(|i| (i.pc, i)).collect();
+        let cfg = ControlFlowGraph::build(code).ok()?;
+        if cfg.blocks.len() > 512
+            || !at.contains_key(&join)
+            || body.contains(&join)
+            || cleanup.contains(&join)
+        {
+            return None;
+        }
+        let first = *releases.iter().min()?;
+        let shared = first + at.get(&first)?.width;
+        let mut paths = HashSet::new();
+        let mut walk = |start: usize, end: usize, bridge: bool| -> Option<()> {
+            let mut pc = start;
+            let mut seen = HashSet::new();
+            while pc != end {
+                if seen.len() == 16
+                    || !seen.insert(pc)
+                    || body.contains(&pc)
+                    || cleanup.contains(&pc)
+                    || code
+                        .try_regions
+                        .iter()
+                        .any(|r| r.start as usize <= pc && pc < r.end as usize)
+                {
+                    return None;
+                }
+                let i = at.get(&pc)?;
+                if i.may_throw
+                    || i.payload_target.is_some()
+                    || !matches!(i.opcode, 0x00..=0x09 | 0x12..=0x19 | 0x28..=0x2a)
+                    || (bridge && !matches!(i.opcode, 0x00 | 0x28..=0x2a))
+                    || (i.opcode == 0 && code.instructions[pc] != 0)
+                    || i.reads.iter().chain(&i.writes).any(|operand| {
+                        usize::from(operand.register) + operand.kind.word_count()
+                            > usize::from(code.registers)
+                    })
+                    || graph.widths.get(pc) != Some(&i.width)
+                    || graph.targets[pc] != i.branch_target
+                {
+                    return None;
+                }
+                let next = i.branch_target.unwrap_or(pc + i.width);
+                if !at.contains_key(&next) {
+                    return None;
+                }
+                let block = &cfg.blocks[*cfg.block_at.get(&pc)?];
+                let position = block.instructions.iter().position(|p| *p == pc)?;
+                if let Some(&following) = block.instructions.get(position + 1) {
+                    if next != following {
+                        return None;
+                    }
+                } else if block.successors.len() != 1
+                    || block.successors[0].kind != EdgeKind::Normal
+                    || cfg.blocks[block.successors[0].target].start != next
+                {
+                    return None;
+                }
+                paths.insert(pc);
+                pc = next;
+            }
+            Some(())
+        };
+        walk(shared, join, false)?;
+        for &release in releases {
+            let instruction = at.get(&release)?;
+            if instruction.opcode != 0x1e || instruction.width != 1 {
+                return None;
+            }
+            walk(release + instruction.width, shared, true)?;
+        }
+        // Ordinary paths can share this unchanged pure suffix; they retain
+        // their original entry frames and are rendered independently. An
+        // exceptional entry would give it a second handler ownership.
+        for block in &cfg.blocks {
+            for edge in &block.successors {
+                if paths.contains(&cfg.blocks[edge.target].start) && edge.kind != EdgeKind::Normal {
+                    return None;
+                }
+            }
+        }
+        Some(())
+    };
+    prove().is_some()
 }
 
 pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
@@ -329,23 +445,31 @@ pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
         if let Some(join) = dispatch_join {
             body.retain(|pc| *pc <= last_release);
             terminal = false;
+            let shared_tail = shared_post_release_tail(code, graph, &exits, join, &body, &cleanup);
             ensure!(
-                join > last_release && join - last_release <= 16,
+                join > last_release && (join - last_release <= 16 || shared_tail),
                 "monitor final release continuation budget"
             );
-            let mut cursor = last_release + graph.widths[last_release];
-            while cursor < join {
-                let insn = at
-                    .get(&cursor)
-                    .context("monitor final continuation boundary")?;
-                ensure!(
-                    !matches!(insn.opcode, 0x0e..=0x11 | 0x27..=0x3d | 0x1d | 0x1e),
-                    "monitor final continuation is not straight-line"
-                );
-                cursor += insn.width;
+            if shared_tail {
+                // Lock ownership ends at the actual release. The dispatch
+                // renderer executes proven suffixes outside synchronized and
+                // the caller resumes at their explicit common join.
+                exit = last_release;
+            } else {
+                let mut cursor = last_release + graph.widths[last_release];
+                while cursor < join {
+                    let insn = at
+                        .get(&cursor)
+                        .context("monitor final continuation boundary")?;
+                    ensure!(
+                        !matches!(insn.opcode, 0x0e..=0x11 | 0x27..=0x3d | 0x1d | 0x1e),
+                        "monitor final continuation is not straight-line"
+                    );
+                    cursor += insn.width;
+                }
+                ensure!(cursor == join, "monitor continuation crosses instruction");
+                exit = join - 1;
             }
-            ensure!(cursor == join, "monitor continuation crosses instruction");
-            exit = join - 1;
         }
         // Address order may put protected throwing arms after the last normal
         // release. They remain inside the synchronized body: Java's implicit
@@ -462,6 +586,15 @@ pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
                 inner_tries.push(index);
             }
         }
+        let mut owned = body.clone();
+        owned.extend(cleanup.iter().copied());
+        owned.insert(enter.pc);
+        owned.extend(exits.iter().copied());
+        for child in &result {
+            if body.contains(&child.enter) {
+                owned.extend(child.owned.iter().copied());
+            }
+        }
         owned_bodies.insert(enter.pc, body);
         owned_cleanup.insert(enter.pc, cleanup);
         result.push(Region {
@@ -473,10 +606,77 @@ pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
             inner_tries,
             releases: exits,
             dispatch_join,
+            owned,
         });
     }
     result.sort_by_key(|region| region.enter);
     Ok(result)
+}
+
+/// Ordinary catches can surround independent code before or after a monitor.
+/// Their later normal continuation may acquire the lock at its real enter;
+/// no protected instruction or exceptional entry may own an already-held frame.
+pub(super) fn ordinary_regions_disjoint(code: &DexCode, regions: &[Region]) -> bool {
+    let prove = || -> Option<()> {
+        if code.instructions.len() > 4096
+            || code.registers > 256
+            || usize::from(code.tries) != code.try_regions.len()
+            || code.try_regions.len() > 16
+            || regions.len() > 32
+            || code
+                .try_regions
+                .iter()
+                .map(|r| r.catches.len())
+                .sum::<usize>()
+                > 64
+        {
+            return None;
+        }
+        let ir = DecodedMethod::decode(code).ok()?;
+        let boundaries: HashSet<_> = ir.instructions.iter().map(|i| i.pc).collect();
+        for (index, region) in code.try_regions.iter().enumerate() {
+            if regions.iter().any(|monitor| {
+                monitor.tries.contains(&index) || monitor.inner_tries.contains(&index)
+            }) {
+                continue;
+            }
+            let start = region.start as usize;
+            let end = region.end as usize;
+            if start >= end
+                || !boundaries.contains(&start)
+                || (end != code.instructions.len() && !boundaries.contains(&end))
+                || region.catches.is_empty()
+                || region.catches.iter().any(|(_, handler)| {
+                    !boundaries.contains(&(*handler as usize))
+                        || regions
+                            .iter()
+                            .any(|monitor| monitor.owned.contains(&(*handler as usize)))
+                })
+            {
+                return None;
+            }
+            let mut cursor = start;
+            for instruction in ir
+                .instructions
+                .iter()
+                .filter(|i| (start..end).contains(&i.pc))
+            {
+                if instruction.pc != cursor
+                    || regions
+                        .iter()
+                        .any(|monitor| monitor.owned.contains(&instruction.pc))
+                {
+                    return None;
+                }
+                cursor += instruction.width;
+            }
+            if cursor != end {
+                return None;
+            }
+        }
+        Some(())
+    };
+    prove().is_some()
 }
 
 pub(super) fn emit(

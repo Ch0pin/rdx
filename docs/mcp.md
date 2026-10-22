@@ -28,23 +28,30 @@ memory while enabled. Opening/reloading a GUI project stops that service.
    require a fully qualified ID. Class-scoped tools also accept `class_name` as an
    alias for `class_id`: `get_class_source`, `get_class_disassembly`,
    `get_methods_of_class`, `get_fields_of_class`, `find_direct_subclasses`,
-   `find_implementations`, and `get_dex_strings`. Supplying both requires them to
+   `find_implementations`, `get_class_hierarchy`, `find_instantiations`, and `get_dex_strings`. Supplying both requires them to
    resolve to the same class; conflicts return `CONFLICTING_CLASS_SELECTORS`.
    This alias differs from the component-name and call-graph filters also named
    `class_name`. Restarting the server changes project identity;
    stale project requests are rejected.
 
-## Currently available (25 tools)
+A missing FQCN returns `SYMBOL_NOT_FOUND` with JSON-formatted `candidates`,
+`candidate_count`, and `candidates_truncated`. Suggestions list loaded classes
+with the same exact simple name, sorted by FQCN, capped at 20 IDs and 16 KiB.
+For example, `com.baogong.app_login.activity.LoginActivity` can suggest
+`com.baogong.app_login.LoginActivity`. Retry explicitly with the intended ID;
+suggestions preserve exact FQCN and unique short-name selection rules.
+
+## Currently available (30 tools)
 
 | Area | Tools |
 | --- | --- |
-| Instances | `list_instances`, `get_health`, `get_instance_info`, `open_apk` |
-| Classes | `get_all_classes`, `search_classes_by_keyword`, `find_direct_subclasses`, `find_implementations` |
+| Instances | `list_instances`, `get_health`, `get_instance_info`, `open_apk`, `forget_instance` |
+| Classes | `get_all_classes`, `search_classes_by_keyword`, `find_direct_subclasses`, `find_implementations`, `get_class_hierarchy` |
 | Code search | `search_code` |
 | Source and metadata | `get_class_source`, `get_method_source`, `get_class_disassembly`, `get_methods_of_class`, `get_fields_of_class` |
 | Resources | `get_all_resource_file_names`, `get_android_manifest`, `get_manifest_summary`, `get_manifest_components`, `get_resource_file`, `get_strings` |
-| Call graphs | `get_call_graph` (exact `method_id`, `direction`: `callers` / `callees` / `both`, `depth`: 1–100, default 20) |
-| DEX analysis | `find_field_references`, `get_lambda_branch` |
+| Call graphs | `get_call_graph` (exact `method_id`, `direction`: `callers` / `callees` / `both`, `depth`: 1–100, default 20 for graph / 1 for call sites) |
+| DEX analysis | `find_field_references`, `get_lambda_branch`, `find_config_key_consumers`, `find_instantiations`, `find_integer_references` |
 | DEX strings | `get_dex_strings` (strings from the DEX containing `class_id`), `find_string_references` |
 
 `search_classes_by_keyword` searches literal class-name substrings only.
@@ -82,8 +89,19 @@ and [tools](https://modelcontextprotocol.io/specification/2025-06-18/server/tool
 
 `get_call_graph` requires `instance_id`, `project_id`, and an exact DEX
 `method_id` from `get_methods_of_class`, such as `sample.Target.doubleValue(I)I`.
+It also accepts `sample.Target.doubleValue:(I)I`,
+`Lsample/Target;->doubleValue(I)I`, and
+`Lsample/Target;->doubleValue:(I)I`. The optional colon immediately before `(`
+is normalized while preserving the complete parameter and return descriptors;
+selection remains exact.
 Use `direction: "callers"` to trace into a method, `"callees"` (default) to
 follow outgoing calls, or `"both"`. Edges always point from caller to callee.
+
+An incomplete selector such as `sample.Target.doubleValue` or
+`sample.Target.doubleValue(I)` returns bounded same-name declaration candidates,
+including their parameter and return descriptors. Candidates come from the
+requested class and known superclass chain; constructors use only their own
+class. Retry with an exact candidate. No overload is selected automatically.
 
 The response includes numbered nodes, method IDs, distance from the root,
 component classifications, available declarations, call-site counts, and
@@ -108,10 +126,19 @@ IDs and offsets without the node/edge payload, use:
 }
 ```
 
+Compact `projection: "call_sites"` defaults to depth 1, so omitted depth returns
+only direct neighbors. Graph projection defaults to depth 20. Set an explicit
+depth to request transitive sites: each record includes its traversal `depth`,
+and `direct_matching_total` counts only depth-1 matches. Method selectors accept
+`pkg.Class.method(desc)ret` and `Lpkg/Class;->method(desc)ret`.
+
 The compact projection returns one record per DEX call site, including
 `caller_method_id`, `caller_signature`, `callee_method_id`, and
 `call_site_offset` in DEX code units. Multiple calls in the same caller remain
-separate. `matching_total` counts all matching records; follow `next_offset`
+separate. Evidence fields include `raw_callee_method_id`, `dex_entry`,
+`method_index` (local to that DEX), `invoke_instruction` (readable raw invoke), `invoke_opcode`, `invoke_words` (numeric
+16-bit instruction words), and `caller_code_offset_bytes`. The raw operand is
+resolved using the caller's own DEX table. `matching_total` counts all matching records; follow `next_offset`
 until null. `source_hash` identifies the complete ordered matching record set
 and stays stable across pages. Compact enumeration is independent of the graph node/edge caps.
 `offset` and `limit` apply only to `projection: "call_sites"` (maximum 500).
@@ -144,6 +171,13 @@ can appear as `source_sugar`; abstract/native declarations can appear as
 `java_complete` also requires no DEX fallbacks. This measures declaration presence;
 semantic equivalence requires separate verification.
 
+When a method uses DEX fallback or is omitted, source text starts with an
+`RDX Java reconstruction incomplete` comment. It reports the counts and up to
+20 exact method IDs with concise reasons (16 KiB header budget); coverage keeps
+the complete list and full reasons. The same header appears in the GUI source.
+Navigation offsets and `source_hash` include the header. Fully reconstructed
+classes retain their usual Java header.
+
 For paged text, `returned_chars`, `page_end`, `has_more`, and
 `full_text_in_response` describe the returned slice. `full_text_in_response: true`
 means this response contains the complete document. Follow `next_offset` until
@@ -157,11 +191,29 @@ from `get_methods_of_class`, including parameter and return descriptors. For
 example, `sample.Target.doubleValue(I)I` selects that overload alone.
 
 The response renders only the requested method. It contains `method_id`, `text`,
-`format` (`java` or `rdx-dex`), `fallback_reason`, `source_hash`, `offset`,
+`format` (`java` or `rdx-dex`), `requested_format` (`auto` or `dex`),
+`reconstruction_attempted`, `fallback_reason`, `source_hash`, `offset`,
 `total_chars`, and `next_offset`, alongside the usual APK/project identity.
+
+The optional request parameter `format` defaults to `auto`: attempt Java, then
+return explicit DEX fallback if reconstruction fails. Use `format: "dex"` to
+read native RDX DEX disassembly of the selected method directly. This bypasses
+Java reconstruction and reports `format: "rdx-dex"`, `requested_format: "dex"`,
+`reconstruction_attempted: false`, and `fallback_reason: null`. An automatic DEX
+fallback instead reports `requested_format: "auto"`,
+`reconstruction_attempted: true`, and the reconstruction failure reason. RDX DEX
+is a diagnostic disassembly format with original instruction offsets, rather
+than assemblable Smali. Both modes retain exact method lookup, cancellation,
+source hashes, and method-local pagination.
 Enclosing imports and generated helper declarations are available through
 `get_class_source`. A DEX fallback retains the complete selected method's
 instructions, switch payloads, and exception table.
+Its first source line explicitly flags Java reconstruction failure with the
+exact method ID and a concise reason, before the raw DEX declaration.
+
+Standalone Java keeps fully qualified types; SDK classfile membership and the
+loaded hierarchy authorize canonical nested spelling such as `java.util.Map.Entry`.
+Binary method/type IDs remain unchanged for navigation and lookup.
 
 Omit `limit` to retrieve the whole method. Optional `offset` and `limit` use
 Unicode scalar characters relative to this method's source; explicit pages have
@@ -171,6 +223,20 @@ pages using the same method and project IDs. Oversized responses report an
 error rather than silently truncating source.
 
 ## Bounded code search
+
+Set `pagination: "hits"` to page by occurrences across the APK. `limit` then
+bounds matches (default 100, maximum 500), rather than classes. The server scans
+until that limit, the end of the filtered class list, or a 20-second budget
+checked between class renders. One expensive class may exceed that budget;
+cancellation remains cooperative. Resume with **both** `next_offset` and
+`next_source_offset`, using the same query, prefix and pagination mode.
+`scan_boundary` explains each page boundary; `scanned_classes` and `total_classes`
+show progress. `page_error_count` includes all failed renders even when the
+bounded `errors` detail list is truncated. This mode reduces round trips;
+uncached generated-source search still needs Java reconstruction. For DEX string
+literals use `find_string_references`, which indexes literal operands directly.
+
+The default `pagination: "classes"` preserves the previous contract:
 
 `search_code` requires `instance_id`, `project_id` and `query`. Optionally set
 `package_prefix` (package boundary match), `offset` (class index), `limit`
@@ -206,6 +272,18 @@ registry entries. `discovery_complete` describes registration scanning;
 `next_offset` describes result pagination. Connection failures appear in
 `diagnostics`, including the affected instance and retry guidance.
 
+New registrations include an owner PID. On Unix, discovery automatically removes
+only records whose owner is confirmed absent by the OS; unknown, legacy and
+reused PIDs are retained. Other platforms retain records conservatively.
+For an unreachable stale record, call `forget_instance` with its exact
+`instance_id`. Reachable instances are refused. This action removes only the
+selected registration, leaving GUI processes and project files intact.
+
+`open_apk.request_key` is required and described in the schema. Its uniqueness
+scope is one gateway connection: reuse the same key for retries of the same
+canonical path, and choose a new key to launch another window. A different path
+with the same key is rejected.
+
 `get_health` accepts the same filters and discovery pagination. It reports
 `transport: "connected"`, gateway executable path, version, PID, and executable
 SHA-256 captured at process startup, plus instance connection diagnostics.
@@ -221,6 +299,14 @@ project is `Running`, the gateway preserves it as `selection_diagnostic` with
 `source: "legacy_gui"`, clears that stale project error, and supplies reload
 instructions. Use the diagnostic and executable/build identities to select the
 current GUI instance.
+
+If the gateway advertises a tool but the selected GUI returns `Unknown tool`,
+the gateway reports `INSTANCE_TOOL_UNAVAILABLE` with the tool, instance ID,
+original GUI error, and `advertised_by_gateway`. Run `get_health` and compare the
+gateway/GUI build identities, select the intended running GUI, and reconnect
+or restart the relevant process when needed. Different build versions are one
+possible cause of this capability mismatch.
+
 A closed client transport requires reconnecting or restarting the MCP connector
 before `get_health` can run. An unreachable registration calls for checking the
 GUI MCP panel and retrying discovery; it alone does not establish process state.
@@ -237,6 +323,43 @@ within the same intent-filter. Records preserve separate data elements and
 relative-filter groups, including their declared allow/block attributes.
 `matching_filter_indexes` identifies matching filters. These are declaration
 queries; runtime route delivery and callback reachability require separate proof.
+
+Both tools resolve `@string`, `@integer`, and `@bool` references (including
+package-qualified names and numeric IDs) before filtering, using the default
+configuration. `resource_resolution.attributes` preserves raw references,
+resolved values, explicit failure status, and every configuration encountered
+through aliases. Alias traversal is bounded at 32 entries and detects cycles. Configuration
+inventory admits at most 32 resource IDs and 4096 configurations/declarations;
+`configuration_inventory_truncated` marks incomplete inventory. Split-origin
+qualifiers retain their declared origin; conflicting values for one qualifier
+return `ambiguous_configuration`. Hexadecimal integer resources resolve to signed
+decimal values while declared raw representations remain available.
+Missing defaults remain unresolved; locale variants never substitute for them.
+Configuration overrides are inventory evidence; route filters select defaults.
+
+For records, `projection: "compact"` retains identity, flags, effective permissions, provider authorities, concise
+intent-filter constraints, matching-filter indexes and resource resolution.
+Compact resource metadata retains relevant route/flag/permission references with
+raw value, default status/value and configuration overrides; cosmetic references
+and duplicate alias declarations stay available in full projection. The default `"full"` retains
+all fields. `fields: "name,exported,intent_filters"` selects an explicit validated
+comma-separated field list and overrides projection. Filtering and coverage
+precede projection and matching-record pagination remains unchanged.
+Compact records omit empty fields and targets equal to the component name.
+Permission entries retain effective values, resolution status, source and concise
+protection levels; full records retain declaration and catalog details. Resource
+metadata belongs to the original declaration subtree; only application attributes
+affecting reachability or permissions are inherited by component records.
+
+`format: "exposure"` on an unfiltered summary returns the existing exported
+component, deep-link, custom-permission and unresolved-flag sections with Unicode
+character pagination. Deep-link literal examples combine direct data declarations
+under Android matching semantics, preserving host/port pairing. Patterns without
+a literal witness are explicitly labeled as templates. Scheme-only declarations can produce `scheme:example`, using an arbitrary
+opaque scheme-specific part allowed by that filter. Examples use declared
+hosts and make no domain-verification or runtime-delivery claim.
+Exposure resource metadata includes relevant route, permission and flag references
+once per original attribute, including their configuration overrides.
 
 ### Component lookup
 
@@ -307,6 +430,13 @@ For example, supply the returned ID in this template:
 `access` accepts `all` (default), `read`, or `write`. The scan covers original
 DEX `iget`/`iput`/`sget`/`sput` variants without Java reconstruction, resolving
 provable inherited-owner aliases through loaded declarations and hierarchy.
+The query owner is resolved too: `sample.Child.value:I` can resolve to
+`sample.Parent.value:I`. Responses preserve `requested_field_id`, expose the
+canonical `field_id` and `resolved_field_id`, and enumerate accesses through
+both owners. Shadowing fields remain separate. Missing or ambiguous hierarchy
+information leaves `resolved_field_id` null and `complete` false; a zero count
+in that response is not proof that there are no readers. Equivalent resolved
+selectors share the same result-set hash and pagination order.
 Each record in `items` includes `method_id`, `symbolic_field_id`, `access`, opcode name
 and value, `code_unit_offset` in 16-bit DEX code units, and
 `byte_offset_in_method`. `read_count` and `write_count` count confirmed accesses
@@ -422,3 +552,181 @@ Component highlights describe ancestry. An accepted service start does not
 prove an app callback executed. Constructor/provider callers do not prove a
 route is registered; route-table data flow and runtime intent delivery are not
 inferred by this static graph.
+
+## Config-key consumers
+
+`find_config_key_consumers` takes `instance_id`, `project_id`, an exact `key`,
+`offset` and `limit` (default 20, maximum 100 candidate methods). It scans DEX
+literal operands without reconstructing Java. Follow `next_offset` until null.
+Pages are also bounded by encoded output size.
+
+Each method includes candidate key/default retrieval calls, `default_raw`,
+parsed `default_json`, and arrays identified by JSON Pointer paths such as
+`/suffix`. Arrays include their packaged default value (including whether the
+path exists and contains an array) and observed operations: `equals`,
+`equalsIgnoreCase`, `endsWith`, `startsWith`, `regex_matches` or `regex_find`.
+Case-folding/trim transformations, argument word position, exact target,
+method ID, DEX offset and static helper call chain accompany each operation.
+
+The query infers retrieval candidates from an exact key passed to a method
+with two String parameters and a String return. It does not assert that an
+obfuscated method is a remote-config API. `contract` labels this inference;
+analysts can inspect `reader_method_id` to verify it. Defaults are literal APK
+arguments, not current server values. `default_status` distinguishes parsed
+JSON, non-JSON text and unresolved defaults.
+
+Analysis follows normal DEX register flow, supported org.json operations,
+and static/direct app helpers up to depth 2. Conflicting joins discard
+provenance; unknown calls invalidate mutable JSON-container aliases. Dynamic
+keys, field storage, collection adapters and virtual helper dispatch are
+outside this coverage. `literal_only`, `analysis_error`, `unresolved_uses` and
+`scan_errors` expose those boundaries. Empty operation lists do not prove an
+array is unused. Results describe static possible uses, not runtime acceptance
+or reachability. No best-effort decompiled text is used as proof.
+
+## Exact superclass metadata
+
+`get_class_hierarchy` returns the queried descriptor, definition availability,
+and immediate `superclass` and `interfaces`, each with an exact `class_id` and
+DEX `descriptor`. External definitions have unknown parent/interface metadata.
+Class-scoped queries accept loaded FQCNs or `Lpackage/Class;` descriptors.
+Hierarchy queries additionally accept unique short names across loaded classes
+and referenced external parents. Ambiguous short names list candidate FQCNs;
+use an exact descriptor to disambiguate across packages.
+
+## Allocation references
+
+`find_instantiations` takes `instance_id`, `project_id`, `class_id` or
+`class_name`, `offset` and `limit` (default 100, maximum 500). Select a loaded
+or DEX-referenced class using its FQCN, `Lpackage/Class;` descriptor, or a unique
+short name. Referenced external classes can be queried without their definition.
+Ambiguous short names list candidates.
+
+Results are exact `new-instance` instructions, resolved against each caller's
+own DEX type table. Each item contains `method_id`, `dex_entry`,
+`allocated_descriptor`, `allocation_offset` in 16-bit code units,
+`method_code_offset_bytes`, destination register, raw type index, instruction
+words and readable instruction text. `call_site_offset` is an alias for the
+allocation offset; it identifies the allocation rather than a constructor call.
+The query scans original instructions without Java reconstruction. It skips
+payload data, rejects malformed instruction/operand metadata and supports
+cancellation independently of the interactive engine lock.
+
+Follow `next_offset` until null; `total` counts all matching instructions across
+loaded classes, and `source_hash` identifies the ordered reference set. Pages
+also have a 1 MiB item budget. `scan_complete` describes the loaded DEX scan.
+Unreachable instructions are included. These sites do not establish successful
+construction or runtime reachability; arrays, reflection, native code and other
+runtime allocations are outside the query's scope.
+
+## Method lookup suggestions
+
+`get_method_source` accepts canonical `pkg.Class.method(desc)ret` and smali-style
+`Lpkg/Class;->method(desc)ret` IDs. An optional colon immediately before the
+parameter descriptor is accepted in both forms: `pkg.Class.method:(I)V` and
+`Lpkg/Class;->method:(I)V`. This separator is normalized to the canonical ID
+without guessing an overload. The response reports the canonical `method_id`
+and the original `requested_method_id`. A wrong/missing descriptor returns
+`SYMBOL_NOT_FOUND` with JSON-formatted `candidates`, `candidate_count` and
+`candidates_truncated` in the error message. Candidates are actual same-name
+declarations in the requested class; exact parameter matches rank first when
+only the return type differs. At most 20 IDs / 16 KiB of candidate text are
+included. Use `get_methods_of_class` for the full list. No candidate is selected
+automatically. Unknown names return an empty candidate list. This assistance is
+for source-method lookup; call graphs retain their external-symbol semantics.
+
+
+## Integer constant references
+
+`find_integer_references` takes `instance_id`, `project_id`, `values`, optional
+`bit_width` (32 by default, or 64), `offset`, and `limit` (default 100, maximum
+500). A batch contains 1–64 signed decimal JSON integers or decimal/hex strings.
+Equivalent normalized values are deduplicated. Decimal inputs must fit the signed
+range for the selected width. Positive hex strings express raw bit patterns:
+`"0xffffffff"` equals -1 at 32 bits and 4294967295 at 64 bits. Negative hex is
+accepted within the signed range. Use strings for exact 64-bit values in clients
+whose JSON number type cannot preserve them.
+
+Example arguments (replace the instance and project identities):
+
+```json
+{"instance_id":"INSTANCE","project_id":"PROJECT","values":["0x02000000",268435456],"bit_width":32,"limit":100}
+```
+
+The query scans original DEX once for the whole batch per page, without Java
+reconstruction. It matches `const/4`, `const/16`, `const`, and `const/high16` in
+32-bit mode, or the four `const-wide` forms in 64-bit mode. Sign extension and
+high-bit shifts are decoded before matching. Each result contains the owning
+method ID, DEX entry, instruction offset in 16-bit code units, byte offset,
+code-item offset, destination register, opcode, raw instruction words, and exact
+`value_decimal`/`value_hex` strings. `values` reports full per-value totals,
+including zero matches; `total` counts matching instructions, not methods.
+
+Follow `next_offset` until null. Each page has a 1 MiB item budget and a stable
+`source_hash` for the ordered reference set. The full scan computes exact totals
+even when the page fills. Cancellation and immutable analysis snapshots keep the
+interactive engine lock free. Malformed instruction/register data returns an
+error with method and offset rather than a successful incomplete result.
+
+These are raw constant loads, including unreachable instructions. DEX bit
+patterns can represent integers, floats, doubles or null; no semantic flag use
+is inferred. Arithmetic literals, computed constants, encoded field initializers,
+and array/switch payloads are outside this query's scope.
+
+## Indexed identifier/API search
+
+Use `search_code` with `mode="identifiers"` for original DEX names and references:
+
+```json
+{"instance_id":"INSTANCE","project_id":"PROJECT","mode":"identifiers","query":"parseUri","match_mode":"exact","case_sensitive":false,"symbol_kind":"method","occurrence":"reference","limit":100}
+```
+
+The first request builds a project-local postings index directly from DEX;
+subsequent queries and pages reuse it. No Java reconstruction is required.
+The build runs on the request worker outside the interactive engine mutex.
+Concurrent queries share a completed index; waiting and building requests can
+be cancelled. Failed or cancelled builds publish no partial index and remain
+retryable. Reopening a project creates a fresh cache. The index has a 256 MiB
+conservative allocation budget; exceeding it returns an explicit error.
+
+`query` matches a simple name or full original ID. `match_mode` is `contains`
+(default) or `exact`; `case_sensitive` defaults to true. Full smali-style class,
+method and field IDs are normalized to canonical IDs. `symbol_kind` accepts
+`all` (default), `class`, `method`, or `field`; `occurrence` accepts `all`
+(default), `declaration`, or `reference`. `package_prefix` filters the owning
+class with package-segment boundaries. These filters are specific to identifier
+mode; source mode rejects them rather than silently ignoring them.
+
+`offset` and `next_offset` count matching identifier occurrences, with `limit`
+default 100 / maximum 500 and a 1 MiB item budget. Omit `pagination`, or set it
+to `hits`; `source_offset` is not used. `total` counts the entire filtered result
+set. Follow `next_offset` until null; `exhausted` then indicates all matches have
+been returned. `index_complete` describes index coverage, independently of page
+completion. `index_hash` identifies the immutable index, not rendered source.
+`index_cached` and build/wait/total timing fields expose first-use work.
+
+Each hit identifies the symbol, owning class/method/field, DEX entry and context.
+Instruction references also contain the exact opcode value, operand index,
+raw instruction words, method code-item offset, and `code_unit_offset` (16-bit
+DEX code units). Declaration and signature references have no instruction
+offset. Only actual instruction operands produce instruction hits; an unused
+DEX table entry is not a reference.
+
+Coverage includes class/method/field declarations, superclass/interface edges,
+field/return/parameter types, and direct type/field/method instruction operands.
+Method operands identify declared targets, including unreachable instructions.
+Generated aliases, local-variable names, comments, string literals, annotations,
+encoded values, catch metadata, dynamic call sites/handles/prototypes and runtime
+dispatch are outside this index. Dynamic instruction sites excluded from the
+index are counted explicitly. Use `mode="source"` for generated Java/mixed DEX
+text or `find_string_references` for string literals.
+
+### Tool argument errors
+
+Tool failures retain `isError: true` and return a JSON error object in both
+`structuredContent` and the text content. Schema-validation failures use
+`error.code = "INVALID_ARGUMENT"`; other tool failures use `"TOOL_ERROR"`.
+For numeric bounds/type failures, `error.details` includes `tool`, `parameter`,
+`received`, `expected_type`, `minimum`, `maximum`, and a correction `hint`.
+For example, `get_call_graph` with `limit: 501` reports the valid range 1–500.
+A rejected query leaves the gateway available for subsequent requests.

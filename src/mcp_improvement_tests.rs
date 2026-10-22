@@ -68,11 +68,13 @@ fn discovery_preserves_live_results_and_reports_gui_disconnect_separately() {
         instance_id: "live".into(),
         address,
         token: "token".into(),
+        owner_pid: None,
     };
     let closed = Registration {
         instance_id: "closed".into(),
         address,
         token: "token".into(),
+        owner_pid: None,
     };
     let peer = thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -248,6 +250,7 @@ fn discovery_registration_batches_are_stable_across_record_pagination() {
             instance_id: format!("instance-{index}"),
             address,
             token: "batch-token".into(),
+            owner_pid: None,
         })
         .collect();
     let peer = thread::spawn(move || {
@@ -605,6 +608,35 @@ fn method_source_resolves_raw_signature_and_short_class_recovers_after_error() {
     )
     .unwrap();
     assert_eq!(result["method_id"], id);
+    let (owner, member) = id.split_once('(').unwrap().0.rsplit_once('.').unwrap();
+    let smali = format!(
+        "L{};->{}{}",
+        owner.replace('.', "/"),
+        member,
+        &id[id.find('(').unwrap()..]
+    );
+    let alias = dispatch(
+        &mut engine,
+        &project,
+        "get_method_source",
+        &json!({"method_id":smali}),
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(alias["method_id"], id);
+    assert_eq!(alias["text"], result["text"]);
+    let wrong_return = format!("{}Lmissing/Return;", &id[..=id.find(')').unwrap()]);
+    let error = dispatch(
+        &mut engine,
+        &project,
+        "get_method_source",
+        &json!({"method_id":wrong_return}),
+        &cancel,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains(id), "{error}");
+    assert!(error.contains("candidates"), "{error}");
     assert!(result["next_offset"].is_null());
     assert_eq!(
         result["source_hash"],
@@ -804,4 +836,126 @@ fn airbnb_short_selection_and_large_method_source_roundtrip() {
         "corpus must exercise reported truncation threshold"
     );
     assert_eq!(server.status().state, "Running");
+}
+
+#[test]
+fn manifest_projection_preserves_filtered_pagination_and_validates_fields() {
+    let xml = r#"<manifest xmlns:a="http://schemas.android.com/apk/res/android" package="example"><application><activity a:name=".A" a:exported="true"/><activity a:name=".B" a:exported="true"/><service a:name=".C" a:exported="false"/></application></manifest>"#;
+    let args = json!({"component_type":"activity","projection":"compact","offset":1,"limit":1});
+    let mut records = crate::manifest_summary::query_resolved(
+        xml,
+        &args,
+        &crate::resource_table::ResourceTable::default(),
+        true,
+    )
+    .unwrap();
+    crate::manifest_summary::project_records(&mut records, &args);
+    let result = page(records, &args).unwrap();
+    assert_eq!(result["total"], 2);
+    assert_eq!(result["items"][0]["name"], "example.B");
+    assert!(result["next_offset"].is_null());
+    let base = json!({"instance_id":"fixture","project_id":"fixture","format":"records","fields":"name,exported"});
+    validate("get_manifest_summary", &base).unwrap();
+    let mut bad = base;
+    bad["fields"] = json!("name,unknown");
+    assert!(validate("get_manifest_summary", &bad).is_err());
+}
+
+#[test]
+fn request_contracts_document_launch_and_search_and_direct_call_sites() {
+    let tools = tools_list();
+    let tool = |name: &str| {
+        tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap()
+    };
+    assert!(
+        tool("open_apk")["inputSchema"]["properties"]["request_key"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("gateway connection")
+    );
+    assert!(
+        tool("get_call_graph")["inputSchema"]["properties"]["depth"]
+            .get("default")
+            .is_none()
+    );
+    validate("search_code", &json!({"instance_id":"i","project_id":"p","query":"parseUri","pagination":"hits","limit":500})).unwrap();
+    validate("forget_instance", &json!({"instance_id":"i"})).unwrap();
+    assert_eq!(
+        tool("forget_instance")["annotations"]["readOnlyHint"],
+        false
+    );
+    assert_eq!(
+        tool("forget_instance")["annotations"]["destructiveHint"],
+        true
+    );
+}
+
+#[test]
+fn forget_instance_checks_reachability_and_preserves_other_records() {
+    let dir = Scratch::new();
+    let id = random_id().unwrap();
+    let path = dir.0.join(format!("{id}.json"));
+    let other = dir.0.join("unrelated.json");
+    fs::write(&other, b"preserve").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let entry = Registration {
+        instance_id: id.clone(),
+        address: listener.local_addr().unwrap(),
+        token: "test-token".into(),
+        owner_pid: None,
+    };
+    fs::write(&path, serde_json::to_vec(&entry).unwrap()).unwrap();
+    let reply_id = id.clone();
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = read_frame(&mut BufReader::new(stream.try_clone().unwrap())).unwrap();
+        let request = request.unwrap();
+        assert_eq!(request["name"], "get_instance_info");
+        write_frame(
+            &mut stream,
+            &json!({"result":{"instance_id":reply_id,"state":"Running"}}),
+        )
+        .unwrap();
+    });
+    assert!(
+        forget_instance_in(&dir.0, &id)
+            .unwrap_err()
+            .to_string()
+            .contains("INSTANCE_REACHABLE")
+    );
+    peer.join().unwrap();
+    assert!(path.exists());
+    assert_eq!(forget_instance_in(&dir.0, &id).unwrap()["forgotten"], true);
+    assert!(!path.exists());
+    assert_eq!(fs::read(other).unwrap(), b"preserve");
+    assert!(forget_instance_in(&dir.0, "../escape").is_err());
+}
+
+#[test]
+fn config_and_hierarchy_tool_schemas_expose_evidence_contracts() {
+    validate(
+        "find_config_key_consumers",
+        &json!({"instance_id":"i","project_id":"p","key":"hosts.key","limit":100}),
+    )
+    .unwrap();
+    assert!(
+        validate(
+            "find_config_key_consumers",
+            &json!({"instance_id":"i","project_id":"p","key":"hosts.key","limit":101})
+        )
+        .is_err()
+    );
+    validate(
+        "get_class_hierarchy",
+        &json!({"instance_id":"i","project_id":"p","class_name":"Landroid/webkit/WebView;"}),
+    )
+    .unwrap();
 }

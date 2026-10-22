@@ -232,6 +232,14 @@ pub fn render_method(name: &str, class: &DexClass, method: &DexMethod) -> Result
     render_method_inner(name, class, method, true, true)
 }
 
+/// Preserve fully qualified standalone source while using proven SDK member spelling.
+pub(crate) fn present_method_source_types(
+    class: &DexClass,
+    code: DecompiledCode,
+) -> DecompiledCode {
+    readable::canonical_platform_members(class, code)
+}
+
 pub(super) fn render_method_without_same_object_retry(
     name: &str,
     class: &DexClass,
@@ -1310,6 +1318,7 @@ pub fn render(name: &str, class: &DexClass) -> Result<DecompiledCode> {
 pub(crate) fn render_mixed(name: &str, class: &DexClass) -> DecompiledCode {
     render_mixed_with(name, class, |method| render_method(name, class, method))
 }
+#[cfg(test)]
 pub(crate) fn render_mixed_with_nested(
     name: &str,
     class: &DexClass,
@@ -1334,23 +1343,6 @@ fn render_mixed_with(
 ) -> DecompiledCode {
     render_mixed_controlled(name, class, render_member, &[], None, &|| false)
         .expect("non-cancellable class rendering")
-}
-
-pub(crate) fn render_mixed_cancellable_with_nested(
-    name: &str,
-    class: &DexClass,
-    children: &[&DexClass],
-    world: Option<&std::collections::BTreeMap<String, DexClass>>,
-    cancelled: &impl Fn() -> bool,
-) -> Result<DecompiledCode> {
-    render_mixed_controlled(
-        name,
-        class,
-        |method| render_method(name, class, method),
-        children,
-        world,
-        cancelled,
-    )
 }
 
 pub(crate) fn render_mixed_reported_with_nested(
@@ -1384,6 +1376,7 @@ pub(crate) fn render_mixed_reported_with_nested(
     Ok((code, coverage))
 }
 
+#[cfg(test)]
 fn render_mixed_controlled(
     name: &str,
     class: &DexClass,

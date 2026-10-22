@@ -179,7 +179,24 @@ fn tool_response(result: Result<Value>) -> Value {
             json!({"result":{"content":[{"type":"text","text":data.to_string()}],"structuredContent":data,"isError":false}})
         }
         Err(error) => {
-            json!({"result":{"content":[{"type":"text","text":format!("{error:#}")}],"isError":true}})
+            let mut detail = json!({"code":"TOOL_ERROR","message":format!("{error:#}")});
+            if let Some(argument) = error.downcast_ref::<ArgumentError>() {
+                detail["code"] = json!("INVALID_ARGUMENT");
+                detail["details"] = argument.details.clone();
+            } else if let Some(unavailable) = error.downcast_ref::<InstanceToolUnavailable>() {
+                detail["code"] = json!("INSTANCE_TOOL_UNAVAILABLE");
+                detail["details"] = json!({
+                    "tool":unavailable.tool,
+                    "instance_id":unavailable.instance_id,
+                    "advertised_by_gateway":true,
+                    "gui_error":unavailable.gui_error,
+                    "possible_cause":"The gateway and GUI may be running different RDX builds.",
+                    "action":"Compare gateway and GUI build identities with get_health; reopen the GUI and reconnect the MCP client using the same RDX build."
+                });
+            }
+            let data = json!({"error":detail});
+            json!({"result":{"content":[{"type":"text","text":data.to_string()}],
+                "structuredContent":data,"isError":true}})
         }
     }
 }
@@ -268,14 +285,7 @@ pub(super) fn run() -> Result<()> {
                     .get("arguments")
                     .cloned()
                     .unwrap_or(json!({}));
-                match gateway_call(name, &args, &mut opened) {
-                    Ok(data) => {
-                        json!({"result":{"content":[{"type":"text","text":data.to_string()}],"structuredContent":data,"isError":false}})
-                    }
-                    Err(e) => {
-                        json!({"result":{"content":[{"type":"text","text":format!("{e:#}")}],"isError":true}})
-                    }
-                }
+                tool_response(gateway_call(name, &args, &mut opened))
             }
             _ => json!({"error":{"code":-32601,"message":"Unknown method"}}),
         };
@@ -290,6 +300,64 @@ pub(super) fn run() -> Result<()> {
 #[cfg(test)]
 mod controlled_reader_tests {
     use super::*;
+
+    fn rejected_gui_tool(name: &str, message: &str) -> anyhow::Error {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let registration = Registration {
+            instance_id: "test-gui".into(),
+            address: listener.local_addr().unwrap(),
+            token: "local-test-token".into(),
+            owner_pid: None,
+        };
+        let message = message.to_owned();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = read_frame(&mut BufReader::new(stream.try_clone().unwrap()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(request["instance_id"], "test-gui");
+            write_frame(&mut stream, &json!({"error":message})).unwrap();
+        });
+        let error = remote(&registration, name, &json!({})).unwrap_err();
+        server.join().unwrap();
+        error
+    }
+
+    #[test]
+    fn advertised_tool_rejected_by_gui_has_actionable_structured_error() {
+        for message in ["Unknown tool", "Unknown tool: find_instantiations"] {
+            let response = tool_response(Err(rejected_gui_tool("find_instantiations", message)));
+            assert_eq!(response["result"]["isError"], true);
+            let error = &response["result"]["structuredContent"]["error"];
+            assert_eq!(error["code"], "INSTANCE_TOOL_UNAVAILABLE");
+            assert_eq!(error["details"]["tool"], "find_instantiations");
+            assert_eq!(error["details"]["instance_id"], "test-gui");
+            assert_eq!(error["details"]["gui_error"], message);
+            assert!(error["message"].as_str().unwrap().contains("get_health"));
+            assert!(
+                response["result"]["structuredContent"]
+                    .get("items")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_gui_errors_and_unadvertised_tools_keep_their_error_type() {
+        for (name, message) in [
+            ("find_instantiations", "Unknown tool: internal_helper"),
+            ("find_instantiations", "SYMBOL_NOT_FOUND: sample.Missing"),
+            ("nonexistent_tool", "Unknown tool"),
+        ] {
+            let response = tool_response(Err(rejected_gui_tool(name, message)));
+            let error = &response["result"]["structuredContent"]["error"];
+            assert_eq!(error["code"], "TOOL_ERROR");
+            assert_eq!(error["message"], message);
+        }
+    }
 
     fn connected() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

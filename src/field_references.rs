@@ -153,34 +153,62 @@ fn scan<'a>(
         loaded.push(class?);
     }
     let classes = loaded;
-    let hierarchy: HashMap<_, _> = classes
-        .iter()
-        .map(|class| (class.descriptor.as_ref(), *class))
-        .collect();
+    // A duplicate type definition cannot prove an inherited field identity.
+    let mut hierarchy = HashMap::new();
+    let mut duplicate_types = HashSet::new();
+    for class in &classes {
+        if hierarchy
+            .insert(class.descriptor.as_ref(), *class)
+            .is_some()
+        {
+            duplicate_types.insert(class.descriptor.as_ref());
+        }
+    }
+    for descriptor in duplicate_types {
+        hierarchy.remove(descriptor);
+    }
+    let requested_field_id = field_id;
     let (query_name, query_type) = field_id.rsplit_once(':').unwrap();
     let (query_owner, query_name) = query_name.rsplit_once('.').unwrap();
-    let query_declarations: usize = classes
-        .iter()
-        .filter(|class| type_name(&class.descriptor) == query_owner)
-        .map(|class| {
-            class
-                .fields
-                .iter()
-                .filter(|field| {
-                    field.declaring_type == class.descriptor
-                        && field.name.as_ref() == query_name
-                        && field.field_type.as_ref() == query_type
-                })
-                .count()
-        })
-        .sum();
+    let declarations = |id: &str| {
+        let (head, ty) = id.rsplit_once(':').unwrap();
+        let (owner, name) = head.rsplit_once('.').unwrap();
+        classes
+            .iter()
+            .filter(|class| type_name(&class.descriptor) == owner)
+            .flat_map(|class| {
+                class
+                    .fields
+                    .iter()
+                    .filter(|field| field.declaring_type == class.descriptor)
+            })
+            .filter(|field| field.name.as_ref() == name && field.field_type.as_ref() == ty)
+            .count()
+    };
     ensure!(
-        query_declarations <= 1,
+        declarations(field_id) <= 1,
         "Ambiguous field identity: multiple loaded declarations match field_id"
     );
-    let declaration_resolved = query_declarations == 1;
-    // All resolutions in this scan use the same field name/type, so owner is a sufficient memo key.
+    // Resolve the query as well as instruction operands, using the same DEX
+    // field-resolution rules (own declaration, interfaces, then superclass).
     let mut resolution_memo = HashMap::new();
+    let descriptor = format!("L{};", query_owner.replace('.', "/"));
+    let resolved = resolve_field(
+        &descriptor,
+        query_name,
+        query_type,
+        &hierarchy,
+        &mut HashSet::new(),
+        &mut resolution_memo,
+        cancel,
+    )?
+    .filter(|id| !id.is_empty());
+    let field_id = resolved.as_deref().unwrap_or(requested_field_id);
+    ensure!(
+        declarations(field_id) <= 1,
+        "Ambiguous field identity: multiple loaded declarations match field_id"
+    );
+    let declaration_resolved = resolved.is_some();
     let mut matches_by_symbols = HashMap::new();
     let mut unresolved_accesses = 0usize;
     let mut unresolved_all_accesses = 0usize;
@@ -319,7 +347,7 @@ fn scan<'a>(
     let source_hash = format!("{:x}", reference_hash.finalize());
     let returned = references.len();
     Ok(
-        json!({"field_id":field_id,"access":access_filter,"items":references,"source_hash":source_hash,
+        json!({"field_id":field_id,"requested_field_id":requested_field_id,"resolved_field_id":resolved,"access":access_filter,"items":references,"source_hash":source_hash,
         "total":total,"offset":offset,"count":returned,
         "has_more":offset.saturating_add(returned) < total,
         "next_offset":if offset.saturating_add(returned) < total {Some(offset + returned)} else {None},
@@ -440,6 +468,70 @@ mod tests {
     }
 
     #[test]
+    fn subclass_query_resolves_both_operand_owners_and_respects_shadowing() {
+        let mut parent = fixture(vec![0x52, 0]);
+        parent.descriptor = "Lsample/Owner;".into();
+        parent.superclass = None;
+        parent.interfaces.clear();
+        parent.fields = vec![crate::native_dex::DexField {
+            declaring_type: parent.descriptor.clone(),
+            name: "value".into(),
+            field_type: "I".into(),
+            access_flags: 0,
+            is_static: false,
+        }];
+        let mut child = fixture(vec![0x59, 0]);
+        child.descriptor = "Lsample/Child;".into();
+        child.superclass = Some(parent.descriptor.clone());
+        child.interfaces.clear();
+        child.fields.clear();
+        Arc::get_mut(&mut child.symbols).unwrap().types[0] = child.descriptor.clone();
+        let run = |child: &DexClass, id: &str, offset, limit| {
+            scan(
+                [Ok(&parent), Ok(child)],
+                id,
+                "all",
+                offset,
+                limit,
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+        };
+        let first = run(&child, "sample.Child.value:I", 0, 1);
+        assert_eq!(first["requested_field_id"], "sample.Child.value:I");
+        assert_eq!(first["resolved_field_id"], "sample.Owner.value:I");
+        assert_eq!(first["field_id"], "sample.Owner.value:I");
+        assert_eq!(first["complete"], true);
+        assert_eq!(first["total"], 2);
+        assert_eq!(first["read_count"], 1);
+        assert_eq!(first["write_count"], 1);
+        assert_eq!(first["next_offset"], 1);
+        let second = run(&child, "sample.Child.value:I", 1, 1);
+        assert_eq!(first["source_hash"], second["source_hash"]);
+        assert_eq!(
+            first["source_hash"],
+            run(&child, "sample.Owner.value:I", 0, 1)["source_hash"]
+        );
+        child.fields = vec![crate::native_dex::DexField {
+            declaring_type: child.descriptor.clone(),
+            name: "value".into(),
+            field_type: "I".into(),
+            access_flags: 0,
+            is_static: false,
+        }];
+        let shadowed = run(&child, "sample.Child.value:I", 0, 10);
+        assert_eq!(shadowed["resolved_field_id"], "sample.Child.value:I");
+        assert_eq!(shadowed["total"], 1);
+        assert_eq!(shadowed["read_count"], 0);
+        child.fields.clear();
+        child.superclass = Some("Lmissing/Parent;".into());
+        let unresolved = run(&child, "sample.Child.value:I", 0, 10);
+        assert_eq!(unresolved["resolved_field_id"], Value::Null);
+        assert_eq!(unresolved["declaration_resolved"], false);
+        assert_eq!(unresolved["complete"], false);
+    }
+
+    #[test]
     fn conflicting_interfaces_are_unresolved() {
         let mut owner = fixture(vec![]);
         owner.descriptor = "Lsample/Owner;".into();
@@ -480,6 +572,17 @@ mod tests {
         .unwrap();
         assert_eq!(value["complete"], false);
         assert_eq!(value["unresolved_access_count"], 1);
+        let ambiguous = scan(
+            [Ok(&owner), Ok(&other), Ok(&child)],
+            "sample.Child.value:I",
+            "all",
+            0,
+            10,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(ambiguous["resolved_field_id"], Value::Null);
+        assert_eq!(ambiguous["complete"], false);
     }
 
     #[test]

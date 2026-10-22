@@ -2,7 +2,7 @@
 use super::*;
 use crate::native_dex::DexMethod;
 use crate::native_hierarchy::Relation;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn signature(method: &DexMethod) -> String {
@@ -40,27 +40,18 @@ impl NativeDexEngine {
         } else {
             None
         };
-        let mut reverse: HashMap<&str, Vec<&str>> = HashMap::new();
-        let mut by_descriptor = HashMap::new();
+        ensure!(
+            !cancel.load(Ordering::Relaxed),
+            "Implementation search cancelled"
+        );
+        let index = self.hierarchy_index();
+        let by_descriptor = |descriptor: &str| {
+            index
+                .names
+                .get(descriptor)
+                .and_then(|name| self.classes.get(name).map(|class| (name.as_str(), class)))
+        };
         let mut work = 0usize;
-        for (name, class) in self.classes.iter() {
-            ensure!(
-                !cancel.load(Ordering::Relaxed),
-                "Implementation search cancelled"
-            );
-            by_descriptor.insert(class.descriptor.as_ref(), (name.as_str(), class));
-            for parent in class.superclass.iter().chain(class.interfaces.iter()) {
-                work += 1;
-                ensure!(
-                    work <= 4_000_000,
-                    "Implementation hierarchy exceeds edge budget"
-                );
-                reverse
-                    .entry(parent.as_ref())
-                    .or_default()
-                    .push(class.descriptor.as_ref());
-            }
-        }
         let mut pending = vec![descriptor.as_str()];
         let mut descendants = HashSet::new();
         while let Some(parent) = pending.pop() {
@@ -71,8 +62,13 @@ impl NativeDexEngine {
             if !descendants.insert(parent) {
                 continue;
             }
-            if let Some(children) = reverse.get(parent) {
-                pending.extend(children);
+            if let Some(children) = index.children.get(parent) {
+                work += children.len();
+                ensure!(
+                    work <= 4_000_000,
+                    "Implementation hierarchy exceeds edge budget"
+                );
+                pending.extend(children.iter().map(String::as_str));
             }
         }
         descendants.remove(descriptor.as_str());
@@ -96,7 +92,7 @@ impl NativeDexEngine {
             results.insert(format!("{owner}.{}", signature(target)));
         }
         for child in descendants {
-            let Some(&(name, class)) = by_descriptor.get(child) else {
+            let Some((name, class)) = by_descriptor(child) else {
                 continue;
             };
             ensure!(
@@ -132,7 +128,7 @@ impl NativeDexEngine {
                     current = node
                         .superclass
                         .as_deref()
-                        .and_then(|p| by_descriptor.get(p).map(|(_, c)| *c));
+                        .and_then(|p| by_descriptor(p).map(|(_, c)| c));
                 }
                 if !inherited {
                     continue;
@@ -170,10 +166,7 @@ impl NativeDexEngine {
                 if !interface || class.access_flags & 0x600 != 0 {
                     break;
                 }
-                current = node
-                    .superclass
-                    .as_deref()
-                    .and_then(|p| by_descriptor.get(p).copied());
+                current = node.superclass.as_deref().and_then(&by_descriptor);
             }
         }
         Ok(results.into_iter().collect())
@@ -302,6 +295,81 @@ mod tests {
             class.symbols.hierarchy.set(hierarchy.clone()).unwrap();
         }
         engine
+    }
+    #[test]
+    fn external_supertype_roots_follow_transitive_edges_and_exclude_abstract_types() {
+        let mut engine = NativeDexEngine::default();
+        for (name, parent, interfaces, flags) in [
+            (
+                "sample.Base",
+                "android.webkit.WebView",
+                vec!["Lvendor/Contract;"],
+                0x401,
+            ),
+            ("sample.Child", "sample.Base", vec![], 1),
+            ("sample.Grandchild", "sample.Child", vec![], 1),
+            ("sample.Client", "android.webkit.WebViewClient", vec![], 1),
+            ("sample.Chrome", "android.webkit.WebChromeClient", vec![], 1),
+        ] {
+            let mut class = native_dex::parse(include_bytes!("../tests/fixtures/hello.dex"))
+                .unwrap()
+                .classes
+                .remove(0);
+            class.descriptor = format!("L{};", name.replace('.', "/")).into();
+            class.superclass = Some(format!("L{};", parent.replace('.', "/")).into());
+            class.interfaces = interfaces.into_iter().map(Into::into).collect();
+            class.access_flags = flags;
+            Arc::get_mut(&mut engine.classes)
+                .unwrap()
+                .insert(name.into(), class);
+        }
+        let cancel = AtomicBool::new(false);
+        let cloned = engine.clone();
+        assert!(Arc::ptr_eq(
+            &engine.hierarchy_index,
+            &cloned.hierarchy_index
+        ));
+        for root in ["android.webkit.WebView", "vendor.Contract"] {
+            assert!(engine.references_supertype(root));
+            assert_eq!(
+                engine.implementations(root, None, &cancel).unwrap(),
+                ["sample.Child", "sample.Grandchild"]
+            );
+        }
+        assert_eq!(
+            engine.direct_subclasses("android.webkit.WebView"),
+            ["sample.Base"]
+        );
+        assert!(engine.direct_subclasses("vendor.Contract").is_empty());
+        assert_eq!(
+            engine
+                .implementations("android.webkit.WebViewClient", None, &cancel)
+                .unwrap(),
+            ["sample.Client"]
+        );
+        assert_eq!(
+            engine
+                .implementations("android.webkit.WebChromeClient", None, &cancel)
+                .unwrap(),
+            ["sample.Chrome"]
+        );
+        assert!(!engine.references_supertype("android.webkit.Missing"));
+        assert!(engine.hierarchy_index.get().is_some());
+        assert_eq!(
+            cloned.direct_subclasses("android.webkit.WebView"),
+            ["sample.Base"]
+        );
+        assert!(
+            engine
+                .implementations("android.webkit.WebView", Some("run()V"), &cancel)
+                .is_err()
+        );
+        cancel.store(true, Ordering::Relaxed);
+        assert!(
+            engine
+                .implementations("android.webkit.WebView", None, &cancel)
+                .is_err()
+        );
     }
     #[test]
     fn interface_implementations_include_indirect_concrete_types() {

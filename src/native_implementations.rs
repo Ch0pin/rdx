@@ -166,7 +166,7 @@ impl NativeDexEngine {
                 if !interface || class.access_flags & 0x600 != 0 {
                     break;
                 }
-                current = node.superclass.as_deref().and_then(&by_descriptor);
+                current = node.superclass.as_deref().and_then(by_descriptor);
             }
         }
         Ok(results.into_iter().collect())

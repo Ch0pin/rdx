@@ -273,3 +273,34 @@ Effects.fail=true;for(int which=0;which<3;which++){try{if(which==0)boolValue(x);
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn exact_constant_recovery_rejects_distinct_or_truncated_alternatives() {
+    for (left, right, expected) in [
+        (5, 5, Some(5)),
+        (5, 6, None),
+        (0x80000000, 0x80000000, Some(i32::MIN)),
+    ] {
+        let c = fixture(Domain::Raw32, left, right);
+        let a = MethodAnalysis::build(&c, &c.methods[0]).unwrap();
+        let mut types = a.infer_types().unwrap();
+        let pc = c.methods[0].code.as_ref().unwrap().instructions.len() - 1;
+        assert_eq!(
+            proof::constant32_at_read(a.instructions(), a.ssa(), &types, pc, 0),
+            expected
+        );
+        let id = a
+            .ssa()
+            .instructions
+            .iter()
+            .find(|i| i.pc == pc)
+            .unwrap()
+            .reads[0]
+            .words[0];
+        types.values[id].assignment_bounds_truncated = true;
+        assert_eq!(
+            proof::constant32_at_read(a.instructions(), a.ssa(), &types, pc, 0),
+            None
+        );
+    }
+}

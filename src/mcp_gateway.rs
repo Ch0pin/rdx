@@ -54,10 +54,25 @@ impl Read for ControlledReader<'_> {
                     // cannot be consumed between the readiness check and read.
                     let result = self.stream.read(bytes);
                     self.check()?;
-                    return result;
+                    match result {
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        result => return result,
+                    }
                 }
                 Ok(false) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                    ) => {}
                 Err(error) => {
                     self.check()?;
                     return Err(error);
@@ -115,7 +130,7 @@ impl Jobs {
             }
         }
     }
-    fn start(&mut self, id: Value, args: Value, output: Output) -> Result<()> {
+    fn start(&mut self, id: Value, name: String, args: Value, output: Output) -> Result<()> {
         self.reap();
         ensure!(
             !self.0.iter().any(|job| job.id == id),
@@ -125,7 +140,7 @@ impl Jobs {
             self.0.len() < 8,
             "INSTANCE_BUSY: eight index requests are active; retry after one completes"
         );
-        validate("find_string_references", &args)?;
+        validate(&name, &args)?;
         let instance_id = required(&args, "instance_id")?;
         let entry = registrations()?
             .into_iter()
@@ -137,12 +152,7 @@ impl Jobs {
         let handle = thread::Builder::new()
             .name("rdx-mcp-index-request".into())
             .spawn(move || {
-                let result = remote_controlled(
-                    &entry,
-                    "find_string_references",
-                    &args,
-                    Some(&worker_control),
-                );
+                let result = remote_controlled(&entry, &name, &args, Some(&worker_control));
                 // Close every socket copy on success, timeout or cancellation. EOF cancels the GUI waiter.
                 worker_control.connection.lock().unwrap().take();
                 let result = if worker_control.cancelled.load(Ordering::Acquire) {
@@ -248,13 +258,20 @@ pub(super) fn run() -> Result<()> {
             continue;
         };
         let method = message["method"].as_str().unwrap_or("");
-        if ready && method == "tools/call" && message["params"]["name"] == "find_string_references"
+        if ready
+            && method == "tools/call"
+            && asynchronous_tool(message["params"]["name"].as_str().unwrap_or(""))
         {
             let args = message["params"]
                 .get("arguments")
                 .cloned()
                 .unwrap_or(json!({}));
-            if let Err(error) = jobs.start(id.clone(), args, output.clone()) {
+            if let Err(error) = jobs.start(
+                id.clone(),
+                message["params"]["name"].as_str().unwrap().into(),
+                args,
+                output.clone(),
+            ) {
                 let mut response = tool_response(Err(error));
                 response["jsonrpc"] = json!("2.0");
                 response["id"] = id.clone();
@@ -295,6 +312,26 @@ pub(super) fn run() -> Result<()> {
         write_response(&mut *output.lock().unwrap(), &response)?;
     }
     Ok(())
+}
+
+fn asynchronous_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "find_string_references"
+            | "search_code"
+            | "resolve_switch_case_callers"
+            | "find_network_stacks"
+            | "get_call_graph"
+            | "get_call_graph_batch"
+            | "resolve_reference"
+            | "find_type_references"
+            | "search_kotlin_metadata"
+            | "search_resource_xml"
+            | "list_nav_deeplinks"
+            | "find_layout_references"
+            | "find_webview_chooser_flows"
+            | "export_package_source"
+    )
 }
 
 #[cfg(test)]

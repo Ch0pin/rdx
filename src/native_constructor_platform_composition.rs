@@ -562,6 +562,7 @@ impl Observations {
                 owner.clone(),
                 key.clone(),
                 RecoveredConstructor {
+                    source_bridge: false,
                     access_flags: 1,
                     parent: parent.descriptor.clone(),
                     invoked_owner: invoked.clone(),

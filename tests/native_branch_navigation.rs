@@ -34,7 +34,7 @@ fn fixture() -> Fixture {
     }
     let code = bytes.len() as u32;
     // if (0 == 0) return 42; else return answer();
-    // The self-call is retained for checking exact symbol mappings, not executed.
+    // The unreachable self-call remains in the DEX index after Java folding.
     let instructions: [u16; 11] = [
         0x0012, 0x0038, 7, 0x0071, 0, 0, 0x000a, 0x000f, 0x0013, 42, 0x000f,
     ];
@@ -82,28 +82,31 @@ fn fixture() -> Fixture {
     Fixture(path)
 }
 #[test]
-fn reconstructed_branch_keeps_exact_navigation_and_single_usage() {
+fn folded_branch_keeps_dex_xref_and_declaration_navigation() {
     let input = fixture();
     let mut engine = NativeEngine::start().unwrap();
     engine.open(&input.0).unwrap();
     let code = engine.decompile_with_metadata("sample.Hello").unwrap();
-    assert!(code.source.contains("if ("), "{}", code.source);
+    assert!(code.source.contains("return 42;"), "{}", code.source);
+    assert!(!code.source.contains("if ("));
     assert!(!code.source.contains(".method"));
     let usages = engine
         .usages_in_class("sample.Hello.answer()I", "sample.Hello")
         .unwrap();
-    assert_eq!(usages.occurrences.len(), 1);
-    let usage = &usages.occurrences[0];
-    assert_eq!(
-        code.source
-            .chars()
-            .skip(usage.start)
-            .take(usage.end - usage.start)
-            .collect::<String>(),
-        "answer"
-    );
+    assert!(usages.occurrences.is_empty());
+    let graph = engine
+        .call_graph_query_by_id(
+            "sample.Hello.answer()I",
+            &serde_json::json!({"direction":"callers","projection":"call_sites","depth":1}),
+            &false.into(),
+        )
+        .unwrap();
+    let sites = graph["call_sites"].as_array().unwrap();
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0]["caller_method_id"], "sample.Hello.answer()I");
+    assert_eq!(sites[0]["call_site_offset"], 3);
     let target = engine
-        .navigate("sample.Hello", usage.start, &code.source_hash)
+        .navigate_graph_method("sample.Hello.answer()I")
         .unwrap();
     let symbol = engine
         .resolve_usage_target("sample.Hello", target.position, &target.code.source_hash)

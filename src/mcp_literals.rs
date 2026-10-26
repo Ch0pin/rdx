@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+type Scanner = dyn Fn(&Value, &AtomicBool) -> Result<Value> + Send + Sync;
 type Builder = dyn Fn(&AtomicBool, &AtomicUsize) -> Result<Index> + Send + Sync;
 struct BuildState {
     phase: &'static str,
@@ -28,6 +29,7 @@ struct BuildState {
 }
 #[derive(Clone)]
 pub(super) struct Controller {
+    scanner: Option<Arc<Scanner>>,
     state: Arc<Mutex<BuildState>>,
     builder: Arc<Mutex<Arc<Builder>>>,
     total: usize,
@@ -40,14 +42,21 @@ impl Controller {
         stop: Arc<AtomicBool>,
     ) -> Self {
         let total = project.classes.len();
-        Self::with_builder(
+        let scan_engine = engine.clone();
+        let scan_project = project.clone();
+        let mut controller = Self::with_builder(
             total,
             stop,
             Arc::new(move |cancel, progress| Index::build(&engine, &project, cancel, progress)),
-        )
+        );
+        controller.scanner = Some(Arc::new(move |args, cancel| {
+            super::scan::literals(&scan_engine, &scan_project, args, cancel)
+        }));
+        controller
     }
     fn with_builder(total: usize, stop: Arc<AtomicBool>, builder: Arc<Builder>) -> Self {
         Self {
+            scanner: None,
             state: Arc::new(Mutex::new(BuildState {
                 phase: "idle",
                 attempt: 0,
@@ -85,7 +94,8 @@ impl Controller {
         json!({"state":if state.phase == "indexing" && state.cancel.load(Ordering::Relaxed) {"cancelling"} else {state.phase},
             "completed_classes":completed,"total_classes":self.total,
             "progress":if self.total == 0 {0.0} else {completed as f64 / self.total as f64},
-            "attempt":state.attempt,"active_waiters":state.waiters,"error":state.error,
+            "attempt":state.attempt,"active_waiters":state.waiters,"error":if state.phase=="streaming" {""} else {&state.error},
+            "fallback_reason":if state.phase=="streaming" {Some(state.error.as_str())} else {None},
             "retryable":(["failed","cancelled"].contains(&state.phase)),"index_complete":state.index.is_some()})
     }
     pub(super) fn search(&self, args: &Value, cancel: &AtomicBool) -> Result<Value> {
@@ -96,6 +106,20 @@ impl Controller {
                 "CANCELLED"
             );
             let mut state = self.state.lock().unwrap();
+            if state.phase == "streaming" {
+                drop(state);
+                return self
+                    .scanner
+                    .as_ref()
+                    .context("Streaming scanner unavailable")?(args, cancel);
+            }
+            if state.phase == "failed"
+                && state.error.contains("LITERAL_INDEX_LIMIT")
+                && self.scanner.is_some()
+            {
+                state.phase = "streaming";
+                continue;
+            }
             if state.phase == "invalidated" {
                 anyhow::bail!("{}", state.error);
             }
@@ -243,6 +267,7 @@ pub(super) struct Index {
     owners: Vec<Owner>,
     postings: BTreeMap<(usize, u32), Vec<Occurrence>>,
     estimated_bytes: usize,
+    max_bytes: usize,
     classes: usize,
 }
 impl Index {
@@ -258,8 +283,17 @@ impl Index {
             owners: Vec::new(),
             postings: BTreeMap::new(),
             estimated_bytes: 0,
+            max_bytes: MAX_INDEX_BYTES,
             classes: 0,
         };
+        if let Some(value) = std::env::var_os("RDX_LITERAL_INDEX_MIB") {
+            let mib = value
+                .to_str()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|n| (1..=4096).contains(n))
+                .context("RDX_LITERAL_INDEX_MIB must be an integer from 1 to 4096")?;
+            index.max_bytes = mib * 1024 * 1024;
+        }
         let mut dexes = HashMap::new();
         for name in &project.classes {
             ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
@@ -287,8 +321,9 @@ impl Index {
             .checked_add(n)
             .context("Literal index size overflow")?;
         ensure!(
-            self.estimated_bytes <= MAX_INDEX_BYTES,
-            "LITERAL_INDEX_LIMIT: index exceeds 128 MiB budget; use package-scoped search_code. No partial index was published."
+            self.estimated_bytes <= self.max_bytes,
+            "LITERAL_INDEX_LIMIT: index exceeds {} MiB budget; switching to bounded complete streaming search. No partial index was published.",
+            self.max_bytes / (1024 * 1024)
         );
         Ok(())
     }
@@ -569,6 +604,44 @@ impl Index {
 #[cfg(test)]
 mod controller_tests {
     use super::*;
+    #[test]
+    fn memory_limit_switches_to_complete_scans_without_rebuilding() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let calls = attempts.clone();
+        let mut controller = Controller::with_builder(
+            2,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(move |_, _| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("LITERAL_INDEX_LIMIT: test budget exceeded")
+            }),
+        );
+        controller.scanner = Some(Arc::new(|args, cancel| {
+            ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+            Ok(json!({"complete":true,"scan_complete":true,"query":args["query"]}))
+        }));
+        for query in ["first", "second"] {
+            let result = controller
+                .search(&json!({"query":query}), &AtomicBool::new(false))
+                .unwrap();
+            assert_eq!(result["scan_complete"], true);
+            assert_eq!(result["query"], query);
+        }
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(controller.status()["state"], "streaming");
+        assert_eq!(controller.status()["error"], "");
+        assert!(
+            controller
+                .search(&json!({"query":"third"}), &AtomicBool::new(true))
+                .is_err()
+        );
+        controller.invalidate();
+        assert!(
+            controller
+                .search(&json!({"query":"fourth"}), &AtomicBool::new(false))
+                .is_err()
+        );
+    }
     fn empty() -> Index {
         Index {
             symbols: vec![],
@@ -576,6 +649,7 @@ mod controller_tests {
             owners: vec![],
             postings: BTreeMap::new(),
             estimated_bytes: 0,
+            max_bytes: MAX_INDEX_BYTES,
             classes: 0,
         }
     }
@@ -823,6 +897,7 @@ mod tests {
             owners: vec![],
             postings: BTreeMap::new(),
             estimated_bytes: 0,
+            max_bytes: MAX_INDEX_BYTES,
             classes: classes.len(),
         };
         for (dex, class) in classes.iter().enumerate() {
@@ -988,6 +1063,7 @@ mod response_tests {
             owners: vec![],
             postings: BTreeMap::new(),
             estimated_bytes: 0,
+            max_bytes: MAX_INDEX_BYTES,
             classes: 0,
         };
         let mut pending = (
@@ -1023,6 +1099,7 @@ mod response_tests {
             owners: vec![],
             postings: BTreeMap::new(),
             estimated_bytes: 0,
+            max_bytes: MAX_INDEX_BYTES,
             classes: 1,
         };
         let owner = index

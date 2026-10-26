@@ -70,7 +70,7 @@ fn nonboolean_loop_exit_is_rejected() {
     let error = source(&class).unwrap_err();
     assert!(
         error.to_string().contains("nonboolean literal")
-            || error.to_string() == "unsupported register type conversion I to Z",
+            || error.root_cause().to_string() == "unsupported register type conversion I to Z",
         "{error:#}"
     );
 }

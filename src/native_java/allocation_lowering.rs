@@ -633,28 +633,27 @@ fn try_region_staging_mode(
         // A region renderer may choose a source cast from a broad Java local.
         // Every original reference input must already satisfy the raw DEX
         // invocation domain; fresh positive proof cannot repair an invalid call.
+        let mut reference_inputs = Vec::new();
         for call in &plan.calls {
             if call.pc != constructor_pc
                 && !plan
                     .nested_initializations
                     .iter()
-                    .any(|(_, constructor)| *constructor == call.pc)
+                    .any(|(_, pc)| *pc == call.pc)
                 && call.receiver.is_some()
             {
-                ensure!(
-                    graph.proven_reference_call_input(class, method, call.pc, None),
-                    "structured reference receiver lacks positive original domain"
-                );
+                reference_inputs.push((call.pc, None));
             }
             for (index, input) in call.arguments.iter().enumerate() {
                 if super::reference(&input.descriptor) {
-                    ensure!(
-                        graph.proven_reference_call_input(class, method, call.pc, Some(index)),
-                        "structured reference argument lacks positive original domain"
-                    );
+                    reference_inputs.push((call.pc, Some(index)));
                 }
             }
         }
+        ensure!(
+            graph.proven_reference_call_inputs(class, method, &reference_inputs),
+            "structured reference inputs lack positive original domains"
+        );
         for read in &plan.first_reads {
             let value = super::register(caller_regs, read.register)?;
             ensure!(
@@ -2220,9 +2219,13 @@ pub(super) fn try_lower(
                         else {
                             anyhow::bail!("constructor does not consume allocation")
                         };
+                        let source_bridge = class.symbols.hierarchy.get().is_some_and(|h| {
+                            h.source_constructor_bridge(&allocation_ty, owner, args)
+                        });
                         let retargeted = owner != allocation_ty
                             && class.symbols.hierarchy.get().is_some_and(|hierarchy| {
                                 hierarchy.equivalent_constructor(&allocation_ty, owner, args)
+                                    || source_bridge
                             });
                         ensure!(
                             kind == 0x70 && (owner == allocation_ty || retargeted) && ret == "V",
@@ -2242,6 +2245,9 @@ pub(super) fn try_lower(
                                 if *origin == site && type_descriptor.as_ref() == allocation_ty),
                                 "constructor SSA identity mismatch"
                             );
+                        }
+                        if source_bridge {
+                            actual.push(Expr::Local("((java.lang.Void) null)".into()));
                         }
                         events.push(Event::Construct {
                             site: cursor,

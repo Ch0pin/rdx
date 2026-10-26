@@ -83,6 +83,42 @@ fn fixture() -> DexClass {
         .unwrap();
     root
 }
+fn joined_handlers_fixture() -> DexClass {
+    let mut class = fixture();
+    let code = class.methods[0].code.as_mut().unwrap();
+    code.tries = 2;
+    code.instructions = vec![
+        0x0238, 8, 0x0071, 0, 0, 0x000e, 0x000d, 0x0628, 0x0071, 0, 0, 0x000e, 0x000d, 0x1071, 1,
+        2, 0x0027,
+    ];
+    code.try_regions = vec![
+        DexTryRegion {
+            start: 2,
+            end: 5,
+            catches: vec![(None, 6)].into(),
+        },
+        DexTryRegion {
+            start: 8,
+            end: 11,
+            catches: vec![(None, 12)].into(),
+        },
+    ];
+    class
+}
+
+#[test]
+fn shared_throw_tail_preserves_each_original_handler_value() {
+    let class = joined_handlers_fixture();
+    let source = native_java::render("sample.Caller", &class).unwrap().source;
+    assert!(source.contains("throw _rdx_caught_throw_"), "{source}");
+    assert_eq!(source.matches("Hooks.touch(").count(), 2, "{source}");
+    // A parameter entering one side of the phi is not a captured exception.
+    let mut bad = class;
+    bad.methods[0].parameters = vec!["Ljava/lang/Throwable;".into()];
+    bad.methods[0].code.as_mut().unwrap().instructions[12] = 0x2007;
+    assert!(native_java::render_method("sample.Caller", &bad, &bad.methods[0]).is_err());
+}
+
 #[test]
 fn checked_callee_header_keeps_original_handler_object_and_caller_header() {
     let class = fixture();
@@ -150,11 +186,17 @@ fn jvm_same_caught_object_and_cleanup_replacement_match_literal_dex() {
     let base = std::env::temp_dir().join(format!("rdx-caught-checked-{}", std::process::id()));
     fs::create_dir_all(base.join("sample")).unwrap();
     let class = fixture();
-    fs::write(
-        base.join("sample/Caller.java"),
-        native_java::render("sample.Caller", &class).unwrap().source,
-    )
-    .unwrap();
+    let mut source = native_java::render("sample.Caller", &class).unwrap().source;
+    let mut joined = joined_handlers_fixture();
+    joined.methods[0].name = "joined".into();
+    let end = source.rfind('}').unwrap();
+    source.insert_str(
+        end,
+        &native_java::render_method("sample.Caller", &joined, &joined.methods[0])
+            .unwrap()
+            .source,
+    );
+    fs::write(base.join("sample/Caller.java"), source).unwrap();
     fs::write(base.join("sample/Hooks.java"),r#"package sample;
 final class Hooks {
 static boolean primary,cleanupFailure;static String trace="";
@@ -179,13 +221,231 @@ catch(Throwable failure){if(pc>=0&&pc<3){pending=failure;pc=9;}else throw failur
 throw new AssertionError("budget");}
 static String run(boolean compiled,int condition){Hooks.trace="";String result="normal";
 try{if(compiled)new Caller().run(condition);else raw(condition);}catch(Throwable failure){if(failure==Hooks.FIRST)result="first";else if(failure==Hooks.SECOND)result="second";else throw new AssertionError("identity",failure);}return result+"|"+Hooks.trace;}
-public static void main(String[] args){for(boolean p:new boolean[]{false,true})for(boolean c:new boolean[]{false,true})for(int x:new int[]{0,1,-1}){Hooks.primary=p;Hooks.cleanupFailure=c;String expected=run(false,x),actual=run(true,x);if(!actual.equals(expected))throw new AssertionError(expected+" != "+actual);}System.out.print("ok");}
+static void joinedChecks(){for(boolean p:new boolean[]{false,true})for(boolean c:new boolean[]{false,true})for(int x:new int[]{0,1,-1}){
+Hooks.primary=p;Hooks.cleanupFailure=c;Hooks.trace="";Throwable got=null;
+try{new Caller().joined(x);}catch(Throwable e){got=e;}
+Throwable expected=p?(c?Hooks.SECOND:Hooks.FIRST):null;
+if(got!=expected||!Hooks.trace.equals(p?"TC":"T"))throw new AssertionError("joined identity/trace");}}
+public static void main(String[] args){joinedChecks();for(boolean p:new boolean[]{false,true})for(boolean c:new boolean[]{false,true})for(int x:new int[]{0,1,-1}){Hooks.primary=p;Hooks.cleanupFailure=c;String expected=run(false,x),actual=run(true,x);if(!actual.equals(expected))throw new AssertionError(expected+" != "+actual);}System.out.print("ok");}
 }"#).unwrap();
     let out = Command::new("javac")
         .args([
             "-Xlint:all",
             "-Werror",
             "sample/Caller.java",
+            "sample/Hooks.java",
+            "sample/Check.java",
+        ])
+        .current_dir(&base)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new("java")
+        .args(["-cp", ".", "sample.Check"])
+        .current_dir(&base)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"ok");
+}
+
+fn cause_fixture(inherited: bool, private_lookup: bool) -> DexClass {
+    let symbols = Arc::new(DexSymbols {
+        types: vec![
+            "Lsample/Hooks;".into(),
+            "Ljava/lang/Throwable;".into(),
+            "Ljava/lang/Class;".into(),
+            "Lsample/Caller;".into(),
+        ],
+        strings: vec![
+            "touch".into(),
+            "getCause".into(),
+            "forName".into(),
+            "take".into(),
+            "java.lang.Object".into(),
+        ],
+        protos: vec![
+            ("V".into(), vec![]),
+            ("Ljava/lang/Throwable;".into(), vec![]),
+            (
+                "Ljava/lang/Class;".into(),
+                vec!["Ljava/lang/String;".into()],
+            ),
+            ("V".into(), vec!["Ljava/lang/String;".into()]),
+        ],
+        methods: vec![(0, 0, 0), (1, 1, 1), (2, 2, 2), (3, 3, 3)],
+        ..Default::default()
+    });
+    let mut words = if inherited {
+        vec![0x011a, 4, 0x206e, 3, 0x0012]
+    } else if private_lookup {
+        vec![0x011a, 4, 0x1071, 2, 1]
+    } else {
+        vec![]
+    };
+    let start = words.len() as u32;
+    words.extend([
+        0x0071, 0, 0, 0x000e, 0x000d, 0x106e, 1, 0, 0x010c, 0x0138, 3, 0x0127, 0x0027,
+    ]);
+    let class = |descriptor: &str, superclass: &str, methods| DexClass {
+        descriptor: descriptor.into(),
+        superclass: Some(superclass.into()),
+        interfaces: vec![],
+        access_flags: 1,
+        annotations_offset: 0,
+        static_values_offset: 0,
+        static_values: vec![],
+        fields: vec![],
+        methods,
+        symbols: symbols.clone(),
+    };
+    let root = class(
+        "Lsample/Caller;",
+        "Lsample/Parent;",
+        vec![DexMethod {
+            declaring_type: "Lsample/Caller;".into(),
+            name: "run".into(),
+            parameters: vec!["I".into()],
+            return_type: "V".into(),
+            thrown_types: vec![],
+            access_flags: if private_lookup { 10 } else { 1 },
+            code: Some(DexCode {
+                registers: 4,
+                ins: if private_lookup { 1 } else { 2 },
+                outs: 2,
+                tries: 1,
+                offset: 0,
+                instructions: words,
+                try_regions: vec![DexTryRegion {
+                    start,
+                    end: start + 3,
+                    catches: vec![(None, start + 4)].into(),
+                }],
+            }),
+        }],
+    );
+    let hooks = class(
+        "Lsample/Hooks;",
+        "Ljava/lang/Object;",
+        vec![DexMethod {
+            declaring_type: "Lsample/Hooks;".into(),
+            name: "touch".into(),
+            parameters: vec![],
+            return_type: "V".into(),
+            thrown_types: vec!["Ljava/io/IOException;".into()],
+            access_flags: 0x109,
+            code: None,
+        }],
+    );
+    let parent = class(
+        "Lsample/Parent;",
+        "Ljava/lang/Object;",
+        ["Ljava/lang/String;", "Ljava/lang/Object;"]
+            .into_iter()
+            .map(|ty| DexMethod {
+                declaring_type: "Lsample/Parent;".into(),
+                name: "take".into(),
+                parameters: vec![ty.into()],
+                return_type: "V".into(),
+                thrown_types: vec![],
+                access_flags: 1,
+                code: Some(DexCode {
+                    registers: 2,
+                    ins: 2,
+                    outs: 0,
+                    tries: 0,
+                    try_regions: vec![],
+                    instructions: vec![0x000e],
+                    offset: 0,
+                }),
+            })
+            .collect(),
+    );
+    symbols
+        .hierarchy
+        .set(Arc::new(
+            TypeHierarchy::from_classes([&root, &parent, &hooks]).unwrap(),
+        ))
+        .unwrap();
+    root
+}
+
+#[test]
+fn caught_cause_and_inherited_overload_keep_the_original_method_header() {
+    for (inherited, private_lookup) in [(false, false), (true, false), (false, true)] {
+        let class = cause_fixture(inherited, private_lookup);
+        let source = native_java::render("sample.Caller", &class).unwrap().source;
+        assert!(
+            source.contains("getCause()") && source.contains("throw _rdx_caught_throw_"),
+            "{source}"
+        );
+        assert!(
+            !source
+                .lines()
+                .find(|l| l.contains(" run("))
+                .unwrap()
+                .contains("throws"),
+            "{source}"
+        );
+        if private_lookup {
+            assert!(
+                source.contains("_rdx_checked_") && source.contains("Class.forName(p0)"),
+                "{source}"
+            );
+        }
+        if inherited {
+            assert!(source.contains("take(\"java.lang.Object\")"), "{source}");
+        }
+    }
+}
+
+#[test]
+fn uncaught_cause_receiver_does_not_gain_a_caught_origin() {
+    let mut class = cause_fixture(false, false);
+    class.methods[0].parameters = vec!["Ljava/lang/Throwable;".into()];
+    class.methods[0].code.as_mut().unwrap().instructions[7] = 3;
+    assert!(native_java::render_method("sample.Caller", &class, &class.methods[0]).is_err());
+}
+
+#[test]
+#[ignore = "requires javac/java; root runs serially"]
+fn jvm_cause_rethrow_preserves_checked_error_and_null_cause_identity() {
+    use std::{fs, process::Command};
+    let base = std::env::temp_dir().join(format!("rdx-caught-cause-{}", std::process::id()));
+    fs::create_dir_all(base.join("sample")).unwrap();
+    fs::write(
+        base.join("sample/Caller.java"),
+        native_java::render("sample.Caller", &cause_fixture(true, false))
+            .unwrap()
+            .source,
+    )
+    .unwrap();
+    fs::write(base.join("sample/Parent.java"), "package sample; public class Parent { public void take(String x) { if(!x.equals(\"java.lang.Object\"))throw new AssertionError(); } public void take(Object x){throw new AssertionError(\"wrong overload\");} }").unwrap();
+    fs::write(base.join("sample/Hooks.java"), r#"package sample; final class Hooks {
+static Throwable failure;
+@SuppressWarnings("unchecked") static <E extends Throwable> void rethrow(Throwable x)throws E {throw(E)x;}
+static void touch()throws java.io.IOException {if(failure!=null)rethrow(failure);}
+}"#).unwrap();
+    fs::write(base.join("sample/Check.java"), r#"package sample; public class Check { public static void main(String[] args) {
+Throwable[] failures={new java.io.IOException(), new AssertionError(), new RuntimeException(new java.io.IOException()), new RuntimeException(new AssertionError())};
+new Caller().run(0);
+for(Throwable f:failures){Hooks.failure=f;Throwable expected=f.getCause()==null?f:f.getCause();try{new Caller().run(0);throw new AssertionError("no exception");}catch(Throwable actual){if(actual!=expected)throw new AssertionError("identity",actual);}}
+System.out.print("ok");}}
+"#).unwrap();
+    let out = Command::new("javac")
+        .args([
+            "-Xlint:all",
+            "-Werror",
+            "sample/Caller.java",
+            "sample/Parent.java",
             "sample/Hooks.java",
             "sample/Check.java",
         ])

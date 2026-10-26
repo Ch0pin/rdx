@@ -32,7 +32,7 @@ fn method(
 }
 fn fixture(bad: usize, range: bool) -> DexClass {
     let symbols = Arc::new(DexSymbols {
-        types: vec!["Lsample/Parent;".into()],
+        types: vec!["Lsample/Parent;".into(), "Lsample/Child;".into()],
         strings: vec!["ping".into()],
         protos: vec![("I".into(), vec!["I".into()])],
         methods: vec![(0, 0, 0)],
@@ -95,6 +95,34 @@ fn fixture(bad: usize, range: bool) -> DexClass {
     if bad == 4 {
         child.methods[0].access_flags = 1;
         child.methods[0].parameters.remove(0);
+    }
+    if bad >= 5 {
+        let m = &mut child.methods[0];
+        m.parameters = vec!["[Ljava/lang/Object;".into(), "I".into()];
+        let c = m.code.as_mut().unwrap();
+        c.registers = 5;
+        c.ins = 2;
+        c.instructions = vec![
+            0x0012,
+            0x0146,
+            0x0003,
+            0x011f,
+            if bad == 6 { 0 } else { 1 },
+            0x0438,
+            4,
+            0x1207,
+            0x0328,
+            0x1207,
+            0x0000,
+            0x206f,
+            0,
+            0x0042,
+            0x000a,
+            0x000f,
+        ];
+        if bad == 7 {
+            c.instructions[9] = 0x3207;
+        }
     }
     symbols
         .hierarchy
@@ -204,4 +232,71 @@ fn instance_super_receiver_join_requires_exact_this_identity() {
             assert!(source.contains("super.ping("), "{source}");
         }
     }
+}
+
+#[test]
+fn array_extracted_receiver_survives_control_flow_copies() {
+    let root = fixture(5, false);
+    let source = native_java::render("sample.Child", &root).unwrap().source;
+    assert!(
+        source.contains("super.ping(p0)") && source.contains("._rdx_super_"),
+        "{source}"
+    );
+    for bad in [6, 7] {
+        let root = fixture(bad, false);
+        assert!(
+            native_java::render_method("sample.Child", &root, &root.methods[0]).is_err(),
+            "accepted receiver {bad}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires javac/java; root runs serially"]
+fn jvm_array_super_bridge_preserves_cast_null_and_nonvirtual_dispatch() {
+    use std::{fs, process::Command};
+    let base = std::env::temp_dir().join(format!("rdx-array-super-{}", std::process::id()));
+    fs::create_dir_all(base.join("sample")).unwrap();
+    fs::write(
+        base.join("sample/Child.java"),
+        native_java::render("sample.Child", &fixture(5, false))
+            .unwrap()
+            .source,
+    )
+    .unwrap();
+    fs::write(base.join("sample/Parent.java"),"package sample; public class Parent { static final java.io.IOException ERROR=new java.io.IOException(); public int ping(int value)throws java.io.IOException {if(value<0)throw ERROR;return value+10;} }").unwrap();
+    fs::write(base.join("sample/Check.java"),r#"package sample; public class Check {public static void main(String[] args){
+Child c=new Child(); for(int x:new int[]{0,1,3})if(Child.bridge(new Object[]{c},x)!=x+10)throw new AssertionError();
+try{Child.bridge(new Object[]{c},-1);throw new AssertionError();}catch(Throwable e){if(e!=Parent.ERROR)throw new AssertionError(e);}
+try{Child.bridge(new Object[]{null},1);throw new AssertionError();}catch(NullPointerException expected){}
+try{Child.bridge(new Object[]{new Parent()},1);throw new AssertionError();}catch(ClassCastException expected){}
+System.out.print("ok");}}
+"#).unwrap();
+    let out = Command::new("javac")
+        .args([
+            "-Xlint:all",
+            "-Werror",
+            "sample/Child.java",
+            "sample/Parent.java",
+            "sample/Check.java",
+        ])
+        .current_dir(&base)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new("java")
+        .args(["-cp", ".", "sample.Check"])
+        .current_dir(&base)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"ok");
 }

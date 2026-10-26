@@ -55,6 +55,98 @@ impl Bridge {
     }
 }
 
+fn cast_origin(
+    class: &DexClass,
+    analysis: &crate::native_method::MethodAnalysis<'_>,
+    pc: usize,
+) -> bool {
+    use crate::native_ssa::DefinitionKind;
+    use std::collections::HashSet;
+    let prove = || -> Option<()> {
+        let receiver = analysis
+            .calls()
+            .calls
+            .iter()
+            .find(|c| c.pc == pc)?
+            .receiver
+            .as_ref()?;
+        if receiver.words.len() != 1 {
+            return None;
+        }
+        let ssa = analysis.ssa();
+        let mut pending = receiver.words.clone();
+        let mut seen = HashSet::new();
+        let mut rooted = false;
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if seen.len() > 4096 {
+                return None;
+            }
+            match &ssa.definitions.get(id)?.kind {
+                DefinitionKind::Instruction { pc, word, .. } if *word == 0 => {
+                    let raw = analysis
+                        .instructions()
+                        .instructions
+                        .iter()
+                        .find(|i| i.pc == *pc)?;
+                    let ins = ssa.instructions.iter().find(|i| i.pc == *pc)?;
+                    if ins.writes.len() != 1 || ins.writes[0].words.as_slice() != [id] {
+                        return None;
+                    }
+                    if raw.opcode == 0x1f {
+                        if class.symbols.types.get(raw.reference?.index as usize)?
+                            != &class.descriptor
+                        {
+                            return None;
+                        }
+                        rooted = true;
+                    } else {
+                        if !matches!(raw.opcode, 0x07..=0x09)
+                            || ins.reads.len() != 1
+                            || ins.reads[0].words.len() != 1
+                        {
+                            return None;
+                        }
+                        pending.push(ins.reads[0].words[0]);
+                    }
+                }
+                DefinitionKind::Phi { block } => {
+                    let phi = ssa.phis.iter().find(|p| p.result == id)?;
+                    let expected: HashSet<_> = ssa
+                        .graph
+                        .blocks
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(from, b)| {
+                            (ssa.reachable[from] && b.successors.iter().any(|e| e.target == *block))
+                                .then_some(Some(from))
+                        })
+                        .chain((*block == 0).then_some(None))
+                        .collect();
+                    let actual: HashSet<_> = phi.incoming.iter().map(|(from, _)| *from).collect();
+                    if !ssa.reachable[*block]
+                        || phi.block != *block
+                        || phi.incoming.is_empty()
+                        || phi.register != ssa.definitions[id].register
+                        || actual != expected
+                        || actual.len() != phi.incoming.len()
+                    {
+                        return None;
+                    }
+                    pending.extend(phi.incoming.iter().map(|(_, id)| *id));
+                }
+                _ => return None,
+            }
+        }
+        // Copy cycles carry no new value. All external inputs must end at a
+        // successful exact cast; undefined, parameter and non-copy roots fail.
+        rooted.then_some(())
+    };
+    prove().is_some()
+}
+
 fn discover(class: &DexClass) -> Option<Vec<Bridge>> {
     if class.access_flags & (0x200 | 0x2000 | 0x4000) != 0
         || class.methods.len() > 8192
@@ -87,6 +179,8 @@ fn discover(class: &DexClass) -> Option<Vec<Bridge>> {
         }
         let ir = DecodedMethod::decode(code).ok()?;
         let calls = BoundCalls::bind(code, &ir, &class.symbols).ok()?;
+        let cfg = crate::native_cfg::ControlFlowGraph::build(code).ok()?;
+        let analysis = std::cell::OnceCell::new();
         let mut parameter_register = code.registers.checked_sub(code.ins)?;
         let mut receivers = Vec::new();
         for ty in &method.parameters {
@@ -109,7 +203,31 @@ fn discover(class: &DexClass) -> Option<Vec<Bridge>> {
             .filter(|i| matches!(i.opcode, 0x6f | 0x75))
         {
             let call = calls.calls.iter().find(|c| c.pc == instruction.pc)?;
-            if !receivers.contains(&call.receiver.as_ref()?.register) {
+            let receiver = call.receiver.as_ref()?.register;
+            let block = &cfg.blocks[*cfg.block_at.get(&instruction.pc)?];
+            let last_write = ir.instructions.iter().rev().find(|i| {
+                i.pc >= block.start
+                    && i.pc < instruction.pc
+                    && i.writes.iter().any(|w| {
+                        receiver >= w.register
+                            && usize::from(receiver - w.register) < w.kind.word_count()
+                    })
+            });
+            let cast_receiver = last_write.is_some_and(|i| {
+                i.opcode == 0x1f
+                    && i.reference
+                        .and_then(|r| class.symbols.types.get(r.index as usize))
+                        == Some(&class.descriptor)
+            });
+            // A successful cast in this basic block establishes the exact
+            // bridge receiver type, including array-extracted arguments.
+            if !cast_receiver
+                && !receivers.contains(&receiver)
+                && !analysis
+                    .get_or_init(|| crate::native_method::MethodAnalysis::build(class, method).ok())
+                    .as_ref()
+                    .is_some_and(|analysis| cast_origin(class, analysis, instruction.pc))
+            {
                 continue;
             }
             let crate::native_calls::CallTarget::Method {

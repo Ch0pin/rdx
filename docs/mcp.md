@@ -6,7 +6,7 @@ configuration. Restart the client connection after changing its configuration.
 The server panel shows status, instance/project IDs, APK SHA-256, request count,
 current request and errors. **Stop server** disables access without closing RDX.
 **Cancel current request** cooperatively cancels active service requests, including
-source reconstruction and literal indexing/search.
+source reconstruction, literal indexing/search, and graph batches.
 
 The native `rdx mcp` command is the stdio gateway. No Python, JVM or separate
 server install is required. Each enabled GUI instance has an authenticated
@@ -28,7 +28,8 @@ memory while enabled. Opening/reloading a GUI project stops that service.
    require a fully qualified ID. Class-scoped tools also accept `class_name` as an
    alias for `class_id`: `get_class_source`, `get_class_disassembly`,
    `get_methods_of_class`, `get_fields_of_class`, `find_direct_subclasses`,
-   `find_implementations`, `get_class_hierarchy`, `find_instantiations`, and `get_dex_strings`. Supplying both requires them to
+   `find_implementations`, `get_class_hierarchy`, `find_instantiations`,
+   `resolve_reference`, and `get_dex_strings`. Supplying both requires them to
    resolve to the same class; conflicts return `CONFLICTING_CLASS_SELECTORS`.
    This alias differs from the component-name and call-graph filters also named
    `class_name`. Restarting the server changes project identity;
@@ -41,22 +42,23 @@ For example, `com.baogong.app_login.activity.LoginActivity` can suggest
 `com.baogong.app_login.LoginActivity`. Retry explicitly with the intended ID;
 suggestions preserve exact FQCN and unique short-name selection rules.
 
-## Currently available (30 tools)
+## Currently available (45 tools)
 
 | Area | Tools |
 | --- | --- |
 | Instances | `list_instances`, `get_health`, `get_instance_info`, `open_apk`, `forget_instance` |
 | Classes | `get_all_classes`, `search_classes_by_keyword`, `find_direct_subclasses`, `find_implementations`, `get_class_hierarchy` |
-| Code search | `search_code` |
-| Source and metadata | `get_class_source`, `get_method_source`, `get_class_disassembly`, `get_methods_of_class`, `get_fields_of_class` |
-| Resources | `get_all_resource_file_names`, `get_android_manifest`, `get_manifest_summary`, `get_manifest_components`, `get_resource_file`, `get_strings` |
-| Call graphs | `get_call_graph` (exact `method_id`, `direction`: `callers` / `callees` / `both`, `depth`: 1–100, default 20 for graph / 1 for call sites) |
-| DEX analysis | `find_field_references`, `get_lambda_branch`, `find_config_key_consumers`, `find_instantiations`, `find_integer_references` |
+| Code search | `search_code` (source text or indexed identifiers) |
+| Source and metadata | `get_class_source`, `get_method_source`, `get_class_disassembly`, `get_methods_of_class`, `get_fields_of_class`, `export_source`, `export_package_source`, `resolve_reference`, `search_kotlin_metadata` |
+| Resources | `get_all_resource_file_names`, `get_android_manifest`, `get_manifest_summary`, `get_manifest_components`, `get_resource_file`, `get_strings`, `get_resource_value`, `search_resources`, `search_resource_xml`, `list_nav_deeplinks`, `find_layout_references` |
+| Call graphs | `get_call_graph_batch`, `get_call_graph` (exact `method_id`, `direction`: `callers` / `callees` / `both`, `depth`: 1–100, default 20 for graph / 1 for call sites) |
+| DEX analysis | `find_field_references`, `get_lambda_branch`, `resolve_switch_case_callers`, `find_network_stacks`, `find_config_key_consumers`, `find_instantiations`, `find_integer_references`, `find_annotation_usages`, `find_type_references`, `find_webview_chooser_flows` |
 | DEX strings | `get_dex_strings` (strings from the DEX containing `class_id`), `find_string_references` |
 
 `search_classes_by_keyword` searches literal class-name substrings only.
 `search_code` searches generated Java and mixed DEX source using a case-sensitive
-literal query; it does not search resources. Resource strings include configurations; binary resources are not exposed.
+literal query by default; `mode: "identifiers"` searches the native symbol index.
+Use `search_resources` for decoded ARSC names and values across configurations.
 Class identifiers currently follow the native engine's class-name identity.
 Disassembly is `rdx-dex`, not assemblable Smali. Java source can contain explicit
 DEX fallbacks. Method IDs retain full DEX signatures.
@@ -75,15 +77,76 @@ The broader [v1 design](/Users/ch0pin/Desktop/Git-Projects/rdx/docs/mcp-v1.md) i
 search by method metadata, general X-Refs, main-application helpers,
 resource resolution and GUI selection. Those tools
 are deliberately absent from `tools/list`. Renaming and debugging are excluded.
-The gateway runs up to eight `find_string_references` calls in the background,
-so the same MCP connection can send health checks and
-`notifications/cancelled` for a pending literal query. Cancellation targets that
-request ID; gateway EOF cancels its outstanding literal queries. Other calls
+The gateway runs up to eight background requests across
+`find_string_references`, `search_code`, `resolve_switch_case_callers`, `find_network_stacks`, call-graph queries, `resolve_reference`, type/metadata/XML/chooser scans, and bulk source export, so the same MCP connection can send health checks and
+`notifications/cancelled`. Cancellation targets that request ID; gateway EOF
+cancels its outstanding background requests. Other calls
 remain sequential, preserving `open_apk` mutation ordering. Cross-connection
 open-request deduplication remains future work.
 
 Protocol reference: [MCP lifecycle](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle)
 and [tools](https://modelcontextprotocol.io/specification/2025-06-18/server/tools).
+
+### Batch graphs, source references, and helper calls
+
+`get_call_graph_batch` accepts `method_ids` (1–16 exact signatures) and the same
+options as `get_call_graph`. Its defaults are `direction: "callers"` and
+`projection: "call_sites"`, hence depth 1. One shared index serves the batch.
+Each result contains `method_id` and either `data` or an explicit `error`;
+`failed_queries` counts errors. `complete` means every input method was processed,
+not that all queries succeeded or every call-site page was consumed.
+
+```json
+{
+  "instance_id": "<instance>", "project_id": "<project>",
+  "method_ids": ["sample.Target.doubleValue(I)I", "sample.Caller.run()V"],
+  "limit": 100,
+  "include_source_locations": true,
+  "include_forwarders": true
+}
+```
+
+The aggregate data budget is 2 MiB, leaving room for MCP text/JSON framing. Resume input-method paging with
+`method_offset: next_method_offset`; each result also retains its own
+`data.next_offset` for call-site paging through `get_call_graph`. Keep the same
+method list and options. Batch progress appears in
+`get_instance_info.invoke_index.active_batches` and is removed after completion
+or cancellation.
+
+For `projection: "call_sites"`, `include_source_locations: true` optionally
+renders up to 20 distinct caller methods per page. Every site keeps its DEX
+offset and receives `source_mapping` with a status, reconstruction status,
+method ID, and source hash when available:
+
+- `unique_target_reference`: one DEX invoke and one source link to that target in
+  the method. This is a structural association, not an instruction emission map.
+- `exact_dex_line`: the exact offset line in the fallback disassembly.
+- `ambiguous`: repeated or rewritten calls prevent a unique Java association.
+- `unavailable` or `not_attempted`: includes the failure or enrichment-budget
+  reason. Smaller pages allow remaining methods to be mapped.
+
+Locations use the **method-local document** from `get_method_source`, with
+one-based line/column and zero-based Unicode scalar offsets. They are not lines
+in the whole class. Optional mapping incurs reconstruction cost; ordinary
+call-site queries use the DEX index alone.
+
+`resolve_reference` resolves a linked source token to its full DEX target ID,
+including nested constructors and static calls. Supply `class_id` or
+`class_name`, the current `source_hash`, and either `source_offset` or `line`
+with optional `column`. A line without a column returns all linked references
+on that line. For a method-local document, also supply `method_id` and the same
+`format` (`auto` or `dex`) used by `get_method_source`. A stale hash returns
+`SOURCE_CHANGED`. Resolution uses emitted symbol links, not guesses from short
+names or arbitrary expressions.
+
+`include_forwarders: true` adds verified `forwarder` metadata and separately
+labelled `cross_namespace_calls` for small static helpers. Exact forwarding
+requires one static invoke, entry arguments forwarded through moves, unchanged
+return, and no branches, handlers, field accesses, or allocations. The separate
+helper-call list reports exact DEX targets and offsets even when guards or other
+work prevent that proof. It does not assert that a call always executes. Actual
+DEX ownership and package names remain unchanged; no semantic owner is inferred.
+`resolve_reference` includes the same bounded helper evidence for method links.
 
 ### Method call graph
 
@@ -102,13 +165,28 @@ An incomplete selector such as `sample.Target.doubleValue` or
 including their parameter and return descriptors. Candidates come from the
 requested class and known superclass chain; constructors use only their own
 class. Retry with an exact candidate. No overload is selected automatically.
+For example, `Lpkg/Class;->m()` is incomplete because it omits the return
+descriptor; a void method is `Lpkg/Class;->m()V` or `pkg.Class.m()V`.
+The error includes examples of both formats and explains the required return
+descriptor, even when no declaration candidates are available.
 
 The response includes numbered nodes, method IDs, distance from the root,
 component classifications, available declarations, call-site counts, and
 component-path highlights. `truncated` reports the 5,000-node/20,000-edge cap;
 `depth_boundary_reached` reports that nodes reached the requested depth.
-The graph is returned as one response, without pagination. Caller queries scan
-the loaded DEX call sites and may take longer than outgoing queries.
+The graph is returned as one response, without pagination. The first caller or
+bidirectional query builds a project-owned disk invoke index. Subsequent queries
+reuse its per-direction shards. Candidates are verified against the original
+DEX class/name/prototype before emission. The cache is shared by immutable
+project snapshots and discarded when the project is released; reopening starts
+a fresh cache. Failed or cancelled builds can be retried. Callee-only queries
+walk reachable methods directly.
+
+`get_instance_info.invoke_index` reports `state`, `scanned_classes`,
+`total_classes`, `invoke_sites`, and `active_batches`. Poll it from the same MCP
+connection while a query runs. Cancellation is cooperative during construction,
+shard scans, traversal, and between method reconstructions. The gateway's 120-second
+request deadline still applies; a cancelled build publishes no partial index.
 
 Use `direct_only: true` for immediate neighbors (effective depth 1). An explicit
 `depth` greater than 1 conflicts with this option. To retrieve complete caller
@@ -186,8 +264,8 @@ slice. Coverage remains class-wide even when only a small source slice is return
 
 ### Method source
 
-`get_method_source` requires `instance_id`, `project_id`, and an exact `method_id`
-from `get_methods_of_class`, including parameter and return descriptors. For
+`get_method_source` requires `instance_id`, `project_id`, and either an exact
+`method_id` or `class_name` plus `method_name` (optional `descriptor`). For
 example, `sample.Target.doubleValue(I)I` selects that overload alone.
 
 The response renders only the requested method. It contains `method_id`, `text`,
@@ -457,6 +535,14 @@ reported static scope; reflection, native code, and generated accesses require
 runtime analysis. Each page performs a cancellable scan, sharing operand match
 tables across classes in the same DEX during that scan.
 
+`find_implementations` accepts exact FQCN/descriptor roots referenced anywhere in
+loaded DEX type tables, including framework types without local definitions.
+A referenced type alone does not establish an implementation. Results distinguish
+`definition_available`, `referenced_type`, and `declared_hierarchy_edge`; coverage
+reports the loaded-class scan and missing external ancestry. Zero known declared
+implementations is not proof about classes loaded dynamically or missing external
+superclasses.
+
 ## Merged lambda branch analysis
 
 Use `get_lambda_branch` for a constructor call of an R8 merged lambda. First
@@ -473,14 +559,17 @@ replace it with the actual constructor instruction offset in 16-bit code units:
 }
 ```
 
-A `status: "resolved"` response connects caller constant/move dataflow to the
-constructor argument, constructor parameter/move dataflow to a field store,
+A `status: "resolved"` response connects caller constant/move dataflow through a
+constructor parameter, or a fixed constant inside the constructor, to a field store,
 and dispatcher field/move dataflow to a validated switch. Results include
 `constructor_method_id`, allocation offset, dispatcher `method_id`,
 `discriminator`, `field_id`, constructor argument/store offsets, selected switch
 target, and `provenance`. DEX `blocks` include successor closure, shared
 continuations (`shared_with_other_case`), exception edges, and referenced helper
 method IDs. Prelude instructions and their exception blocks remain visible.
+`discriminator_source` distinguishes `caller_argument` from `constructor_constant`.
+For fixed constructor constants, `constructor_argument_word` is null. Both paths
+retain final-field, mutation, allocation and control-flow checks.
 Each returned DEX instruction includes readable native disassembly text alongside
 its code-unit offset and raw words. Selected branch blocks, the executed prelude,
 and the prelude exception closure are reported separately.
@@ -491,6 +580,21 @@ control/dataflow returns `status: "unresolved"` with a reason. A selected static
 branch establishes the documented discriminator path; active route registration,
 callback execution, attacker-controlled delivery, and runtime impact need
 separate evidence.
+
+`resolve_switch_case_callers` performs the reverse lookup. Supply `class_id` or
+`class_name`, a signed integer `case`, and optionally an exact dispatcher
+`method_id`. Results connect proven constructor arguments to dispatcher switch
+targets using the same proof as `get_lambda_branch`. `limit` bounds candidate
+constructor sites per page (default 25, maximum 100), rather than matching rows.
+Continue with `next_cursor` as `resume_cursor` until `scan_complete=true`.
+`unresolved_sites` names every candidate whose mapping could not be proven;
+`page_proofs_complete` applies only to the current page. Keep unresolved records
+across pages when assessing total coverage. A complete scan can still contain
+unresolved constructor inputs.
+
+```json
+{"instance_id":"INSTANCE","project_id":"PROJECT","class_name":"je.j","case":23,"limit":25}
+```
 
 ## DEX literal owners
 
@@ -515,18 +619,19 @@ other analysis.
 `get_instance_info.literal_index` reports `state`, `completed_classes`,
 `total_classes`, `progress`, `attempt`, `active_waiters`, `error`, `retryable`, and
 `index_complete`. States are `idle`, `indexing`, `cancelling`, `ready`, `failed`,
-`cancelled`, and `invalidated`.
+`cancelled`, `streaming`, and `invalidated`.
 
 Index construction has a 120-second deadline and a conservative 128 MiB
-allocation budget. Cancelling a query or closing its connection removes its
+allocation budget (override with `RDX_LITERAL_INDEX_MIB=1..4096` on the GUI/server process). Cancelling a query or closing its connection removes its
 waiter; the final departing waiter cancels the build. MCP cancellation
 notifications and gateway shutdown also cancel pending literal queries. Failed
-or cancelled builds publish no partial index, and the next query retries.
+or cancelled builds publish no partial index. Memory overflow switches to complete
+streaming scans; other failures can retry on the next query.
 Successful indexes are cached for the running project service. Stopping the
 server cancels indexing; a changed APK invalidates the project index and requires
 restarting the service. Package filters apply to search results across the
-complete project index. For an index-budget failure, use package-scoped
-`search_code` as a bounded alternative.
+complete project index or streaming scan. Streaming status preserves the
+index-budget reason as `fallback_reason`; queries continue to cover all classes.
 
 The local service admits at most eight active operations and 32 connections.
 `get_instance_info` has reserved operation admission. A saturated operation pool
@@ -619,6 +724,12 @@ Unreachable instructions are included. These sites do not establish successful
 construction or runtime reachability; arrays, reflection, native code and other
 runtime allocations are outside the query's scope.
 
+Reverse lookup uses `allocating_class` or `allocating_method_id` instead of the
+allocated-type selector. For example, `find_instantiations(allocating_class="ye.b")`
+returns every exact type allocated by that class's methods. Supplying `class_name`
+as well intersects the two filters. Pagination and DEX evidence use the same
+format in both directions.
+
 ## Method lookup suggestions
 
 `get_method_source` accepts canonical `pkg.Class.method(desc)ret` and smali-style
@@ -681,13 +792,50 @@ Use `search_code` with `mode="identifiers"` for original DEX names and reference
 {"instance_id":"INSTANCE","project_id":"PROJECT","mode":"identifiers","query":"parseUri","match_mode":"exact","case_sensitive":false,"symbol_kind":"method","occurrence":"reference","limit":100}
 ```
 
-The first request builds a project-local postings index directly from DEX;
-subsequent queries and pages reuse it. No Java reconstruction is required.
-The build runs on the request worker outside the interactive engine mutex.
-Concurrent queries share a completed index; waiting and building requests can
-be cancelled. Failed or cancelled builds publish no partial index and remain
-retryable. Reopening a project creates a fresh cache. The index has a 256 MiB
-conservative allocation budget; exceeding it returns an explicit error.
+`search_mode="auto"` (default) sends method-reference queries
+(`symbol_kind="method", occurrence="reference"`) through a direct method-table
+filter and resumable DEX scan. It avoids building the global identifier index.
+Use `search_mode="scan"` for this pagination model with any identifier kind.
+Each page stops at the result limit, response budget, or a cooperative 15-second
+scan budget. Pass `next_cursor` as `resume_cursor`, keeping query, filters and
+projection unchanged, until `coverage_complete=true`. The cursor is bound to the
+open project and advances within a method; it survives transport retries during
+the same project session. Reopening the project requires a fresh scan.
+
+Scan pages report `scanned_classes / total_classes`, `matches_so_far`, and
+`unique_classes_so_far / unique_methods_so_far`. `total` and final unique counts
+remain null until the entire scope has been scanned. A short or empty page can
+still carry a continuation cursor. `next_offset` is null in this mode; use the
+cursor even when no hits appeared. Cancellation and malformed DEX remain explicit
+errors. A transport error does not create a partial page: retry the same cursor.
+The MCP gateway retries transient socket read failures while preserving its
+response buffer, cancellation and absolute deadline.
+
+Choose `projection="summary"` for counts without instruction records, or
+`projection="callers"` for paginated unique enclosing method IDs and their match
+counts. Both use the resumable scanner. Class/field-only matches count in the
+summary but have no enclosing-method row. `projection="full"` retains the
+original instruction evidence. For example:
+
+```json
+{"instance_id":"INSTANCE","project_id":"PROJECT","mode":"identifiers","query":"java.io.File.delete()Z","match_mode":"exact","symbol_kind":"method","occurrence":"reference","projection":"summary"}
+```
+
+The following offset-based index behavior applies to other `auto` queries and
+explicit `search_mode="index"` with `projection="full"`.
+Unscoped requests build a project-local postings index directly from DEX;
+subsequent queries and pages reuse it. The build runs on the request worker
+outside the interactive engine mutex, with cancellation while waiting or building.
+The index has a 256 MiB conservative allocation budget. Overflow automatically
+switches the project to a complete streaming scan; subsequent requests skip the
+failed build. Other build errors remain retryable. Reopening resets this state.
+
+Requests with `package_prefix` always stream only classes inside that scope,
+without building or waiting for global postings. References from those classes
+to external packages remain included. Streaming retains one bounded result page
+and the current symbol, scans the full requested scope for exact totals, and
+supports cancellation. It requires no Java reconstruction or partial index.
+Each streaming page rescans its requested scope; it is not a persistent disk index.
 
 `query` matches a simple name or full original ID. `match_mode` is `contains`
 (default) or `exact`; `case_sensitive` defaults to true. Full smali-style class,
@@ -701,8 +849,19 @@ mode; source mode rejects them rather than silently ignoring them.
 default 100 / maximum 500 and a 1 MiB item budget. Omit `pagination`, or set it
 to `hits`; `source_offset` is not used. `total` counts the entire filtered result
 set. Follow `next_offset` until null; `exhausted` then indicates all matches have
-been returned. `index_complete` describes index coverage, independently of page
-completion. `index_hash` identifies the immutable index, not rendered source.
+been returned. `coverage_complete: true` means the entire requested scope was
+searched, independently of page completion and index availability. Streaming
+returns `index_complete: false`, `indexed_classes: 0`, `scanned_classes`,
+`scanned_code_methods`, `out_of_scope_classes`, and `skipped_classes: 0`.
+Malformed in-scope DEX and cancellation return errors rather than a complete result.
+
+`execution_mode` is `index` or `streaming`. Indexed pages use
+`pagination_order: "symbol_then_occurrence"` and `index_hash` identifies the
+immutable index. Streaming pages use `pagination_order: "class_then_dex_occurrence"`,
+with classes sorted by name and declarations/instructions in DEX traversal order.
+Their `source_hash` hashes every matching record in order (JSON plus newline),
+independently of page size and offset; `index_hash` is null. Keep the same project,
+query and filters across pages. Mode and ordering remain stable for those requests.
 `index_cached` and build/wait/total timing fields expose first-use work.
 
 Each hit identifies the symbol, owning class/method/field, DEX entry and context.
@@ -730,3 +889,160 @@ For numeric bounds/type failures, `error.details` includes `tool`, `parameter`,
 `received`, `expected_type`, `minimum`, `maximum`, and a correction `hint`.
 For example, `get_call_graph` with `limit: 501` reports the valid range 1–500.
 A rejected query leaves the gateway available for subsequent requests.
+
+## Large-APK review queries
+
+`find_string_references` automatically switches to a complete streaming DEX scan
+when its literal-owner index exceeds the memory budget. The service remembers
+this mode for the project instead of rebuilding the failing index on every query.
+`search_mode: "streaming"` bypasses index construction explicitly. Streaming
+retains only a bounded response page, reports `scan_complete: true`,
+`index_complete: false`, exact `total`, `source_hash`, and `next_offset`. A
+completed scan covers all loaded classes matching `package_prefix`; an exhausted
+page is distinct from a completed scan. Continue with the same search mode,
+query, project and filters. Cancellation or malformed DEX produces an error,
+never a successful partial negative result. No Java decompilation is involved.
+
+For API/class references, use the existing identifier index rather than source
+pagination:
+
+```json
+{"instance_id":"INSTANCE","project_id":"PROJECT","mode":"identifiers","query":"ServerDrivenActionService","symbol_kind":"class","occurrence":"reference","package_prefix":"com.mercadolibre.android.sc_feed","limit":500}
+```
+
+Pass that object to `search_code`. Source-mode `limit` counts classes by default
+(25, maximum 500); `pagination: "hits"` instead pages source matches.
+
+`find_annotation_usages` accepts `annotation_type` as an FQCN or DEX descriptor,
+`element: "all"|"class"|"field"|"method"|"parameter"`, and `package_prefix`.
+Results include owner IDs, zero-based parameter indices excluding the receiver,
+DEX entry, visibility (0 build / 1 runtime / 2 system), and typed decoded values.
+It searches explicit declarations, including obfuscated annotation names. It does
+not infer inherited annotations or fill in annotation defaults. Pages count
+matching annotations; follow `next_offset`. Oversized individual annotation
+values fail explicitly instead of being silently truncated.
+
+`get_method_source` also accepts `class_name` plus `method_name` and optional
+`descriptor` (for example `(Ljava/lang/String;)V`). `find_field_references`
+accepts `class_name` plus `field_name` and an optional field descriptor. Unique
+matches resolve to canonical IDs; ambiguous names return candidate IDs. Field
+lookup preserves subclass shadowing. Use the original DEX names. Supply either
+a canonical member ID or the separate class/member selector, not both.
+
+`export_source` writes full source and coverage metadata directly on the RDX
+host. `out_path` must be an absolute path to a **new directory** whose parent
+exists. It creates `source.txt` and `coverage.json`, returning their absolute
+paths, hashes and source size without the source text. Existing paths are never
+overwritten. Source may contain Java or explicitly labelled DEX fallback.
+Select `class_name`, an exact `method_id`, or `class_name` plus `method_name` and
+optional `descriptor`. Method exports accept `format: "auto"|"dex"`. The sidecar
+records project/instance and APK identity, the source hash and reconstruction coverage.
+A failed write reports the incomplete export directory so it can be inspected.
+
+`get_resource_value` accepts exactly one of `resource_id` (decimal or `0x` hex
+string) and `resource_name` (`[package:]type/name`). `search_resources(query)`
+searches names and decoded values by case-sensitive substring. Both page resource
+variants and accept `config` as an exact stored configuration label. Scalar aliases
+include effective configurations inherited from their targets. Scalars
+include reference resolution status; other resource kinds expose decoded ARSC
+text and reference/file metadata. Configuration selection does not simulate
+Android's device best-match algorithm. `get_strings` remains the convenient
+string-only query.
+
+For APK-wide callers, use `get_call_graph` with `direction: "callers"`,
+`projection: "call_sites"`, and `direct_only: true`. Set `include_const_args: true`
+to attach constant-argument evidence to the returned page. Analysis follows
+constant loads/moves and CFG joins; conflicting predecessors, exception entry
+state, arithmetic, wide values, fields and call results remain unresolved.
+Arguments exclude the receiver and retain their parameter descriptor and source
+register. Literal size/work budgets are reported explicitly. A preceding nearby
+string is never assumed to be an argument without register-flow evidence.
+
+### Reviewer discovery and XML queries
+
+All queries below require `instance_id` and `project_id`. New scans support cancellation and stable occurrence pagination (`offset`, `limit <= 500`), bounded response pages, and explicit error coverage. `complete` describes the documented scan, never application security coverage.
+
+- `get_all_classes` and `search_classes_by_keyword` accept `case_sensitive:false`. Returned IDs preserve case; an empty case-sensitive search includes up to 20 case-insensitive near matches. Resolution never silently substitutes a case variant. Missing-class errors describe absence from the loaded DEX set, without asserting runtime loading.
+- Validation errors include `accepted_parameters` containing the tool input schema and selector alternatives. Singular IDs and plural batch IDs retain their separate meanings.
+- `find_type_references(class_name, package_prefix?)` wraps the native identifier scanner with exact type-reference matching. Use FQCN or a DEX descriptor. Array component matches preserve the actual array operand in results. Includes class literals, casts, type checks, allocations, inheritance and field/parameter/return declaration types. Scope exclusions from the identifier scanner remain explicit.
+- `search_kotlin_metadata(query, case_sensitive?, package_prefix?)` searches `kotlin.Metadata.d2`, returning owning DEX class, table index and matched string. These are discovery evidence, **not verified original-name aliases**: a d2 entry may describe a referenced type or member. Canonical lookup continues to use DEX identities.
+
+`export_source` now reports the full missing parent path before rendering. Create the parent explicitly; the final export directory must be new. `export_package_source(out_path, package_prefix)` writes complete class documents to numeric filenames (`class-00000000.txt`, etc.), plus `manifest.jsonl` mapping each exact descriptor to its actual absolute output path, source hash and reconstruction coverage. This remains unambiguous on case-insensitive filesystems. `completion.json` is written after scanning finishes and reports class failures. Cancellation retains partial files and the manifest; absence of completion.json identifies an unfinished export. Existing paths are never overwritten. This manifest describes RDX exports, not apktool's filesystem renaming rules.
+
+`search_resource_xml(query, resource_prefix?, case_sensitive?)` searches decoded XML lines, including binary XML and resource files whose archive names were obfuscated. Stripped application attribute names are recovered by exact resource-map IDs against ARSC; names removed from the table retain explicit resource-ID identities. A request-local ZIP reader reuses the central directory without caching decompressed documents. Results carry archive path, decoded line number, source hash and stored configurations. Each line is one occurrence; previews longer than 4096 characters are explicitly truncated. Fetch the resource for full text. Failed XML files are counted and listed separately (first 50 diagnostics).
+
+`list_nav_deeplinks(resource_prefix?)` returns deep-link declarations and graph-include edges. Each deep link includes its graph, nested graph IDs, destination tag/ID/class, URI/action/MIME attributes and destination arguments. Resource-backed scalar attributes carry raw spelling, default resolution and per-configuration overrides. Includes list referenced graph files; graphs are inventoried once, preserving cycles instead of recursively duplicating destinations. Runtime argument substitution, device best-match resource selection and verified-app-link state are outside this inventory.
+
+When APK optimization replaces application attribute names with decimal resource IDs, decoded XML preserves them as `app:resource_0xID`. Navigation records expose these exact IDs and scalar values in `unresolved_attributes`; semantic names such as `uri` are not guessed. `attribute_semantics_complete` and `unresolved_attribute_count` distinguish decoded coverage from semantic recovery. Unqualified layout tags such as `WebView` are reported as possible platform-prefix inflation matches, with the original tag preserved.
+
+`find_layout_references(class_name, resource_prefix?)` locates fully qualified custom view tags, `<view class=...>` and fragment class declarations. These are **possible inflation sites**, explicitly distinct from the `new-instance` instructions returned by `find_instantiations`. ARSC file identity covers obfuscated layout paths. Resource-backed class names expose default resolution; dynamic layout factories and alternate class-name configurations require further review.
+
+### Interface caller expansion
+
+Use `get_call_graph(method_id, direction="callers", projection="call_sites", depth=1, dispatch_through_interfaces=true)` to include invokes through known ancestor interface declarations. The original `callee_method_id`, `raw_callee_method_id`, opcode and offset remain unchanged. Rows have `relationship="exact_declared_call"` or `"possible_interface_dispatch"`; inferred rows add `possible_implementation_method_id`. `exact_matching_total` and `possible_dispatch_total` keep the counts separate. A runtime receiver may select another implementation. The opt-in is limited to direct caller call-site queries; batch queries can pass the same option.
+
+Superclass dispatch uses `dispatch_through_superclasses=true` with the same
+direct caller projection. It includes `invoke-virtual` sites targeting known
+overridden superclass declarations, including abstract bases, and labels them
+`possible_virtual_dispatch`. `invoke-super`, static and direct calls are excluded
+from inferred dispatch. The raw declared target remains available; possible
+receiver dispatch is separate from exact calls. Both dispatch options can be
+combined.
+
+### Asset contents
+
+`get_all_resource_file_names(query="assets/")` lists asset paths.
+`get_resource_file(resource_path="assets/json/android_v10.json")` reads UTF-8
+text, including JSON. XML retains decoded XML output. Binary content returns an
+explicit `BINARY_RESOURCE` error.
+
+`search_resources(scope="assets", query="path-configuration", asset_prefix="assets/json/", case_sensitive=false)`
+searches text content and paths, returning one record per matching file with
+line-numbered previews and a content hash. Follow `next_offset` for stable pages.
+The scan reads one file at a time with an 8 MiB per-file ceiling. Coverage reports
+scanned and skipped files; `complete=false` identifies binary, oversized or
+unreadable entries. Previews have their own truncation markers; use
+`get_resource_file` or export for full content. The default resource-table scope
+is unchanged and assets have no ARSC configuration selector.
+
+### WebView chooser-flow candidates
+
+`find_webview_chooser_flows(package_prefix?)` locates `onShowFileChooser` callback storage and normal-control-flow activity-result URI propagation to `ValueCallback.onReceiveValue`. Models include Intent data, ClipData items, FileChooserParams.parseResult, explicit ActivityResultCallback signatures, casts, moves, local URI arrays, and direct callback fields shared across methods, including verified straight-line getter/setter accessors. Intent action/URI literals and chooser launch calls are retained as evidence. Results retain DEX offsets, sources, sinks, callback-field associations and validation-related calls. Provider declarations are returned as authority candidates for review; actual UID ownership and access must be checked at runtime.
+
+The rule emits candidates and unresolved flows, never a vulnerability verdict. Field aliasing/object identity, helper-method transfer, heap containers, exceptional paths, path feasibility, and validation dominance/adequacy remain explicit analysis boundaries. External results can refer to private `file://` paths or target-owned content authorities even without a FileProvider producer call. Runtime proof must establish accepted URI, actual read and delivery to the web origin. A reported validation call alone does not establish that a candidate is safe.
+
+## Relocated networking member maps
+
+`find_network_stacks` detects **OkHttp-compatible structural candidates** using
+linked declarations, independently of package and member names. The supported
+shape connects request, response, URL, headers, chain and interceptor types.
+It requires a concrete interceptor matching a direct interface contract, a
+chain that consumes the request and returns the response, and compatible
+request/response fields. It does not identify an exact library version.
+
+```json
+{"instance_id":"INSTANCE","project_id":"PROJECT","package_prefix":"hu","limit":25}
+```
+
+`package_prefix` filters interceptor owners at package boundaries while retaining
+cross-package dependencies. Omit it for an app-wide scan. Results provide exact
+method and field IDs under `hook_map`, role descriptors, matching evidence and
+`unresolved_roles`. `offset` / `next_offset` page candidate maps, with `limit`
+default 25 and maximum 100. Ordering is stable for an unchanged project and query.
+
+The header array field is included when the structural profile matches. Header
+name/value slot ordering is an **inference** from that profile. Simple accessors
+that return array entries at `2 * index` and `2 * index + 1` additionally get a
+DEX indexing proof; delegated or unsupported accessors remain unresolved. The
+static map requires runtime validation before use as an observer configuration.
+It installs no hooks and returns no observed URLs, headers, bodies or credentials.
+The included observer policy permits redacted URL origins, validated HTTP method
+tokens, header names and credential-header presence booleans; it excludes header
+values, URL userinfo/path/query/fragment and request/response bodies.
+
+`coverage.complete` describes the bounded scan of supported declaration shapes,
+not exhaustive networking-library identification. Work and candidate-graph limits
+are explicit; `total` is null when scanning is incomplete. Paging retrieves only
+the candidates found within that scan budget. Inherited-only contracts, removed
+members, unsupported library families and runtime-loaded classes can be missed.
+`runtime_verified` always remains false for this static query.

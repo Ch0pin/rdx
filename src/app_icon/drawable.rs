@@ -264,6 +264,60 @@ pub(super) fn load_reference(
     }
     None
 }
+// Preview the rectangular solid/radial fills used by adaptive launcher layers.
+// Other shape effects remain unsupported rather than silently disappearing.
+fn shape(node: &Node, package: &str, table: &ResourceTable) -> Option<RgbaImage> {
+    if !matches!(node.attr("shape").unwrap_or("0"), "0" | "0x0" | "rectangle")
+        || node.children.len() != 1
+    {
+        return None;
+    }
+    let fill = &node.children[0];
+    if fill.tag == "solid" {
+        return Some(RgbaImage::from_pixel(
+            SIZE,
+            SIZE,
+            image::Rgba(color(fill.attr("color")?, package, table, 0)?),
+        ));
+    }
+    if fill.tag != "gradient"
+        || !matches!(fill.attr("type")?, "1" | "0x1" | "radial")
+        || fill.attr("centerColor").is_some()
+        || fill
+            .attr("useLevel")
+            .is_some_and(|v| v != "false" && v != "0")
+    {
+        return None;
+    }
+    let start = color(fill.attr("startColor")?, package, table, 0)?;
+    let end = color(fill.attr("endColor")?, package, table, 0)?;
+    let cx = fill.number("centerX", 0.5)? * SIZE as f32;
+    let cy = fill.number("centerY", 0.5)? * SIZE as f32;
+    let value = fill.attr("gradientRadius")?;
+    let radius: f32 = if let Some(n) = value.strip_suffix("%p").or_else(|| value.strip_suffix('%'))
+    {
+        n.parse::<f32>().ok()? * SIZE as f32 / 100.0
+    } else {
+        value
+            .strip_suffix("dip")
+            .or_else(|| value.strip_suffix("dp"))
+            .or_else(|| value.strip_suffix("px"))
+            .unwrap_or(value)
+            .parse()
+            .ok()?
+    };
+    if !radius.is_finite() || radius <= 0.0 || radius > 1_000_000.0 {
+        return None;
+    }
+    Some(RgbaImage::from_fn(SIZE, SIZE, |x, y| {
+        let t = (((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt() / radius)
+            .clamp(0.0, 1.0);
+        image::Rgba(std::array::from_fn(|i| {
+            (start[i] as f32 * (1.0 - t) + end[i] as f32 * t).round() as u8
+        }))
+    }))
+}
+
 fn render_node(
     node: &Node,
     package: &str,
@@ -277,22 +331,41 @@ fn render_node(
     }
     match node.tag.as_str() {
         "vector" => vector(node, package, table),
+        "shape" => shape(node, package, table),
         "adaptive-icon" => {
             let mut layers = Vec::new();
             for tag in ["background", "foreground"] {
-                let layer = node.children.iter().find(|n| n.tag == tag)?;
-                let image = if let Some(raw) = layer.attr("drawable") {
-                    load_reference(raw, package, table, container, depth + 1, budget)?
-                } else {
-                    render_node(
-                        layer.children.first()?,
-                        package,
-                        table,
-                        container,
-                        depth + 1,
-                        budget,
-                    )?
+                let load = |layer: &Node, budget: &mut usize| {
+                    if let Some(raw) = layer.attr("drawable") {
+                        load_reference(raw, package, table, container, depth + 1, budget)
+                    } else {
+                        render_node(
+                            layer.children.first()?,
+                            package,
+                            table,
+                            container,
+                            depth + 1,
+                            budget,
+                        )
+                    }
                 };
+                let image = node
+                    .children
+                    .iter()
+                    .find(|n| n.tag == tag)
+                    .and_then(|layer| load(layer, budget))
+                    .or_else(|| {
+                        // Standalone base APKs can omit density-split foregrounds.
+                        // Prefer the app's actual monochrome launcher artwork when available.
+                        (tag == "foreground")
+                            .then(|| {
+                                node.children
+                                    .iter()
+                                    .find(|n| n.tag == "monochrome")
+                                    .and_then(|layer| load(layer, budget))
+                            })
+                            .flatten()
+                    })?;
                 layers.push(image::imageops::resize(
                     &image,
                     SIZE,
@@ -321,6 +394,30 @@ fn render_node(
 mod tests {
     use super::*;
     #[test]
+    fn radial_shape_background_retains_center_edge_and_rejects_unsupported_effects() {
+        let xml = r##"<shape xmlns:a="http://schemas.android.com/apk/res/android" a:shape="0"><gradient a:startColor="#d0e7f8" a:endColor="#aad0f3" a:type="1" a:centerX="0.5" a:centerY="0.5" a:gradientRadius="50%"/></shape>"##;
+        let icon = shape(&parse(xml).unwrap(), "demo", &ResourceTable::default()).unwrap();
+        assert_eq!(icon.dimensions(), (108, 108));
+        assert!(icon.get_pixel(54, 54).0[0] >= 207);
+        assert_eq!(icon.get_pixel(0, 0).0, [170, 208, 243, 255]);
+        assert!(
+            shape(
+                &parse(&xml.replace("50%", "NaN")).unwrap(),
+                "demo",
+                &ResourceTable::default()
+            )
+            .is_none()
+        );
+        assert!(
+            shape(
+                &parse(&xml.replace("</shape>", "<corners a:radius=\"4dp\"/></shape>")).unwrap(),
+                "demo",
+                &ResourceTable::default()
+            )
+            .is_none()
+        );
+    }
+    #[test]
     fn app_icon_vector_colors_groups_and_alpha() {
         let xml = r##"<vector xmlns:a="http://schemas.android.com/apk/res/android" a:viewportWidth="10" a:viewportHeight="10"><path a:fillColor="#ff8652ff" a:pathData="M0,0h10v10H0z"/><group a:translateX="2" a:translateY="2"><path a:fillColor="#80ffffff" a:pathData="M0,0h6v6H0z"/></group></vector>"##;
         let icon = vector(&parse(xml).unwrap(), "demo", &ResourceTable::default()).unwrap();
@@ -348,6 +445,23 @@ mod tests {
         assert_eq!(icon.get_pixel(24, 24).0, [255, 255, 255, 255]);
         assert_eq!(icon.get_pixel(24, 5).0, [134, 82, 255, 255]);
         assert_eq!(icon.get_pixel(0, 0).0[3], 0);
+        let missing_foreground = xml
+            .replace(
+                "<foreground>",
+                "<foreground a:drawable=\"@mipmap/missing\"/><monochrome>",
+            )
+            .replace("</foreground>", "</monochrome>");
+        let fallback = render_node(
+            &parse(&missing_foreground).unwrap(),
+            "",
+            &table,
+            &container,
+            0,
+            &mut 64,
+        )
+        .unwrap();
+        assert_eq!(fallback, icon);
+
         table.entries.insert(
             0x7f010001,
             crate::resource_table::Resource {

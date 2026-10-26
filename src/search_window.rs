@@ -57,6 +57,7 @@ pub struct SearchWindow {
     started_at: Option<Instant>,
     node_fraction: f32,
     preview_cache: VecDeque<((usize, bool), egui::text::LayoutJob)>,
+    result_widths: Option<(usize, f32, egui::Vec2)>,
     exclusion_input: String,
     mode_changed: bool,
     stale_scope: bool,
@@ -84,6 +85,7 @@ impl Default for SearchWindow {
             started_at: None,
             node_fraction: 0.45,
             preview_cache: VecDeque::new(),
+            result_widths: None,
             exclusion_input: String::new(),
             mode_changed: false,
             stale_scope: false,
@@ -92,6 +94,37 @@ impl Default for SearchWindow {
 }
 
 impl SearchWindow {
+    fn measured_result_widths(&mut self, ui: &egui::Ui) -> egui::Vec2 {
+        let scale = ui.ctx().pixels_per_point();
+        let (mut count, _, mut widths) = self
+            .result_widths
+            .filter(|(count, old_scale, _)| *count <= self.results.len() && *old_scale == scale)
+            .unwrap_or((0, scale, egui::Vec2::ZERO));
+        ui.fonts(|fonts| {
+            for hit in &self.results[count..] {
+                let font = egui::FontId::monospace(13.0);
+                let title = format!("{}:{}", hit.document.name, hit.line);
+                widths.x = widths.x.max(
+                    fonts
+                        .layout_no_wrap(title, font.clone(), egui::Color32::WHITE)
+                        .size()
+                        .x
+                        + 32.0,
+                );
+                widths.y = widths.y.max(
+                    fonts
+                        .layout_no_wrap(hit.preview.clone(), font, egui::Color32::WHITE)
+                        .size()
+                        .x
+                        + 16.0,
+                );
+                count += 1;
+            }
+        });
+        self.result_widths = Some((count, scale, widths));
+        widths
+    }
+
     pub fn viewport_id() -> egui::ViewportId {
         egui::ViewportId::from_hash_of("rdx_text_search")
     }
@@ -124,6 +157,7 @@ impl SearchWindow {
             self.stale_scope = self.running;
             self.results.clear();
             self.preview_cache.clear();
+            self.result_widths = None;
             self.selected_result = None;
             self.errors.clear();
             self.scanned = 0;
@@ -170,6 +204,7 @@ impl SearchWindow {
         self.running = true;
         self.results.clear();
         self.preview_cache.clear();
+        self.result_widths = None;
         self.selected_result = None;
         self.errors.clear();
         self.cancel_requested = false;
@@ -238,6 +273,7 @@ impl SearchWindow {
     pub fn error(&mut self, error: String) {
         self.results.clear();
         self.preview_cache.clear();
+        self.result_widths = None;
         self.selected_result = None;
         self.running = false;
         self.cancel_requested = false;
@@ -452,44 +488,36 @@ impl SearchWindow {
                 });
             }
             ui.separator();
-            let table_width = ui.available_width();
-            let minimum = 140.0_f32.min(table_width / 2.0);
-            let node_width =
-                (table_width * self.node_fraction).clamp(minimum, table_width - minimum);
+            let widths = self.measured_result_widths(ui);
+            let fraction = self.node_fraction.clamp(0.1, 0.9);
+            let viewport_width = ui.available_width();
+            let minimum = 140.0_f32.min(viewport_width / 2.0);
+            let node_width = (viewport_width * fraction)
+                .clamp(minimum, viewport_width - minimum)
+                .max(widths.x);
+            // A long code preview expands its own column, keeping short node
+            // names and the beginning of the code visible before scrolling.
+            let table_width = node_width + (viewport_width - node_width).max(widths.y);
             let header_height = 24.0;
             let (header, _) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width(), header_height),
                 egui::Sense::hover(),
             );
-            ui.painter().text(
-                header.min + egui::vec2(26.0, 4.0),
-                egui::Align2::LEFT_TOP,
-                "Node",
-                egui::FontId::proportional(14.0),
-                ui.visuals().text_color(),
-            );
-            ui.painter().text(
-                header.min + egui::vec2(node_width + 8.0, 4.0),
-                egui::Align2::LEFT_TOP,
-                "Code",
-                egui::FontId::proportional(14.0),
-                ui.visuals().text_color(),
-            );
             ui.separator();
             let row_height = 25.0;
-            egui::ScrollArea::vertical()
+            let mut content_left = header.left();
+            egui::ScrollArea::both()
                 .id_salt("rdx_search_results")
                 .auto_shrink([false, false])
                 .show_rows(ui, row_height, self.results.len(), |ui, rows| {
+                    ui.set_min_width(table_width);
+                    content_left = ui.min_rect().left();
                     for index in rows {
                         let hit = &self.results[index];
                         ui.push_id(index, |ui| {
                             let title = format!("{}:{}", hit.document.name, hit.line);
                             let (rect, response) = ui.allocate_exact_size(
-                                egui::vec2(
-                                    ui.available_width(),
-                                    row_height - ui.spacing().item_spacing.y,
-                                ),
+                                egui::vec2(table_width, row_height - ui.spacing().item_spacing.y),
                                 egui::Sense::click(),
                             );
                             if self.selected_result == Some(index) {
@@ -585,7 +613,21 @@ impl SearchWindow {
                         });
                     }
                 });
-            let divider_x = header.left() + node_width;
+            ui.painter().with_clip_rect(header).text(
+                egui::pos2(content_left + 26.0, header.top() + 4.0),
+                egui::Align2::LEFT_TOP,
+                "Node",
+                egui::FontId::proportional(14.0),
+                ui.visuals().text_color(),
+            );
+            ui.painter().with_clip_rect(header).text(
+                egui::pos2(content_left + node_width + 8.0, header.top() + 4.0),
+                egui::Align2::LEFT_TOP,
+                "Code",
+                egui::FontId::proportional(14.0),
+                ui.visuals().text_color(),
+            );
+            let divider_x = content_left + node_width;
             let divider_rect = egui::Rect::from_min_max(
                 egui::pos2(divider_x - 4.0, header.top()),
                 egui::pos2(divider_x + 4.0, ui.max_rect().bottom()),
@@ -601,10 +643,10 @@ impl SearchWindow {
             if resize.dragged()
                 && let Some(pointer) = resize.interact_pointer_pos()
             {
-                self.node_fraction = ((pointer.x - header.left())
-                    .clamp(minimum, table_width - minimum)
-                    / table_width)
-                    .clamp(0.0, 1.0);
+                self.node_fraction = ((pointer.x - content_left)
+                    .clamp(minimum, viewport_width - minimum)
+                    / viewport_width)
+                    .clamp(0.1, 0.9);
                 ui.ctx().request_repaint();
             }
             ui.painter().line_segment(
@@ -645,6 +687,7 @@ impl SearchWindow {
                 self.stale_scope = self.running;
                 self.results.clear();
                 self.preview_cache.clear();
+                self.result_widths = None;
                 self.selected_result = None;
                 self.errors.clear();
                 self.scanned = 0;
@@ -1040,6 +1083,110 @@ mod tests {
     #[test]
     fn result_shows_preview_and_opens_on_click() {
         check_result_click(false);
+    }
+
+    #[test]
+    fn long_results_scroll_horizontally_with_headers_and_remain_clickable() {
+        let ctx = egui::Context::default();
+        let preview = format!("{} target", "long_result_".repeat(12));
+        let mut window = SearchWindow {
+            visible: true,
+            keep_open: true,
+            results: vec![SearchHit {
+                document: Arc::new(SearchDocument {
+                    target: SearchTarget::Class("sample.Example".into()),
+                    name: "sample.Example".into(),
+                    source: preview.clone(),
+                    syntax: "java".into(),
+                    links: Vec::new(),
+                    source_hash: None,
+                    metadata_complete: true,
+                }),
+                start: 7,
+                end: 13,
+                line: 1,
+                kind: "code".into(),
+                preview: preview.clone(),
+                preview_match: 7..13,
+            }],
+            ..Default::default()
+        };
+        let render = |window: &mut SearchWindow, time, events| {
+            let mut actions = SearchActions::default();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 600.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| actions = window.show_contents(ctx, true),
+            );
+            (actions, output)
+        };
+        let position = |output: &egui::FullOutput, needle: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.job.text == needle => {
+                        Some(text.pos)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{needle} is painted"))
+        };
+        render(&mut window, 0.0, vec![]);
+        let (_, before) = render(&mut window, 0.1, vec![]);
+        let row = position(&before, &preview);
+        assert!(
+            row.x < 900.0,
+            "long previews keep the start of the code visible"
+        );
+        let point = egui::pos2(450.0, row.y + 6.0);
+        render(
+            &mut window,
+            0.2,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(-300.0, 0.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (_, after) = render(&mut window, 0.3, vec![]);
+        let shifted = position(&after, &preview);
+        assert!(
+            shifted.x < row.x - 20.0,
+            "horizontal wheel moves the result text"
+        );
+        let header_delta = position(&after, "Node").x - position(&before, "Node").x;
+        assert!(
+            (header_delta - (shifted.x - row.x)).abs() < 1.0,
+            "headers scroll with rows"
+        );
+        assert_eq!(
+            position(&after, "Search:"),
+            position(&before, "Search:"),
+            "search controls stay fixed"
+        );
+        assert_eq!(window.result_widths.unwrap().0, 1);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        render(&mut window, 0.4, vec![button(true)]);
+        let (actions, _) = render(&mut window, 0.5, vec![button(false)]);
+        assert_eq!(actions.open.unwrap().start, 7);
+        window.begin();
+        assert!(window.result_widths.is_none());
     }
 
     #[test]

@@ -17,8 +17,21 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "identifier_scan.rs"]
+mod scan;
+
 const MAX_INDEX_BYTES: usize = 256 * 1024 * 1024;
 const NO_POSITION: u32 = u32::MAX;
+
+#[derive(Debug)]
+struct IndexLimit;
+impl std::fmt::Display for IndexLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IDENTIFIER_INDEX_LIMIT")
+    }
+}
+impl std::error::Error for IndexLimit {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Kind {
     Class,
@@ -83,9 +96,14 @@ struct Index {
 
 /// Clones share one completed index. Opening a project creates a fresh cache.
 /// The current request builds outside the interactive engine lock; cancellation
-/// drops an incomplete build, and another waiter may retry. Failures aren't cached.
+/// drops an incomplete build, and another waiter may retry. Memory overflow
+/// remembers streaming mode; other failures aren't cached.
 #[derive(Clone, Default)]
-pub(crate) struct Cache(Arc<Mutex<Option<Arc<Index>>>>);
+pub(crate) struct Cache {
+    index: Arc<Mutex<Option<Arc<Index>>>>,
+    streaming: Arc<AtomicBool>,
+    scan_session: Arc<std::sync::OnceLock<String>>,
+}
 impl Cache {
     fn get_or_build(
         &self,
@@ -94,7 +112,7 @@ impl Cache {
     ) -> Result<(Arc<Index>, bool)> {
         let mut slot = loop {
             ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-            match self.0.try_lock() {
+            match self.index.try_lock() {
                 Ok(slot) => break slot,
                 Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(5)),
                 Err(TryLockError::Poisoned(_)) => {
@@ -119,11 +137,60 @@ impl Cache {
         args: &Value,
         cancel: &AtomicBool,
     ) -> Result<Value> {
+        self.search_with_budget(classes, args, cancel, MAX_INDEX_BYTES)
+    }
+    fn search_with_budget(
+        &self,
+        classes: Arc<BTreeMap<String, DexClass>>,
+        args: &Value,
+        cancel: &AtomicBool,
+        budget: usize,
+    ) -> Result<Value> {
         let query = Query::parse(args)?;
+        if args["search_mode"] == "scan"
+            || args.get("resume_cursor").is_some()
+            || args["projection"].as_str().is_some_and(|p| p != "full")
+            || (args["search_mode"] != "index"
+                && query.kind == "method"
+                && query.occurrence == "reference")
+        {
+            let session = self.scan_session.get_or_init(|| {
+                format!(
+                    "{:?}-{:p}",
+                    std::time::SystemTime::now(),
+                    Arc::as_ptr(&classes)
+                )
+            });
+            return scan::run(classes, args, query, cancel, session);
+        }
         let started = Instant::now();
-        let (index, cached) = self.get_or_build(cancel, || Index::build(classes, cancel))?;
+        // A scoped request never waits for or builds unrelated global postings.
+        // Once the global build exceeds its budget, remember the execution mode,
+        // not a failed result. Every subsequent query remains fully searchable.
+        let streaming = !query.package.is_empty() || self.streaming.load(Ordering::Relaxed);
+        let built = if streaming {
+            None
+        } else {
+            match self.get_or_build(cancel, || {
+                if self.streaming.load(Ordering::Relaxed) {
+                    return Err(IndexLimit.into());
+                }
+                let result = Index::build_with_budget(classes.clone(), cancel, budget);
+                if result.as_ref().is_err_and(|e| e.is::<IndexLimit>()) {
+                    self.streaming.store(true, Ordering::Relaxed);
+                }
+                result
+            }) {
+                Ok(index) => Some(index),
+                Err(error) if error.is::<IndexLimit>() => None,
+                Err(error) => return Err(error),
+            }
+        };
         let build_ms = started.elapsed().as_millis();
-        let mut result = index.search(&query, cancel)?;
+        let (mut result, cached) = match built {
+            Some((index, cached)) => (index.search(&query, cancel)?, cached),
+            None => (stream(classes, query, cancel)?, false),
+        };
         result["index_cached"] = json!(cached);
         result["index_wait_build_ms"] = json!(build_ms);
         result["elapsed_ms"] = json!(started.elapsed().as_millis());
@@ -132,6 +199,7 @@ impl Cache {
 }
 
 struct Query {
+    array_components: bool,
     matcher: Regex,
     kind: String,
     occurrence: String,
@@ -171,6 +239,13 @@ fn normalized_query(text: &str) -> String {
 }
 impl Query {
     fn parse(args: &Value) -> Result<Self> {
+        choice(args, "search_mode", "auto", &["auto", "index", "scan"])?;
+        choice(args, "projection", "full", &["full", "summary", "callers"])?;
+        ensure!(
+            args.get("resume_cursor")
+                .is_none_or(|c| c.as_str().is_some_and(|s| s.len() <= 4096)),
+            "Invalid resume_cursor"
+        );
         let query = args["query"].as_str().context("Missing query")?;
         ensure!(
             !query.is_empty() && query.len() <= 4096,
@@ -208,6 +283,7 @@ impl Query {
             .trim_end_matches('.')
             .to_owned();
         Ok(Self {
+            array_components: args["include_array_components"].as_bool().unwrap_or(false),
             matcher,
             kind: choice(
                 args,
@@ -233,26 +309,163 @@ pub(crate) fn validate(args: &Value) -> Result<()> {
     Query::parse(args).map(|_| ())
 }
 
+impl Query {
+    fn accepts_class(&self, owner: &str) -> bool {
+        self.package.is_empty()
+            || owner == self.package
+            || owner
+                .strip_prefix(&self.package)
+                .is_some_and(|s| s.starts_with('.'))
+    }
+    fn matches_symbol(&self, symbol: &Symbol) -> bool {
+        (self.kind == "all" || self.kind == symbol.kind.name())
+            && (self.matcher.is_match(&symbol.id)
+                || self.matcher.is_match(&symbol.name)
+                || (self.array_components
+                    && symbol.kind == Kind::Class
+                    && self.matcher.is_match(symbol.id.trim_end_matches("[]"))))
+    }
+    fn matches_site(&self, site: &Site) -> bool {
+        match self.occurrence.as_str() {
+            "declaration" => site.context == ContextKind::Declaration,
+            "reference" => site.context != ContextKind::Declaration,
+            _ => true,
+        }
+    }
+    fn matches(&self, symbol: &Symbol, site: &Site) -> bool {
+        self.matches_symbol(symbol) && self.matches_site(site)
+    }
+}
+
+// Retains at most one response page (1 MiB / 500 records), regardless of offset.
+// The complete scan computes the exact total and digest without retaining hits.
+struct Stream {
+    query: Query,
+    items: Vec<Value>,
+    total: usize,
+    bytes: usize,
+    full: bool,
+    digest: Sha256,
+}
+impl Stream {
+    fn record(&mut self, item: Value) -> Result<()> {
+        let encoded = serde_json::to_vec(&item)?;
+        self.digest.update(&encoded);
+        self.digest.update(b"\n");
+        if self.total >= self.query.offset && !self.full {
+            ensure!(
+                encoded.len() <= 1_000_000,
+                "Identifier record exceeds output budget"
+            );
+            if self.bytes + encoded.len() > 1_000_000 {
+                self.full = true;
+            } else {
+                self.bytes += encoded.len();
+                self.items.push(item);
+                self.full = self.items.len() == self.query.limit;
+            }
+        }
+        self.total += 1;
+        Ok(())
+    }
+}
+fn stream(
+    classes: Arc<BTreeMap<String, DexClass>>,
+    query: Query,
+    cancel: &AtomicBool,
+) -> Result<Value> {
+    let mut builder = Builder {
+        index: Index {
+            classes: classes.clone(),
+            names: vec![],
+            symbols: vec![],
+            hash: String::new(),
+            estimated_bytes: 0,
+            code_methods: 0,
+            dynamic_sites: 0,
+        },
+        ids: BTreeMap::new(),
+        operands: HashMap::new(),
+        budget: 0,
+        stream: Some(Stream {
+            query,
+            items: vec![],
+            total: 0,
+            bytes: 0,
+            full: false,
+            digest: Sha256::new(),
+        }),
+    };
+    let mut scanned = 0;
+    for (name, class) in classes.iter() {
+        ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+        if !builder.stream.as_ref().unwrap().query.accepts_class(name) {
+            continue;
+        }
+        builder.index.names.clear();
+        builder.index.names.push(name.clone());
+        builder.class(class, 0, cancel)?;
+        scanned += 1;
+    }
+    ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+    let stream = builder.stream.unwrap();
+    ensure!(
+        stream.query.offset <= stream.total,
+        "Invalid matching-occurrence offset"
+    );
+    let next = stream.query.offset + stream.items.len();
+    Ok(
+        json!({"mode":"identifiers","pagination":"hits","execution_mode":"streaming",
+        "pagination_order":"class_then_dex_occurrence","items":stream.items,"total":stream.total,
+        "offset":stream.query.offset,"offset_unit":"matching identifier occurrences",
+        "next_offset":(next<stream.total).then_some(next),"exhausted":next==stream.total,
+        "source_hash":format!("{:x}",stream.digest.finalize()),"index_hash":null,"index_complete":false,
+        "coverage_complete":true,"scanned_classes":scanned,"skipped_classes":0,
+        "out_of_scope_classes":classes.len()-scanned,"package_prefix":stream.query.package,
+        "scanned_code_methods":builder.index.code_methods,"indexed_classes":0,
+        "dynamic_instruction_sites_excluded":builder.index.dynamic_sites,
+        "scope":IDENTIFIER_SCOPE}),
+    )
+}
+
+const IDENTIFIER_SCOPE: &str = "Original DEX class/method/field declarations, superclass/interfaces, declaration types, and direct type/field/method instruction operands. Method references are declared targets, including unreachable instructions. Generated Java names, locals, comments, string literals, annotations, encoded values, catch metadata, dynamic call sites/handles/prototypes and runtime dispatch are outside this index.";
+
 struct Builder {
     index: Index,
     ids: BTreeMap<(Kind, Arc<str>), u32>,
     operands: HashMap<(usize, Kind, u32), u32>,
+    budget: usize,
+    stream: Option<Stream>,
 }
 impl Builder {
     fn charge(&mut self, bytes: usize) -> Result<()> {
+        if self.stream.is_some() {
+            return Ok(());
+        }
         self.index.estimated_bytes = self
             .index
             .estimated_bytes
             .checked_add(bytes)
             .context("Identifier index size overflow")?;
-        ensure!(
-            self.index.estimated_bytes <= MAX_INDEX_BYTES,
-            "IDENTIFIER_INDEX_LIMIT: identifier postings exceed 256 MiB; no partial index was published"
-        );
+        if self.index.estimated_bytes > self.budget {
+            return Err(IndexLimit.into());
+        }
         Ok(())
     }
     fn intern(&mut self, kind: Kind, id: String, name: String) -> Result<u32> {
         let id: Arc<str> = id.into();
+        if self.stream.is_some() {
+            // Only the current symbol exists in streaming mode; no postings or
+            // operand cache grow with the number of references or classes.
+            self.index.symbols.clear();
+            self.index.symbols.push(Symbol {
+                kind,
+                id,
+                name,
+                sites: vec![],
+            });
+            return Ok(0);
+        }
         if let Some(index) = self.ids.get(&(kind, id.clone())) {
             return Ok(*index);
         }
@@ -268,6 +481,14 @@ impl Builder {
         Ok(index)
     }
     fn add(&mut self, symbol: u32, site: Site) -> Result<()> {
+        if let Some(stream) = &mut self.stream {
+            let symbol = &self.index.symbols[symbol as usize];
+            if stream.query.matches(symbol, &site) {
+                let item = self.index.item(symbol, &site)?;
+                stream.record(item)?;
+            }
+            return Ok(());
+        }
         // Covers geometric Vec growth and allocator overhead conservatively.
         self.charge(2 * std::mem::size_of::<Site>() + 8)?;
         self.index.symbols[symbol as usize].sites.push(site);
@@ -336,8 +557,10 @@ impl Builder {
             }
         };
         let id = self.intern(kind, id, name)?;
-        self.charge(96)?;
-        self.operands.insert(key, id);
+        if self.stream.is_none() {
+            self.charge(96)?;
+            self.operands.insert(key, id);
+        }
         Ok(id)
     }
     fn class(&mut self, class: &DexClass, ci: u32, cancel: &AtomicBool) -> Result<()> {
@@ -468,7 +691,15 @@ impl Builder {
     }
 }
 impl Index {
+    #[cfg(test)]
     fn build(classes: Arc<BTreeMap<String, DexClass>>, cancel: &AtomicBool) -> Result<Self> {
+        Self::build_with_budget(classes, cancel, MAX_INDEX_BYTES)
+    }
+    fn build_with_budget(
+        classes: Arc<BTreeMap<String, DexClass>>,
+        cancel: &AtomicBool,
+        budget: usize,
+    ) -> Result<Self> {
         let mut builder = Builder {
             index: Self {
                 classes: classes.clone(),
@@ -481,6 +712,8 @@ impl Index {
             },
             ids: BTreeMap::new(),
             operands: HashMap::new(),
+            budget,
+            stream: None,
         };
         for (ci, (name, class)) in classes.iter().enumerate() {
             ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
@@ -569,28 +802,15 @@ impl Index {
         let mut full = false;
         for symbol in &self.symbols {
             ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-            if query.kind != "all" && query.kind != symbol.kind.name() {
-                continue;
-            }
-            if !query.matcher.is_match(&symbol.id) && !query.matcher.is_match(&symbol.name) {
+            if !query.matches_symbol(symbol) {
                 continue;
             }
             for (i, site) in symbol.sites.iter().enumerate() {
                 if i % 256 == 0 {
                     ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
                 }
-                let declaration = site.context == ContextKind::Declaration;
-                if (query.occurrence == "declaration" && !declaration)
-                    || (query.occurrence == "reference" && declaration)
-                {
-                    continue;
-                }
-                let owner = &self.names[site.class as usize];
-                if !query.package.is_empty()
-                    && owner != &query.package
-                    && !owner
-                        .strip_prefix(&query.package)
-                        .is_some_and(|s| s.starts_with('.'))
+                if !query.matches_site(site)
+                    || !query.accepts_class(&self.names[site.class as usize])
                 {
                     continue;
                 }
@@ -615,9 +835,10 @@ impl Index {
         Ok(
             json!({"mode":"identifiers","pagination":"hits","items":items,"total":total,"offset":query.offset,
             "offset_unit":"matching identifier occurrences","next_offset":(next<total).then_some(next),"exhausted":next==total,
+            "execution_mode":"index","pagination_order":"symbol_then_occurrence","coverage_complete":true,"skipped_classes":0,
             "index_complete":true,"index_hash":self.hash,"indexed_classes":self.names.len(),"indexed_code_methods":self.code_methods,
             "indexed_symbols":self.symbols.len(),"index_estimated_bytes":self.estimated_bytes,"dynamic_instruction_sites_excluded":self.dynamic_sites,
-            "scope":"Original DEX class/method/field declarations, superclass/interfaces, declaration types, and direct type/field/method instruction operands. Method references are declared targets, including unreachable instructions. Generated Java names, locals, comments, string literals, annotations, encoded values, catch metadata, dynamic call sites/handles/prototypes and runtime dispatch are outside this index."}),
+            "scope":IDENTIFIER_SCOPE}),
         )
     }
 }
@@ -670,7 +891,7 @@ mod tests {
         class.symbols = Arc::new(symbols);
         class
     }
-    fn classes() -> Arc<BTreeMap<String, DexClass>> {
+    pub(super) fn classes() -> Arc<BTreeMap<String, DexClass>> {
         Arc::new(BTreeMap::from([
             (
                 "app.One".into(),
@@ -687,6 +908,217 @@ mod tests {
             .search(&Query::parse(&args).unwrap(), &AtomicBool::new(false))
             .unwrap()
     }
+    #[test]
+    fn scoped_search_bypasses_global_budget_and_unrelated_invalid_dex() {
+        let mut map = Arc::try_unwrap(classes()).ok().unwrap();
+        map.get_mut("other.Two").unwrap().methods[0]
+            .code
+            .as_mut()
+            .unwrap()
+            .instructions = vec![0x1071, 0];
+        let cache = Cache::default();
+        let cancel = AtomicBool::new(false);
+        // Even a zero-byte global budget and malformed unrelated code cannot
+        // block a scoped request. External targets referenced inside it remain.
+        let page = cache
+            .search_with_budget(
+                Arc::new(map),
+                &json!({"query":"parseUri","package_prefix":"app"}),
+                &cancel,
+                0,
+            )
+            .unwrap();
+        assert_eq!(page["total"], 1);
+        assert_eq!(
+            page["items"][0]["symbol_id"],
+            "framework.Api.parseUri(Ljava/lang/String;)V"
+        );
+        assert_eq!(page["coverage_complete"], true);
+        assert_eq!(page["index_complete"], false);
+        assert_eq!(page["scanned_classes"], 1);
+        assert_eq!(page["out_of_scope_classes"], 1);
+        assert_eq!(page["skipped_classes"], 0);
+        assert!(cache.index.lock().unwrap().is_none());
+        assert!(!cache.streaming.load(Ordering::Relaxed));
+        let empty = cache
+            .search_with_budget(
+                classes(),
+                &json!({"query":"parse","package_prefix":"ap"}),
+                &cancel,
+                0,
+            )
+            .unwrap();
+        assert_eq!(empty["total"], 0);
+        assert_eq!(empty["scanned_classes"], 0);
+    }
+
+    #[test]
+    fn overflow_streams_complete_stable_pages_and_does_not_retry_global_build() {
+        let cache = Cache::default();
+        let cancel = AtomicBool::new(false);
+        let args = json!({"query":"String","symbol_kind":"class"});
+        let all = cache
+            .search_with_budget(classes(), &args, &cancel, 1)
+            .unwrap();
+        assert_eq!(all["total"], 4);
+        assert_eq!(all["execution_mode"], "streaming");
+        assert_eq!(all["coverage_complete"], true);
+        assert_eq!(all["scanned_classes"], 2);
+        assert!(cache.streaming.load(Ordering::Relaxed));
+        let mut items = vec![];
+        for offset in 0..4 {
+            let page = cache
+                .search_with_budget(
+                    classes(),
+                    &json!({"query":"String","symbol_kind":"class","limit":1,"offset":offset}),
+                    &cancel,
+                    usize::MAX,
+                )
+                .unwrap();
+            assert_eq!(page["execution_mode"], "streaming");
+            assert_eq!(page["source_hash"], all["source_hash"]);
+            assert_eq!(page["total"], 4);
+            items.extend(page["items"].as_array().unwrap().iter().cloned());
+        }
+        assert_eq!(items, all["items"].as_array().unwrap().clone());
+        assert!(cache.index.lock().unwrap().is_none());
+        let terminal = cache
+            .search_with_budget(
+                classes(),
+                &json!({"query":"String","symbol_kind":"class","offset":4}),
+                &cancel,
+                1,
+            )
+            .unwrap();
+        assert_eq!(terminal["items"], json!([]));
+        assert_eq!(terminal["exhausted"], true);
+        assert!(terminal["next_offset"].is_null());
+        assert!(
+            cache
+                .search_with_budget(
+                    classes(),
+                    &json!({"query":"String","symbol_kind":"class","offset":5}),
+                    &cancel,
+                    1
+                )
+                .is_err()
+        );
+        let fresh = Cache::default()
+            .search_with_budget(classes(), &args, &cancel, usize::MAX)
+            .unwrap();
+        assert_eq!(fresh["execution_mode"], "index");
+    }
+
+    #[test]
+    fn streaming_and_index_have_identical_occurrences_for_all_filters() {
+        let index = Index::build(classes(), &AtomicBool::new(false)).unwrap();
+        for args in [
+            json!({"query":".","occurrence":"all"}),
+            json!({"query":"run","occurrence":"declaration"}),
+            json!({"query":"parse","occurrence":"reference"}),
+            json!({"query":"value","symbol_kind":"field"}),
+            json!({"query":"String","symbol_kind":"class"}),
+            json!({"query":"parseuri","case_sensitive":false}),
+            json!({"query":"Lframework/Api;->parseUri(Ljava/lang/String;)V","match_mode":"exact"}),
+            json!({"query":"parse","package_prefix":"app."}),
+            json!({"query":"unusedApi"}),
+        ] {
+            let expected = search(&index, args.clone());
+            let actual = stream(
+                classes(),
+                Query::parse(&args).unwrap(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let sorted = |v: &Value| {
+                let mut items: Vec<_> = v["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| serde_json::to_string(i).unwrap())
+                    .collect();
+                items.sort();
+                items
+            };
+            assert_eq!(sorted(&actual), sorted(&expected), "{args}");
+            assert_eq!(actual["total"], expected["total"]);
+        }
+    }
+
+    #[test]
+    fn scoped_queries_do_not_wait_for_a_global_build() {
+        let cache = Cache::default();
+        let _building = cache.index.lock().unwrap();
+        let result = cache
+            .search(
+                classes(),
+                &json!({"query":"parse","package_prefix":"app"}),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(result["total"], 1);
+    }
+
+    #[test]
+    fn streaming_rejects_late_malformed_input_even_after_page_is_full() {
+        let mut map = Arc::try_unwrap(classes()).ok().unwrap();
+        map.get_mut("other.Two").unwrap().methods[0]
+            .code
+            .as_mut()
+            .unwrap()
+            .instructions = vec![0x1071, 0];
+        let result = Cache::default().search_with_budget(
+            Arc::new(map),
+            &json!({"query":"parseUri","limit":1}),
+            &AtomicBool::new(false),
+            1,
+        );
+        assert!(result.unwrap_err().to_string().contains("other.Two"));
+    }
+
+    #[test]
+    fn streaming_cancellation_and_invalid_scoped_code_are_errors() {
+        let cache = Cache::default();
+        assert!(
+            cache
+                .search(
+                    classes(),
+                    &json!({"query":"parse","package_prefix":"app"}),
+                    &AtomicBool::new(true)
+                )
+                .is_err()
+        );
+        let mut map = Arc::try_unwrap(classes()).ok().unwrap();
+        map.get_mut("app.One").unwrap().methods[0]
+            .code
+            .as_mut()
+            .unwrap()
+            .instructions = vec![0x1071, 0];
+        assert!(
+            cache
+                .search(
+                    Arc::new(map),
+                    &json!({"query":"parse","package_prefix":"app"}),
+                    &AtomicBool::new(false)
+                )
+                .is_err()
+        );
+        assert!(cache.index.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn streaming_page_memory_does_not_grow_with_hit_count_or_offset() {
+        let mut class = fixture("app.One", "classes.dex", "parseUri");
+        class.methods[0].code.as_mut().unwrap().instructions = [0x1071, 0, 0].repeat(20_000);
+        let map = Arc::new(BTreeMap::from([("app.One".into(), class)]));
+        let args = json!({"query":"parseUri","package_prefix":"app","offset":19_998,"limit":1});
+        let page = stream(map, Query::parse(&args).unwrap(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(page["total"], 20_000);
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["items"][0]["code_unit_offset"], 19_998 * 3);
+        assert_eq!(page["next_offset"], 19_999);
+    }
+
     #[test]
     fn dex_local_operands_exact_names_case_and_smali_aliases_are_correct() {
         let index = Index::build(classes(), &AtomicBool::new(false)).unwrap();
@@ -785,13 +1217,13 @@ mod tests {
                 .get_or_build(&cancel, || anyhow::bail!("broken input"))
                 .is_err()
         );
-        assert!(cache.0.lock().unwrap().is_none());
+        assert!(cache.index.lock().unwrap().is_none());
         assert!(
             cache
                 .get_or_build(&cancel, || panic!("builder panic"))
                 .is_err()
         );
-        assert!(cache.0.lock().unwrap().is_none());
+        assert!(cache.index.lock().unwrap().is_none());
         assert!(
             cache
                 .get_or_build(&cancel, || {
@@ -801,7 +1233,7 @@ mod tests {
                 })
                 .is_err()
         );
-        assert!(cache.0.lock().unwrap().is_none());
+        assert!(cache.index.lock().unwrap().is_none());
         cancel.store(false, Ordering::Relaxed);
         let (first, hit) = cache
             .get_or_build(&cancel, || Index::build(classes(), &cancel))
@@ -816,7 +1248,7 @@ mod tests {
     #[test]
     fn waiting_for_index_is_cancellable_and_invalid_requests_do_not_build() {
         let cache = Cache::default();
-        let guard = cache.0.lock().unwrap();
+        let guard = cache.index.lock().unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let worker_cache = cache.clone();
@@ -842,7 +1274,7 @@ mod tests {
                     .search(classes(), &args, &AtomicBool::new(false))
                     .is_err()
             );
-            assert!(cache.0.lock().unwrap().is_none());
+            assert!(cache.index.lock().unwrap().is_none());
         }
     }
     #[test]
@@ -884,7 +1316,7 @@ mod tests {
                     .search(map, &json!({"query":"parseUri"}), &AtomicBool::new(false))
                     .is_err()
             );
-            assert!(cache.0.lock().unwrap().is_none());
+            assert!(cache.index.lock().unwrap().is_none());
         }
         assert!(Index::build(classes(), &AtomicBool::new(true)).is_err());
     }

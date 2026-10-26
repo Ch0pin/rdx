@@ -40,7 +40,7 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     assert_eq!(replies[0]["error"]["code"], -32600);
     assert_eq!(replies[1]["result"]["protocolVersion"], "2025-06-18");
     let tools = replies[2]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 30);
+    assert_eq!(tools.len(), 45);
     let schema = |name: &str| {
         &tools
             .iter()
@@ -48,6 +48,33 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
             .unwrap_or_else(|| panic!("{name} must be advertised over stdio"))["inputSchema"]
     };
     let health = schema("get_health");
+    let batch = schema("get_call_graph_batch");
+    assert_eq!(batch["properties"]["method_ids"]["maxItems"], 16);
+    assert!(
+        batch["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("method_ids"))
+    );
+    for name in ["get_call_graph", "get_call_graph_batch"] {
+        assert_eq!(
+            schema(name)["properties"]["include_source_locations"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            schema(name)["properties"]["include_forwarders"]["type"],
+            "boolean"
+        );
+    }
+    let reference = schema("resolve_reference");
+    assert!(
+        reference["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("source_hash"))
+    );
+    assert_eq!(reference["properties"]["source_offset"]["minimum"], 0);
+    assert_eq!(reference["properties"]["line"]["minimum"], 1);
     let search = schema("search_code");
     assert_eq!(
         search["properties"]["mode"]["enum"],
@@ -74,7 +101,7 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
 
     assert_eq!(
         schema("find_instantiations")["anyOf"],
-        json!([{"required":["class_id"]},{"required":["class_name"]}])
+        json!([{"required":["class_id"]},{"required":["class_name"]},{"required":["allocating_class"]},{"required":["allocating_method_id"]}])
     );
     assert_eq!(
         schema("find_instantiations")["properties"]["limit"]["maximum"],
@@ -105,7 +132,7 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         json!(["all", "read", "write"])
     );
     let method_source = schema("get_method_source");
-    for key in ["method_id", "instance_id", "project_id"] {
+    for key in ["instance_id", "project_id"] {
         assert!(
             method_source["required"]
                 .as_array()
@@ -113,6 +140,38 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
                 .contains(&json!(key))
         );
     }
+    assert_eq!(
+        method_source["anyOf"],
+        json!([{"required":["method_id"]},{"required":["class_name","method_name"]}])
+    );
+    assert_eq!(
+        schema("find_field_references")["anyOf"],
+        json!([{"required":["field_id"]},{"required":["class_name","field_name"]}])
+    );
+    assert_eq!(
+        schema("find_annotation_usages")["properties"]["element"]["enum"],
+        json!(["all", "class", "field", "method", "parameter"])
+    );
+    assert_eq!(
+        schema("get_resource_value")["anyOf"],
+        json!([{"required":["resource_id"]},{"required":["resource_name"]}])
+    );
+    assert_eq!(
+        schema("search_resources")["properties"]["query"]["type"],
+        "string"
+    );
+    assert_eq!(
+        schema("export_source")["properties"]["out_path"]["type"],
+        "string"
+    );
+    assert_eq!(
+        schema("find_string_references")["properties"]["search_mode"]["enum"],
+        json!(["auto", "streaming"])
+    );
+    assert_eq!(
+        schema("get_call_graph")["properties"]["include_const_args"]["type"],
+        "boolean"
+    );
     assert_eq!(method_source["properties"]["limit"]["maximum"], 128000);
     assert_eq!(method_source["properties"]["offset"]["minimum"], 0);
     assert_eq!(

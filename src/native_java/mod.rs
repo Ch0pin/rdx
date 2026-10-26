@@ -361,38 +361,67 @@ fn render_method_inner(
                                 // Preserve established precise rethrows first. A
                                 // final source-only retry changes only certified
                                 // throw actions and keeps the original header.
-                                let Ok(body) = method::reconstruct_caught_source(
+                                match method::reconstruct_caught_source(
                                     name,
                                     class,
                                     method,
                                     failure.site.throw_pc,
-                                ) else {
+                                ) {
+                                    Ok(body) => body,
+                                    Err(_) => {
+                                        return Err(baseline_error);
+                                    }
+                                }
+                            }
+                        } else if let Some(failure) =
+                            baseline_error.downcast_ref::<method::CaughtSourceFailure>()
+                            && allow_caught_source_retry
+                        {
+                            match method::reconstruct_caught_source(
+                                name,
+                                class,
+                                method,
+                                failure.throw_pc,
+                            ) {
+                                Ok(body) => body,
+                                Err(_) => {
                                     return Err(baseline_error);
-                                };
-                                body
+                                }
                             }
                         } else if let Some(failure) = baseline_error
                             .downcast_ref::<method::StaticSneakyRethrowFailure>()
                             .cloned()
                         {
-                            let Ok(proof) = static_sneaky_rethrow::prove(class, method, &failure)
-                            else {
-                                return Err(baseline_error);
-                            };
-                            let Ok(body) = method::reconstruct_static_sneaky_rethrow(
-                                name,
-                                class,
-                                method,
-                                &proof.authorization,
-                            ) else {
-                                return Err(baseline_error);
-                            };
-                            ensure!(
-                                body.inferred_throws.is_empty(),
-                                "static sneaky-rethrow retry cannot infer another declaration"
-                            );
-                            static_sneaky_type_parameter = Some(proof.type_parameter);
-                            body
+                            if allow_caught_source_retry
+                                && let Ok(body) = method::reconstruct_caught_source(
+                                    name,
+                                    class,
+                                    method,
+                                    failure.site.throw_pc,
+                                )
+                            {
+                                body
+                            } else {
+                                let Ok(proof) =
+                                    static_sneaky_rethrow::prove(class, method, &failure)
+                                else {
+                                    return Err(baseline_error);
+                                };
+                                let Ok(body) = method::reconstruct_static_sneaky_rethrow(
+                                    name,
+                                    class,
+                                    method,
+                                    &proof.authorization,
+                                ) else {
+                                    return Err(baseline_error);
+                                };
+                                ensure!(
+                                    body.inferred_throws.is_empty(),
+                                    "static sneaky-rethrow retry cannot infer another declaration"
+                                );
+                                static_sneaky_type_parameter = Some(proof.type_parameter);
+                                body
+                            }
                         } else {
                             return Err(baseline_error);
                         }
@@ -1151,12 +1180,21 @@ fn class_prefix(name: &str, class: &DexClass) -> Result<Output> {
             let display = java_type(&class.descriptor)?;
             let short = display.rsplit('.').next().unwrap_or(&display);
             let signature = format!("{name}.<init>({})V", constructor.parameters.join(""));
-            out.push(
-                "\n    // Reconstructed forwarding constructor removed by DEX optimization.\n    ",
-            );
+            out.push(if constructor.source_bridge {
+                "\n    // Source-only initializer bridge; this overload is absent from DEX.\n    "
+            } else {
+                "\n    // Reconstructed forwarding constructor removed by DEX optimization.\n    "
+            });
             out.push(access(constructor.access_flags)?);
-            out.definition(short, "<init>", &signature, "method");
+            if constructor.source_bridge {
+                out.push(short);
+            } else {
+                out.definition(short, "<init>", &signature, "method");
+            }
             out.push("(");
+            if constructor.source_bridge {
+                out.push("java.lang.Void _rdxInitializer");
+            }
             for (index, ty) in constructor.parameters.iter().enumerate() {
                 if index != 0 {
                     out.push(", ");
@@ -1300,7 +1338,7 @@ pub fn render(name: &str, class: &DexClass) -> Result<DecompiledCode> {
     for helper in super_bridge::definitions(class) {
         out.push(&helper);
     }
-    for helper in checked_call_bridge::definitions(class) {
+    for helper in checked_call_bridge::definitions(class, &out.text) {
         out.push(&helper);
     }
     for helper in explicit_checked_throw::definitions(class) {
@@ -1432,7 +1470,7 @@ fn render_mixed_controlled_reported(
             for helper in super_bridge::definitions(class) {
                 out.push(&helper);
             }
-            for helper in checked_call_bridge::definitions(class) {
+            for helper in checked_call_bridge::definitions(class, &out.text) {
                 out.push(&helper);
             }
             for helper in explicit_checked_throw::definitions(class) {
@@ -1663,7 +1701,7 @@ fn upgrade_methods_controlled(
         for helper in super_bridge::definitions(class) {
             out.push(&helper);
         }
-        for helper in checked_call_bridge::definitions(class) {
+        for helper in checked_call_bridge::definitions(class, &out.text) {
             out.push(&helper);
         }
         for helper in explicit_checked_throw::definitions(class) {

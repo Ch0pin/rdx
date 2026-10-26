@@ -1108,6 +1108,7 @@ pub(super) fn commit(
         result.entry(owner).or_default().insert(
             String::new(),
             RecoveredConstructor {
+                source_bridge: false,
                 access_flags: candidate.access_flags,
                 parent: candidate.parent.clone(),
                 invoked_owner: candidate.parent,

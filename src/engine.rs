@@ -155,6 +155,7 @@ pub struct NativeEngine {
     resource_error: Option<String>,
     usage_index: Option<crate::usage_index::UsageIndexHandle>,
     identifier_index: crate::identifier_search::Cache,
+    pub(crate) invoke_index: crate::call_graph::QueryCache,
 }
 
 /// A deterministic identity for locally generated source, not a security digest.
@@ -182,6 +183,7 @@ impl NativeEngine {
         self.native = NativeDexEngine::default();
         self.source_cache = Default::default();
         self.identifier_index = Default::default();
+        self.invoke_index = Default::default();
         self.classes = Default::default();
         self.resources = Default::default();
         self.resource_error = None;
@@ -295,8 +297,28 @@ impl NativeEngine {
         self.native.references_supertype(name)
     }
 
+    pub fn references_type(&self, name: &str) -> bool {
+        let descriptor = format!("L{};", name.replace('.', "/"));
+        let mut seen = std::collections::HashSet::new();
+        self.native.shared_classes().values().any(|class| {
+            seen.insert(std::sync::Arc::as_ptr(&class.symbols) as usize)
+                && class
+                    .symbols
+                    .types
+                    .iter()
+                    .any(|ty| ty.as_ref() == descriptor)
+        })
+    }
+
     pub fn direct_subclass_names(&self, name: &str) -> Vec<String> {
         self.native.direct_subclasses(name)
+    }
+    pub(crate) fn resource_reader(&self) -> Result<crate::package_container::ResourceReader<'_>> {
+        Ok(self
+            .prepared
+            .as_ref()
+            .context("Open an APK first")?
+            .resource_reader())
     }
     fn resource_bytes(&self, name: &str) -> Result<Vec<u8>> {
         self.prepared
@@ -312,7 +334,23 @@ impl NativeEngine {
     }
     pub fn read_resource_with_metadata(&mut self, name: &str) -> Result<DecompiledCode> {
         let bytes = self.resource_bytes(name)?;
-        let (source, references) = crate::native_resources::decode_with_references(&bytes)?;
+        if !name.ends_with(".xml") && !bytes.starts_with(&[3, 0, 8, 0]) {
+            let source = archive_text(&bytes)?.to_owned();
+            return Ok(DecompiledCode {
+                source_hash: source_identity(&source),
+                source,
+                links: vec![],
+                definitions: vec![],
+            });
+        }
+        let (source, references) =
+            crate::native_resources::decode_with_attribute_resolver(&bytes, &|id| {
+                self.resources
+                    .entries
+                    .get(&id)
+                    .filter(|r| r.kind == "attr")
+                    .map(|r| r.name.as_str())
+            })?;
         let mut code = DecompiledCode {
             source_hash: source_identity(&source),
             source,
@@ -773,7 +811,7 @@ impl NativeEngine {
         args: &serde_json::Value,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<serde_json::Value> {
-        crate::call_graph::query(&self.native, method, args, cancel)
+        crate::call_graph::query_cached(&self.native, method, args, cancel, &self.invoke_index)
     }
 
     pub fn call_graph_at(
@@ -970,7 +1008,7 @@ impl NativeEngine {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<String>> {
         ensure!(
-            self.native.class(class).is_some() || self.native.references_supertype(class),
+            self.native.class(class).is_some() || self.references_type(class),
             "SYMBOL_NOT_FOUND: no loaded definition or app-declared superclass/interface edge; framework definitions may be absent from the APK; use an exact referenced FQCN or DEX descriptor"
         );
         self.native.implementations(class, None, cancel)
@@ -1039,7 +1077,17 @@ impl DecompilerEngine for NativeEngine {
         Ok(self.decompile_with_metadata(class)?.source)
     }
     fn read_resource(&mut self, name: &str) -> Result<String> {
-        crate::native_resources::decode(&self.resource_bytes(name)?)
+        Ok(crate::native_resources::decode_with_attribute_resolver(
+            &self.resource_bytes(name)?,
+            &|id| {
+                self.resources
+                    .entries
+                    .get(&id)
+                    .filter(|r| r.kind == "attr")
+                    .map(|r| r.name.as_str())
+            },
+        )?
+        .0)
     }
 }
 
@@ -1444,6 +1492,12 @@ mod navigation_cache_tests {
     #[test]
     fn reopening_detaches_project_cache_even_when_open_fails() {
         let mut engine = opened();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let args = serde_json::json!({"direction":"callers","projection":"call_sites"});
+        engine
+            .call_graph_query_by_id("sample.Target.doubleValue(I)I", &args, &cancel)
+            .unwrap();
+        assert_eq!(engine.invoke_index.status()["state"], "ready");
         engine.decompile_with_metadata("sample.Target").unwrap();
         let original = engine.source_cache.get("sample.Target").unwrap();
         let mut clone = engine.clone();
@@ -1457,6 +1511,13 @@ mod navigation_cache_tests {
                 .is_err()
         );
         assert!(engine.source_cache.get("sample.Target").is_none());
+        assert_eq!(engine.invoke_index.status()["state"], "not_built");
+        assert_eq!(
+            clone
+                .call_graph_query_by_id("sample.Target.doubleValue(I)I", &args, &cancel)
+                .unwrap()["invoke_index_cached"],
+            true
+        );
         assert!(engine.decompile_with_metadata("sample.Target").is_err());
         assert!(clone.decompile_with_metadata("sample.Target").is_ok());
         engine
@@ -1468,4 +1529,16 @@ mod navigation_cache_tests {
             &engine.source_cache.get("sample.Target").unwrap()
         ));
     }
+}
+
+/// UTF-8 asset text only: do not turn binary data into misleading source.
+pub(crate) fn archive_text(bytes: &[u8]) -> Result<&str> {
+    let text = std::str::from_utf8(bytes).context("BINARY_RESOURCE: resource is not UTF-8 text")?;
+    anyhow::ensure!(
+        !text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')),
+        "BINARY_RESOURCE: resource contains binary control characters"
+    );
+    Ok(text)
 }

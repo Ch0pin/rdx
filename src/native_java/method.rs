@@ -146,6 +146,22 @@ impl std::fmt::Display for PreciseRethrowFailure {
 }
 impl std::error::Error for PreciseRethrowFailure {}
 
+#[derive(Debug)]
+pub(super) struct CaughtSourceFailure {
+    pub throw_pc: usize,
+    pub effect: String,
+}
+impl std::fmt::Display for CaughtSourceFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Precise rethrow requires the protected checked exception contract: {}",
+            self.effect
+        )
+    }
+}
+impl std::error::Error for CaughtSourceFailure {}
+
 #[derive(Debug, Clone)]
 pub(super) struct SameObjectRethrowAuthorization {
     pub site: PreciseRethrowSite,
@@ -2029,7 +2045,7 @@ fn register(registers: &[Option<Value>], r: usize) -> Result<Value> {
     let value = registers
         .get(r)
         .and_then(Clone::clone)
-        .context("undefined register")?;
+        .with_context(|| format!("undefined register v{r}"))?;
     ensure!(
         value.text != "<masked-constructor-this>",
         "masked constructor receiver read"
@@ -2722,6 +2738,29 @@ fn apply_loop_literal_types(
 
     for (r, slot) in regs.iter_mut().enumerate() {
         let Some(value) = slot else { continue };
+        // A 0/1 entry diamond may have been expressed as a Java boolean, even
+        // though the loop carries an integer counter. Use the exact SSA phi
+        // type before allocating its mutable source slot.
+        if value.ty == "Z" && written.get(r) == Some(&true) && graph.live_at(start, r) {
+            let mut phis = ssa.phis.iter().filter(|phi| {
+                usize::from(phi.register) == r && ssa.graph.blocks[phi.block].start == start
+            });
+            if let Some(phi) = phis.next()
+                && phis.next().is_none()
+                && let Some(inferred) = types.values.get(phi.result)
+                && !inferred.bounds_truncated
+                && matches!(&inferred.resolution, TypeResolution::Resolved(ty) if ty.as_ref() == "I")
+            {
+                *value = Value {
+                    text: argument(value, "I")?,
+                    ty: "I".into(),
+                    literal: None,
+                    wide_literal: None,
+                    raw_bits32: false,
+                };
+                continue;
+            }
+        }
         if value.ty == "J"
             && written.get(r) == Some(&true)
             && graph.live_at(start, r)
@@ -2866,6 +2905,16 @@ struct Loop {
     tail: Option<usize>,
 }
 impl Loop {
+    // A conditional latch can fall through to a bare return before the
+    // forward guard's exit. Earlier body branches may share that return.
+    fn post_latch_return(&self, target: usize, widths: &[usize], words: &[u16]) -> bool {
+        target > self.latch
+            && target < self.exit
+            && widths.get(target) == Some(&1)
+            && words
+                .get(target)
+                .is_some_and(|w| matches!(*w as u8, 0x0e..=0x11))
+    }
     fn body_end(&self, widths: &[usize]) -> usize {
         if self.tail.is_some() {
             self.exit
@@ -4600,6 +4649,7 @@ struct Graph {
     constructor_throw_tails: Vec<constructor_throw_tails::Plan>,
     initializer_exits: Option<super::initializer_exits::Plan>,
     caught_source_site: Option<usize>,
+    caught_source_certificate: Option<(String, std::collections::BTreeSet<usize>)>,
     caught_source_uses: std::cell::RefCell<std::collections::BTreeSet<usize>>,
     terminal_child: Option<terminal_child_loop::TerminalChildPlan>,
     parent_prefix: Option<parent_prefix_fusion::PrefixPlan>,
@@ -4936,6 +4986,21 @@ impl Graph {
         pc: usize,
         argument_index: Option<usize>,
     ) -> bool {
+        self.proven_reference_call_inputs(class, method, &[(pc, argument_index)])
+    }
+
+    fn proven_reference_call_inputs(
+        &self,
+        class: &DexClass,
+        method: &DexMethod,
+        inputs: &[(usize, Option<usize>)],
+    ) -> bool {
+        if inputs.is_empty() {
+            return true;
+        }
+        if inputs.len() > 256 {
+            return false;
+        }
         if self.parent_prefix.is_some()
             || method
                 .code
@@ -4952,10 +5017,6 @@ impl Graph {
                     .iteration
                     .as_ref()
                     .is_some_and(|iteration| !iteration.allocation_islands.is_empty())
-                || plan
-                    .copies
-                    .iter()
-                    .any(|copy| copy.instructions.contains(&pc))
             {
                 return false;
             }
@@ -5006,18 +5067,22 @@ impl Graph {
                 return false;
             };
             return analysis.types.wide_pair_issues == 0
-                && positive_reference_call_input(
-                    class,
-                    &analysis.calls,
-                    &analysis.types,
-                    pc,
-                    argument_index,
-                );
+                && inputs.iter().all(|&(pc, index)| {
+                    positive_reference_call_input(
+                        class,
+                        &analysis.calls,
+                        &analysis.types,
+                        pc,
+                        index,
+                    )
+                });
         }
         let Some(analysis) = self.loop_type_analysis(class, method) else {
             return false;
         };
-        positive_reference_call_input(class, &analysis.calls, &analysis.types, pc, argument_index)
+        inputs.iter().all(|&(pc, index)| {
+            positive_reference_call_input(class, &analysis.calls, &analysis.types, pc, index)
+        })
     }
 
     fn single_use_call_result(
@@ -5386,6 +5451,7 @@ impl Graph {
             constructor_throw_tails: Vec::new(),
             initializer_exits: None,
             caught_source_site: None,
+            caught_source_certificate: None,
             caught_source_uses: Default::default(),
             terminal_child: None,
             parent_prefix: None,
@@ -5856,6 +5922,32 @@ impl Graph {
                     && loop_entry_copy::validate(code, plan),
                 "entry-copy canonical proof differs"
             );
+            if plan.iteration.is_none()
+                && plan.copies.iter().any(|copy| {
+                    copy.instructions
+                        .iter()
+                        .any(|pc| code.instructions[*pc] as u8 == 0x22)
+                })
+            {
+                let analysis = crate::native_method::MethodAnalysis::build(class, method)?;
+                let constructors = analysis.constructors()?;
+                for copy in &plan.copies {
+                    for &allocation in copy
+                        .instructions
+                        .iter()
+                        .filter(|pc| code.instructions[**pc] as u8 == 0x22)
+                    {
+                        let bindings:Vec<_>=constructors.bindings.iter().filter(|b|matches!(&b.origin,
+                            crate::native_constructors::ConstructorOrigin::Allocation{pc,..} if *pc==allocation)).collect();
+                        ensure!(
+                            bindings.len() == 1
+                                && !bindings[0].owner_retarget_required
+                                && copy.instructions.contains(&bindings[0].invoke_pc),
+                            "copied allocation lacks a unique owned initializer"
+                        );
+                    }
+                }
+            }
             if let Some(iteration) = &plan.iteration
                 && !iteration.allocation_islands.is_empty()
             {
@@ -5916,7 +6008,7 @@ impl Graph {
             ensure!(
                 self.widths == expected_widths
                     && self.payloads.len() == code.instructions.len()
-                    && self.payloads.iter().all(|payload| !payload)
+                    && plan.widths.iter().all(|(pc, _)| !self.payloads[*pc])
                     && self.targets == expected_targets
                     && matching.next().is_none()
                     && region.guard
@@ -6342,7 +6434,10 @@ impl Graph {
         }
         if let Some(plan) = entry_copy {
             ensure!(
-                handlers.is_empty() && graph.switches.iter().all(Option::is_none),
+                handlers.is_empty()
+                    && graph.switches.iter().enumerate().all(|(pc, s)| s.is_none()
+                        || (!plan.scc_members.contains(&pc)
+                            && !plan.copies.iter().any(|c| c.instructions.contains(&pc)))),
                 "loop entry copy crosses protected or switch ownership"
             );
             graph.loop_entry_copy = Some(plan);
@@ -6728,6 +6823,7 @@ impl Graph {
                     // A shared bare return after the loop is a method exit,
                     // not a second loop continuation. It can be emitted in place.
                     if to == exit
+                        || region.post_latch_return(to, &graph.widths, words)
                         || (!(start..body_end).contains(&to)
                             && graph.non_reentering_tail(to, start..body_end, words)?)
                         || exact_code.is_some_and(|code| {
@@ -7230,6 +7326,36 @@ impl Graph {
         }
         Ok(reaches_header.then(|| path.into_iter().collect()))
     }
+    /// Ordinary entry reachability, without structural loop shortcuts or exception edges.
+    fn ordinary_reachable(&self, words: &[u16]) -> Result<Vec<bool>> {
+        let mut seen = vec![false; words.len()];
+        let mut work = vec![0];
+        while let Some(pc) = work.pop() {
+            self.tick()?;
+            ensure!(
+                pc < words.len() && self.widths[pc] != 0 && !self.payloads[pc],
+                "Invalid ordinary CFG edge"
+            );
+            if std::mem::replace(&mut seen[pc], true) {
+                continue;
+            }
+            let op = words[pc] as u8;
+            if matches!(op, 0x0e..=0x11 | 0x27) {
+                continue;
+            }
+            if let Some(switch) = &self.switches[pc] {
+                work.extend(switch.cases.iter().map(|(_, target)| *target));
+            }
+            if let Some(target) = self.targets[pc] {
+                work.push(target);
+            }
+            if !matches!(op, 0x28..=0x2a) {
+                work.push(pc + self.widths[pc]);
+            }
+        }
+        Ok(seen)
+    }
+
     // A shared escape region may physically precede the loop and may contain
     // later independent loops. Follow every normal CFG edge to prove no reentry.
     // Paths may terminate or remain in a separately validated loop; this does
@@ -7312,6 +7438,68 @@ impl Graph {
         }
         Ok(true)
     }
+    // A detached handler can enter a suffix of another protected interval.
+    // Follow both ordinary and exceptional edges, including that interval's
+    // handlers, before permitting the real renderer to structure the suffix.
+    fn non_reentering_exception_tail(
+        &self,
+        code: &crate::native_dex::DexCode,
+        start: usize,
+        excluded: std::ops::Range<usize>,
+    ) -> Result<bool> {
+        if code.instructions.len() > 32768
+            || code.try_regions.len() > 128
+            || code
+                .try_regions
+                .iter()
+                .map(|r| r.catches.len())
+                .sum::<usize>()
+                > 512
+        {
+            return Ok(false);
+        }
+        let ir = crate::native_ir::DecodedMethod::decode(code)?;
+        let instructions: std::collections::BTreeMap<_, _> =
+            ir.instructions.iter().map(|i| (i.pc, i)).collect();
+        let mut pending = vec![start];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(pc) = pending.pop() {
+            self.tick()?;
+            if excluded.contains(&pc) {
+                return Ok(false);
+            }
+            if !seen.insert(pc) {
+                continue;
+            }
+            let Some(ins) = instructions.get(&pc) else {
+                return Ok(false);
+            };
+            if self.widths.get(pc) != Some(&ins.width) || self.payloads[pc] {
+                return Ok(false);
+            }
+            if ins.may_throw {
+                for region in &code.try_regions {
+                    if region.start as usize <= pc && pc < region.end as usize {
+                        pending.extend(region.catches.iter().map(|(_, handler)| *handler as usize));
+                    }
+                }
+            }
+            if matches!(ins.opcode, 0x0e..=0x11 | 0x27) {
+                continue;
+            }
+            if let Some(switch) = &self.switches[pc] {
+                pending.extend(switch.cases.iter().map(|(_, target)| *target));
+            }
+            if let Some(target) = self.targets[pc] {
+                pending.push(target);
+            }
+            if !matches!(ins.opcode, 0x28..=0x2a) {
+                pending.push(pc + ins.width);
+            }
+        }
+        Ok(true)
+    }
+
     /// A shared default assignment may be copied at an external entry to a
     /// loop's exit tail. Only straight-line, nonthrowing DEX moves/constants
     /// are safe to duplicate across those owners.
@@ -7796,6 +7984,23 @@ fn condition_sources(
     } else {
         register(regs, right.context("missing comparison right operand")?)?
     };
+    // Literal propagation is already invalidated at writes and joins. Fold
+    // only integer/null constants; never infer purity from an expression string.
+    if let (Some(a), Some(b)) = (lhs.literal, rhs.literal)
+        && (kind <= 1 || (!reference(&lhs.ty) && !reference(&rhs.ty)))
+        && !matches!(lhs.ty.as_str(), "F" | "D" | "J")
+        && !matches!(rhs.ty.as_str(), "F" | "D" | "J")
+    {
+        let answer = match kind {
+            0 => a == b,
+            1 => a != b,
+            2 => a < b,
+            3 => a >= b,
+            4 => a > b,
+            _ => a <= b,
+        };
+        return Ok(answer.to_string());
+    }
     let symbol = ["==", "!=", "<", ">=", ">", "<="][kind as usize];
     let (left, right) = if reference(&lhs.ty) || reference(&rhs.ty) {
         ensure!(kind <= 1, "ordered reference comparison");
@@ -8698,7 +8903,7 @@ fn reconstruct_inner(
     // Disjoint typed and catch-all regions can use the ordinary renderer;
     // it proves each protected range, handler and continuation independently.
     // Prefer finally only when its duplicate-cleanup proof succeeds.
-    let separate_regions = code.try_regions.len() <= 16
+    let separate_regions = code.try_regions.len() <= 128
         && code
             .try_regions
             .windows(2)
@@ -8819,6 +9024,8 @@ fn reconstruct_inner(
         )?
     };
     graph.caught_source_site = caught_source_site;
+    graph.caught_source_certificate =
+        caught_source_site.and_then(|_| super::caught_checked_throw::certificate(class, method));
     graph.initializer_exits = super::initializer_exits::select(class, method);
     if graph.initializer_exits.is_some() {
         out.indent += 1;
@@ -9062,7 +9269,13 @@ fn reconstruct_inner(
                 continue;
             }
             if matches!(code.instructions[pc] as u8, 0x71 | 0x77)
-                && super::checked_call_bridge::for_site(class, method, pc).is_none()
+                && super::checked_call_bridge::for_site(
+                    class,
+                    method,
+                    pc,
+                    graph.caught_source_site.is_some(),
+                )
+                .is_none()
                 && let Some(&(owner_idx, proto_idx, name_idx)) = class
                     .symbols
                     .methods
@@ -9126,7 +9339,8 @@ fn reconstruct_inner(
         );
         ensure!(
             out.inferred_throws.is_empty(),
-            "caught source bridge changed root header"
+            "caught source bridge changed root header: {:?}",
+            out.inferred_throws
         );
     }
     let same_object_rethrow_uses = std::mem::take(&mut out.same_object_rethrow_uses);
@@ -11073,7 +11287,7 @@ fn protected_branch_split(
     {
         return Ok(Some(escape));
     }
-    match protected_normal_exit(graph, words, start, end, loop_start) {
+    match protected_normal_exit(graph, words, entry, end, loop_start) {
         Ok(_) => return Ok(None),
         Err(error)
             if error.to_string() == "protected return tail crosses effectful continuation" =>
@@ -11086,11 +11300,18 @@ fn protected_branch_split(
                 graph.widths[pc] != 0 && matches!(words[pc] as u8, 0x28..=0x2a | 0x32..=0x3d)
             }));
         }
+        Err(error) if error.to_string() == "protected region has distinct effectful exits" => {
+            // A later split can leave an earlier arm jumping past the suffix.
+            // Split at the first nonthrowing control edge so every destination
+            // is reconsidered with its original protected interval.
+            return Ok((entry..=escape).find(|&pc| {
+                graph.widths[pc] != 0 && matches!(words[pc] as u8, 0x28..=0x2a | 0x32..=0x3d)
+            }));
+        }
         Err(error)
-            if error.to_string() == "protected region has distinct effectful exits"
-                || error
-                    .to_string()
-                    .starts_with("cyclic protected return tail") => {}
+            if error
+                .to_string()
+                .starts_with("cyclic protected return tail") => {}
         Err(error) => return Err(error),
     }
     Ok((entry..escape)
@@ -11534,6 +11755,139 @@ fn render_pure_try_body(
     Ok((slots, false))
 }
 
+// A detached handler may retry a straight-line protected call. Restrict this
+// recovery to dead temporary writes: every iteration has the same input frame,
+// and the successful continuation observes no locals declared inside the loop.
+fn detached_retry_type<'a>(
+    class: &DexClass,
+    method: &DexMethod,
+    region: &'a crate::native_dex::DexTryRegion,
+    regs: &[Option<Value>],
+) -> Option<&'a str> {
+    let code = method.code.as_ref()?;
+    let start = region.start as usize;
+    let end = region.end as usize;
+    if code.instructions.len() > 32768
+        || code.registers > 256
+        || region.catches.len() != 1
+        || end.checked_sub(start)? > 32
+        || start >= end
+    {
+        return None;
+    }
+    let (ty, handler) = &region.catches[0];
+    let ty = ty.as_deref()?;
+    if *handler < region.end || throwing::validate_catch_type(class, ty, false).is_err() {
+        return None;
+    }
+    let ir = crate::native_ir::DecodedMethod::decode(code).ok()?;
+    let body: Vec<_> = ir
+        .instructions
+        .iter()
+        .filter(|i| (start..end).contains(&i.pc))
+        .collect();
+    let last = *body.last()?;
+    if body.first()?.pc != start
+        || last.pc + last.width != end
+        || !matches!(last.opcode, 0x71 | 0x77)
+        || body[..body.len() - 1]
+            .iter()
+            .any(|i| !matches!(i.opcode, 0x00..=0x09 | 0x12..=0x1b))
+    {
+        return None;
+    }
+    let (_, proto, _) = class.symbols.methods.get(last.reference?.index as usize)?;
+    if class.symbols.protos.get(*proto as usize)?.0.as_ref() != "V" {
+        return None;
+    }
+    let live = super::liveness::analyze(code)?;
+    for ins in &body {
+        for written in &ins.writes {
+            for r in usize::from(written.register)
+                ..usize::from(written.register) + written.kind.word_count()
+            {
+                if live.contains(start, r) || live.contains(end, r) {
+                    return None;
+                }
+            }
+        }
+        for read in &ins.reads {
+            let r = usize::from(read.register);
+            if live.contains(start, r) && !regs.get(r)?.as_ref().is_some_and(stable_retry_argument)
+            {
+                return None;
+            }
+        }
+    }
+    // Track word identities, including dead values omitted from the source
+    // frame. Pure handler copies/constants can be discarded only if every
+    // live input word is unchanged when the protected body is retried.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Word {
+        Entry(usize),
+        Bits(u32),
+    }
+    let mut initial: Vec<_> = (0..regs.len()).map(Word::Entry).collect();
+    for (r, value) in regs.iter().enumerate() {
+        if let Some(value) = value {
+            if let Some(bits) = value.wide_literal {
+                initial[r] = Word::Bits(bits as u32);
+                *initial.get_mut(r + 1)? = Word::Bits((bits >> 32) as u32);
+            } else if let Some(bits) = value.literal {
+                initial[r] = Word::Bits(bits as u32);
+            }
+        }
+    }
+    let mut after = initial.clone();
+    let mut pc = *handler as usize;
+    for _ in 0..16 {
+        if code
+            .try_regions
+            .iter()
+            .any(|r| r.start as usize <= pc && pc < r.end as usize)
+        {
+            return None;
+        }
+        let ins = ir.instructions.iter().find(|i| i.pc == pc)?;
+        match ins.opcode {
+            0x28..=0x2a => {
+                return (ins.branch_target == Some(start)
+                    && after
+                        .iter()
+                        .zip(&initial)
+                        .enumerate()
+                        .all(|(r, (a, b))| !live.contains(start, r) || a == b))
+                .then_some(ty);
+            }
+            0x00 => {}
+            0x01..=0x09 => {
+                let read = ins.reads.first()?;
+                let write = ins.writes.first()?;
+                let count = read.kind.word_count();
+                if count != write.kind.word_count() {
+                    return None;
+                }
+                let from = usize::from(read.register);
+                let to = usize::from(write.register);
+                let value = after.get(from..from + count)?.to_vec();
+                after.get_mut(to..to + count)?.copy_from_slice(&value);
+            }
+            0x12..=0x19 => {
+                let write = ins.writes.first()?;
+                let to = usize::from(write.register);
+                let bits = ins.literal? as u64;
+                *after.get_mut(to)? = Word::Bits(bits as u32);
+                if write.kind.word_count() == 2 {
+                    *after.get_mut(to + 1)? = Word::Bits((bits >> 32) as u32);
+                }
+            }
+            _ => return None,
+        }
+        pc += ins.width;
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_try(
     class: &DexClass,
@@ -11553,9 +11907,108 @@ fn render_try(
         .as_ref()
         .context("missing try code")?
         .instructions;
-    let entry_frame = regs.clone();
-    let start = region.start as usize;
+    let mut adjusted_region = region.clone();
+    let mut start = region.start as usize;
     let end = region.end as usize;
+    // A straight-line nonthrowing prefix establishes the frame observed by
+    // every possible exception. Render it before taking handler snapshots,
+    // including locals first defined here rather than at the method entry.
+    if enclosing_loop.is_none() && pure_plan.is_none() && end <= stop {
+        let mut prefix_end = start;
+        while prefix_end < end
+            && matches!(words[prefix_end] as u8, 0x00..=0x09 | 0x12..=0x19)
+            && graph.widths[prefix_end] != 0
+            && !graph.payloads[prefix_end]
+        {
+            prefix_end += graph.widths[prefix_end];
+        }
+        let newly_defined = (prefix_end > start)
+            .then(|| graph.written_in(method.code.as_ref().unwrap(), start, prefix_end))
+            .flatten()
+            .is_some_and(|written| {
+                written
+                    .iter()
+                    .enumerate()
+                    .any(|(r, w)| *w && regs[r].is_none())
+            });
+        let no_reentry = newly_defined
+            && region.catches.iter().all(|(_, handler)| {
+                graph
+                    .reachable(*handler as usize, words.len(), words)
+                    .is_ok_and(|seen| !(start..prefix_end).any(|pc| seen[pc]))
+            });
+        if no_reentry && prefix_end < end && words[prefix_end] as u8 != 0x0d {
+            let slots = vec![None; regs.len()];
+            let (values, terminal) = render(
+                class,
+                method,
+                graph,
+                start,
+                prefix_end,
+                regs,
+                out,
+                depth + 1,
+                true,
+                None,
+                Some(&slots),
+            )?;
+            ensure!(!terminal, "nonthrowing try prefix terminates");
+            regs = values;
+            adjusted_region.start = prefix_end as u32;
+            start = prefix_end;
+        }
+    }
+    let region = &adjusted_region;
+    let entry_frame = regs.clone();
+    if end <= stop
+        && enclosing_loop.is_none()
+        && pure_plan.is_none()
+        && let Some(ty) = detached_retry_type(class, method, region, &regs)
+    {
+        let mut body = Output {
+            sequence: out.sequence,
+            indent: out.indent + 2,
+            ..out.empty_fork()
+        };
+        let slots = vec![None; regs.len()];
+        let (_, terminal) = render(
+            class,
+            method,
+            graph,
+            start,
+            end,
+            regs.clone(),
+            &mut body,
+            depth + 1,
+            true,
+            None,
+            Some(&slots),
+        )?;
+        ensure!(!terminal, "retry body must reach its normal continuation");
+        out.sequence = body.sequence;
+        let name = format!("retry{}", out.sequence);
+        out.sequence += 1;
+        out.line("while (true) {", &[]);
+        out.indent += 1;
+        out.line("try {", &[]);
+        out.indent += 1;
+        out.append(body);
+        out.line("break;", &[]);
+        out.indent -= 1;
+        let display = java_type(ty)?;
+        out.line(
+            &format!("}} catch ({display} {name}) {{"),
+            &[(
+                9,
+                display.chars().count(),
+                class_label(ty).context("invalid retry catch type")?,
+            )],
+        );
+        out.line("}", &[]);
+        out.indent -= 1;
+        out.line("}", &[]);
+        return Ok((regs, end, false));
+    }
     let bounded_argument_handler =
         |handler: usize| {
             graph
@@ -11659,7 +12112,11 @@ fn render_try(
             start,
             end,
             enclosing_loop.map(|context| context.start),
-        )?
+        )
+        .map_err(|error| {
+            let detail = format!("try normal exit {start:x}..{end:x}, stop {stop:x}: {error}");
+            error.context(detail)
+        })?
     };
     // A pure return tail may extend past the enclosing branch's shared join.
     // Keep that join outside this try when every path reaches it or terminates
@@ -11702,10 +12159,15 @@ fn render_try(
         "protected continuation crosses another exception region"
     );
     ensure!(
-        region
-            .catches
-            .iter()
-            .all(|(_, handler)| { *handler >= region.end || !normal_reachable[*handler as usize] }),
+        region.catches.iter().all(|(_, handler)| {
+            *handler >= region.end
+                || !normal_reachable[*handler as usize]
+                || shared_nonthrowing_exit::pure_protected_tail(
+                    method.code.as_ref().unwrap(),
+                    start..end,
+                    *handler as usize,
+                )
+        }),
         "normal flow enters interleaved handler"
     );
     for (_, handler) in region.catches.iter() {
@@ -11719,7 +12181,7 @@ fn render_try(
                         start..end,
                         handler,
                     ),
-                "outside handler re-enters protected region"
+                "outside handler re-enters protected region: {start:x}..{end:x}, handler {handler:x}"
             );
         }
     }
@@ -11876,16 +12338,16 @@ fn render_try(
     // Unknown liveness keeps the ordinary probe and its existing checks.
     let code = method.code.as_ref().unwrap();
     let snapshot_liveness = (!matches!(method.name.as_ref(), "<init>" | "<clinit>")
-        && code.instructions.len() <= 4096
+        && code.instructions.len() <= 32768
         && code.registers <= 256
         && usize::from(code.tries) == code.try_regions.len()
-        && code.try_regions.len() <= 16
+        && code.try_regions.len() <= 128
         && code
             .try_regions
             .iter()
             .map(|region| region.catches.len())
             .sum::<usize>()
-            <= 64)
+            <= 512)
         .then(|| super::liveness::analyze(code))
         .flatten();
     let mut needed = vec![false; regs.len()];
@@ -11935,23 +12397,23 @@ fn render_try(
         let argument_stop = bounded_argument_handler(handler);
         if terminal_plan.is_none()
             && argument_stop.is_none()
-            && snapshot_liveness.as_ref().is_some_and(|live| {
-                probe.iter().enumerate().all(|(r, value)| match value {
-                    None => !live.contains(entry, r),
-                    Some(value) if value.text == format!("__rdx_exception_input_{r}__") => {
-                        !live.contains(entry, r)
-                            && (!(wide(&value.ty)
-                                || regs[r].as_ref().is_some_and(|original| wide(&original.ty)))
-                                || !live.contains(entry, r + 1))
-                    }
-                    Some(_) => true,
-                })
-            })
+            && let Some(live) = &snapshot_liveness
         {
-            // Immutable inputs and the freshly captured exception already
-            // have their real values. Every unknown or mutable input is dead.
-            // The actual catch renderer below still validates its complete
-            // instructions, termination, catch dispatch and frame types.
+            // Exact DEX liveness includes exceptional pre-write edges and the
+            // entire handler continuation. It conservatively identifies every
+            // mutable entry value read there without recursively rendering the
+            // rest of the method for each protected range. Missing values do
+            // not acquire snapshots; the real handler still rejects any
+            // undefined read. The real handler
+            // below still validates types, effects, termination and dispatch.
+            for (r, value) in probe.iter().enumerate() {
+                if let Some(value) = value
+                    && value.text == format!("__rdx_exception_input_{r}__")
+                {
+                    needed[r] |=
+                        live.contains(entry, r) || (wide(&value.ty) && live.contains(entry, r + 1));
+                }
+            }
             continue;
         }
         let saved_caught_values = graph.caught_values.borrow().clone();
@@ -12143,17 +12605,35 @@ fn render_try(
             // shared by disjoint protected ranges when its tail cannot
             // re-enter this enclosing region and terminates independently.
             let seen = graph.reachable(handler, words.len(), words)?;
+            // Shared catch tails may be placed before this try. Address order
+            // alone is not ownership: require disjoint ordinary-entry flow and
+            // a terminating, protected-region-safe tail before copying it.
+            let exclusive_backward_tail = if seen[..=stop].iter().any(|live| *live) {
+                let ordinary = graph.ordinary_reachable(words)?;
+                !seen.iter().zip(&ordinary).any(|(a, b)| *a && *b)
+                    && graph.non_reentering_tail_with_handlers(handler, 0..0, words, true)?
+            } else {
+                false
+            };
             ensure!(
-                !seen[..=stop].iter().any(|seen| *seen)
-                    && graph.non_reentering_tail_with_handlers(
-                        handler,
-                        0..stop + 1,
-                        words,
-                        true
-                    )?,
-                "outside handler re-enters enclosing region"
+                exclusive_backward_tail
+                    || (!seen[..=stop].iter().any(|seen| *seen)
+                        && (graph.non_reentering_tail_with_handlers(
+                            handler,
+                            0..stop + 1,
+                            words,
+                            true
+                        )? || graph.non_reentering_exception_tail(
+                            method.code.as_ref().unwrap(),
+                            handler,
+                            0..stop + 1
+                        )?)),
+                "outside handler re-enters enclosing region: try={start:#x}..{end:#x}; handler={handler:#x}; stop={stop:#x}"
             );
             outside_handlers.insert(handler);
+            if exclusive_backward_tail {
+                detached_forward_handlers.insert(handler);
+            }
         }
         if handler < stop && bounded_argument_handler(handler).is_none() {
             // A catch can jump past the normal continuation to its own
@@ -13728,6 +14208,8 @@ fn render_switch(
     Ok((regs, join, all_returned))
 }
 
+include!("emit_instruction.rs");
+
 #[allow(clippy::too_many_arguments)]
 #[track_caller]
 fn render(
@@ -14137,7 +14619,7 @@ fn render(
             && let Some(region) = graph.loops.iter().find(|l| l.start == pc)
         {
             ensure!(
-                initialized && pending.is_none() && allocation.is_none(),
+                pending.is_none() && allocation.is_none(),
                 "loop interrupts instruction state"
             );
             ensure!(
@@ -14163,6 +14645,67 @@ fn render(
                 );
             }
             let before = regs.clone();
+            if !initialized {
+                // Java constructor prologues may compute delegation arguments
+                // in loops, but cannot observe or initialize the receiver there.
+                // Prove every decoded operand leaves all receiver aliases alone;
+                // loop slots can then retain their identity without emitting an
+                // illegal pre-delegation read into a Java local.
+                let code = method.code.as_ref().unwrap();
+                ensure!(
+                    constructor
+                        && code.try_regions.is_empty()
+                        && exception_slots.is_none()
+                        && class_captures.is_empty()
+                        && region.guard.is_some()
+                        && region.tail.is_none()
+                        && region.exit < words.len(),
+                    "unsupported constructor prologue loop"
+                );
+                let decoded = graph
+                    .front_end
+                    .is_none()
+                    .then(|| crate::native_ir::DecodedMethod::decode(code))
+                    .transpose()?;
+                let mut cursor = region.start;
+                while cursor < region.exit {
+                    ensure!(
+                        !matches!(words[cursor] as u8, 0x0e..=0x11),
+                        "constructor loop returns before delegation"
+                    );
+                    ensure!(
+                        graph.switches[cursor].is_none()
+                            && graph.targets[cursor].is_none_or(|target| (region.start..=region.exit).contains(&target)),
+                        "constructor loop escapes proved region"
+                    );
+                    let instruction = graph
+                        .instruction(cursor)?
+                        .or_else(|| {
+                            let instructions = &decoded.as_ref()?.instructions;
+                            let index =
+                                instructions.binary_search_by_key(&cursor, |i| i.pc).ok()?;
+                            Some(&instructions[index])
+                        })
+                        .context("constructor loop requires decoded operands")?;
+                    ensure!(
+                        instruction.width == graph.widths[cursor] && instruction.width > 0,
+                        "constructor loop instruction boundary differs"
+                    );
+                    for operand in instruction.reads.iter().chain(&instruction.writes) {
+                        let start = usize::from(operand.register);
+                        let values = regs
+                            .get(start..start + operand.kind.word_count())
+                            .context("constructor loop operand out of bounds")?;
+                        ensure!(
+                            values
+                                .iter()
+                                .all(|value| value.as_ref().is_none_or(|v| v.text != "this")),
+                            "constructor loop touches uninitialized receiver"
+                        );
+                    }
+                    cursor += instruction.width;
+                }
+            }
             regs = render_loop(
                 class,
                 method,
@@ -14174,8 +14717,20 @@ fn render(
                 exception_slots.is_some(),
             )
             .map_err(|error| {
-                anyhow::anyhow!("{error:#}; render loop {region:x?}; pc={pc:#x}; stop={stop:#x}")
+                let detail =
+                    format!("render loop {region:x?}; pc={pc:#x}; stop={stop:#x}: {error}");
+                error.context(detail)
             })?;
+            if !initialized {
+                for (r, value) in before.iter().enumerate() {
+                    if value.as_ref().is_some_and(|v| v.text == "this") {
+                        ensure!(
+                            regs[r] == *value,
+                            "constructor loop changed receiver identity"
+                        );
+                    }
+                }
+            }
             if let Some(slots) = exception_slots {
                 for (r, slot) in slots.iter().enumerate() {
                     if slot.is_some() {
@@ -14510,6 +15065,48 @@ fn render(
                     matches!(op, 0x28..=0x2a) && suppressed_loop.is_none() && header <= stop,
                     "entry copy crosses its prefix boundary"
                 );
+                let feedbacks = copy
+                    .instructions
+                    .iter()
+                    .filter(|pc| graph.targets[**pc] == Some(header))
+                    .count();
+                if feedbacks > 1 {
+                    let code = method.code.as_ref().context("missing copy code")?;
+                    let written = graph
+                        .written_in(code, copy.target, last + graph.widths[last])
+                        .context("copy writes unavailable")?;
+                    let slots = loop_slots(&regs, graph, header, out, Some(&written), None)?;
+                    out.line("do {", &[]);
+                    out.indent += 1;
+                    let (_, terminal) = render(
+                        class,
+                        method,
+                        graph,
+                        copy.target,
+                        last + graph.widths[last],
+                        regs.clone(),
+                        out,
+                        depth + 1,
+                        initialized,
+                        Some(LoopContext {
+                            start: header,
+                            slots: &slots,
+                            exit: usize::MAX,
+                            exit_slots: &[],
+                        }),
+                        None,
+                    )?;
+                    ensure!(terminal, "copied iteration does not reach header or return");
+                    out.indent -= 1;
+                    out.line("} while (false);", &[]);
+                    for (r, slot) in slots.into_iter().enumerate() {
+                        if let Some(slot) = slot {
+                            regs[r] = Some(slot);
+                        }
+                    }
+                    pc = header;
+                    continue;
+                }
                 let (values, terminal) = render(
                     class,
                     method,
@@ -14817,14 +15414,15 @@ fn render(
                     .iter()
                     .find(|region| region.start == context.start)
                     .is_some_and(|region| {
-                        (!(region.start..region.body_end(&graph.widths)).contains(&target)
-                            && graph
-                                .non_reentering_tail(
-                                    target,
-                                    region.start..region.body_end(&graph.widths),
-                                    words,
-                                )
-                                .unwrap_or(false))
+                        region.post_latch_return(target, &graph.widths, words)
+                            || (!(region.start..region.body_end(&graph.widths)).contains(&target)
+                                && graph
+                                    .non_reentering_tail(
+                                        target,
+                                        region.start..region.body_end(&graph.widths),
+                                        words,
+                                    )
+                                    .unwrap_or(false))
                             || method.code.as_ref().is_some_and(|code| {
                                 shared_nonthrowing_exit::loop_exit(
                                     code,
@@ -15435,14 +16033,15 @@ fn render(
                     .iter()
                     .find(|region| region.start == context.start)
                     .is_some_and(|region| {
-                        (!(region.start..region.body_end(&graph.widths)).contains(&target)
-                            && graph
-                                .non_reentering_tail(
-                                    target,
-                                    region.start..region.body_end(&graph.widths),
-                                    words,
-                                )
-                                .unwrap_or(false))
+                        region.post_latch_return(target, &graph.widths, words)
+                            || (!(region.start..region.body_end(&graph.widths)).contains(&target)
+                                && graph
+                                    .non_reentering_tail(
+                                        target,
+                                        region.start..region.body_end(&graph.widths),
+                                        words,
+                                    )
+                                    .unwrap_or(false))
                             || method.code.as_ref().is_some_and(|code| {
                                 shared_nonthrowing_exit::loop_exit(
                                     code,
@@ -15658,6 +16257,35 @@ fn render(
                     graph.join(pc + width, target, stop, words)?,
                 )
             };
+            if initialized
+                && graph.protected.is_empty()
+                && matches!(condition.as_str(), "true" | "false")
+            {
+                let selected = if condition == "true" {
+                    target
+                } else {
+                    fallthrough
+                };
+                let (selected_regs, terminal) = render(
+                    class,
+                    method,
+                    graph,
+                    selected,
+                    join,
+                    regs,
+                    out,
+                    depth + 1,
+                    initialized,
+                    suppressed_loop,
+                    exception_slots,
+                )?;
+                regs = selected_regs;
+                if terminal {
+                    return Ok((regs, true));
+                }
+                pc = join;
+                continue;
+            }
             if !initialized {
                 // Keep initialization outside both arms. Masking rejects any
                 // reads/escapes/delegation through this, and this write proof
@@ -15856,1758 +16484,35 @@ fn render(
             pending = None;
             continue;
         }
-        if !matches!(op, 0x0a..=0x0c) {
-            pending = None;
-        }
-        match op {
-            0x00 => ensure!(w == 0, "payload in straight-line body"),
-            0x01..=0x09 => {
-                let (dst, src) = if let Some(instruction) = instruction {
-                    decoded_move(instruction, regs.len())?
-                } else {
-                    match (op - 1) % 3 {
-                        0 => (a & 15, a >> 4),
-                        1 => (a, words[pc + 1] as usize),
-                        _ => (words[pc + 1] as usize, words[pc + 2] as usize),
-                    }
-                };
-                let kind = (op - 1) / 3;
-                let mut value = if !initialized
-                    && constructor
-                    && kind == 2
-                    && regs.get(src).and_then(Option::as_ref).is_some_and(|v| {
-                        v.text == "<masked-constructor-this>" && v.ty == class.descriptor.as_ref()
-                    }) {
-                    regs[src].as_ref().unwrap().clone()
-                } else {
-                    register(&regs, src)?
-                };
-                if kind == 2
-                    && graph.loop_entry_copy.is_none()
-                    && graph.parent_prefix.is_none()
-                    && matches!(value.ty.as_str(), "I" | "Z" | "B" | "S" | "C")
-                    && value.literal.is_none()
-                    && graph
-                        .loop_type_analysis(class, method)
-                        .is_some_and(|analysis| {
-                            ssa_null_read::at_read(
-                                &analysis.ir,
-                                &analysis.ssa,
-                                &analysis.types,
-                                pc,
-                                src,
-                            )
-                        })
-                {
-                    value = Value {
-                        text: "null".into(),
-                        ty: "Ljava/lang/Object;".into(),
-                        literal: Some(0),
-                        wide_literal: None,
-                        raw_bits32: false,
-                    };
-                }
-                ensure!(
-                    match kind {
-                        0 => !reference(&value.ty) && !matches!(value.ty.as_str(), "J" | "D"),
-                        1 => matches!(value.ty.as_str(), "J" | "D"),
-                        _ => reference(&value.ty) || value.literal == Some(0),
-                    },
-                    "move type mismatch at {pc:04x}: register v{src} has type {}",
-                    value.ty
-                );
-                ensure!(
-                    dst == src
-                        || !value.text.starts_with("<class:")
-                        || exception_slots
-                            .is_none_or(|slots| slots.get(dst).is_none_or(Option::is_none)),
-                    "deferred class alias writes exception-visible register"
-                );
-                assign(&mut regs, dst, value)?;
-            }
-            0x0a..=0x0c => {
-                let dst = if let Some(instruction) = instruction {
-                    decoded_result_destination(instruction, regs.len())?
-                } else {
-                    a
-                };
-                if let Some(front) = &graph.front_end {
-                    let index = front.ir.instructions.partition_point(|insn| insn.pc < pc);
-                    let producer = index
-                        .checked_sub(1)
-                        .and_then(|index| front.ir.instructions.get(index))
-                        .context("missing shared move-result producer")?;
-                    let call_index = front
-                        .bound
-                        .calls
-                        .binary_search_by_key(&producer.pc, |call| call.pc)
-                        .map_err(|_| anyhow::anyhow!("missing shared move-result binding"))?;
-                    let result = front.bound.calls[call_index]
-                        .result
-                        .as_ref()
-                        .context("missing shared bound result")?;
-                    ensure!(
-                        result.move_pc == pc && usize::from(result.register.register) == dst,
-                        "shared move-result destination differs from bound result"
-                    );
-                }
-                let value = pending.take().context("move-result without invoke")?;
-                ensure!(
-                    match op {
-                        0x0a => !reference(&value.ty) && !matches!(value.ty.as_str(), "J" | "D"),
-                        0x0b => matches!(value.ty.as_str(), "J" | "D"),
-                        _ => reference(&value.ty),
-                    },
-                    "result opcode type mismatch"
-                );
-                assign(&mut regs, dst, value)?;
-            }
-            0x0d => bail!("move-exception outside handled entry"),
-            0x27 => {
-                ensure!(allocation.is_none(), "throw interrupts allocation");
-                let terminal_throw_arm = !initialized
-                    && constructor
-                    && graph
-                        .constructor_throw_boundary
-                        .get()
-                        .is_some_and(|(start, end)| start <= pc && pc < end)
-                    && method
-                        .code
-                        .as_ref()
-                        .unwrap()
-                        .try_regions
-                        .iter()
-                        .all(|region| {
-                            !(region.start as usize..region.end as usize).contains(&pc)
-                                && region
-                                    .catches
-                                    .iter()
-                                    .all(|(_, handler)| *handler as usize != pc)
-                        });
-                let throwing_prologue = !terminal_throw_arm
-                    && !initialized
-                    && constructor
-                    && (class.superclass.as_deref() == Some("Ljava/lang/Object;")
-                        || class
-                            .symbols
-                            .hierarchy
-                            .get()
-                            .is_some_and(|h| h.has_accessible_noarg_super(&class.descriptor)))
-                    && method.code.as_ref().unwrap().try_regions.is_empty()
-                    && graph.targets.iter().all(Option::is_none)
-                    && graph.switches.iter().all(Option::is_none);
-                ensure!(
-                    initialized || throwing_prologue || terminal_throw_arm,
-                    "throw before initialization: implicit super() would change construction/finalization effects"
-                );
-                let src = if let Some(instruction) = instruction {
-                    decoded_throw_source(instruction, regs.len())?
-                } else {
-                    a
-                };
-                let value = register(&regs, src)?;
-                // Java precise rethrow preserves the exception from this catch.
-                // Only unchanged catch identities qualify, not arbitrary Throwable values.
-                let refined = graph
-                    .caught_values
-                    .borrow()
-                    .contains(&value.text)
-                    .then(|| immediate_caught_throw_type(class, method, graph, pc, src))
-                    .flatten()
-                    .map(|ty| Value {
-                        ty: ty.to_string(),
-                        ..value.clone()
-                    });
-                let mut explicit_checked_bridge = false;
-                let caught_source_bridge = if graph.caught_source_site.is_some()
-                    && value.literal.is_none()
-                    && refined
-                        .as_ref()
-                        .is_none_or(|refined| throwing::expression(class, method, refined).is_err())
-                    && throwing::expression(class, method, &value).is_err()
-                    && graph.same_object_rethrow_authorization.is_none()
-                    && graph.loop_entry_copy.is_none()
-                    && graph.parent_prefix.is_none()
-                {
-                    super::caught_checked_throw::for_site(class, method, pc, src)
-                } else {
-                    None
-                };
-                let expression = if let Some(helper) = caught_source_bridge {
-                    graph.caught_source_uses.borrow_mut().insert(pc);
-                    explicit_checked_bridge = true;
-                    format!("{helper}({})", argument(&value, "Ljava/lang/Throwable;")?)
-                } else if let Some(refined) = refined {
-                    let expression = format!("(({}) {})", java_type(&refined.ty)?, value.text);
-                    if throwing::expression(class, method, &refined).is_err()
-                        && !throwing::locally_caught(class, method, pc, &refined)
-                    {
-                        ensure!(
-                            throwing::may_infer_declaration(class, method, &refined),
-                            "Refined caught throw requires the exact checked declaration contract"
-                        );
-                        out.inferred_throws.insert(refined.ty.clone());
-                    }
-                    if throwing::checked_effect(class, &refined.ty) {
-                        out.checked_effects.insert(refined.ty);
-                    }
-                    expression
-                } else if graph.caught_values.borrow().contains(&value.text) {
-                    let typed_rethrow = throwing::expression(class, method, &value).is_ok();
-                    let caught_origin = graph.caught_origins.borrow().get(&value.text).copied();
-                    let effects = if !typed_rethrow
-                        && graph.catch_rethrows.borrow().contains_key(&value.text)
-                    {
-                        graph
-                            .caught_dispatch_effects
-                            .borrow()
-                            .get(&value.text)
-                            .cloned()
-                    } else {
-                        graph
-                            .caught_checked_effects
-                            .borrow()
-                            .get(&value.text)
-                            .cloned()
-                    };
-                    if let Some(effects) = effects {
-                        for ty in &effects {
-                            let effect = Value {
-                                ty: ty.clone(),
-                                ..value.clone()
-                            };
-                            if throwing::expression(class, method, &effect).is_err()
-                                && !throwing::locally_caught(class, method, pc, &effect)
-                            {
-                                let Some((handler_pc, caught_register)) = caught_origin else {
-                                    anyhow::bail!(
-                                        "Precise rethrow requires the protected checked exception contract: {ty}"
-                                    );
-                                };
-                                let site = PreciseRethrowSite {
-                                    declaring_type: method.declaring_type.clone(),
-                                    method_name: method.name.clone(),
-                                    parameters: method.parameters.clone(),
-                                    return_type: method.return_type.clone(),
-                                    static_method: method.access_flags & 8 != 0,
-                                    code_offset: method.code.as_ref().unwrap().offset,
-                                    handler_pc,
-                                    caught_register,
-                                    throw_pc: pc,
-                                };
-                                if ty == "Ljava/lang/Throwable;"
-                                    && graph
-                                        .same_object_rethrow_authorization
-                                        .as_ref()
-                                        .is_some_and(|authorization| {
-                                            authorization.site == site
-                                                || authorization.additional_sites.contains(&site)
-                                        })
-                                {
-                                    // Authorization changes only the final Java
-                                    // source obligation. Preserve the original
-                                    // operational effect and bind its exact type
-                                    // to the consumed provenance record.
-                                    out.checked_effects.insert(ty.clone());
-                                    out.same_object_rethrow_uses.push(SameObjectRethrowUse {
-                                        site,
-                                        effect: ty.clone(),
-                                    });
-                                    continue;
-                                }
-                                return Err(PreciseRethrowFailure {
-                                    site,
-                                    effect: ty.clone(),
-                                }
-                                .into());
-                            }
-                            out.checked_effects.insert(ty.clone());
-                        }
-                    }
-
-                    if typed_rethrow {
-                        value.text.clone()
-                    } else {
-                        graph
-                            .catch_rethrows
-                            .borrow()
-                            .get(&value.text)
-                            .cloned()
-                            .unwrap_or_else(|| value.text.clone())
-                    }
-                } else {
-                    match throwing::expression(class, method, &value) {
-                        Ok(expression) => expression,
-                        Err(error) => {
-                            if (graph.loop_entry_copy.is_none() && graph.parent_prefix.is_none())
-                                && value.literal.is_none()
-                                && graph
-                                    .loop_type_analysis(class, method)
-                                    .is_some_and(|facts| {
-                                        throw_zero_proof::proves_read(
-                                            &facts.ir,
-                                            &facts.ssa,
-                                            &facts.types,
-                                            pc,
-                                            src,
-                                        )
-                                    })
-                            {
-                                "null".to_string()
-                            } else if throwing::locally_caught(class, method, pc, &value) {
-                                value.text.clone()
-                            } else if throwing::may_infer_declaration(class, method, &value) {
-                                out.inferred_throws.insert(value.ty.clone());
-                                value.text.clone()
-                            } else if let Some(helper) = super::explicit_checked_throw::for_site(
-                                class, method, pc, &value.ty,
-                            )
-                            .or_else(|| {
-                                (graph.loop_entry_copy.is_none() && graph.parent_prefix.is_none())
-                                    .then(|| {
-                                        super::explicit_checked_throw::for_nonnull_field_site(
-                                            class, method, pc, src, &value.ty,
-                                        )
-                                    })
-                                    .flatten()
-                            }) {
-                                explicit_checked_bridge = true;
-                                format!("{helper}({})", value.text)
-                            } else {
-                                if value.ty != "Ljava/lang/Throwable;" {
-                                    return Err(error);
-                                }
-                                let site = StaticSneakyRethrowSite {
-                                    declaring_type: method.declaring_type.clone(),
-                                    method_name: method.name.clone(),
-                                    parameters: method.parameters.clone(),
-                                    return_type: method.return_type.clone(),
-                                    static_method: method.access_flags & 8 != 0,
-                                    code_offset: method.code.as_ref().unwrap().offset,
-                                    throw_pc: pc,
-                                    throw_register: src as u16,
-                                };
-                                let Some(authorization) = graph
-                                    .static_sneaky_rethrow_authorization
-                                    .as_ref()
-                                    .filter(|authorization| authorization.site == site)
-                                else {
-                                    return Err(StaticSneakyRethrowFailure {
-                                        site,
-                                        effect: value.ty.clone(),
-                                    }
-                                    .into());
-                                };
-                                out.checked_effects.insert(value.ty.clone());
-                                out.static_sneaky_rethrow_uses.push(StaticSneakyRethrowUse {
-                                    site,
-                                    effect: value.ty.clone(),
-                                    type_parameter: authorization.type_parameter.clone(),
-                                });
-                                format!("(({}) {})", authorization.type_parameter, value.text)
-                            }
-                        }
-                    }
-                };
-                if !explicit_checked_bridge
-                    && !graph.caught_values.borrow().contains(&value.text)
-                    && expression != "null"
-                    && throwing::checked_effect(class, &value.ty)
-                {
-                    out.checked_effects.insert(value.ty.clone());
-                }
-                if throwing_prologue {
-                    // Java 25 keeps the delegation source-reachable but emits
-                    // no superclass invocation for this always-throw prologue.
-                    out.line("if (true) {", &[]);
-                    out.indent += 1;
-                    out.line(&format!("throw {expression};"), &[]);
-                    out.indent -= 1;
-                    out.line("}", &[]);
-                    out.line("super();", &[]);
-                } else {
-                    out.line(&format!("throw {expression};"), &[]);
-                }
-                returned = true;
-            }
-            0x0e => {
-                if let Some(instruction) = instruction {
-                    ensure!(
-                        decoded_return_source(instruction, regs.len())?.is_none(),
-                        "invalid shared void return"
-                    );
-                }
-                ensure!(
-                    method.return_type.as_ref() == "V" && initialized,
-                    "invalid void return"
-                );
-                if let Some(plan) = &graph.initializer_exits {
-                    let assignments = plan
-                        .returns
-                        .get(&pc)
-                        .context("initializer return differs from CFG proof")?;
-                    for assignment in assignments {
-                        out.line(
-                            &format!("{} = {};", assignment.name, assignment.value),
-                            &[(0, assignment.name.chars().count(), assignment.label.clone())],
-                        );
-                    }
-                    out.line(&format!("break {};", super::initializer_exits::LABEL), &[]);
-                } else {
-                    out.line("return;", &[]);
-                }
-                returned = true;
-            }
-            0x0f..=0x11 => {
-                let src = if let Some(instruction) = instruction {
-                    decoded_return_source(instruction, regs.len())?
-                        .context("missing shared return source")?
-                } else {
-                    a
-                };
-                ensure!(
-                    initialized && method.return_type.as_ref() != "V",
-                    "invalid return"
-                );
-                ensure!(
-                    (op == 0x11) == reference(&method.return_type)
-                        && (op == 0x10) == wide(&method.return_type),
-                    "return opcode type mismatch"
-                );
-                let value = register(&regs, src)?;
-                let converted =
-                    argument_at_read(&value, &method.return_type, src, class, method, graph, pc);
-                let expr = match converted {
-                    Ok(expr) => expr,
-                    Err(original)
-                        if method.return_type.as_ref() == "Z"
-                            && value.ty == "I"
-                            && value.literal.is_none()
-                            && !value.raw_bits32 =>
-                    {
-                        if proven_boolean_return(class, method, graph, pc, src)? {
-                            format!("({} != 0)", value.text)
-                        } else {
-                            return Err(original);
-                        }
-                    }
-                    Err(original) => return Err(original),
-                };
-                if exception_slots.is_some()
-                    && reference(&method.return_type)
-                    && !method
-                        .code
-                        .as_ref()
-                        .unwrap()
-                        .try_regions
-                        .iter()
-                        .any(|region| region.start as usize <= pc && pc < region.end as usize)
-                {
-                    // An absorbed DEX return cannot throw. Do not introduce a
-                    // potentially failing Java downcast under a new catch.
-                    ensure!(
-                        expr == value.text
-                            || expr == "null"
-                            || method.return_type.as_ref() == "Ljava/lang/Object;"
-                            || class.symbols.hierarchy.get().is_some_and(|hierarchy| {
-                                hierarchy.assignable(&value.ty, &method.return_type)
-                                    == crate::native_hierarchy::Relation::Proven
-                            }),
-                        "return tail requires a potentially throwing conversion"
-                    );
-                }
-                out.return_value(&value, &expr, &method.return_type);
-                returned = true;
-            }
-            0x12..=0x15 => {
-                let (dst, n) = if let Some(instruction) = instruction {
-                    let (dst, literal) = decoded_constant(instruction, regs.len())?;
-                    (
-                        dst,
-                        i32::try_from(literal).context("shared constant exceeds 32 bits")?,
-                    )
-                } else {
-                    match op {
-                        0x12 => (a & 15, ((w as i16) >> 12) as i32),
-                        0x13 => (a, words[pc + 1] as i16 as i32),
-                        0x14 => (
-                            a,
-                            (words[pc + 1] as u32 | ((words[pc + 2] as u32) << 16)) as i32,
-                        ),
-                        _ => (a, (words[pc + 1] as i32) << 16),
-                    }
-                };
-                assign(
-                    &mut regs,
-                    dst,
-                    Value {
-                        text: n.to_string(),
-                        ty: "I".into(),
-                        literal: Some(n),
-                        wide_literal: None,
-                        raw_bits32: false,
-                    },
-                )?;
-            }
-            0x16..=0x19 => {
-                let (dst, bits) = if let Some(instruction) = instruction {
-                    let (dst, literal) = decoded_constant(instruction, regs.len())?;
-                    (dst, literal as u64)
-                } else {
-                    (
-                        a,
-                        match op {
-                            0x16 => words[pc + 1] as i16 as i64 as u64,
-                            0x17 => {
-                                (words[pc + 1] as u32 | ((words[pc + 2] as u32) << 16)) as i32
-                                    as i64 as u64
-                            }
-                            0x18 => (0..4).fold(0u64, |bits, i| {
-                                bits | ((words[pc + 1 + i] as u64) << (16 * i))
-                            }),
-                            _ => (words[pc + 1] as u64) << 48,
-                        },
-                    )
-                };
-                assign(
-                    &mut regs,
-                    dst,
-                    Value {
-                        text: format!("{}L", bits as i64),
-                        ty: "J".into(),
-                        literal: None,
-                        wide_literal: Some(bits),
-                        raw_bits32: false,
-                    },
-                )?;
-            }
-            0x2d..=0x31 => {
-                let spec = numeric::Compare::decode(op).context("comparison opcode")?;
-                let (dst, left, right) = if let Some(instruction) = instruction {
-                    let (dst, sources, _) = decoded_arithmetic(instruction, regs.len())?;
-                    (dst, sources[0], sources[1])
-                } else {
-                    let packed = words[pc + 1];
-                    (a, (packed & 255) as usize, (packed >> 8) as usize)
-                };
-                let lhs = argument_at_read(
-                    &register(&regs, left)?,
-                    spec.input.descriptor(),
-                    left,
-                    class,
-                    method,
-                    graph,
-                    pc,
-                )?;
-                let rhs = argument_at_read(
-                    &register(&regs, right)?,
-                    spec.input.descriptor(),
-                    right,
-                    class,
-                    method,
-                    graph,
-                    pc,
-                )?;
-                let value = out.local("I", &spec.expression(&lhs, &rhs), &[])?;
-                assign(&mut regs, dst, value)?;
-            }
-            0x1a | 0x1b => {
-                let (dst, index) = if let Some(instruction) = instruction {
-                    decoded_reference_constant(instruction, regs.len())?
-                } else {
-                    let mut index = words[pc + 1] as usize;
-                    if op == 0x1b {
-                        index |= (words[pc + 2] as usize) << 16;
-                    }
-                    (a, index)
-                };
-                let s = class.symbols.strings.get(index).context("string index")?;
-                let text = string_literal(s)?;
-                let value = if (method.name.as_ref() == "<init>" && !initialized)
-                    || graph.argument_string_producer(class, method, pc)
-                    || graph.argument_region_contains(pc)
-                    || graph
-                        .constructor_prefix_strings
-                        .get()
-                        .is_some_and(|(start, end)| (start..end).contains(&pc))
-                {
-                    // Preserve the original resolution point before subsequent
-                    // argument-region effects, even when this literal is dead.
-                    out.local("Ljava/lang/String;", &text, &[])?
-                } else {
-                    Value {
-                        text,
-                        ty: "Ljava/lang/String;".into(),
-                        literal: None,
-                        wide_literal: None,
-                        raw_bits32: false,
-                    }
-                };
-                assign(&mut regs, dst, value)?;
-            }
-            0x1c if allocation.is_some() => {
-                let ty = class
-                    .symbols
-                    .types
-                    .get(words[pc + 1] as usize)
-                    .context("class literal type")?;
-                let display = java_type(ty)?;
-                let snapshot =
-                    if let Some(Some(slot)) = exception_slots.and_then(|slots| slots.get(a)) {
-                        ensure!(
-                            slot.ty == "Ljava/lang/Class;",
-                            "class capture changes exception register type"
-                        );
-                        Some(slot.text.clone())
-                    } else {
-                        None
-                    };
-                let name = out.next_local_name()?;
-                out.opaque_declaration(&format!("java.lang.Class {name};"), &[]);
-                let index = class_captures.len();
-                class_captures.push((name, display, class_label(ty), snapshot));
-                assign(
-                    &mut regs,
-                    a,
-                    Value {
-                        text: format!("<class:{index}>"),
-                        ty: "Ljava/lang/Class;".into(),
-                        literal: None,
-                        wide_literal: None,
-                        raw_bits32: false,
-                    },
-                )?;
-            }
-            0x8d..=0x8f if instruction.is_some() => {
-                let (dst, sources, _) = decoded_arithmetic(instruction.unwrap(), regs.len())?;
-                let input = register(&regs, sources[0])?;
-                ensure!(
-                    initialized || input.text != "this",
-                    "uninitialized this used by array/type operation"
-                );
-                let ty = ["B", "C", "S"][(op - 0x8d) as usize];
-                let value = out.local(
-                    ty,
-                    &format!("({}) ({})", java_type(ty)?, integral(&input)?),
-                    &[],
-                )?;
-                assign(&mut regs, dst, value)?;
-            }
-            0x1c | 0x1f..=0x21 | 0x23 | 0x44..=0x51 | 0x8d..=0x8f => {
-                let operands = if let Some(instruction) = instruction {
-                    if op == 0x1c {
-                        let (dst, index) = decoded_reference_constant(instruction, regs.len())?;
-                        operations::Operands {
-                            dst,
-                            reads: [0; 3],
-                            read_count: 0,
-                            type_index: Some(index),
-                        }
-                    } else {
-                        decoded_array_type(instruction, regs.len())?
-                    }
-                } else {
-                    operations::Operands::legacy(op, a, if width > 1 { words[pc + 1] } else { 0 })
-                };
-                if !initialized {
-                    let inputs = operands.guarded_inputs(op);
-                    for &input in &inputs[..operands.read_count] {
-                        ensure!(
-                            register(&regs, input)?.text != "this",
-                            "uninitialized this used by array/type operation"
-                        );
-                    }
-                }
-                operations::emit(class, op, operands, &mut regs, out)?;
-            }
-            0x24 | 0x25 => {
-                if !initialized {
-                    let packed = words[pc + 2];
-                    let inputs: Vec<usize> = if op == 0x25 {
-                        (packed as usize..packed as usize + a).collect()
-                    } else {
-                        let count = a >> 4;
-                        ensure!(count <= 5, "filled-array register count");
-                        let registers = [
-                            (packed & 15) as usize,
-                            ((packed >> 4) & 15) as usize,
-                            ((packed >> 8) & 15) as usize,
-                            (packed >> 12) as usize,
-                            a & 15,
-                        ];
-                        registers[..count].to_vec()
-                    };
-                    for input in inputs {
-                        ensure!(
-                            register(&regs, input)?.text != "this",
-                            "uninitialized this escapes through filled array"
-                        );
-                    }
-                }
-                // Preserve physical locals; reinterpret only the exact zero
-                // reaching a reference-array operand in the original SSA graph.
-                let mut array_regs = regs.clone();
-                if graph.loop_entry_copy.is_none()
-                    && graph.parent_prefix.is_none()
-                    && class
-                        .symbols
-                        .types
-                        .get(words[pc + 1] as usize)
-                        .and_then(|ty| ty.strip_prefix('['))
-                        .is_some_and(reference)
-                    && let Some(analysis) = graph.loop_type_analysis(class, method)
-                    && let Some(insn) = analysis.ir.instructions.iter().find(|insn| insn.pc == pc)
-                {
-                    for input in &insn.reads {
-                        let r = usize::from(input.register);
-                        if let Some(Some(value)) = array_regs.get_mut(r)
-                            && value.ty == "I"
-                            && value.literal.is_none()
-                            && ssa_null_read::at_read(
-                                &analysis.ir,
-                                &analysis.ssa,
-                                &analysis.types,
-                                pc,
-                                r,
-                            )
-                        {
-                            *value = Value {
-                                text: "null".into(),
-                                ty: "Ljava/lang/Object;".into(),
-                                literal: Some(0),
-                                wide_literal: None,
-                                raw_bits32: false,
-                            };
-                        }
-                    }
-                }
-                pending = Some(operations::filled(
-                    class,
-                    op,
-                    a,
-                    words[pc + 1],
-                    words[pc + 2],
-                    &array_regs,
-                    out,
-                )?);
-            }
-            0x26 => {
-                let offset = i32::from_le_bytes([
-                    words[pc + 1] as u8,
-                    (words[pc + 1] >> 8) as u8,
-                    words[pc + 2] as u8,
-                    (words[pc + 2] >> 8) as u8,
-                ]);
-                let payload = usize::try_from(pc as i64 + i64::from(offset))
-                    .context("array payload outside method")?;
-                operations::fill_array(words, payload, &register(&regs, a)?, out)?;
-            }
-            0x22 => {
-                // The allocation decoder must not read or capture uninitialized
-                // this, including any aliases. Mask those inputs transactionally.
-                let prologue_regs = (!initialized).then(|| {
-                    regs.iter()
-                        .map(|value| {
-                            value.clone().filter(|value| {
-                                !matches!(value.text.as_str(), "this" | "<masked-constructor-this>")
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                });
-                if (initialized || constructor)
-                    // Staging is safe for handler state only when no entry
-                    // register needs a mutable exception snapshot.
-                    && exception_slots.is_none_or(|slots| slots.iter().all(Option::is_none))
-                    && let Some(lowered) = allocation_lowering::try_lower(
-                        class, method, graph, words, pc, stop,
-                        prologue_regs.as_deref().unwrap_or(&regs), out,
-                    )?
-                    && method.code.as_ref().is_some_and(|code| code.try_regions.iter().all(|region| {
-                        let start = region.start as usize;
-                        let end = region.end as usize;
-                        end <= pc || start >= lowered.next_pc || (start <= pc && lowered.next_pc <= end) || lowered.internal_handler_regions.iter().any(|owned|owned==region)
-                    }))
-                {
-                    let mut values = lowered.regs;
-                    if !initialized {
-                        let written = super::liveness::written_in(
-                            method.code.as_ref().unwrap(),
-                            pc,
-                            lowered.next_pc,
-                        )
-                        .context("constructor allocation register writes unknown")?;
-                        for (index, original) in regs.iter().enumerate() {
-                            if original.as_ref().is_some_and(|value| {
-                                matches!(value.text.as_str(), "this" | "<masked-constructor-this>")
-                            }) && !written[index]
-                            {
-                                ensure!(
-                                    values[index].is_none(),
-                                    "masked constructor receiver replaced"
-                                );
-                                values[index] = original.clone();
-                            }
-                        }
-                    }
-                    regs = values;
-                    out.sequence = lowered.out.sequence;
-                    out.append(lowered.out);
-                    pc = lowered.next_pc;
-                    continue;
-                }
-                ensure!(
-                    exception_slots.is_none_or(|slots| slots.get(a).is_none_or(Option::is_none)),
-                    "allocation overwrites exception-visible register"
-                );
-                // Independent allocations are valid Java 25 constructor prologue
-                // statements. Their arguments must not expose the receiver.
-                ensure!(
-                    initialized || constructor,
-                    "allocation before constructor initialization"
-                );
-                let ty = class
-                    .symbols
-                    .types
-                    .get(words[pc + 1] as usize)
-                    .context("allocation type")?;
-                ensure!(ty.starts_with('L'), "new-instance requires class");
-                java_type(ty)?;
-                assign(
-                    &mut regs,
-                    a,
-                    Value {
-                        text: "<uninitialized>".into(),
-                        ty: ty.to_string(),
-                        literal: None,
-                        wide_literal: None,
-                        raw_bits32: false,
-                    },
-                )?;
-                allocation = Some((a, ty.to_string()));
-            }
-            0x52..=0x6d => {
-                let (reg, receiver_reg, index) = if let Some(instruction) = instruction {
-                    decoded_field(instruction, regs.len())?
-                } else {
-                    (
-                        if op >= 0x60 { a } else { a & 15 },
-                        if op >= 0x60 { None } else { Some(a >> 4) },
-                        words[pc + 1] as usize,
-                    )
-                };
-                let &(owner, ty, name) = class.symbols.fields.get(index).context("field index")?;
-                let owner = class
-                    .symbols
-                    .types
-                    .get(owner as usize)
-                    .context("field owner")?;
-                let ty = class.symbols.types.get(ty as usize).context("field type")?;
-                let name = class
-                    .symbols
-                    .strings
-                    .get(name as usize)
-                    .context("field name")?;
-                let display_name = names::member(name)?;
-                let family = if op >= 0x67 {
-                    op - 0x67
-                } else if op >= 0x60 {
-                    op - 0x60
-                } else if op >= 0x59 {
-                    op - 0x59
-                } else {
-                    op - 0x52
-                };
-                ensure!(
-                    match family {
-                        0 => matches!(ty.as_ref(), "I" | "F"),
-                        1 => wide(ty),
-                        2 => reference(ty),
-                        3 => ty.as_ref() == "Z",
-                        4 => ty.as_ref() == "B",
-                        5 => ty.as_ref() == "C",
-                        6 => ty.as_ref() == "S",
-                        _ => false,
-                    },
-                    "field opcode type mismatch"
-                );
-                let is_static = op >= 0x60;
-                let put = if is_static { op >= 0x67 } else { op >= 0x59 };
-                let independent_early_field = constructor
-                    && if is_static {
-                        !put
-                    } else {
-                        register(&regs, receiver_reg.context("missing field receiver")?)?.text
-                            != "this"
-                            && (!put || register(&regs, reg)?.text != "this")
-                    };
-                if !(initialized || independent_early_field) {
-                    // Independent static reads do not touch the uninitialized receiver.
-                    // Emit them in DEX order; single-use adjacent delegation arguments
-                    // can be inlined later without repeating or moving a field read.
-                    // Java 25 early construction permits assignments to fields
-                    // declared in this class, but forbids reading/escaping this.
-                    // Keep DEX order: superclass callbacks may observe the write.
-                    ensure!(
-                        constructor
-                            && !is_static
-                            && put
-                            && owner.as_ref() == class.descriptor.as_ref()
-                            && register(&regs, receiver_reg.context("missing field receiver")?)?
-                                .text
-                                == "this"
-                            && class.fields.iter().any(|field| !field.is_static
-                                && field.declaring_type == class.descriptor
-                                && field.name.as_ref() == name
-                                && field.field_type.as_ref() == ty.as_ref()),
-                        "unsupported field access before constructor initialization"
-                    );
-                    ensure!(
-                        register(&regs, reg)?.text != "this",
-                        "uninitialized this escapes through field value"
-                    );
-                    early_field_writes = true;
-                }
-                let target = if is_static {
-                    java_type(owner)?
-                } else {
-                    receiver(
-                        &register(&regs, receiver_reg.context("missing field receiver")?)?,
-                        owner,
-                    )?
-                };
-                // Own blank-final fields require a simple assignment name in
-                // Java. A field can also hide the class/package qualifier.
-                // Do not use a bare name that could bind a generated local.
-                let declared_field = class.fields.iter().find(|field| {
-                    field.is_static
-                        && field.declaring_type == class.descriptor
-                        && field.name.as_ref() == name.as_str()
-                        && field.field_type.as_ref() == ty.as_ref()
-                });
-                let initializer_needs_bare = is_static
-                    && put
-                    && method.name.as_ref() == "<clinit>"
-                    && owner == &class.descriptor
-                    && declared_field.is_some()
-                    && (declared_field.is_some_and(|field| field.access_flags & 0x10 != 0)
-                        || class.fields.iter().any(|field| {
-                            names::member(&field.name).is_ok_and(|field_name| {
-                                Some(field_name.as_str()) == target.split('.').next()
-                                    || Some(field_name.as_str()) == target.rsplit('.').next()
-                            })
-                        }));
-                let generated_collision =
-                    ["v", "e", "caught", "monitorExit"].iter().any(|prefix| {
-                        if *prefix != "v"
-                            && method
-                                .code
-                                .as_ref()
-                                .is_some_and(|code| code.try_regions.is_empty())
-                        {
-                            return false;
-                        }
-                        display_name.strip_prefix(prefix).is_some_and(|suffix| {
-                            !suffix.is_empty()
-                                && suffix.bytes().all(|b| b.is_ascii_digit())
-                                && (*prefix != "v"
-                                    || suffix
-                                        .parse::<usize>()
-                                        .is_ok_and(|index| index >= graph.local_sequence_floor))
-                        })
-                    });
-                ensure!(
-                    !initializer_needs_bare || !generated_collision,
-                    "initializer field collides with generated local namespace"
-                );
-                let bare_initializer_field = initializer_needs_bare;
-                let expr = if bare_initializer_field {
-                    display_name.clone()
-                } else {
-                    format!("{target}.{display_name}")
-                };
-                let label = format!(
-                    "{}.{}:{}",
-                    owner
-                        .trim_start_matches('L')
-                        .trim_end_matches(';')
-                        .replace('/', "."),
-                    name,
-                    ty
-                );
-                let mut refs = vec![(
-                    if bare_initializer_field {
-                        0
-                    } else {
-                        target.chars().count() + 1
-                    },
-                    display_name.chars().count(),
-                    label,
-                )];
-                if is_static && !bare_initializer_field {
-                    refs.push((
-                        0,
-                        target.chars().count(),
-                        class_label(owner).context("invalid owner")?,
-                    ));
-                }
-                if put {
-                    let stored = register(&regs, reg)?;
-                    // Narrow DEX field stores truncate the incoming integral
-                    // register. Java requires that conversion explicitly.
-                    let value = if stored.ty == "I" && matches!(ty.as_ref(), "B" | "S" | "C") {
-                        format!("(({}) {})", java_type(ty)?, stored.text)
-                    } else {
-                        argument_at_read(&stored, ty, reg, class, method, graph, pc)?
-                    };
-                    out.line(&format!("{expr} = {value};"), &refs);
-                } else {
-                    let value = out.local(ty, &expr, &refs)?;
-                    assign(&mut regs, reg, value)?;
-                }
-            }
-            0x6e..=0x72 | 0x74..=0x78 => {
-                let kind = if op >= 0x74 { op - 6 } else { op };
-                let static_call = kind == 0x71;
-                let inputs: Vec<usize> = if let Some(insn) = instruction {
-                    insn.reads
-                        .iter()
-                        .map(|input| usize::from(input.register))
-                        .collect()
-                } else if op >= 0x74 {
-                    (words[pc + 2] as usize..words[pc + 2] as usize + a).collect()
-                } else {
-                    let n = a >> 4;
-                    ensure!(n <= 5, "invoke register count");
-                    let packed = words[pc + 2];
-                    let all = [
-                        (packed & 15) as usize,
-                        ((packed >> 4) & 15) as usize,
-                        ((packed >> 8) & 15) as usize,
-                        ((packed >> 12) & 15) as usize,
-                        a & 15,
-                    ];
-                    all[..n].to_vec()
-                };
-                let local_binding;
-                let call = if let Some(front) = &graph.front_end {
-                    let index = front
-                        .bound
-                        .calls
-                        .binary_search_by_key(&pc, |call| call.pc)
-                        .map_err(|_| {
-                            anyhow::anyhow!("missing shared invocation binding at {pc}")
-                        })?;
-                    &front.bound.calls[index]
-                } else {
-                    local_binding = crate::native_calls::bind_invocation(
-                        op,
-                        pc,
-                        u32::from(words[pc + 1]),
-                        &inputs,
-                        &class.symbols,
-                    )?;
-                    &local_binding
-                };
-                let crate::native_calls::CallTarget::Method {
-                    declaring_type: owner,
-                    name,
-                    prototype_index,
-                    ..
-                } = &call.target
-                else {
-                    bail!("ordinary invoke has non-method target");
-                };
-                let name = name.as_ref();
-                let args = &class.symbols.protos[usize::from(*prototype_index)].1;
-                let ret = &call.return_type;
-                let target = if static_call {
-                    java_type(owner)?
-                } else {
-                    let value = register(
-                        &regs,
-                        usize::from(
-                            call.receiver
-                                .as_ref()
-                                .context("missing invoke receiver")?
-                                .register,
-                        ),
-                    )?;
-                    if receiver_cleanup::sdk_number_conversion_receiver(
-                        &value,
-                        owner,
-                        name,
-                        args,
-                        ret,
-                        op,
-                        class.symbols.hierarchy.get().map(AsRef::as_ref),
-                    ) || receiver_cleanup::proven_void_receiver(
-                        &value,
-                        owner,
-                        name,
-                        args,
-                        ret,
-                        op,
-                        class.symbols.hierarchy.get().map(AsRef::as_ref),
-                    ) {
-                        value.text.clone()
-                    } else {
-                        receiver(&value, owner)?
-                    }
-                };
-                let effect_owner = if name == "<init>" {
-                    allocation
-                        .as_ref()
-                        .map(|(_, ty)| ty.clone())
-                        .unwrap_or_else(|| owner.to_string())
-                } else if !static_call {
-                    let value = register(
-                        &regs,
-                        usize::from(
-                            call.receiver
-                                .as_ref()
-                                .context("missing invoke receiver")?
-                                .register,
-                        ),
-                    )?;
-                    if value.text == target && reference(&value.ty) {
-                        value.ty.clone()
-                    } else {
-                        owner.to_string()
-                    }
-                } else {
-                    owner.to_string()
-                };
-                if let Some(hierarchy) = class.symbols.hierarchy.get()
-                    && let Some(effects) =
-                        hierarchy.call_checked_effects(&effect_owner, name, args, ret, static_call)
-                {
-                    out.checked_effects.extend(
-                        effects
-                            .into_iter()
-                            .filter_map(|ty| throwing::checked_effect_type(class, &ty)),
-                    );
-                }
-
-                let label = format!(
-                    "{}.{}({}){}",
-                    owner
-                        .trim_start_matches('L')
-                        .trim_end_matches(';')
-                        .replace('/', "."),
-                    name,
-                    args.join(""),
-                    ret
-                );
-                let unambiguous_object_call = static_call
-                    && args.iter().any(|ty| ty.as_ref() == "Ljava/lang/Object;")
-                    && class
-                        .symbols
-                        .hierarchy
-                        .get()
-                        .is_some_and(|hierarchy| hierarchy.is_unambiguous_object_call(&label));
-                let mut actual = Vec::new();
-                let mut capture_count = 0;
-                let mut capture_refs = Vec::new();
-                for (argument_index, input) in call.arguments.iter().enumerate() {
-                    let ty = &input.descriptor;
-                    let reg = usize::from(input.register);
-                    let mut value = register(&regs, reg)?;
-                    ensure!(
-                        !reference(ty)
-                            || ty.as_ref() == value.ty
-                            || !graph.invalid_reference_call_argument(
-                                class,
-                                method,
-                                pc,
-                                argument_index
-                            ),
-                        "DEX reference argument is not assignable to invoked descriptor"
-                    );
-                    if let Some(index) = value
-                        .text
-                        .strip_prefix("<class:")
-                        .and_then(|v| v.strip_suffix('>'))
-                        .and_then(|v| v.parse::<usize>().ok())
-                    {
-                        ensure!(
-                            allocation.is_some() && name == "<init>",
-                            "deferred class literal outside allocation"
-                        );
-                        let (local, display, label, snapshot) = &class_captures[index];
-                        ensure!(
-                            index <= capture_count,
-                            "constructor arguments reorder class resolution"
-                        );
-                        if index == capture_count {
-                            let prefix = if let Some(snapshot) = snapshot {
-                                format!("({snapshot} = ({local} = ")
-                            } else {
-                                format!("({local} = ")
-                            };
-                            value.text = format!(
-                                "{prefix}{display}.class{}",
-                                if snapshot.is_some() { "))" } else { ")" }
-                            );
-                            if let Some(label) = label {
-                                capture_refs.push((
-                                    actual.len(),
-                                    prefix.chars().count(),
-                                    display.chars().count(),
-                                    label.clone(),
-                                ));
-                            }
-                            capture_count += 1;
-                        } else {
-                            value.text = local.clone();
-                        }
-                    }
-                    ensure!(
-                        value.text != "<uninitialized>" && (initialized || value.text != "this"),
-                        "uninitialized invocation argument"
-                    );
-                    // Typed null preserves the DEX descriptor when Java has
-                    // overloads (including constructors and varargs arrays).
-                    let omit_cast = receiver_cleanup::proven_call_argument(
-                        &value,
-                        owner,
-                        name,
-                        args,
-                        ret,
-                        op,
-                        argument_index,
-                        class.symbols.hierarchy.get().map(AsRef::as_ref),
-                    );
-                    actual.push(if value.literal == Some(0) && reference(ty) {
-                        if omit_cast {
-                            "null".into()
-                        } else {
-                            format!("(({}) null)", java_type(ty)?)
-                        }
-                    } else if omit_cast
-                        || (unambiguous_object_call
-                            && ty.as_ref() == "Ljava/lang/Object;"
-                            && reference(&value.ty))
-                    {
-                        value.text.clone()
-                    } else if ty.as_ref() == "I" && matches!(value.ty.as_str(), "B" | "S" | "C") {
-                        format!("((int) {})", value.text)
-                    } else {
-                        match argument_at_read(&value, ty, reg, class, method, graph, pc) {
-                            Ok(converted) => converted,
-                            Err(original)
-                                if ty.as_ref() == "Z"
-                                    && value.ty == "I"
-                                    && value.literal.is_none()
-                                    && !value.raw_bits32
-                                    && (graph.loop_entry_copy.is_none()
-                                        && graph.parent_prefix.is_none())
-                                    && words.len() <= 4096 =>
-                            {
-                                let analysis =
-                                    crate::native_method::MethodAnalysis::build(class, method)?;
-                                if boolean_return_definition_proven(
-                                    analysis.instructions(),
-                                    analysis.ssa(),
-                                    analysis.calls(),
-                                    pc,
-                                    reg,
-                                ) {
-                                    format!("({} != 0)", value.text)
-                                } else {
-                                    return Err(original);
-                                }
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    });
-                }
-                ensure!(name != "<clinit>", "static initializer invocation");
-                if name == "<init>" {
-                    if let Some((dst, ty)) = allocation.take() {
-                        let retargeted = owner.as_ref() != ty
-                            && class.symbols.hierarchy.get().is_some_and(|hierarchy| {
-                                hierarchy.equivalent_constructor(&ty, owner, args)
-                                    || (owner.as_ref() == "Ljava/lang/Object;"
-                                        && args.is_empty()
-                                        && hierarchy.fresh_null_constructor(&ty)
-                                        && method.code.as_ref().is_some_and(|raw| {
-                                            pc >= 2
-                                                && raw.instructions.get(pc - 2).is_some_and(
-                                                    |word| *word == (((dst as u16) << 8) | 0x22),
-                                                )
-                                                && raw
-                                                    .instructions
-                                                    .get(pc - 1)
-                                                    .and_then(|index| {
-                                                        class.symbols.types.get(*index as usize)
-                                                    })
-                                                    .is_some_and(|actual| actual.as_ref() == ty)
-                                                && raw.instructions.get(pc..pc + width)
-                                                    == words.get(pc..pc + width)
-                                        }))
-                            });
-                        ensure!(
-                            kind == 0x70
-                                && inputs.first() == Some(&dst)
-                                && (owner.as_ref() == ty || retargeted)
-                                && ret.as_ref() == "V",
-                            "allocation constructor mismatch"
-                        );
-                        ensure!(
-                            register(&regs, dst)?.text == "<uninitialized>",
-                            "allocation register overwritten"
-                        );
-                        ensure!(
-                            capture_count == class_captures.len(),
-                            "unused class literal during allocation"
-                        );
-                        let display = java_type(&ty)?;
-                        let expr = format!("new {display}({})", actual.join(", "));
-                        let mut refs = vec![(4, display.chars().count(), label)];
-                        for (arg, start, len, label) in capture_refs {
-                            let offset = 5
-                                + display.chars().count()
-                                + actual[..arg]
-                                    .iter()
-                                    .map(|s| s.chars().count() + 2)
-                                    .sum::<usize>();
-                            // The Class-valued capture itself has no conversion
-                            // unless the declared parameter type differs.
-                            let cast_prefix = if args[arg].as_ref() == "Ljava/lang/Class;" {
-                                0
-                            } else {
-                                format!("(({}) ", java_type(&args[arg])?).chars().count()
-                            };
-                            refs.push((offset + cast_prefix + start, len, label));
-                        }
-                        let value = out.local(&ty, &expr, &refs)?;
-                        for register in regs.iter_mut().flatten() {
-                            if register.text == "<uninitialized>" {
-                                *register = value.clone();
-                            }
-                            if let Some(index) = register
-                                .text
-                                .strip_prefix("<class:")
-                                .and_then(|v| v.strip_suffix('>'))
-                                .and_then(|v| v.parse::<usize>().ok())
-                            {
-                                register.text = class_captures[index].0.clone();
-                            }
-                        }
-                        class_captures.clear();
-                        if let Some(slots) = exception_slots
-                            && graph
-                                .exception_snapshot_end
-                                .get()
-                                .is_none_or(|end| pc + width < end)
-                        {
-                            sync_exception_registers(
-                                slots,
-                                &regs,
-                                &mut previous_exception_values,
-                                out,
-                                false,
-                            )?;
-                        }
-                        pc += width;
-                        continue;
-                    }
-                    let retargeted_super = equivalent_constructor_delegation(class, owner, args);
-                    ensure!(
-                        constructor
-                            && !initialized
-                            && kind == 0x70
-                            && (owner.as_ref() == class.descriptor.as_ref()
-                                || class.superclass.as_deref() == Some(owner.as_ref())
-                                || retargeted_super)
-                            && ret.as_ref() == "V",
-                        "unsupported constructor invocation"
-                    );
-                    let receiver = register(&regs, inputs[0])?;
-                    ensure!(receiver.text == "this", "constructor receiver");
-                    if retargeted_super {
-                        // Java selects an overload on the restored direct parent,
-                        // while ordinary cast cleanup examined the raw ancestor.
-                        // Pin every argument's original invocation descriptor.
-                        for (expression, ty) in actual.iter_mut().zip(args) {
-                            *expression = format!("(({}) {})", java_type(ty)?, expression);
-                        }
-                    }
-                    // Invocation binding separates argument heads from DEX's
-                    // raw wide words; tails are not independently readable values.
-                    for argument in &call.arguments {
-                        ensure!(
-                            register(&regs, usize::from(argument.register))?.text != "this",
-                            "uninitialized this as constructor argument"
-                        );
-                    }
-                    let keyword = if owner.as_ref() == class.descriptor.as_ref() {
-                        ensure!(
-                            !early_field_writes,
-                            "field writes before this delegation not reconstructed"
-                        );
-                        ensure!(
-                            *args != method.parameters,
-                            "recursive constructor delegation"
-                        );
-                        "this"
-                    } else {
-                        "super"
-                    };
-                    out.line(
-                        &format!("{keyword}({});", actual.join(", ")),
-                        &[(0, keyword.len(), label)],
-                    );
-                    initialized = true;
-                } else {
-                    ensure!(allocation.is_none(), "invalid method call");
-                    if !initialized {
-                        ensure!(
-                            constructor && kind != 0x6f,
-                            "invalid early construction call"
-                        );
-                        for input in &inputs {
-                            if regs
-                                .get(*input)
-                                .and_then(Option::as_ref)
-                                .is_some_and(|value| value.ty == "<wide-tail>")
-                            {
-                                continue;
-                            }
-                            let value = register(&regs, *input)?;
-                            ensure!(
-                                value.text != "this" && value.text != "<uninitialized>",
-                                "uninitialized this escapes through invocation"
-                            );
-                        }
-                    }
-                    let mut display_name = names::member(name)?;
-                    if kind == 0x70 {
-                        ensure!(
-                            owner.as_ref() == class.descriptor.as_ref()
-                                && class.methods.iter().any(|m| m.name.as_ref() == name
-                                    && m.parameters == *args
-                                    && m.return_type == *ret
-                                    && m.access_flags & 2 != 0),
-                            "nonprivate direct call not reconstructed"
-                        );
-                    }
-                    let target = if static_call
-                        && let Some(bridge) =
-                            super::checked_call_bridge::for_site(class, method, pc)
-                    {
-                        display_name = bridge.name;
-                        java_type(&class.descriptor)?
-                    } else if kind == 0x6f {
-                        let receiver = register(&regs, inputs[0])?;
-                        // DEX may name an ancestor above the direct superclass.
-                        // Both class invoke-super and Java super dispatch from
-                        // the nearest superclass; do not turn this into a cast
-                        // or a normal virtual call. Interface-super is distinct.
-                        let ancestor = class.symbols.hierarchy.get().map_or_else(
-                            || class.superclass.as_deref() == Some(owner.as_ref()),
-                            |hierarchy| {
-                                hierarchy.strict_superclass(&class.descriptor, owner)
-                                    == crate::native_hierarchy::Relation::Proven
-                            },
-                        );
-                        let receiver_is_this = receiver.text == "this"
-                            || (method.access_flags & 8 == 0
-                                && words.len() <= 4096
-                                && graph.loop_entry_copy.is_none()
-                                && graph.parent_prefix.is_none()
-                                && crate::native_method::MethodAnalysis::build(class, method)
-                                    .ok().is_some_and(|analysis| {
-                                        crate::native_hierarchy::this_receiver_identity::proves_read(
-                                            method, analysis.instructions(), analysis.ssa(), pc, inputs[0],
-                                        )
-                                    }));
-                        if !receiver_is_this {
-                            let bridge = super::super_bridge::for_site(class, method, pc)
-                                .context("invalid super receiver")?;
-                            ensure!(
-                                receiver.ty == class.descriptor.as_ref()
-                                    || receiver.literal == Some(0),
-                                "invalid super bridge receiver type"
-                            );
-                            display_name = bridge.name;
-                            format!(
-                                "(({}) {})",
-                                java_type(&class.descriptor)?,
-                                argument(&receiver, &class.descriptor)?
-                            )
-                        } else if ancestor {
-                            "super".into()
-                        } else {
-                            let qualifier = class
-                                .symbols
-                                .hierarchy
-                                .get()
-                                .and_then(|hierarchy| {
-                                    hierarchy
-                                        .interface_super_qualifier(class, owner, name, args, ret)
-                                })
-                                .context("invalid super receiver")?;
-                            // The shared argument reader already preserves
-                            // descriptor types (including null and primitive
-                            // widening). Its cast-cleanup proof excludes super
-                            // opcodes, so retain those conversions exactly once
-                            // when selecting this direct-interface qualifier.
-                            format!("{}.super", java_type(&qualifier)?)
-                        }
-                    } else {
-                        target
-                    };
-                    let shrink_index = if static_call && allocation.is_none() {
-                        out.last_local.as_ref().and_then(|local| {
-                            call.arguments.iter().enumerate().skip(1).find_map(
-                                |(index, argument)| {
-                                    let value =
-                                        register(&regs, usize::from(argument.register)).ok()?;
-                                    if value != local.value
-                                        || local.indent != out.indent
-                                        || local.value.ty != argument.descriptor.as_ref()
-                                        || actual[index] != value.text
-                                        || !actual[..index]
-                                            .iter()
-                                            .zip(&call.arguments[..index])
-                                            .all(|(rendered, earlier)| {
-                                                register(&regs, usize::from(earlier.register))
-                                                    .is_ok_and(|value| {
-                                                        value.ty == earlier.descriptor.as_ref()
-                                                            && rendered == &value.text
-                                                            && value
-                                                                .text
-                                                                .strip_prefix('v')
-                                                                .or_else(|| {
-                                                                    value.text.strip_prefix('p')
-                                                                })
-                                                                .is_some_and(|digits| {
-                                                                    !digits.is_empty()
-                                                                        && digits.bytes().all(
-                                                                            |byte| {
-                                                                                byte.is_ascii_digit(
-                                                                                )
-                                                                            },
-                                                                        )
-                                                                })
-                                                    })
-                                            })
-                                        || !graph.single_use_call_result(
-                                            method,
-                                            pc,
-                                            argument.register,
-                                            &local.value.ty,
-                                        )
-                                    {
-                                        return None;
-                                    }
-                                    Some(index)
-                                },
-                            )
-                        })
-                    } else {
-                        None
-                    };
-                    let moved_local = shrink_index.and_then(|index| {
-                        let prefix = format!(
-                            "(({}) ",
-                            java_type(&out.last_local.as_ref()?.value.ty).ok()?
-                        );
-                        let local = out.last_local.take()?;
-                        actual[index] = format!("{prefix}{})", local.expression);
-                        Some((index, local, prefix.chars().count()))
-                    });
-                    let expr = format!("{target}.{display_name}({})", actual.join(", "));
-                    let mut refs = vec![(
-                        target.chars().count() + 1,
-                        display_name.chars().count(),
-                        label,
-                    )];
-                    if static_call {
-                        refs.push((
-                            0,
-                            target.chars().count(),
-                            class_label(owner).context("invalid owner")?,
-                        ));
-                    }
-                    if let Some((index, local, cast_prefix)) = moved_local {
-                        let offset = target.chars().count()
-                            + display_name.chars().count()
-                            + 2
-                            + actual[..index]
-                                .iter()
-                                .map(|arg| arg.chars().count() + 2)
-                                .sum::<usize>();
-                        refs.extend(local.refs.iter().map(|(start, len, label)| {
-                            (offset + cast_prefix + start, *len, label.clone())
-                        }));
-                        out.truncate_local(&local);
-                    }
-                    let consumes_result = if graph.front_end.is_some() {
-                        call.result.is_some()
-                    } else {
-                        words
-                            .get(pc + width)
-                            .is_some_and(|word| matches!(word & 0xff, 0x0a..=0x0c))
-                    };
-                    if ret.as_ref() == "V" || !consumes_result {
-                        out.line(&format!("{expr};"), &refs);
-                    } else {
-                        pending = Some(out.local(ret, &expr, &refs)?);
-                    }
-                }
-            }
-            0x7b..=0x8c => {
-                let spec = numeric::Unary::decode(op).context("unary opcode")?;
-                let (dst, src) = if let Some(instruction) = instruction {
-                    let (dst, sources, _) = decoded_arithmetic(instruction, regs.len())?;
-                    (dst, sources[0])
-                } else {
-                    (a & 15, a >> 4)
-                };
-                let source = argument_at_read(
-                    &register(&regs, src)?,
-                    spec.input.descriptor(),
-                    src,
-                    class,
-                    method,
-                    graph,
-                    pc,
-                )?;
-                let value = out.local(spec.result.descriptor(), &spec.expression(&source), &[])?;
-                ensure!(value.ty == spec.result_descriptor, "unary result type");
-                assign(&mut regs, dst, value)?;
-            }
-            0x9b..=0xaf | 0xbb..=0xcf => {
-                let spec = numeric::Binary::decode(op).context("binary opcode")?;
-                let (dst, left, right) = if let Some(instruction) = instruction {
-                    let (dst, sources, _) = decoded_arithmetic(instruction, regs.len())?;
-                    (dst, sources[0], sources[1])
-                } else if op >= 0xb0 {
-                    (a & 15, a & 15, a >> 4)
-                } else {
-                    let packed = words[pc + 1];
-                    (a, (packed & 255) as usize, (packed >> 8) as usize)
-                };
-                let left = argument_at_read(
-                    &register(&regs, left)?,
-                    spec.left.descriptor(),
-                    left,
-                    class,
-                    method,
-                    graph,
-                    pc,
-                )?;
-                let right = argument_at_read(
-                    &register(&regs, right)?,
-                    spec.right.descriptor(),
-                    right,
-                    class,
-                    method,
-                    graph,
-                    pc,
-                )?;
-                let value = out.local(
-                    spec.result.descriptor(),
-                    &spec.expression(&left, &right),
-                    &[],
-                )?;
-                assign(&mut regs, dst, value)?;
-            }
-            0x90..=0x9a | 0xb0..=0xba | 0xd0..=0xe2 => {
-                let decoded = instruction
-                    .map(|instruction| decoded_arithmetic(instruction, regs.len()))
-                    .transpose()?;
-                if let Some((dst, expression)) =
-                    boolean_bitwise_expression(op, a, words, pc, &regs, decoded.as_ref())?
-                {
-                    let value = out.local("Z", &expression, &[])?;
-                    assign(&mut regs, dst, value)?;
-                } else {
-                    let (dst, lhs, rhs, kind) = if let Some((dst, sources, literal)) = &decoded {
-                        let kind = if op <= 0x9a {
-                            op - 0x90
-                        } else if op <= 0xba {
-                            op - 0xb0
-                        } else if op <= 0xd7 {
-                            op - 0xd0
-                        } else {
-                            op - 0xd8
-                        };
-                        (
-                            *dst,
-                            integral(&register(&regs, sources[0])?)?,
-                            if let Some(n) = literal {
-                                n.to_string()
-                            } else {
-                                integral(&register(&regs, sources[1])?)?
-                            },
-                            kind,
-                        )
-                    } else if op <= 0x9a {
-                        let w = words[pc + 1];
-                        (
-                            a,
-                            integral(&register(&regs, (w & 255) as usize)?)?,
-                            integral(&register(&regs, (w >> 8) as usize)?)?,
-                            op - 0x90,
-                        )
-                    } else if op <= 0xba {
-                        (
-                            a & 15,
-                            integral(&register(&regs, a & 15)?)?,
-                            integral(&register(&regs, a >> 4)?)?,
-                            op - 0xb0,
-                        )
-                    } else if op <= 0xd7 {
-                        (
-                            a & 15,
-                            integral(&register(&regs, a >> 4)?)?,
-                            (words[pc + 1] as i16).to_string(),
-                            op - 0xd0,
-                        )
-                    } else {
-                        (
-                            a,
-                            integral(&register(&regs, (words[pc + 1] & 255) as usize)?)?,
-                            ((words[pc + 1] >> 8) as i8).to_string(),
-                            op - 0xd8,
-                        )
-                    };
-                    let (lhs, rhs) = if matches!(op, 0xd1 | 0xd9) {
-                        (rhs, lhs)
-                    } else {
-                        (lhs, rhs)
-                    };
-                    let value = out.local("I", &format!("{lhs} {} ({rhs})", opname(kind)?), &[])?;
-                    assign(&mut regs, dst, value)?;
-                }
-            }
-            0x1d | 0x1e => bail!("unmatched or unproven monitor instruction"),
-            _ => bail!("unsupported opcode 0x{op:02x} at {pc}"),
-        }
-        ensure!(
-            out.text.len() <= 4 * 1024 * 1024,
-            "reconstructed method exceeds output budget"
-        );
-        if !returned
-            && graph
-                .exception_snapshot_end
-                .get()
-                .is_none_or(|end| pc + width < end)
-            && !bare_return_tail(graph, words, pc + width)
-            && let Some(slots) = exception_slots
-        {
-            sync_exception_registers(
-                slots,
-                &regs,
-                &mut previous_exception_values,
-                out,
-                allocation.is_some(),
-            )?;
-        }
-        pc += width;
+        let state = emit_instruction(
+            class,
+            method,
+            graph,
+            pc,
+            stop,
+            regs,
+            out,
+            initialized,
+            pending,
+            allocation,
+            class_captures,
+            early_field_writes,
+            previous_exception_values,
+            exception_slots,
+        )
+        .map_err(|error| {
+            let message = format!("{error} at instruction {pc:#x}");
+            error.context(message)
+        })?;
+        pc = state.pc;
+        regs = state.regs;
+        initialized = state.initialized;
+        pending = state.pending;
+        allocation = state.allocation;
+        class_captures = state.class_captures;
+        early_field_writes = state.early_field_writes;
+        previous_exception_values = state.previous_exception_values;
+        returned = state.returned;
         if returned {
             return Ok((regs, true));
         }
@@ -24860,12 +23765,12 @@ mod tests {
             end: 3,
             catches: vec![(Some("Ljava/lang/Exception;".into()), 1)].into(),
         });
+        let error = reconstruct("sample.Example", &c, &m).err().unwrap();
         assert!(
-            reconstruct("sample.Example", &c, &m)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("normal flow enters")
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("normal flow enters")),
+            "{error:#}"
         );
     }
 
@@ -26601,7 +25506,7 @@ mod copied_reference_source_tests {
         let (c, m) = fixture(false);
         let g = graph(&m);
         assert!(g.proven_reference_call_input(&c, &m, 17, Some(0)));
-        assert!(!g.proven_reference_call_input(&c, &m, 10, Some(1)));
+        assert!(g.proven_reference_call_input(&c, &m, 10, Some(1)));
         assert!(!g.proven_reference_call_input(&c, &m, 18, Some(0)));
         assert!(!g.proven_reference_call_input(&c, &m, 17, None));
         assert!(!g.proven_reference_call_input(&c, &m, 17, Some(1)));
@@ -26662,6 +25567,16 @@ mod copied_reference_source_tests {
         m.parameters[3] = "Ljava/lang/String;".into();
         assert!(!g.proven_reference_call_input(&c, &m, 17, Some(0)));
         assert_eq!(g.raw_reference_attempts.get(), 10);
+    }
+    #[test]
+    fn batched_reference_inputs_share_one_fresh_bounded_pass() {
+        let (c, mut m) = fixture(false);
+        let g = graph(&m);
+        assert!(g.proven_reference_call_inputs(&c, &m, &[(10, Some(1)), (17, Some(0))]));
+        assert_eq!(g.raw_reference_attempts.get(), 1);
+        m.parameters[3] = "Ljava/lang/Object;".into();
+        assert!(!g.proven_reference_call_inputs(&c, &m, &[(10, Some(1)), (17, Some(0))]));
+        assert_eq!(g.raw_reference_attempts.get(), 2);
     }
     #[test]
     fn allocation_island_plan_declines_before_fresh_validation() {

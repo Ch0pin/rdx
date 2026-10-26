@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct RecoveredConstructor {
+    /// Source-only Void marker overload preserves an otherwise conflicting initializer.
+    pub source_bridge: bool,
     /// Exact Java constructor visibility. Existing recovery categories remain
     /// public; ctorless flat classes use the class's implicit-constructor
     /// visibility and never widen a package-private class API.
@@ -74,6 +76,22 @@ fn platform_constructor(owner: &str, args: &[Arc<str>]) -> Option<Vec<Arc<str>>>
     let (access, thrown) = facts.constructors.get(&key)?;
     (access & 5 != 0 && access & (8 | 0x100 | 0x400) == 0)
         .then(|| thrown.iter().map(|ty| Arc::from(ty.as_str())).collect())
+}
+
+// Conflicting retained initializers are recovered only for SDK exception
+// families. Other allocation patterns retain their existing stricter proofs.
+fn platform_exception_parent(owner: &str) -> bool {
+    let mut current = owner;
+    for _ in 0..32 {
+        if current == "Ljava/lang/Throwable;" {
+            return true;
+        }
+        let Some(parent) = super::unloaded_platform_superclass(current) else {
+            return false;
+        };
+        current = parent;
+    }
+    false
 }
 
 /// A public SDK parent may end a chain of erased implicit no-arg constructors.
@@ -934,10 +952,27 @@ pub(super) fn recover(
                         )
                         && ret.as_ref() == "V"
                         && let Some(leaf) = owners.get(allocated.as_ref())
-                        && !leaf
+                        && (!leaf
                             .methods
                             .iter()
                             .any(|m| m.name.as_ref() == "<init>" && m.parameters == *args)
+                            || (args.is_empty()
+                                && leaf.superclass.as_ref() == Some(parent)
+                                && platform_exception_parent(parent)
+                                && super::trivial_noarg_constructor(leaf).as_ref() != Some(parent)
+                                && !leaf.methods.iter().any(|m| {
+                                    m.name.as_ref() == "<init>"
+                                        && m.parameters
+                                            .iter()
+                                            .map(AsRef::as_ref)
+                                            .eq(["Ljava/lang/Void;"])
+                                })
+                                && !owners.contains_key("Ljava/lang/Void;")
+                                && accessible_platform_noarg_constructor(
+                                    parent,
+                                    &owners,
+                                    &duplicates,
+                                )))
                         && !duplicates.contains(parent.as_ref())
                         && let Some(immediate) = leaf.superclass.as_ref()
                         && !duplicates.contains(immediate.as_ref())
@@ -953,6 +988,10 @@ pub(super) fn recover(
                         result.entry(allocated.clone()).or_default().insert(
                             args.join(""),
                             RecoveredConstructor {
+                                source_bridge: args.is_empty()
+                                    && leaf.methods.iter().any(|m| {
+                                        m.name.as_ref() == "<init>" && m.parameters.is_empty()
+                                    }),
                                 access_flags: 1,
                                 parent: immediate.clone(),
                                 invoked_owner: parent.clone(),
@@ -1099,6 +1138,7 @@ fn commit_layered_noarg_observations(
         result.entry(leaf_name).or_default().insert(
             String::new(),
             RecoveredConstructor {
+                source_bridge: false,
                 access_flags: 1,
                 parent: candidate.immediate.clone(),
                 invoked_owner: invoked,
@@ -1775,6 +1815,7 @@ fn recover_observed_super_forwarders(
                     continue;
                 }
                 let record = RecoveredConstructor {
+                    source_bridge: false,
                     access_flags: 1,
                     parent: layer.superclass.clone().expect("proven parent"),
                     invoked_owner: invoked.clone(),
@@ -2113,6 +2154,7 @@ mod layered_noarg_certificate_tests {
 
     fn record() -> RecoveredConstructor {
         RecoveredConstructor {
+            source_bridge: false,
             access_flags: 1,
             parent: Arc::from("Ljava/lang/Object;"),
             invoked_owner: Arc::from("Ljava/lang/Object;"),

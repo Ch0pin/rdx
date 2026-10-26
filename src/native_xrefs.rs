@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallSite {
     pub caller: String,
     pub callee: String,
@@ -46,7 +46,6 @@ pub fn method_call_sites(
 ) -> Result<Vec<CallSite>> {
     ensure!(!cancel.load(Ordering::Relaxed), "Call search cancelled");
     let mut sites = Vec::new();
-    let caller = crate::native_engine::disassembly::method_id(m);
     let Some(code) = &m.code else {
         return Ok(sites);
     };
@@ -62,60 +61,68 @@ pub fn method_call_sites(
             pc + width <= code.instructions.len(),
             "Truncated instruction"
         );
-        let op = code.instructions[pc] as u8;
-        let dispatch = match op {
-            0x6e | 0x74 => "virtual (declared target)",
-            0x6f | 0x75 => "super",
-            0x70 | 0x76 => "direct",
-            0x71 | 0x77 => "static",
-            0x72 | 0x78 => "interface (declared target)",
-            0xfa | 0xfb => "polymorphic (declared target)",
-            _ => "",
-        };
-        if !payload && !dispatch.is_empty() {
-            let index = *code
-                .instructions
-                .get(pc + 1)
-                .context("Missing method operand")? as usize;
-            let &(owner, proto, name) = class
-                .symbols
-                .methods
-                .get(index)
-                .context("Invalid method index")?;
-            let (ret, args) = class
-                .symbols
-                .protos
-                .get(proto as usize)
-                .context("Invalid prototype")?;
-            let owner = class
-                .symbols
-                .types
-                .get(owner as usize)
-                .context("Invalid owner")?;
-            let name = class
-                .symbols
-                .strings
-                .get(name as usize)
-                .context("Invalid method name")?;
-            sites.push(CallSite {
-                caller: caller.clone(),
-                callee: format!(
-                    "{}.{}({}){}",
-                    crate::native_engine::disassembly::type_name(owner),
-                    name,
-                    args.join(""),
-                    ret
-                ),
-                pc,
-                dispatch,
-                dex_entry: class.symbols.origin.get().cloned(),
-                method_index: index,
-                opcode: op,
-                words: code.instructions[pc..pc + width].to_vec(),
-                code_offset: code.offset,
-            });
+        if !payload && let Some(site) = call_site_at(class, m, pc)? {
+            sites.push(site);
         }
         pc += width;
     }
     Ok(sites)
+}
+
+/// Decode an invoke at an instruction boundary established by the DEX scanner.
+pub fn call_site_at(class: &DexClass, m: &DexMethod, pc: usize) -> Result<Option<CallSite>> {
+    let code = m.code.as_ref().context("Method has no code")?;
+    let op = *code.instructions.get(pc).context("Invalid call offset")? as u8;
+    let dispatch = match op {
+        0x6e | 0x74 => "virtual (declared target)",
+        0x6f | 0x75 => "super",
+        0x70 | 0x76 => "direct",
+        0x71 | 0x77 => "static",
+        0x72 | 0x78 => "interface (declared target)",
+        0xfa | 0xfb => "polymorphic (declared target)",
+        _ => return Ok(None),
+    };
+    let (width, payload) = instruction_width(&code.instructions, pc)?;
+    ensure!(
+        !payload && pc + width <= code.instructions.len(),
+        "Truncated invoke"
+    );
+    let index = code.instructions[pc + 1] as usize;
+    let &(owner, proto, name) = class
+        .symbols
+        .methods
+        .get(index)
+        .context("Invalid method index")?;
+    let (ret, args) = class
+        .symbols
+        .protos
+        .get(proto as usize)
+        .context("Invalid prototype")?;
+    let owner = class
+        .symbols
+        .types
+        .get(owner as usize)
+        .context("Invalid owner")?;
+    let name = class
+        .symbols
+        .strings
+        .get(name as usize)
+        .context("Invalid method name")?;
+    Ok(Some(CallSite {
+        caller: crate::native_engine::disassembly::method_id(m),
+        callee: format!(
+            "{}.{}({}){}",
+            crate::native_engine::disassembly::type_name(owner),
+            name,
+            args.join(""),
+            ret
+        ),
+        pc,
+        dispatch,
+        dex_entry: class.symbols.origin.get().cloned(),
+        method_index: index,
+        opcode: op,
+        words: code.instructions[pc..pc + width].to_vec(),
+        code_offset: code.offset,
+    }))
 }

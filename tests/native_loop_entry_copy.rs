@@ -279,7 +279,7 @@ fn forward_diamonds_and_initial_acyclic_stem_own_only_reachable_nodes() {
 
 #[test]
 fn backward_conditional_cycles_terminal_arms_and_pending_result_entries_decline() {
-    for (pc, word) in [(23, 0x0038), (21, 2), (6, 13), (14, 0xfffa)] {
+    for (pc, word) in [(23, 0x0038), (21, 2), (6, 13), (14, 0xfffc)] {
         let mut class = fixture(6);
         class.methods[0].code.as_mut().unwrap().instructions[pc] = word;
         assert!(
@@ -456,4 +456,119 @@ public class Effects {
         );
         eprintln!("{}", String::from_utf8_lossy(&result.stdout));
     }
+}
+
+fn early_continue_fixture() -> DexClass {
+    let mut c = fixture(0);
+    c.methods[0].name = "resumeSkip".into();
+    c.methods[0].code.as_mut().unwrap().instructions = vec![
+        0x0012, 0x0112, 0x0338, 4, 0x4001, 0x0528, 0x2035, 11, 0x00d8, 0x0100, 0x0038, 0xfffc,
+        0x1071, 0, 0, 0x010a, 0xf628, 0x010f,
+    ];
+    c
+}
+#[test]
+fn copied_suffix_keeps_both_early_continue_and_final_feedback() {
+    let c = early_continue_fixture();
+    let code = c.methods[0].code.as_ref().unwrap();
+    let plan = loop_entry_copy::select(code).unwrap();
+    assert!(loop_entry_copy::validate(code, &plan));
+    assert_eq!(plan.copies.iter().filter(|c| c.header.is_some()).count(), 1);
+    let source = native_java::render_method("sample.Hello", &c, &c.methods[0])
+        .unwrap()
+        .source;
+    assert!(source.contains("do {"), "{source}");
+    assert!(source.contains("} while (false);"), "{source}");
+}
+#[test]
+#[ignore = "requires javac/java; checks multiple feedback edges in a resume suffix"]
+fn early_resume_continue_preserves_effects_and_faults() {
+    let c = early_continue_fixture();
+    let source = native_java::render_method("sample.Hello", &c, &c.methods[0])
+        .unwrap()
+        .source;
+    let dir = std::env::temp_dir().join(format!("rdx-resume-continue-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    let java = format!(
+        r#"package sample; public class Effects {{
+ static java.util.List<Integer> trace=new java.util.ArrayList<>(); static int failAt;static final RuntimeException FAULT=new RuntimeException();
+ public static int touch(int x){{trace.add(x);if(trace.size()==failAt)throw FAULT;return x*10;}}
+ {source}
+ static int oracle(int limit,int resume,int seed){{int i=0,value=0;if(resume!=0){{i=seed;if(i!=0)value=touch(i);}}while(i<limit){{i++;if(i==0)continue;value=touch(i);}}return value;}}
+ public static void main(String[] args){{for(int limit=-2;limit<=6;limit++)for(int resume=0;resume<2;resume++)for(int seed=-2;seed<=6;seed++)for(int fail=0;fail<4;fail++){{
+ failAt=fail;trace.clear();int expected=0;RuntimeException e=null;try{{expected=oracle(limit,resume,seed);}}catch(RuntimeException x){{e=x;}}java.util.List<Integer> t=new java.util.ArrayList<>(trace);trace.clear();int actual=0;RuntimeException a=null;try{{actual=resumeSkip(limit,resume,seed);}}catch(RuntimeException x){{a=x;}}if(a!=e||(e==null&&actual!=expected)||!trace.equals(t))throw new AssertionError(limit+":"+resume+":"+seed+":"+fail+":"+trace+" vs "+t);
+ }} }} }}"#
+    );
+    fs::write(dir.join("sample/Effects.java"), &java).unwrap();
+    for (p, a) in [("javac", "sample/Effects.java"), ("java", "sample.Effects")] {
+        let r = Command::new(p).arg(a).current_dir(&dir).output().unwrap();
+        assert!(
+            r.status.success(),
+            "{}\n{java}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+fn copied_allocation_fixture() -> DexClass {
+    let mut c = fixture(0);
+    c.methods[0].name = "resumeAllocate".into();
+    c.symbols = Arc::new(DexSymbols {
+        types: vec!["Lsample/Effects$Box;".into()],
+        strings: vec!["<init>".into(), "get".into()],
+        protos: vec![("V".into(), vec!["I".into()]), ("I".into(), vec![])],
+        methods: vec![(0, 0, 0), (0, 1, 1)],
+        ..Default::default()
+    });
+    let code = c.methods[0].code.as_mut().unwrap();
+    code.outs = 2;
+    code.instructions = vec![
+        0x0012, 0x0112, 0x0338, 4, 0x4001, 0x0528, 0x2035, 14, 0x00d8, 0x0100, 0x0122, 0, 0x2070,
+        0, 1, 0x106e, 1, 1, 0x010a, 0xf328, 0x010f,
+    ];
+    c
+}
+#[test]
+fn copied_allocation_requires_owned_matching_initializer() {
+    let c = copied_allocation_fixture();
+    let source = native_java::render_method("sample.Hello", &c, &c.methods[0])
+        .unwrap()
+        .source;
+    assert_eq!(
+        source.matches("new sample.Effects$Box").count(),
+        2,
+        "{source}"
+    );
+    let mut c = copied_allocation_fixture();
+    c.methods[0].code.as_mut().unwrap().instructions[13] = 1;
+    assert!(native_java::render_method("sample.Hello", &c, &c.methods[0]).is_err());
+}
+#[test]
+#[ignore = "requires javac/java; checks copied allocation and constructor effects"]
+fn copied_allocation_preserves_constructor_order() {
+    let c = copied_allocation_fixture();
+    let source = native_java::render_method("sample.Hello", &c, &c.methods[0])
+        .unwrap()
+        .source;
+    let dir = std::env::temp_dir().join(format!("rdx-copy-allocation-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    let java = format!(
+        r#"package sample; public class Effects {{
+ static java.util.List<Integer> trace=new java.util.ArrayList<>();static int failAt;static RuntimeException FAULT=new RuntimeException();
+ {source}
+ static int oracle(int limit,int resume,int seed){{int i=0,value=0;if(resume!=0){{i=seed;value=new Effects$Box(i).get();}}while(i<limit){{i++;value=new Effects$Box(i).get();}}return value;}}
+ public static void main(String[] args){{for(int limit=-2;limit<=6;limit++)for(int resume=0;resume<2;resume++)for(int seed=-2;seed<=6;seed++)for(int fail=0;fail<4;fail++){{failAt=fail;trace.clear();int expected=0;RuntimeException e=null;try{{expected=oracle(limit,resume,seed);}}catch(RuntimeException x){{e=x;}}java.util.List<Integer> t=new java.util.ArrayList<>(trace);trace.clear();int actual=0;RuntimeException a=null;try{{actual=resumeAllocate(limit,resume,seed);}}catch(RuntimeException x){{a=x;}}if(a!=e||(e==null&&actual!=expected)||!trace.equals(t))throw new AssertionError();}}}}
+ }} class Effects$Box {{int v;Effects$Box(int n){{Effects.trace.add(n);if(Effects.trace.size()==Effects.failAt)throw Effects.FAULT;v=n*10;}}int get(){{return v;}}}}"#
+    );
+    fs::write(dir.join("sample/Effects.java"), &java).unwrap();
+    for (p, a) in [("javac", "sample/Effects.java"), ("java", "sample.Effects")] {
+        let r = Command::new(p).arg(a).current_dir(&dir).output().unwrap();
+        assert!(
+            r.status.success(),
+            "{}\n{java}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
 }

@@ -215,3 +215,35 @@ pub(crate) fn proves_read(
     }
     roots != 0
 }
+
+/// Re-materialize an exact narrow constant when a source frame has lost an
+/// otherwise valid SSA input. Every reachable origin must be a raw constant
+/// or a value-preserving copy, and all alternatives must have identical bits.
+pub(crate) fn constant32_at_read(
+    ir: &DecodedMethod,
+    ssa: &SsaMethod,
+    types: &InferredTypes,
+    pc: usize,
+    register: usize,
+) -> Option<i32> {
+    let instruction = ssa.instructions.iter().find(|i| i.pc == pc)?;
+    let mut reads = instruction
+        .reads
+        .iter()
+        .filter(|r| usize::from(r.register) == register);
+    let read = reads.next()?;
+    if reads.next().is_some() || read.words.len() != 1 {
+        return None;
+    }
+    let value = types.values.get(read.words[0])?;
+    let [AssignmentBound::Literal { bits, wide: false }] = value.assignment.as_slice() else {
+        return None;
+    };
+    if value.assignment_bounds_truncated
+        || value.bounds_truncated
+        || !proves_read(ir, ssa, types, pc, register, Domain::Raw32)
+    {
+        return None;
+    }
+    i32::try_from(*bits).ok()
+}

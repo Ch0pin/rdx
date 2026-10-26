@@ -1,4 +1,7 @@
-//! Exact DEX call-site queries. Filters select results after depth-bounded traversal.
+#[path = "invoke_index.rs"]
+mod index;
+pub(crate) use index::Cache;
+// Exact DEX call-site queries. Filters select results after depth-bounded traversal.
 use super::{CallGraph, Component, Edge, Node, component, dispatch_targets_with, owner};
 use crate::{native_dex::DexClass, native_engine::NativeDexEngine, native_xrefs};
 use anyhow::{Context, Result, ensure};
@@ -15,6 +18,8 @@ const EDGE_LIMIT: usize = 20_000;
 
 struct Options<'a> {
     direction: &'a str,
+    interface_dispatch: bool,
+    superclass_dispatch: bool,
     depth: usize,
     direct_only: bool,
     projection: &'a str,
@@ -96,7 +101,22 @@ impl<'a> Options<'a> {
                 _ => anyhow::bail!("Invalid component_type"),
             })
             .transpose()?;
+        let interface_dispatch = args["dispatch_through_interfaces"]
+            .as_bool()
+            .unwrap_or(false);
+        let superclass_dispatch = args["dispatch_through_superclasses"]
+            .as_bool()
+            .unwrap_or(false);
+        ensure!(
+            !(interface_dispatch || superclass_dispatch)
+                || (direction == "callers"
+                    && projection == "call_sites"
+                    && (direct_only || requested_depth == 1)),
+            "Dispatch expansion requires direction=callers, projection=call_sites and depth=1"
+        );
         Ok(Self {
+            interface_dispatch,
+            superclass_dispatch,
             direction,
             depth: if direct_only { 1 } else { requested_depth },
             direct_only,
@@ -153,6 +173,9 @@ impl<'a> Catalog<'a> {
         let mut cache = self.method_positions.borrow_mut();
         if !cache.contains_key(name) {
             let class = self.class(name)?;
+            if cache.len() >= 1024 {
+                cache.clear();
+            }
             let mut positions = HashMap::new();
             for (i, m) in class.methods.iter().enumerate() {
                 if self.cancel.load(Ordering::Relaxed) {
@@ -274,13 +297,75 @@ pub fn query(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
+    query_cached(engine, root, args, cancel, &Cache::default())
+}
+pub(crate) fn query_cached(
+    engine: &NativeDexEngine,
+    root: &str,
+    args: &Value,
+    cancel: &AtomicBool,
+    cache: &Cache,
+) -> Result<Value> {
     check_cancel(cancel)?;
-    query_catalog(
-        Catalog::new(engine.graph_classes(), cancel)?,
-        root,
-        args,
-        cancel,
-    )
+    let catalog = Catalog::new(engine.graph_classes(), cancel)?;
+    query_cached_catalog(catalog, root, args, cancel, cache)
+}
+fn query_cached_catalog(
+    catalog: Catalog<'_>,
+    root: &str,
+    args: &Value,
+    cancel: &AtomicBool,
+    cache: &Cache,
+) -> Result<Value> {
+    let options = Options::parse(args)?;
+    let normalized = crate::method_lookup::graph_selector(root, |name| catalog.class(name))?;
+    if options.direction == "callees" {
+        return query_catalog(catalog, &normalized, args, cancel);
+    }
+    let (index, cached) = cache.get(&catalog)?;
+    let canonical = catalog.canonical(&normalized);
+    let aliases = interface_aliases(&catalog, &normalized, &options, cancel)?;
+    let mut queue = VecDeque::from([(canonical.clone(), 0)]);
+    let mut visited = HashSet::from([canonical]);
+    let mut seen_sites = HashSet::new();
+    let mut sites = vec![];
+    for alias in &aliases {
+        for site in index.neighbors(&catalog, alias, true)? {
+            if matches!(site.opcode, 0x6e | 0x74 | 0x72 | 0x78)
+                && seen_sites.insert((site.caller.clone(), site.pc, site.callee.clone()))
+            {
+                sites.push(site);
+            }
+        }
+    }
+    while let Some((current, depth)) = queue.pop_front() {
+        check_cancel(cancel)?;
+        if depth >= options.depth {
+            continue;
+        }
+        for reverse in [true, false] {
+            if !reverse && options.direction == "callers" {
+                continue;
+            }
+            for site in index.neighbors(&catalog, &current, reverse)? {
+                let next = if reverse {
+                    site.caller.clone()
+                } else {
+                    catalog.canonical(&site.callee)
+                };
+                if visited.insert(next.clone()) {
+                    queue.push_back((next, depth + 1));
+                }
+                if seen_sites.insert((site.caller.clone(), site.pc, site.callee.clone())) {
+                    sites.push(site);
+                }
+            }
+        }
+    }
+    let mut result = query_catalog_with_sites(catalog, &normalized, args, cancel, Some(sites))?;
+    result["invoke_index_cached"] = json!(cached);
+    result["invoke_index"] = cache.status();
+    Ok(result)
 }
 
 fn callee_sites(
@@ -316,6 +401,42 @@ fn callee_sites(
     Ok(sites)
 }
 
+fn interface_aliases(
+    catalog: &Catalog<'_>,
+    root: &str,
+    options: &Options<'_>,
+    cancel: &AtomicBool,
+) -> Result<HashSet<String>> {
+    if !(options.interface_dispatch || options.superclass_dispatch) {
+        return Ok(HashSet::new());
+    }
+    if let Some(class) = owner(root).and_then(|name| catalog.class(name))
+        && (class.access_flags & 0x200 != 0
+            || class.methods.iter().any(|m| {
+                crate::native_engine::disassembly::method_id(m) == root
+                    && m.access_flags & 0x400 != 0
+            }))
+    {
+        return Ok(HashSet::new());
+    }
+    let (ancestors, truncated) = dispatch_targets_with(|name| catalog.class(name), root, cancel)?;
+    ensure!(
+        !truncated,
+        "Dispatch ancestry exceeds budget; query ancestor methods explicitly"
+    );
+    Ok(ancestors
+        .into_iter()
+        .filter(|id| {
+            owner(id).and_then(|n| catalog.class(n)).is_some_and(|c| {
+                if c.access_flags & 0x200 != 0 {
+                    options.interface_dispatch
+                } else {
+                    options.superclass_dispatch
+                }
+            })
+        })
+        .collect())
+}
 fn record(site: &native_xrefs::CallSite, depth: usize) -> Value {
     json!({"caller_method_id":site.caller,"caller_signature":site.caller,"callee_method_id":site.callee,"raw_callee_method_id":site.callee,"call_site_offset":site.pc,"depth":depth,
         "invoke_instruction":crate::native_engine::disassembly::invoke_text(&site.words, site.pc, &site.callee),"dex_entry":site.dex_entry,"method_index":site.method_index,"invoke_opcode":site.opcode,"invoke_words":site.words,"caller_code_offset_bytes":site.code_offset,"dispatch":site.dispatch})
@@ -327,14 +448,26 @@ fn query_catalog(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
+    query_catalog_with_sites(catalog, root, args, cancel, None)
+}
+fn query_catalog_with_sites(
+    catalog: Catalog<'_>,
+    root: &str,
+    args: &Value,
+    cancel: &AtomicBool,
+    provided: Option<Vec<native_xrefs::CallSite>>,
+) -> Result<Value> {
     let options = Options::parse(args)?;
     let normalized_root = crate::method_lookup::graph_selector(root, |name| catalog.class(name))?;
     let root = normalized_root.as_str();
     check_cancel(cancel)?;
     let root_key = catalog.canonical(root);
+    let aliases = interface_aliases(&catalog, root, &options, cancel)?;
     // Outgoing queries scan only reachable bodies. Reverse traversal needs the
     // project-wide call index, independently of graph projection limits.
-    let mut sites = if options.direction == "callees" {
+    let mut sites = if let Some(sites) = provided {
+        sites
+    } else if options.direction == "callees" {
         callee_sites(&catalog, &root_key, options.depth, cancel)?
     } else {
         let mut sites = Vec::new();
@@ -359,6 +492,12 @@ fn query_catalog(
             .entry(site.callee.clone())
             .or_insert_with(|| catalog.canonical(&site.callee))
             .clone();
+        let callee =
+            if aliases.contains(&site.callee) && matches!(site.opcode, 0x6e | 0x74 | 0x72 | 0x78) {
+                root_key.clone()
+            } else {
+                callee
+            };
         outgoing.entry(caller.clone()).or_default().push(i);
         incoming.entry(callee.clone()).or_default().push(i);
         keys.push((caller, callee));
@@ -425,17 +564,46 @@ fn query_catalog(
         result["call_site_semantics"] = json!(
             "Each record is one raw DEX invoke to callee_method_id. depth is traversal distance from the query root; only depth=1 records are direct root neighbors. call_sites defaults to depth=1; explicit depth includes transitive sites."
         );
+        let record_for = |i: usize, depth: usize| {
+            let mut row = record(&sites[i], depth);
+            let inferred = aliases.contains(&sites[i].callee)
+                && matches!(sites[i].opcode, 0x6e | 0x74 | 0x72 | 0x78);
+            row["relationship"] = json!(if inferred {
+                if matches!(sites[i].opcode, 0x72 | 0x78) {
+                    "possible_interface_dispatch"
+                } else {
+                    "possible_virtual_dispatch"
+                }
+            } else {
+                "exact_declared_call"
+            });
+            if inferred {
+                row["possible_implementation_method_id"] = json!(root);
+            }
+            row
+        };
+        let inferred = selected_sites
+            .keys()
+            .filter(|&&i| {
+                aliases.contains(&sites[i].callee)
+                    && matches!(sites[i].opcode, 0x6e | 0x74 | 0x72 | 0x78)
+            })
+            .count();
+        result["exact_matching_total"] = json!(total - inferred);
+        result["possible_dispatch_total"] = json!(inferred);
+        result["dispatch_through_interfaces"] = json!(options.interface_dispatch);
+        result["dispatch_through_superclasses"] = json!(options.superclass_dispatch);
         let mut hash = Sha256::new();
         for (&i, &depth) in &selected_sites {
             check_cancel(cancel)?;
-            hash.update(serde_json::to_vec(&record(&sites[i], depth))?);
+            hash.update(serde_json::to_vec(&record_for(i, depth))?);
             hash.update(b"\n");
         }
         let records: Vec<_> = selected_sites
             .iter()
             .skip(options.offset)
             .take(options.limit)
-            .map(|(&i, &depth)| record(&sites[i], depth))
+            .map(|(&i, &depth)| record_for(i, depth))
             .collect();
         let returned = records.len();
         let next = options.offset.saturating_add(returned);
@@ -539,7 +707,7 @@ mod tests {
     };
     use std::sync::Arc;
 
-    fn class(
+    pub(super) fn class(
         name: &str,
         parent: Option<&str>,
         methods: Vec<(&str, Vec<&str>, Vec<&str>)>,
@@ -602,6 +770,108 @@ mod tests {
         }
     }
 
+    #[test]
+    fn interface_dispatch_keeps_declared_target_and_separate_counts() {
+        let cancel = AtomicBool::new(false);
+        let mut interface = class("p.Contract", None, vec![("run", vec![], vec![])]);
+        interface.access_flags = 0x201;
+        interface.methods[0].access_flags = 0x401;
+        let mut implementation = class("p.Impl", None, vec![("run", vec![], vec![])]);
+        implementation.interfaces = vec!["Lp/Contract;".into()];
+        implementation.methods[0].access_flags = 1;
+        let mut caller = class(
+            "p.Caller",
+            None,
+            vec![("call", vec![], vec!["p.Contract.run()V", "p.Impl.run()V"])],
+        );
+        let body = caller.methods[0].code.as_mut().unwrap();
+        body.instructions[1] = 0x1072;
+        body.instructions[5] = 0x106e;
+        body.outs = 1;
+        let args = json!({"direction":"callers","projection":"call_sites","dispatch_through_interfaces":true,"limit":1});
+        let run = |args: &Value| {
+            query_cached_catalog(
+                Catalog::new([&interface, &implementation, &caller], &cancel).unwrap(),
+                "p.Impl.run()V",
+                args,
+                &cancel,
+                &Cache::default(),
+            )
+            .unwrap()
+        };
+        let first = run(&args);
+        assert_eq!(first["matching_total"], 2);
+        assert_eq!(first["exact_matching_total"], 1);
+        assert_eq!(first["possible_dispatch_total"], 1);
+        assert_eq!(
+            first["call_sites"][0]["raw_callee_method_id"],
+            "p.Contract.run()V"
+        );
+        assert_eq!(
+            first["call_sites"][0]["relationship"],
+            "possible_interface_dispatch"
+        );
+        let mut next = args.clone();
+        next["offset"] = json!(1);
+        let second = run(&next);
+        assert_eq!(
+            second["call_sites"][0]["relationship"],
+            "exact_declared_call"
+        );
+        assert_eq!(first["source_hash"], second["source_hash"]);
+        next["dispatch_through_interfaces"] = json!(false);
+        next["offset"] = json!(0);
+        assert_eq!(run(&next)["matching_total"], 1);
+        implementation.access_flags = 0x401;
+        implementation.methods[0].access_flags = 0x401;
+        implementation.methods[0].code = None;
+        let abstract_result = query_cached_catalog(
+            Catalog::new([&interface, &implementation, &caller], &cancel).unwrap(),
+            "p.Impl.run()V",
+            &args,
+            &cancel,
+            &Cache::default(),
+        )
+        .unwrap();
+        assert_eq!(abstract_result["possible_dispatch_total"], 0);
+    }
+
+    #[test]
+    fn superclass_dispatch_preserves_raw_target_and_excludes_super_calls() {
+        let cancel = AtomicBool::new(false);
+        let mut base = class("p.Base", None, vec![("run", vec![], vec![])]);
+        base.access_flags = 0x401;
+        base.methods[0].access_flags = 0x401;
+        base.methods[0].code = None;
+        let mut child = class("p.Child", Some("p.Base"), vec![("run", vec![], vec![])]);
+        child.methods[0].access_flags = 1;
+        let mut caller = class(
+            "p.Caller",
+            None,
+            vec![("call", vec![], vec!["p.Base.run()V", "p.Base.run()V"])],
+        );
+        let body = caller.methods[0].code.as_mut().unwrap();
+        body.instructions[1] = 0x106e;
+        body.instructions[5] = 0x106f;
+        body.outs = 1;
+        let run = |expand| {
+            query_cached_catalog(Catalog::new([&base,&child,&caller],&cancel).unwrap(),"p.Child.run()V",
+            &json!({"direction":"callers","projection":"call_sites","dispatch_through_superclasses":expand}),&cancel,&Cache::default()).unwrap()
+        };
+        assert_eq!(run(false)["matching_total"], 0);
+        let result = run(true);
+        assert_eq!(result["matching_total"], 1);
+        assert_eq!(result["possible_dispatch_total"], 1);
+        assert_eq!(
+            result["call_sites"][0]["raw_callee_method_id"],
+            "p.Base.run()V"
+        );
+        assert_eq!(
+            result["call_sites"][0]["relationship"],
+            "possible_virtual_dispatch"
+        );
+    }
+
     fn annotate(
         class: &mut DexClass,
         class_type: Option<&str>,
@@ -639,6 +909,62 @@ mod tests {
             &cancel,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn disk_query_matches_full_scan_for_transitive_filtered_and_bidirectional_graphs() {
+        let classes = vec![
+            class(
+                "app.A",
+                None,
+                vec![("run", vec![], vec!["app.B.run()V", "api.Child.call()V"])],
+            ),
+            class(
+                "app.B",
+                None,
+                vec![("run", vec![], vec!["api.Parent.call()V"])],
+            ),
+            class(
+                "api.Parent",
+                None,
+                vec![("call", vec![], vec!["app.A.run()V"])],
+            ),
+            class("api.Child", Some("api.Parent"), vec![]),
+        ];
+        let cancel = AtomicBool::new(false);
+        let cache = Cache::default();
+        for direction in ["callers", "callees", "both"] {
+            for depth in [1, 2, 4] {
+                for projection in ["graph", "call_sites"] {
+                    for filter in [None, Some("app.")] {
+                        let mut args =
+                            json!({"direction":direction,"depth":depth,"projection":projection});
+                        if let Some(prefix) = filter {
+                            args["package_prefix"] = json!(prefix);
+                        }
+                        if projection == "call_sites" {
+                            args["offset"] = json!(1);
+                            args["limit"] = json!(2);
+                        }
+                        let expected = run(&classes, "api.Child.call()V", args.clone());
+                        let mut actual = query_cached_catalog(
+                            Catalog::new(&classes, &cancel).unwrap(),
+                            "api.Child.call()V",
+                            &args,
+                            &cancel,
+                            &cache,
+                        )
+                        .unwrap();
+                        actual.as_object_mut().unwrap().remove("invoke_index");
+                        actual
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("invoke_index_cached");
+                        assert_eq!(actual, expected, "{args}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

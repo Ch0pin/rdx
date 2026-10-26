@@ -1,5 +1,16 @@
 # Android API type and exception facts
 
+`src/native_resource_names.rs` contains framework attribute IDs and names from
+Android SDK 36 `data/res/values/public-final.xml`, with its source SHA-256 recorded
+in the generated file. Binary XML uses this catalog to restore framework attribute
+names and namespaces from resource-map IDs, including manifests with stripped
+strings. Unknown IDs retain valid supplied names; unidentified blank names remain
+explicit decoding errors. No SDK is required at runtime. Regenerate with:
+
+```
+python3 scripts/generate_resource_names.py /path/to/android-36/data/res/values/public-final.xml src/native_resource_names.rs
+```
+
 `android-35-exceptions.json` records class and interface ancestry plus exact method throws
 declarations extracted from the Android SDK API 35 `android.jar`. It contains
 metadata only, not class implementations. The input SHA-256 is embedded in the

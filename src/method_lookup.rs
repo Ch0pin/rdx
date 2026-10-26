@@ -6,6 +6,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 
 pub(crate) const EXAMPLE: &str = "pkg.Class.method(Ljava/lang/String;)V";
+const SMALI_EXAMPLE: &str = "Lpkg/Class;->method(Ljava/lang/String;)V";
 
 // Use the DEX 040+ SimpleNameChar grammar, including Zs spaces, rather than
 // Java identifier rules. Selector identity must preserve legal obfuscation.
@@ -60,7 +61,7 @@ pub(crate) fn normalize(id: &str) -> Result<String> {
         "Method ID must contain 1..4096 bytes"
     );
     let example = format!(
-        "INVALID_METHOD_SELECTOR: expected {EXAMPLE} or Lpkg/Class;->method(Ljava/lang/String;)V; optional ':' is accepted only immediately before '('"
+        "INVALID_METHOD_SELECTOR: expected {EXAMPLE} or {SMALI_EXAMPLE}; optional ':' is accepted only immediately before '('"
     );
     let normalized = if let Some((owner, member)) = id.split_once("->") {
         let owner = owner
@@ -170,7 +171,9 @@ pub(crate) fn graph_selector<'a>(
         "candidates_truncated": candidates.len() < total,
         "scope":"same-name declarations in requested class and known superclass chain (up to 256 types)",
         "hint":"Retry with an exact candidate including parameter and return descriptors; no overload was selected"});
-    anyhow::bail!("Expected exact DEX method signature, e.g. {EXAMPLE}; {detail}")
+    anyhow::bail!(
+        "Expected exact DEX method signature, e.g. {EXAMPLE} or {SMALI_EXAMPLE}; include parameter descriptors in parentheses and a return descriptor after ')' (V for void); {detail}"
+    )
 }
 
 pub(crate) fn resolve<'a>(class: &'a DexClass, id: &str) -> Result<&'a DexMethod> {

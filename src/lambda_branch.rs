@@ -451,7 +451,7 @@ fn prove(
     }
     if proofs.is_empty() {
         return Err(
-            "no dispatcher has a proven this-field switch fed by a constant constructor argument"
+            "no dispatcher has a proven this-field switch fed by a constructor constant or constant argument"
                 .into(),
         );
     }
@@ -480,7 +480,7 @@ fn dispatch(
             let Origin::Field(field) = read(&state, i, 0) else {
                 return Ok(None);
             };
-            let Some((Origin::Parameter(parameter), store_pc)) = stores.get(&field) else {
+            let Some((origin, store_pc)) = stores.get(&field) else {
                 return Ok(None);
             };
             let Some(definition) = class
@@ -496,15 +496,32 @@ fn dispatch(
             {
                 return Ok(None);
             }
-            let Some(Origin::Constant(value)) = args.get(*parameter as usize) else {
-                return Ok(None);
+            let (value, parameter, discriminator_source, origin_proof) = match origin {
+                Origin::Parameter(parameter) => {
+                    let Some(Origin::Constant(value)) = args.get(*parameter as usize) else {
+                        return Ok(None);
+                    };
+                    (
+                        *value,
+                        Some(*parameter),
+                        "caller_argument",
+                        "caller const/move dataflow through constructor parameter to this-field store",
+                    )
+                }
+                Origin::Constant(value) => (
+                    *value,
+                    None,
+                    "constructor_constant",
+                    "constructor const/move dataflow to this-field store",
+                ),
+                _ => return Ok(None),
             };
             let value = match definition.field_type.as_ref() {
-                "I" => *value,
-                "B" => *value as i8 as i32,
-                "S" => *value as i16 as i32,
-                "C" => *value as u16 as i32,
-                "Z" if *value == 0 || *value == 1 => *value,
+                "I" => value,
+                "B" => value as i8 as i32,
+                "S" => value as i16 as i32,
+                "C" => value as u16 as i32,
+                "Z" if value == 0 || value == 1 => value,
                 _ => return Ok(None),
             };
             let payload = i.payload_target.ok_or("switch payload missing")?;
@@ -603,7 +620,7 @@ fn dispatch(
                 json!({"block_id":b,"start_offset":block.start,"end_offset_exclusive":block.end,"shared_with_other_case":others.contains(&b),"exception_only":!normal.contains(&b),"instructions":instructions,"successors":block.successors.iter().map(|e|json!({"block_id":e.target,"kind":if e.kind==EdgeKind::Exceptional {"exceptional"} else {"normal"}})).collect::<Vec<_>>()})
             }).collect();
             return Ok(Some(
-                json!({"method_id":method_id(m),"class_id":crate::native_engine::disassembly::type_name(&class.descriptor),"discriminator":value,"field_id":field,"constructor_argument_word":parameter,"constructor_store_offset":store_pc,"switch_offset":i.pc,"selected_target_offset":selected,"selected_default":!matched,"prelude_instructions":prelude_instructions,"prelude_exception_blocks":prelude_exception_blocks,"blocks":blocks,"provenance":["caller const/move dataflow to constructor argument","constructor parameter/move dataflow to this-field store","dispatcher this-field/move dataflow to switch","validated DEX payload and CFG successor closure"]}),
+                json!({"method_id":method_id(m),"class_id":crate::native_engine::disassembly::type_name(&class.descriptor),"discriminator":value,"field_id":field,"constructor_argument_word":parameter,"discriminator_source":discriminator_source,"constructor_store_offset":store_pc,"switch_offset":i.pc,"selected_target_offset":selected,"selected_default":!matched,"prelude_instructions":prelude_instructions,"prelude_exception_blocks":prelude_exception_blocks,"blocks":blocks,"provenance":[origin_proof,"dispatcher this-field/move dataflow to switch","validated DEX payload and CFG successor closure"]}),
             ));
         }
         if !linear(i) {
@@ -810,7 +827,45 @@ mod tests {
             "analysis cancelled"
         );
         assert_eq!(result["dispatchers"][0]["blocks"][0]["start_offset"], 6);
-        let mut class = class;
+        assert_eq!(
+            result["dispatchers"][0]["discriminator_source"],
+            "caller_argument"
+        );
+        // A constructor can set a fixed discriminator regardless of an unknown
+        // incoming argument. Keep the allocation, final-field and mutation proofs.
+        let mut fixed = class;
+        fixed.methods[0].code.as_mut().unwrap().instructions = vec![0x1112, 0x0159, 0, 0x000e];
+        fixed.methods[2].code.as_mut().unwrap().instructions[2] = 0x010a;
+        let resolved = analyze(&[&fixed], "Lambda.factory()V", 3, &|| false);
+        assert_eq!(resolved["status"], "resolved", "{resolved}");
+        assert_eq!(resolved["dispatchers"][0]["discriminator"], 1);
+        assert_eq!(
+            resolved["dispatchers"][0]["discriminator_source"],
+            "constructor_constant"
+        );
+        assert!(resolved["dispatchers"][0]["constructor_argument_word"].is_null());
+        fixed.methods[0].code.as_mut().unwrap().instructions =
+            vec![0x1112, 0x01d8, 1, 0x0159, 0, 0x000e];
+        assert_eq!(
+            analyze(&[&fixed], "Lambda.factory()V", 3, &|| false)["status"],
+            "unresolved"
+        );
+        fixed.methods[0].code.as_mut().unwrap().instructions =
+            vec![0x1112, 0x0159, 0, 0x0159, 0, 0x000e];
+        assert_eq!(
+            analyze(&[&fixed], "Lambda.factory()V", 3, &|| false)["status"],
+            "unresolved"
+        );
+        fixed.methods[0].code.as_mut().unwrap().instructions = vec![0x1112, 0x0159, 0, 0x000e];
+        fixed.fields[0].access_flags = 0;
+        assert_eq!(
+            analyze(&[&fixed], "Lambda.factory()V", 3, &|| false)["status"],
+            "unresolved"
+        );
+        fixed.fields[0].access_flags = 0x10;
+        fixed.methods[0].code.as_mut().unwrap().instructions = vec![0x0159, 0, 0x000e];
+        fixed.methods[2].code.as_mut().unwrap().instructions[2] = 0x1112;
+        let mut class = fixed;
         class.methods[1].code.as_mut().unwrap().instructions = vec![
             0x1052, 0, 0x002b, 6, 0, 0x000e, 0x000e, 0, 0x0100, 2, 1, 0, 4, 0, 4, 0,
         ];

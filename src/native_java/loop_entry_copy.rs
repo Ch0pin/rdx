@@ -198,7 +198,7 @@ fn select_forward_dag(code: &DexCode) -> Option<EntryCopyPlan> {
                 .copied()
                 .unwrap_or(block.end);
             let op = words[pc] as u8;
-            if matches!(op, 0x1d | 0x1e | 0x2b | 0x2c) || (op == 0 && words[pc] != 0) {
+            if matches!(op, 0x1d | 0x1e) || (op == 0 && words[pc] != 0) {
                 return None;
             }
             widths.insert(pc, end - pc);
@@ -221,11 +221,15 @@ fn select_forward_dag(code: &DexCode) -> Option<EntryCopyPlan> {
         }
     }
     let mut end = 0;
-    for (&pc, &width) in &widths {
-        if pc != end {
+    while end < words.len() {
+        let (width, payload) = crate::native_cfg::instruction_width(words, end).ok()?;
+        if !payload && widths.get(&end) != Some(&width) {
             return None;
         }
-        end = pc + width;
+        if payload && widths.contains_key(&end) {
+            return None;
+        }
+        end = end.checked_add(width)?;
     }
     if end != words.len() {
         return None;
@@ -248,7 +252,12 @@ fn select_forward_dag(code: &DexCode) -> Option<EntryCopyPlan> {
         let forward = reachable(header, &successors)?;
         let reverse = reachable(header, &predecessors)?;
         let members: BTreeSet<_> = forward.intersection(&reverse).copied().collect();
-        if members.len() < 2 || members.first() != Some(&header) {
+        if members.len() < 2
+            || members.first() != Some(&header)
+            || members
+                .iter()
+                .any(|pc| matches!(words[*pc] as u8, 0x2b | 0x2c))
+        {
             continue;
         }
         let latch = *members.last()?;
@@ -261,7 +270,10 @@ fn select_forward_dag(code: &DexCode) -> Option<EntryCopyPlan> {
             .filter(|&&pc| targets.get(&pc) == Some(&header))
             .copied()
             .collect();
-        if backedges != vec![latch] || !iteration_is_dag(header, &members, &successors) {
+        if backedges.is_empty()
+            || backedges.len() > 8
+            || !iteration_is_dag(header, &members, &successors)
+        {
             continue;
         }
         let block = cfg.block_at.get(&header).copied()?;
@@ -335,7 +347,11 @@ fn select_forward_dag(code: &DexCode) -> Option<EntryCopyPlan> {
         // Pure terminal prefix leaves can sit after the loop. Copy these
         // separately so nonterminal prefix arms merge at the actual header.
         for (&from, &to) in &targets {
-            if from < header && to >= exit {
+            if from < header && to >= exit && reachable(0, &successors)?.contains(&from) {
+                // Only prefix branches which can enter this loop participate.
+                if !reachable(from, &successors)?.contains(&header) {
+                    continue;
+                }
                 let Some(path) = terminal_path(words, &widths, to) else {
                     valid = false;
                     break;
@@ -482,7 +498,7 @@ fn forward_suffix(
             return None;
         }
         let op = *words.get(pc)? as u8;
-        if matches!(op, 0x0e..=0x11 | 0x1d | 0x1e | 0x22..=0x27 | 0x2b | 0x2c) {
+        if matches!(op, 0x0e..=0x11 | 0x1d | 0x1e | 0x23..=0x27 | 0x2b | 0x2c) {
             return None;
         }
         // A branch or split entry must not manufacture a pending call result.
@@ -511,10 +527,10 @@ fn forward_suffix(
             return None;
         }
         for &to in next {
-            if to > latch
-                || to == header
-                || (to <= pc && !(stem.contains(&pc) && matches!(op, 0x28..=0x2a)))
-            {
+            if to == header {
+                continue;
+            }
+            if to > latch || (to <= pc && !(stem.contains(&pc) && matches!(op, 0x28..=0x2a))) {
                 return None;
             }
             pending.push(to);

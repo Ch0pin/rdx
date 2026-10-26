@@ -177,7 +177,12 @@ pub(super) fn select(class: &DexClass, method: &DexMethod) -> Option<Plan> {
             }
         }
     }
-    if visited != cfg.blocks.len() || returns.len() < 2 {
+    // A lone normal exit can precede a throwing arm. It needs the same labelled
+    // exit as multiple returns; stripping a terminal return cannot represent it.
+    if visited != cfg.blocks.len()
+        || returns.is_empty()
+        || (returns.len() == 1 && ir.instructions.last()?.opcode == 0x0e)
+    {
         return None;
     }
     Some(Plan { returns })

@@ -82,16 +82,9 @@ fn candidates(raw: &str, package: &str, table: &ResourceTable) -> Vec<String> {
         };
         for variant in resource.variants.iter().take(64) {
             if let Some(path) = &variant.file {
-                let extension = path
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                if matches!(
-                    extension.as_str(),
-                    "png" | "webp" | "jpg" | "jpeg" | "gif" | "bmp" | "xml"
-                ) && !paths.contains(path)
-                {
+                // Resource shrinkers may strip file extensions. The bounded
+                // decoder detects bitmap/XML formats from the bytes themselves.
+                if !paths.contains(path) {
                     paths.push(path.clone());
                     if paths.len() >= 32 {
                         break;
@@ -163,6 +156,62 @@ mod tests {
             );
         }
         assert!(candidates("@mipmap/missing", "example.app", &table).is_empty());
+    }
+
+    #[test]
+    fn extensionless_bitmap_and_xml_artwork_are_detected_from_contents() {
+        use std::io::Write;
+        let mut png = Cursor::new(Vec::new());
+        RgbaImage::from_pixel(48, 48, image::Rgba([10, 20, 30, 255]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let vector = br##"<vector xmlns:a="http://schemas.android.com/apk/res/android" a:viewportWidth="10" a:viewportHeight="10"><path a:fillColor="#0a141e" a:pathData="M0,0h10v10H0z"/></vector>"##;
+        for (index, contents) in [png.get_ref().as_slice(), vector.as_slice(), b"invalid"]
+            .into_iter()
+            .enumerate()
+        {
+            let path = std::env::temp_dir().join(format!(
+                "rdx-icon-extensionless-{}-{index}.apk",
+                std::process::id()
+            ));
+            let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            for (name, bytes) in [
+                ("AndroidManifest.xml", br#"<manifest xmlns:a="http://schemas.android.com/apk/res/android" package="sample"><application a:icon="@mipmap/launcher"/></manifest>"#.as_slice()),
+                ("classes.dex", include_bytes!("../tests/fixtures/hello.dex").as_slice()),
+                ("res/raw/aBc", contents),
+            ] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            std::fs::write(&path, zip.finish().unwrap().into_inner()).unwrap();
+            let mut table = ResourceTable::default();
+            table.entries.insert(
+                0x7f010001,
+                Resource {
+                    id: 0x7f010001,
+                    package: "sample".into(),
+                    kind: "mipmap".into(),
+                    name: "launcher".into(),
+                    variants: vec![Variant {
+                        configuration: "default".into(),
+                        value: String::new(),
+                        reference: None,
+                        file: Some("res/raw/aBc".into()),
+                    }],
+                },
+            );
+            let container = PackageContainer::open(&path).unwrap();
+            let result = load(&container, &table);
+            if index < 2 {
+                let image = result.unwrap();
+                assert_eq!(image.dimensions(), (48, 48));
+                assert_eq!(image.get_pixel(24, 24).0, [10, 20, 30, 255]);
+            } else {
+                assert!(result.is_none());
+            }
+            drop(container);
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

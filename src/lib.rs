@@ -35,6 +35,7 @@ pub mod call_graph;
 
 mod field_references;
 mod lambda_branch;
+mod lambda_case_callers;
 pub mod manifest_summary;
 mod source_coverage;
 
@@ -45,3 +46,7 @@ mod method_lookup;
 pub mod integer_references;
 
 mod identifier_search;
+
+mod call_arguments;
+
+mod network_stacks;

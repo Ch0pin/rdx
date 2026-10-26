@@ -4,6 +4,7 @@ mod query;
 use crate::{native_engine::NativeDexEngine, native_xrefs};
 use anyhow::{Context, Result, ensure};
 pub use query::query;
+pub(crate) use query::{Cache as QueryCache, query_cached};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicBool, Ordering},

@@ -2,7 +2,10 @@
 use anyhow::{Context, Result, bail, ensure};
 #[path = "native_resource_attributes.rs"]
 mod attributes;
+#[path = "native_resource_names.rs"]
+mod resource_names;
 const NONE: u32 = u32::MAX;
+const ANDROID_NAMESPACE: &str = "http://schemas.android.com/apk/res/android";
 /// Shared cap for XML archive reads and native decoding.
 pub const MAX_XML_BYTES: usize = 32 * 1024 * 1024;
 const LIMIT: usize = MAX_XML_BYTES;
@@ -177,6 +180,29 @@ fn qualified(strings: &[String], namespaces: &[(u32, u32)], ns: u32, id: u32) ->
         Ok(format!("{}:{local}", name(prefix)?))
     }
 }
+// Resource IDs survive attribute-name and namespace stripping by APK optimizers.
+// Use an active, non-default binding: default namespaces do not qualify attributes.
+fn namespace_prefix(
+    strings: &[String],
+    namespaces: &[(u32, u32)],
+    wanted: &str,
+    base: &str,
+) -> Result<(String, bool)> {
+    let mut seen = std::collections::HashSet::new();
+    for &(prefix, uri) in namespaces.iter().rev() {
+        let prefix = string(strings, prefix)?;
+        if seen.insert(prefix) && !prefix.is_empty() && string(strings, uri)? == wanted {
+            return Ok((name(prefix)?.to_owned(), false));
+        }
+    }
+    let mut prefix = String::from(base);
+    let mut suffix = 0;
+    while seen.contains(prefix.as_str()) {
+        suffix += 1;
+        prefix = format!("{base}{suffix}");
+    }
+    Ok((prefix, true))
+}
 pub(crate) fn typed(strings: &[String], ty: u8, data: u32) -> Result<String> {
     Ok(match ty {
         0 => if data == 1 { "@empty" } else { "@null" }.to_owned(),
@@ -226,6 +252,22 @@ pub fn decode(bytes: &[u8]) -> Result<String> {
 }
 /// Character spans of actual compiled reference attributes, excluding literal strings.
 pub fn decode_with_references(bytes: &[u8]) -> Result<(String, Vec<std::ops::Range<usize>>)> {
+    decode_xml(bytes, &|_| None, false)
+}
+/// Recover application attribute names by exact resource ID from the loaded ARSC table.
+/// Stripped, unmapped application attributes retain their IDs as resource_0xID names.
+/// The default decoder remains independent of an application table.
+pub fn decode_with_attribute_resolver<'a>(
+    bytes: &[u8],
+    attribute_name: &impl Fn(u32) -> Option<&'a str>,
+) -> Result<(String, Vec<std::ops::Range<usize>>)> {
+    decode_xml(bytes, attribute_name, true)
+}
+fn decode_xml<'a>(
+    bytes: &[u8],
+    attribute_name: &impl Fn(u32) -> Option<&'a str>,
+    preserve_application_ids: bool,
+) -> Result<(String, Vec<std::ops::Range<usize>>)> {
     let mut references = Vec::new();
     ensure!(bytes.len() <= LIMIT, "XML input exceeds 32 MiB");
     if let Ok(text) = std::str::from_utf8(bytes)
@@ -246,6 +288,7 @@ pub fn decode_with_references(bytes: &[u8]) -> Result<(String, Vec<std::ops::Ran
     );
     let mut p = 8;
     let mut strings = Vec::new();
+    let mut resource_map = None;
     let mut namespaces = Vec::new();
     let mut pending = Vec::new();
     let mut stack = Vec::new();
@@ -268,10 +311,21 @@ pub fn decode_with_references(bytes: &[u8]) -> Result<(String, Vec<std::ops::Ran
                 );
                 strings = pool(b, header)?;
             }
-            0x180 => ensure!(
-                header == 8 && (size - header).is_multiple_of(4),
-                "Invalid XML resource map"
-            ),
+            0x180 => {
+                ensure!(
+                    header == 8 && (size - header).is_multiple_of(4),
+                    "Invalid XML resource map"
+                );
+                ensure!(
+                    resource_map.is_none() && roots == 0,
+                    "Misplaced XML resource map"
+                );
+                ensure!(
+                    (size - header) / 4 <= strings.len(),
+                    "XML resource map exceeds string pool"
+                );
+                resource_map = Some(&b[header..]);
+            }
             0x100 | 0x101 => {
                 ensure!(header >= 16, "Invalid namespace header");
                 let pair = (u32_at(b, header)?, u32_at(b, header + 4)?);
@@ -316,26 +370,91 @@ pub fn decode_with_references(bytes: &[u8]) -> Result<(String, Vec<std::ops::Ran
                     output.push('"');
                 }
                 let mut attributes = std::collections::HashSet::new();
+                let mut recovered_prefix = None;
+                let mut recovered_app_prefix = None;
                 for i in 0..count {
                     let a = header + start + i * stride;
-                    let key = qualified(&strings, &namespaces, u32_at(b, a)?, u32_at(b, a + 4)?)?;
-                    ensure!(attributes.insert(key.clone()), "Duplicate XML attribute");
+                    let namespace = u32_at(b, a)?;
+                    let name_id = u32_at(b, a + 4)?;
+                    let original_name = string(&strings, name_id)?;
+                    let resource_id = resource_map
+                        .and_then(|map| map.get(name_id as usize * 4..name_id as usize * 4 + 4))
+                        .and_then(|id| Some(u32::from_le_bytes(id.try_into().ok()?)));
+                    let mapped_name = resource_id.and_then(resource_names::attribute);
+                    let application_name = resource_id.and_then(attribute_name);
+                    // Optimizers can replace ARSC attribute names with their decimal ID.
+                    // Preserve that exact identity without claiming a recovered semantic name.
+                    let identity_name;
+                    let (key, local, uri) = if let Some(local) = mapped_name {
+                        let prefix = match &recovered_prefix {
+                            Some(prefix) => prefix,
+                            None => {
+                                let (prefix, declare) = namespace_prefix(
+                                    &strings,
+                                    &namespaces,
+                                    ANDROID_NAMESPACE,
+                                    "android",
+                                )?;
+                                if declare {
+                                    output.push_str(&format!(
+                                        " xmlns:{prefix}=\"{ANDROID_NAMESPACE}\""
+                                    ));
+                                }
+                                recovered_prefix.insert(prefix)
+                            }
+                        };
+                        (format!("{prefix}:{local}"), local, ANDROID_NAMESPACE)
+                    } else if let Some(id) = resource_id.filter(|id| {
+                        application_name.is_some()
+                            || (preserve_application_ids
+                                && original_name.is_empty()
+                                && (2..=254).contains(&(id >> 24))
+                                && id & 0x00ff0000 != 0)
+                    }) {
+                        let local = application_name.unwrap_or("");
+                        let local = if local.is_empty() || local == id.to_string() {
+                            identity_name = format!("resource_0x{id:08x}");
+                            identity_name.as_str()
+                        } else {
+                            local
+                        };
+                        let local = name(local)?;
+                        const APP_NAMESPACE: &str = "http://schemas.android.com/apk/res-auto";
+                        let prefix = match &recovered_app_prefix {
+                            Some(prefix) => prefix,
+                            None => {
+                                let (prefix, declare) =
+                                    namespace_prefix(&strings, &namespaces, APP_NAMESPACE, "app")?;
+                                if declare {
+                                    output
+                                        .push_str(&format!(" xmlns:{prefix}=\"{APP_NAMESPACE}\""));
+                                }
+                                recovered_app_prefix.insert(prefix)
+                            }
+                        };
+                        (format!("{prefix}:{local}"), local, APP_NAMESPACE)
+                    } else {
+                        (
+                            qualified(&strings, &namespaces, namespace, name_id)?,
+                            original_name,
+                            if namespace == NONE {
+                                ""
+                            } else {
+                                string(&strings, namespace)?
+                            },
+                        )
+                    };
+                    ensure!(
+                        attributes.insert((uri.to_owned(), local.to_owned())),
+                        "Duplicate XML attribute"
+                    );
                     let raw = u32_at(b, a + 8)?;
                     ensure!(u16_at(b, a + 12)? == 8, "Invalid XML typed value");
                     let value = if raw != NONE {
                         string(&strings, raw)?.to_owned()
                     } else {
-                        let namespace = u32_at(b, a)?;
-                        let symbolic = if namespace != NONE {
-                            attributes::symbolic(
-                                string(&strings, namespace)?,
-                                string(&strings, u32_at(b, a + 4)?)?,
-                                b[a + 15],
-                                u32_at(b, a + 16)?,
-                            )
-                        } else {
-                            None
-                        };
+                        let symbolic =
+                            attributes::symbolic(uri, local, b[a + 15], u32_at(b, a + 16)?);
                         match symbolic {
                             Some(value) => value,
                             None => typed(&strings, b[a + 15], u32_at(b, a + 16)?)?,

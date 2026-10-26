@@ -89,13 +89,17 @@ fn initializer_block_omits_only_terminal_return_and_preserves_exact_links() {
 }
 
 #[test]
-fn initializer_allows_branches_that_share_one_terminal_return() {
+fn initializer_folds_constant_branch_before_shared_terminal_return() {
     // Both arms assign a register, then the shared tail performs one static write.
     let class = fixture(vec![
         0x0012, 0x0038, 4, 0x1012, 0x0228, 0x2012, 0x0067, 0, 0x000e,
     ]);
     let code = native_java::render_method("sample.Init", &class, &class.methods[0]).unwrap();
-    assert!(code.source.contains("if ("));
+    assert!(
+        code.source.contains("sample.Init.count = 2;"),
+        "{}",
+        code.source
+    );
     assert_eq!(code.source.matches("sample.Init.count =").count(), 1);
     assert!(!code.source.contains("return;"));
 }

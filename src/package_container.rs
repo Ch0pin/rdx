@@ -57,6 +57,58 @@ pub struct PackageContainer {
     summary: Option<String>,
 }
 
+/// Request-local resource reader: retain one ZIP directory, never decompressed documents.
+pub(crate) struct ResourceReader<'a> {
+    container: &'a PackageContainer,
+    archive: Option<(usize, zip::ZipArchive<File>)>,
+}
+impl ResourceReader<'_> {
+    pub(crate) fn read_path(&mut self, path: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let c = self.container;
+        let index = *c
+            .by_path
+            .get(path)
+            .with_context(|| format!("Resource not found: {path}"))?;
+        let expected = &c.entries[index];
+        ensure!(
+            expected.size <= max_bytes,
+            "Archive member exceeds resource limit"
+        );
+        let source = &c.sources[expected.source_index];
+        c.check_original(source)?;
+        if self
+            .archive
+            .as_ref()
+            .is_none_or(|(i, _)| *i != expected.source_index)
+        {
+            self.archive = Some((
+                expected.source_index,
+                zip::ZipArchive::new(File::open(&source.path)?)?,
+            ));
+        }
+        let mut entry = self
+            .archive
+            .as_mut()
+            .unwrap()
+            .1
+            .by_index(expected.zip_index)?;
+        ensure!(
+            entry.name() == expected.member_path
+                && entry.size() == expected.size
+                && entry.compressed_size() == expected.compressed_size
+                && entry.crc32() == expected.crc32,
+            "Archive member changed; reopen it"
+        );
+        let mut bytes = Vec::new();
+        entry.by_ref().take(max_bytes + 1).read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 == expected.size && bytes.len() as u64 <= max_bytes,
+            "Archive member decompression size mismatch"
+        );
+        Ok(bytes)
+    }
+}
+
 #[derive(Debug)]
 struct SplitMeta {
     package: String,
@@ -721,6 +773,12 @@ impl PackageContainer {
         let mut bytes = Vec::new();
         self.copy_member(index, &mut bytes, max_bytes)?;
         Ok(bytes)
+    }
+    pub(crate) fn resource_reader(&self) -> ResourceReader<'_> {
+        ResourceReader {
+            container: self,
+            archive: None,
+        }
     }
     pub fn read_path(&self, path: &str, max_bytes: u64) -> Result<Vec<u8>> {
         self.read_member(

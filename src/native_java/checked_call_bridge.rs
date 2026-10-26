@@ -51,7 +51,7 @@ impl Bridge {
         ))
     }
 }
-fn discover(class: &DexClass) -> Option<Vec<Bridge>> {
+fn discover(class: &DexClass, preserve_header: bool) -> Option<Vec<Bridge>> {
     if class.access_flags & (0x200 | 0x2000 | 0x4000) != 0
         || class.methods.len() > 8192
         || !super::source_header_authority(class)
@@ -129,7 +129,8 @@ fn discover(class: &DexClass) -> Option<Vec<Bridge>> {
                         .thrown_types
                         .iter()
                         .any(|declared| hierarchy.assignable(ty, declared) == Relation::Proven)
-                    && !hierarchy.permits_inferred_checked_throw(class, method, ty)
+                    && (preserve_header
+                        || !hierarchy.permits_inferred_checked_throw(class, method, ty))
                     && !super::inherited_override_exception(class, method)
                         .into_iter()
                         .any(|parent| hierarchy.assignable(ty, parent) == Relation::Proven)
@@ -175,7 +176,12 @@ fn discover(class: &DexClass) -> Option<Vec<Bridge>> {
     }
     Some(bridges.into_values().collect())
 }
-pub(super) fn for_site(class: &DexClass, method: &DexMethod, pc: usize) -> Option<Bridge> {
+pub(super) fn for_site(
+    class: &DexClass,
+    method: &DexMethod,
+    pc: usize,
+    preserve_header: bool,
+) -> Option<Bridge> {
     // Rendering asks about every static call. Resolve only the exact pool entry
     // first; class-wide decoding is needed solely for uncovered checked calls.
     // discover remains the single authority for helper names and helper-set limits.
@@ -213,7 +219,7 @@ pub(super) fn for_site(class: &DexClass, method: &DexMethod, pc: usize) -> Optio
                             .is_none_or(|catch| hierarchy.assignable(ty, catch) == Relation::Proven)
                     })
             })
-            && !hierarchy.permits_inferred_checked_throw(class, method, ty)
+            && (preserve_header || !hierarchy.permits_inferred_checked_throw(class, method, ty))
             && !super::inherited_override_exception(class, method)
                 .into_iter()
                 .any(|parent| hierarchy.assignable(ty, parent) == Relation::Proven)
@@ -232,14 +238,16 @@ pub(super) fn for_site(class: &DexClass, method: &DexMethod, pc: usize) -> Optio
     if matches.next().is_some() {
         return None;
     }
-    discover(class)?
+    discover(class, preserve_header)?
         .into_iter()
         .find(|p| p.sites.contains(&(index, pc)))
 }
-pub(super) fn definitions(class: &DexClass) -> Vec<String> {
-    discover(class)
+pub(super) fn definitions(class: &DexClass, rendered: &str) -> Vec<String> {
+    discover(class, true)
+        .or_else(|| discover(class, false))
         .unwrap_or_default()
         .iter()
+        .filter(|bridge| super::caught_checked_throw::referenced_call(rendered, &bridge.name))
         .filter_map(Bridge::source)
         .collect()
 }

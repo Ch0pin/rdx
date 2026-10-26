@@ -1680,6 +1680,65 @@ impl TypeHierarchy {
     pub(crate) fn loaded_source_owner(&self, owner: &str) -> bool {
         self.loaded_owners.contains(owner) && !self.ambiguous.contains(owner)
     }
+    /// Resolve a virtual reference whose pool owner inherits the declaration.
+    /// Stop at the first matching source family; never skip an ambiguous override.
+    pub(crate) fn inherited_virtual_source_declaration(
+        &self,
+        caller: &str,
+        owner: &str,
+        name: &str,
+        args: &[Arc<str>],
+        ret: &str,
+        opcode: u8,
+    ) -> Option<ExactSourceDeclaration> {
+        if !matches!(opcode, 0x6e | 0x74) || name.starts_with('<') {
+            return None;
+        }
+        let mut current = owner;
+        let mut seen = HashSet::new();
+        for _ in 0..256 {
+            if self.ambiguous.contains(current)
+                || self.override_ambiguous_owners.contains(current)
+                || !seen.insert(current)
+            {
+                return None;
+            }
+            if self.loaded_owners.contains(current) {
+                let summary = self.loaded_call_families.get(current)?;
+                if summary
+                    .methods
+                    .get(name)
+                    .is_some_and(|family| family.contains_key(&args.len()))
+                {
+                    return self.exact_rethrow_source_declaration(
+                        caller, current, name, args, ret, opcode,
+                    );
+                }
+            } else {
+                let facts = platform_source_declarations();
+                let signature = format!(
+                    "{current}->{name}({})",
+                    args.iter().map(AsRef::as_ref).collect::<String>()
+                );
+                if facts.ambiguous_source_signatures.contains(&signature) {
+                    return None;
+                }
+                if facts.methods.contains_key(&format!("{signature}{ret}")) {
+                    return self.exact_platform_source_declaration_for_invoke(
+                        caller,
+                        current,
+                        name,
+                        args,
+                        ret,
+                        PlatformInvokeKind::Virtual,
+                    );
+                }
+            }
+            current = self.entries.get(current)?.superclass.as_deref()?;
+        }
+        None
+    }
+
     /// Exact source declaration used only by the bounded precise-rethrow retry.
     /// Loaded methods require a closed source header, never an inferred runtime
     /// effect approximation. Missing/ambiguous declarations retain the refusal.
@@ -1702,7 +1761,19 @@ impl TypeHierarchy {
             return None;
         }
         let summary = self.loaded_call_families.get(owner)?;
-        let candidate = summary.methods.get(name)?.get(&args.len())?.as_ref()?;
+        let candidate = summary
+            .methods
+            .get(name)?
+            .get(&args.len())?
+            .as_ref()
+            .or_else(|| {
+                summary
+                    .exact_overloads
+                    .as_ref()?
+                    .get(name)?
+                    .get(args)?
+                    .as_ref()
+            })?;
         let erased_abstract_interface =
             summary.erased_interface_source_header && candidate.access_flags & 0x400 != 0;
         if ((summary.generic_class || candidate.generic_method) && !erased_abstract_interface)
@@ -2648,10 +2719,12 @@ impl TypeHierarchy {
                 if static_call || ret != "V" {
                     return unknown();
                 }
-                let mut recovered = self
-                    .recovered_constructors(owner)
-                    .iter()
-                    .filter(|constructor| constructor.parameters == args);
+                let mut recovered =
+                    self.recovered_constructors(owner)
+                        .iter()
+                        .filter(|constructor| {
+                            !constructor.source_bridge && constructor.parameters == args
+                        });
                 let constructor = recovered.next()?;
                 if recovered.next().is_some() {
                     return unknown();
@@ -3020,9 +3093,27 @@ impl TypeHierarchy {
                     .iter()
                     .any(|constructor| {
                         constructor.observed_allocation
+                            && !constructor.source_bridge
                             && constructor.invoked_owner.as_ref() == invoked
                             && constructor.parameters == args
                     }))
+    }
+
+    pub(crate) fn source_constructor_bridge(
+        &self,
+        allocated: &str,
+        invoked: &str,
+        args: &[Arc<str>],
+    ) -> bool {
+        args.is_empty()
+            && !self.ambiguous.contains(allocated)
+            && !self.ambiguous.contains(invoked)
+            && self.recovered_constructors(allocated).iter().any(|c| {
+                c.source_bridge
+                    && c.observed_allocation
+                    && c.invoked_owner.as_ref() == invoked
+                    && c.parameters.is_empty()
+            })
     }
 
     /// Newly recovered unloaded-platform forwarders must not enter the
@@ -3478,6 +3569,7 @@ impl TypeHierarchy {
                 constructors.insert(
                     0,
                     RecoveredConstructor {
+                        source_bridge: false,
                         access_flags: 1,
                         parent: parent.clone(),
                         invoked_owner: parent.clone(),

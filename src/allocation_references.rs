@@ -79,18 +79,48 @@ pub fn search(
     limit: usize,
     cancel: &AtomicBool,
 ) -> Result<Value> {
-    scan(
-        project
-            .classes
-            .iter()
-            .map(|name| engine.dex_class(name).context("Missing DEX class")),
-        class_id,
+    search_filtered(
+        engine,
+        project,
+        Some(class_id),
+        None,
+        None,
         offset,
         limit,
         cancel,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_filtered(
+    engine: &NativeEngine,
+    project: &Project,
+    class_id: Option<&str>,
+    allocating_class: Option<&str>,
+    allocating_method: Option<&str>,
+    offset: usize,
+    limit: usize,
+    cancel: &AtomicBool,
+) -> Result<Value> {
+    let mut result = scan_filtered(
+        project
+            .classes
+            .iter()
+            .filter(|name| allocating_class.is_none_or(|owner| owner == name.as_str()))
+            .map(|name| engine.dex_class(name).context("Missing DEX class")),
+        class_id,
+        allocating_method,
+        offset,
+        limit,
+        cancel,
+    )?;
+    // Declaration availability describes the project, independently of the
+    // allocating-side filter. A reverse query selects no single allocated type.
+    result["definition_available"] = json!(class_id.map(|id| engine.dex_class(id).is_some()));
+    Ok(result)
+}
+
+#[cfg(test)]
 fn scan<'a>(
     classes: impl IntoIterator<Item = Result<&'a DexClass>>,
     class_id: &str,
@@ -98,8 +128,19 @@ fn scan<'a>(
     limit: usize,
     cancel: &AtomicBool,
 ) -> Result<Value> {
+    scan_filtered(classes, Some(class_id), None, offset, limit, cancel)
+}
+
+fn scan_filtered<'a>(
+    classes: impl IntoIterator<Item = Result<&'a DexClass>>,
+    class_id: Option<&str>,
+    allocating_method: Option<&str>,
+    offset: usize,
+    limit: usize,
+    cancel: &AtomicBool,
+) -> Result<Value> {
     ensure!((1..=500).contains(&limit), "Limit must be 1..500");
-    let descriptor = format!("L{};", class_id.replace('.', "/"));
+    let descriptor = class_id.map(|id| format!("L{};", id.replace('.', "/")));
     let mut items = Vec::new();
     let mut total = 0usize;
     let mut bytes = 0;
@@ -108,13 +149,16 @@ fn scan<'a>(
     let mut methods_scanned = 0;
     let mut declaration_available = false;
     let mut digest = Sha256::new();
-    digest.update(descriptor.as_bytes());
+    digest.update(descriptor.as_deref().unwrap_or("*").as_bytes());
     for class in classes {
         ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
         let class = class?;
-        declaration_available |= class.descriptor.as_ref() == descriptor;
+        declaration_available |= Some(class.descriptor.as_ref()) == descriptor.as_deref();
         classes_scanned += 1;
         for method in &class.methods {
+            if allocating_method.is_some_and(|id| method_id(method) != id) {
+                continue;
+            }
             ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
             let Some(code) = &method.code else { continue };
             methods_scanned += 1;
@@ -151,7 +195,7 @@ fn scan<'a>(
                         "Invalid new-instance class descriptor in {} at {pc:#x}",
                         method_id(method)
                     );
-                    if ty.as_ref() == descriptor {
+                    if descriptor.as_deref().is_none_or(|d| ty.as_ref() == d) {
                         let id = method_id(method);
                         let dex = class.symbols.origin.get();
                         digest.update([0]);
@@ -163,7 +207,7 @@ fn scan<'a>(
                         digest.update(register.to_le_bytes());
                         digest.update((index as u64).to_le_bytes());
                         if total >= offset && !page_full {
-                            let item = json!({"method_id":id,"class_id":type_name(&class.descriptor),"allocated_class_id":class_id,
+                            let item = json!({"method_id":id,"class_id":type_name(&class.descriptor),"allocated_class_id":type_name(ty),
                                 "allocated_descriptor":ty.as_ref(),"dex_entry":dex,"call_site_offset":pc,"allocation_offset":pc,
                                 "offset_unit":"16-bit DEX code units","byte_offset_in_method":pc*2,"method_code_offset_bytes":code.offset,
                                 "destination_register":register,"type_index":index,"opcode":"new-instance","opcode_value":0x22,
@@ -192,7 +236,7 @@ fn scan<'a>(
         json!({"allocated_class_id":class_id,"allocated_descriptor":descriptor,"definition_available":declaration_available,
         "items":items,"total":total,"offset":offset,"next_offset":(next<total).then_some(next),"scan_complete":true,
         "source_hash":format!("{:x}",digest.finalize()),"classes_scanned":classes_scanned,"code_methods_scanned":methods_scanned,
-        "scope":"Exact DEX new-instance operands in all loaded project classes. Includes unreachable instructions; does not prove successful construction or runtime reachability. Arrays, reflection and native/runtime allocations are excluded."}),
+        "scope":"Exact DEX new-instance operands in the selected loaded project classes and methods. Includes unreachable instructions; does not prove successful construction or runtime reachability. Arrays, reflection and native/runtime allocations are excluded."}),
     )
 }
 
@@ -224,6 +268,30 @@ mod tests {
         symbols.origin.set(format!("{name}.dex")).unwrap();
         c.symbols = Arc::new(symbols);
         c
+    }
+    #[test]
+    fn reverse_lookup_returns_distinct_types_and_method_filter() {
+        let a = fixture("CallerA", "Ltarget/One;", vec![0x22, 0, 0x22, 0]);
+        let b = fixture("CallerB", "Ltarget/Two;", vec![0x22, 0]);
+        let cancel = AtomicBool::new(false);
+        let result = scan_filtered([Ok(&a), Ok(&b)], None, None, 0, 1, &cancel).unwrap();
+        assert_eq!(result["total"], 3);
+        assert_eq!(result["next_offset"], 1);
+        assert_eq!(result["items"][0]["allocated_class_id"], "target.One");
+        let id = method_id(&b.methods[0]);
+        let result = scan_filtered([Ok(&a), Ok(&b)], None, Some(&id), 0, 10, &cancel).unwrap();
+        assert_eq!(result["total"], 1);
+        assert_eq!(result["items"][0]["allocated_class_id"], "target.Two");
+        let result = scan_filtered(
+            [Ok(&a), Ok(&b)],
+            Some("target.One"),
+            Some(&id),
+            0,
+            10,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(result["total"], 0);
     }
     #[test]
     fn dex_local_types_payloads_and_nonallocation_operands_are_distinguished() {

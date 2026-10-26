@@ -447,7 +447,7 @@ fn identical_reaching_zero_retains_null_throw_proof() {
         .unwrap()
         .source;
     assert!(source.contains("throw null;"), "{source}");
-    assert!(source.contains("if (0 != 0)"), "{source}");
+    assert!(source.contains("if (false)"), "{source}");
 }
 #[test]
 fn mixed_or_undefined_cleanup_value_cannot_become_null_throw() {

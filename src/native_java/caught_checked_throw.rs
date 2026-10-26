@@ -1,4 +1,4 @@
-//! Source-only rethrow of one original handler object; callee headers are irrelevant.
+//! Source-only rethrow of caught values and their evaluated causes; callee headers are irrelevant.
 use crate::{
     native_cfg::EdgeKind,
     native_dex::{DexClass, DexMethod},
@@ -95,7 +95,21 @@ fn own_source_operands(
                 .methods
                 .iter()
                 .filter(|m| m.name.as_ref() == name && m.parameters == *args);
-            let target = methods.next()?;
+            let Some(target) = methods.next() else {
+                class
+                    .symbols
+                    .hierarchy
+                    .get()?
+                    .inherited_virtual_source_declaration(
+                        &class.descriptor,
+                        owner,
+                        name,
+                        args,
+                        ret,
+                        ins.opcode,
+                    )?;
+                continue;
+            };
             if methods.next().is_some()
                 || target.return_type != *ret
                 || !super::ordinary_method_declaration_authority(class, target)
@@ -112,10 +126,10 @@ fn sites(class: &DexClass, method: &DexMethod) -> Option<BTreeSet<usize>> {
     let code = method.code.as_ref()?;
     if matches!(method.name.as_ref(), "<init>" | "<clinit>")
         || method.declaring_type != class.descriptor
-        || code.instructions.len() > 4096
+        || code.instructions.len() > 32768
         || code.registers > 256
         || code.try_regions.is_empty()
-        || code.try_regions.len() > 16
+        || code.try_regions.len() > 128
         || usize::from(code.tries) != code.try_regions.len()
     {
         return None;
@@ -128,8 +142,8 @@ fn sites(class: &DexClass, method: &DexMethod) -> Option<BTreeSet<usize>> {
     let ir = analysis.instructions();
     let cfg = analysis.blocks();
     let ssa = analysis.ssa();
-    if cfg.blocks.len() > 1024
-        || ssa.definitions.len() > 32768
+    if cfg.blocks.len() > 8192
+        || ssa.definitions.len() > 262144
         || ir
             .instructions
             .iter()
@@ -139,7 +153,7 @@ fn sites(class: &DexClass, method: &DexMethod) -> Option<BTreeSet<usize>> {
     }
     let instructions: HashMap<_, _> = ir.instructions.iter().map(|i| (i.pc, i)).collect();
     let ssa_at: HashMap<_, _> = ssa.instructions.iter().map(|i| (i.pc, i)).collect();
-    if ssa.graph.blocks.len() > 4096 || ssa.reachable.len() != ssa.graph.blocks.len() {
+    if ssa.graph.blocks.len() > 32768 || ssa.reachable.len() != ssa.graph.blocks.len() {
         return None;
     }
     let mut predecessors = vec![HashSet::new(); ssa.graph.blocks.len()];
@@ -177,9 +191,11 @@ fn sites(class: &DexClass, method: &DexMethod) -> Option<BTreeSet<usize>> {
             }
             let pc = *handler as usize;
             let raw = instructions.get(&pc)?;
-            let read = ssa_at.get(&pc)?;
-            if raw.opcode != 0x0d || read.writes.len() != 1 || read.writes[0].words.len() != 1 {
-                return None;
+            // An uncaptured exception has no SSA origin to certify. Its body
+            // may also be reached normally; the region renderer checks that
+            // control flow independently.
+            if raw.opcode != 0x0d {
+                continue;
             }
             let block = *cfg.block_at.get(&pc)?;
             if cfg.blocks[block].start != pc
@@ -191,20 +207,24 @@ fn sites(class: &DexClass, method: &DexMethod) -> Option<BTreeSet<usize>> {
             {
                 return None;
             }
-            roots.insert(read.writes[0].words[0], pc);
+            let read = ssa_at.get(&pc)?;
+            if read.writes.len() != 1 || read.writes[0].words.len() != 1 {
+                return None;
+            }
+            roots.insert(read.writes[0].words[0], ());
         }
     }
     fn origin(
         id: usize,
         analysis: &MethodAnalysis<'_>,
-        roots: &HashMap<usize, usize>,
+        roots: &HashMap<usize, ()>,
         predecessors: &[HashSet<Option<usize>>],
         active: &mut HashSet<usize>,
         budget: &mut usize,
-    ) -> Option<usize> {
+    ) -> Option<()> {
         *budget = budget.checked_sub(1)?;
-        if let Some(root) = roots.get(&id) {
-            return Some(*root);
+        if roots.contains_key(&id) {
+            return Some(());
         }
         if active.len() >= 256 || !active.insert(id) {
             return None;
@@ -250,20 +270,49 @@ fn sites(class: &DexClass, method: &DexMethod) -> Option<BTreeSet<usize>> {
                 {
                     return None;
                 }
-                let mut root = None;
                 for (_, value) in &phi.incoming {
-                    let next = origin(*value, analysis, roots, predecessors, active, budget)?;
-                    if root.is_some_and(|r| r != next) {
-                        return None;
-                    }
-                    root = Some(next);
+                    origin(*value, analysis, roots, predecessors, active, budget)?;
                 }
-                root
+                Some(())
             }
             _ => None,
         };
         active.remove(&id);
         result
+    }
+    // Reflection wrappers commonly rethrow getCause(), falling back to the
+    // original caught object when it is null. Certify the exact call and its
+    // caught receiver through SSA; the helper rethrows the evaluated result.
+    for call in &analysis.calls().calls {
+        let raw = instructions.get(&call.pc)?;
+        if !matches!(raw.opcode, 0x6e | 0x74) {
+            continue;
+        }
+        let (owner, proto, name) = *class.symbols.methods.get(raw.reference?.index as usize)?;
+        let (ret, args) = class.symbols.protos.get(proto as usize)?;
+        if class.symbols.types.get(owner as usize)?.as_ref() != "Ljava/lang/Throwable;"
+            || class.symbols.strings.get(name as usize)?.as_str() != "getCause"
+            || ret.as_ref() != "Ljava/lang/Throwable;"
+            || !args.is_empty()
+        {
+            continue;
+        }
+        let (Some(receiver), Some(result)) = (&call.receiver, &call.result) else {
+            continue;
+        };
+        if receiver.words.len() != 1 || result.words.len() != 1 {
+            continue;
+        }
+        if let Some(root) = origin(
+            receiver.words[0],
+            &analysis,
+            &roots,
+            &predecessors,
+            &mut HashSet::new(),
+            &mut 4096,
+        ) {
+            roots.insert(result.words[0], root);
+        }
     }
     let mut selected = BTreeSet::new();
     let mut budget = 100000;
@@ -287,23 +336,22 @@ fn sites(class: &DexClass, method: &DexMethod) -> Option<BTreeSet<usize>> {
     }
     Some(selected)
 }
-pub(super) fn for_site(
+pub(super) fn certificate(
     class: &DexClass,
     method: &DexMethod,
-    pc: usize,
-    register: usize,
-) -> Option<String> {
-    let code = method.code.as_ref()?;
-    let raw = *code.instructions.get(pc)?;
-    if raw as u8 != 0x27 || usize::from(raw >> 8) != register {
-        return None;
-    }
+) -> Option<(String, BTreeSet<usize>)> {
     let name = helper_name(class)?;
-    sites(class, method)?.contains(&pc).then_some(name)
+    Some((name, sites(class, method)?))
 }
 // Inspect emitter-owned tokens, never literal/comment text. This avoids
 // class-wide SSA rediscovery and emits no helper for ordinary Java rethrows.
 fn referenced(source: &str, name: &str) -> bool {
+    referenced_inner(source, name, true)
+}
+pub(super) fn referenced_call(source: &str, name: &str) -> bool {
+    referenced_inner(source, name, false)
+}
+fn referenced_inner(source: &str, name: &str, require_throw: bool) -> bool {
     let bytes = source.as_bytes();
     let mut pc = 0;
     let mut previous = "";
@@ -346,7 +394,7 @@ fn referenced(source: &str, name: &str) -> bool {
                     pc += 1;
                 }
                 let token = &source[start..pc];
-                if token == name && previous == "throw" {
+                if token == name && (!require_throw || previous == "throw") {
                     let mut next = pc;
                     while next < bytes.len() && bytes[next].is_ascii_whitespace() {
                         next += 1;

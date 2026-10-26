@@ -86,10 +86,16 @@ impl Gui {
                         &mut stream,
                         json!({
                             "instance_id":INSTANCE, "project_id":PROJECT, "state":"Running",
-                            "literal_index":{"state":"indexing"}, "active_requests":1,
+                            "literal_index":{"state":"indexing"}, "invoke_index":{"state":"building","scanned_classes":12}, "active_requests":1,
                         }),
                     ),
-                    "find_string_references" => {
+                    "find_string_references"
+                    | "get_call_graph"
+                    | "get_call_graph_batch"
+                    | "resolve_reference"
+                    | "search_code"
+                    | "resolve_switch_case_callers"
+                    | "find_network_stacks" => {
                         if tx.send((stream, request)).is_err() {
                             break;
                         }
@@ -376,4 +382,76 @@ fn stdin_eof_cancels_pending_socket_even_with_unread_large_stdout() {
     let mut pending = gui.literal("pending");
     gateway.eof_and_wait();
     assert_disconnected(&mut pending);
+}
+
+#[test]
+fn graph_and_scan_requests_keep_stdio_progress_and_cancellation_live() {
+    let gui = Gui::start();
+    let mut gateway = Gateway::start(&gui, true);
+    for (index, (name, selector)) in [
+        (
+            "get_call_graph",
+            json!({"method_id":"sample.Target.doubleValue(I)I","direction":"callers"}),
+        ),
+        (
+            "get_call_graph_batch",
+            json!({"method_ids":["sample.Target.doubleValue(I)I"]}),
+        ),
+        (
+            "resolve_reference",
+            json!({"class_name":"sample.Target","source_hash":"fixture","line":1}),
+        ),
+        (
+            "search_code",
+            json!({"query":"setAllow","mode":"identifiers","symbol_kind":"method","occurrence":"reference"}),
+        ),
+        (
+            "resolve_switch_case_callers",
+            json!({"class_name":"sample.Target","case":23}),
+        ),
+        ("find_network_stacks", json!({"package_prefix":"sample"})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request_id = 30 + 3 * index as u64;
+        let mut args = selector;
+        args["instance_id"] = json!(INSTANCE);
+        args["project_id"] = json!(PROJECT);
+        gateway.tool(request_id, name, args.clone());
+        let (mut held, request) = gui
+            .requests
+            .recv_timeout(TIMEOUT)
+            .expect("navigation request did not reach GUI");
+        assert_eq!(request["name"], name);
+        gateway.tool(
+            request_id + 1,
+            "get_instance_info",
+            json!({"instance_id":INSTANCE}),
+        );
+        assert_eq!(
+            gateway.receive(request_id + 1)["result"]["structuredContent"]["invoke_index"]["scanned_classes"],
+            12
+        );
+        gateway.send(
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":request_id}}),
+        );
+        assert_disconnected(&mut held);
+        let cancelled = gateway.receive(request_id);
+        assert_eq!(cancelled["result"]["isError"], true);
+        assert!(
+            cancelled["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("CANCELLED")
+        );
+        gateway.tool(request_id + 2, name, args);
+        let (mut retry, _) = gui.requests.recv_timeout(TIMEOUT).unwrap();
+        reply(&mut retry, json!({"verified_retry":true}));
+        assert_eq!(
+            gateway.receive(request_id + 2)["result"]["structuredContent"]["verified_retry"],
+            true
+        );
+    }
+    gateway.eof_and_wait();
 }

@@ -68,6 +68,19 @@ fn early_exit_initializes_only_missing_final_default_and_preserves_links() {
     assert!(!out.source.contains("return;"), "{}", out.source);
 }
 #[test]
+fn single_normal_exit_before_throw_keeps_initializer_control_flow() {
+    let mut class = fixture();
+    class.methods[0].code.as_mut().unwrap().instructions = vec![
+        0x0071, 0, 0, 0x000a, 0x0038, 6, 0x7012, 0x0067, 0, 0x000e, 0x0012, 0x0027,
+    ];
+    let out = native_java::render_method("sample.Init", &class, &class.methods[0]).unwrap();
+    assert!(out.source.contains("rdxInitializerExit:"), "{}", out.source);
+    assert_eq!(out.source.matches("break rdxInitializerExit;").count(), 1);
+    assert!(out.source.contains("throw null;"), "{}", out.source);
+    assert!(!out.source.contains("return;"));
+}
+
+#[test]
 fn encoded_nondefault_duplicate_writes_cycles_and_handlers_decline() {
     for shape in 0..5 {
         let mut class = fixture();

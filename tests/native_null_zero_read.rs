@@ -1,4 +1,5 @@
 pub use rdx::{native_ir, native_ssa, native_types};
+#[allow(dead_code)]
 #[path = "../src/native_java/literal_read_proof.rs"]
 mod proof;
 use proof::Domain;

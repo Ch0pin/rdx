@@ -1739,7 +1739,7 @@ impl TypeHierarchy {
         None
     }
 
-    /// Exact source declaration used only by the bounded precise-rethrow retry.
+    /// Exact source declaration for bounded precise-rethrow and receiver-guard proofs.
     /// Loaded methods require a closed source header, never an inferred runtime
     /// effect approximation. Missing/ambiguous declarations retain the refusal.
     pub(crate) fn exact_rethrow_source_declaration(

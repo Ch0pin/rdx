@@ -1160,6 +1160,25 @@ fn emit_instruction(
                             .register,
                     ),
                 )?;
+                let value = if graph
+                    .guarded_interface_receivers
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|sites| sites.contains(&pc))
+                {
+                    ensure!(kind == 0x72 && args.is_empty(), "invalid guarded interface call");
+                    let value = out.local("Ljava/lang/Object;", &value.text, &[])?;
+                    out.line(
+                        &format!(
+                            "if ({} != null && !({} instanceof {})) throw new java.lang.IncompatibleClassChangeError();",
+                            value.text, value.text, java_type(owner)?
+                        ),
+                        &[],
+                    );
+                    value
+                } else {
+                    value
+                };
                 if receiver_cleanup::sdk_number_conversion_receiver(
                     &value,
                     owner,

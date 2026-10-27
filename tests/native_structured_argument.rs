@@ -3160,3 +3160,124 @@ fn private_internal_handler_refuses_owned_normal_reentry_and_fallthrough() {
     // is a normal endpoint rather than an exceptional handler head.
     assert!(native_java::render_method("sample.Test", &baseline, &baseline.methods[0]).is_ok());
 }
+
+fn object_interface_getter_fixture(member_flags: u32) -> DexClass {
+    let mut c = fixture();
+    c.methods[0].parameters = vec!["Z".into(), "Ljava/lang/Object;".into()];
+    let code = c.methods[0].code.as_mut().unwrap();
+    code.registers = 4;
+    code.ins = 2;
+    // Allocate A before the branch, invoke an interface getter on Object only
+    // on the true branch, then initialize A with the selected integer.
+    code.instructions = vec![
+        0x0022, 0, 0x0238, 7, 0x1072, 0, 3, 0x010a, 0x0228, 0x2112, 0x2070, 1, 0x0010, 0x0011,
+    ];
+    let mut interface = fixture();
+    interface.descriptor = "Lsample/Source;".into();
+    interface.access_flags = 0x601;
+    interface.methods = vec![DexMethod {
+        declaring_type: interface.descriptor.clone(),
+        name: "value".into(),
+        return_type: "I".into(),
+        parameters: vec![],
+        thrown_types: vec![],
+        access_flags: member_flags,
+        code: None,
+    }];
+    c.symbols
+        .hierarchy
+        .set(Arc::new(
+            native_hierarchy::TypeHierarchy::from_classes([&c, &interface]).unwrap(),
+        ))
+        .unwrap();
+    c
+}
+
+#[test]
+fn object_interface_getter_retains_allocation_and_interface_failure_check() {
+    let mut c = object_interface_getter_fixture(0x401);
+    let rendered = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    let source = &rendered.source;
+    assert!(source.contains("instanceof sample.Source"), "{source}");
+    assert!(
+        source.contains("IncompatibleClassChangeError()"),
+        "{source}"
+    );
+    assert!(
+        source.find("new sample.A").unwrap() < source.find("instanceof").unwrap(),
+        "{source}"
+    );
+    assert_eq!(source.matches(".value()").count(), 1, "{source}");
+    // Incompatible invoke kinds and inaccessible members cannot gain a guard.
+    for flags in [0x409, 0x402] {
+        let c = object_interface_getter_fixture(flags);
+        assert!(native_java::render_method("sample.Test", &c, &c.methods[0]).is_err());
+    }
+    let mut missing = fixture();
+    missing.methods[0] = c.methods.remove(0);
+    assert!(native_java::render_method("sample.Test", &missing, &missing.methods[0]).is_err());
+}
+
+#[test]
+#[ignore = "requires JDK17+ via RDX_JAVA_HOME"]
+fn object_interface_getter_executes_both_branches_and_preserves_faults() {
+    let c = object_interface_getter_fixture(0x401);
+    let rendered = native_java::render_method("sample.Test", &c, &c.methods[0]).unwrap();
+    let dir = std::env::temp_dir().join(format!("rdx-interface-getter-{}", std::process::id()));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    fs::write(dir.join("sample/Test.java"), format!(r#"package sample;
+public class Test {{
+{}
+public static String run(boolean branch, int kind, boolean initFault) {{
+    State.initFault = initFault;
+    Object input = switch(kind) {{case 0 -> (Source) () -> {{State.trace += "G"; return 42;}};
+        case 1 -> null; case 2 -> new Object(); default -> (Source) () -> {{State.trace += "G"; throw State.fault;}};}};
+    try {{ A a=make(branch,input); return State.trace+":"+a.value; }}
+    catch (NullPointerException e) {{ return State.trace+":null"; }}
+    catch (IncompatibleClassChangeError e) {{ return State.trace+":interface"; }}
+    catch (RuntimeException e) {{if(e!=State.fault) throw e; return State.trace+":getter";}}
+    catch (AssertionError e) {{if(e!=State.init) throw e; return State.trace+":init";}}
+}}
+}}
+interface Source {{ int value(); }}
+class State {{static String trace="";static boolean initFault;static final RuntimeException fault=new RuntimeException();static final AssertionError init=new AssertionError();}}
+class A {{static {{State.trace+="N";if(State.initFault) throw State.init;}} final int value; A(int value){{State.trace+="C";this.value=value;}}}}
+"#, rendered.source)).unwrap();
+    fs::write(dir.join("Runner.java"), r#"import java.net.*;import java.nio.file.*;
+public class Runner {public static void main(String[] args)throws Exception {
+int count=0;
+for(boolean branch:new boolean[]{false,true}) for(int kind=0;kind<4;kind++) for(boolean fault:new boolean[]{false,true}) {
+ try(URLClassLoader loader=new URLClassLoader(new URL[]{Path.of(args[0]).toUri().toURL()},null)) {
+ String actual=(String)Class.forName("sample.Test",true,loader).getMethod("run",boolean.class,int.class,boolean.class).invoke(null,branch,kind,fault);
+ String expected=fault?"N:init":!branch?"NC:2":switch(kind){case 0->"NGC:42";case 1->"N:null";case 2->"N:interface";default->"NG:getter";};
+ if(!actual.equals(expected))throw new AssertionError(actual+" != "+expected); count++;
+ }}System.out.print("ok:"+count);
+}}
+"#).unwrap();
+    let home = std::env::var("RDX_JAVA_HOME").expect("explicit JDK home");
+    let compile = Command::new(format!("{home}/bin/javac"))
+        .arg(dir.join("sample/Test.java"))
+        .arg(dir.join("Runner.java"))
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&compile.stderr),
+        rendered.source
+    );
+    let run = Command::new(format!("{home}/bin/java"))
+        .args(["-Xverify:all", "-cp"])
+        .arg(&dir)
+        .arg("Runner")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"ok:16");
+    fs::remove_dir_all(dir).unwrap();
+}

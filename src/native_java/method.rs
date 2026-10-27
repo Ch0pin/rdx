@@ -4666,6 +4666,7 @@ struct Graph {
     owned_handler_instructions: std::cell::RefCell<Option<std::collections::BTreeSet<usize>>>,
     owned_entry_copy_instructions: std::cell::RefCell<Option<std::collections::BTreeSet<usize>>>,
     constructor_argument_regions: std::cell::RefCell<Vec<(usize, usize, Option<usize>)>>,
+    guarded_interface_receivers: std::cell::RefCell<Option<std::collections::BTreeSet<usize>>>,
     argument_handler_scopes: std::cell::RefCell<Vec<(crate::native_dex::DexTryRegion, usize)>>,
     argument_probe_exit: std::cell::RefCell<Option<(usize, usize, Option<usize>)>>,
     argument_projection:
@@ -5085,6 +5086,88 @@ impl Graph {
         })
     }
 
+    // DEX permits Object-typed invoke-interface receivers. A Java cast alone
+    // changes a wrong receiver's ICCE into CCE. Permit this bounded getter case
+    // only when emission inserts the interface check at the original call site.
+    fn guardable_interface_receiver(
+        &self,
+        class: &DexClass,
+        method: &DexMethod,
+        pc: usize,
+    ) -> bool {
+        use crate::{
+            native_calls::{CallKind, CallTarget},
+            native_types::AssignmentBound,
+        };
+        if self.loop_entry_copy.is_some()
+            || self.parent_prefix.is_some()
+            || self.argument_projection.borrow().is_some()
+            || method
+                .code
+                .as_ref()
+                .is_none_or(|c| c.instructions.len() > 4096)
+        {
+            return false;
+        }
+        let Some(analysis) = self.loop_type_analysis(class, method) else {
+            return false;
+        };
+        let Some(call) = analysis.bound.calls.iter().find(|c| c.pc == pc) else {
+            return false;
+        };
+        let CallTarget::Method {
+            declaring_type,
+            name,
+            prototype_index,
+            ..
+        } = &call.target
+        else {
+            return false;
+        };
+        if call.kind != CallKind::Interface || !call.arguments.is_empty() {
+            return false;
+        }
+        let args = &class.symbols.protos[usize::from(*prototype_index)].1;
+        if !class.symbols.hierarchy.get().is_some_and(|h| {
+            h.exact_rethrow_source_declaration(
+                &class.descriptor,
+                declaring_type,
+                name,
+                args,
+                &call.return_type,
+                0x72,
+            )
+            .is_some()
+        }) {
+            return false;
+        }
+        let Some(input) = analysis
+            .calls
+            .calls
+            .iter()
+            .find(|c| c.pc == pc)
+            .and_then(|c| c.receiver.as_ref())
+        else {
+            return false;
+        };
+        if input.words.len() != 1 {
+            return false;
+        }
+        let Some(value) = analysis.types.values.get(input.words[0]) else {
+            return false;
+        };
+        !value.assignment_bounds_truncated
+            && !value.assignment.is_empty()
+            && value.assignment.iter().all(|bound| match bound {
+                AssignmentBound::Type(ty) => ty.as_ref() == "Ljava/lang/Object;",
+                AssignmentBound::Literal {
+                    bits: 0,
+                    wide: false,
+                } => true,
+                _ => false,
+            })
+    }
+
     fn single_use_call_result(
         &self,
         method: &DexMethod,
@@ -5471,6 +5554,7 @@ impl Graph {
             argument_handler_scopes: Default::default(),
             argument_probe_exit: Default::default(),
             argument_projection: Default::default(),
+            guarded_interface_receivers: Default::default(),
             shared_catch_loop: Default::default(),
             protected_loop_escape: Default::default(),
             protected_pure_escape: Default::default(),

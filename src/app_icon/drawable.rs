@@ -133,11 +133,134 @@ fn color(raw: &str, package: &str, table: &ResourceTable, depth: usize) -> Optio
         _ => return None,
     })
 }
-fn paint(node: &Node, name: &str, package: &str, table: &ResourceTable) -> Option<String> {
-    let c = color(node.attr(name).unwrap_or("#00000000"), package, table, 0)?;
-    Some(format!("#{:02x}{:02x}{:02x}{:02x}", c[0], c[1], c[2], c[3]))
+struct VectorContext<'a> {
+    package: &'a str,
+    table: &'a ResourceTable,
+    container: Option<&'a PackageContainer>,
+    budget: &'a mut usize,
+    definitions: String,
+    next_id: usize,
 }
-fn vector_node(node: &Node, out: &mut String, package: &str, table: &ResourceTable) -> Option<()> {
+impl VectorContext<'_> {
+    fn id(&mut self) -> String {
+        let id = format!("paint{}", self.next_id);
+        self.next_id += 1;
+        id
+    }
+    fn paint(&mut self, node: &Node, name: &str) -> Option<String> {
+        let raw = node.attr(name).unwrap_or("#00000000");
+        if let Some(c) = color(raw, self.package, self.table, 0) {
+            return Some(format!("#{:02x}{:02x}{:02x}{:02x}", c[0], c[1], c[2], c[3]));
+        }
+        let container = self.container?;
+        for path in super::candidates(raw, self.package, self.table) {
+            if *self.budget == 0 {
+                return None;
+            }
+            *self.budget -= 1;
+            let Some(gradient) = container
+                .read_path(&path, 1024 * 1024)
+                .ok()
+                .and_then(|bytes| crate::native_resources::decode(&bytes).ok())
+                .and_then(|xml| parse(&xml))
+            else {
+                continue;
+            };
+            if let Some(paint) = self.linear_gradient(&gradient) {
+                return Some(paint);
+            }
+        }
+        None
+    }
+    fn linear_gradient(&mut self, node: &Node) -> Option<String> {
+        if node.tag != "gradient"
+            || !matches!(node.attr("type").unwrap_or("0"), "0" | "0x0" | "linear")
+        {
+            return None;
+        }
+        let spread = match node.attr("tileMode").unwrap_or("0") {
+            "0" | "0x0" | "clamp" => "pad",
+            "1" | "0x1" | "repeat" => "repeat",
+            "2" | "0x2" | "mirror" => "reflect",
+            _ => return None,
+        };
+        let x1 = node.number("startX", 0.0)?;
+        let y1 = node.number("startY", 0.0)?;
+        let x2 = node.number("endX", 0.0)?;
+        let y2 = node.number("endY", 0.0)?;
+        if x1 == x2 && y1 == y2 {
+            return None;
+        }
+        let mut stops = Vec::new();
+        if node.children.is_empty() {
+            stops.push((
+                0.0,
+                color(node.attr("startColor")?, self.package, self.table, 0)?,
+            ));
+            if let Some(center) = node.attr("centerColor") {
+                stops.push((0.5, color(center, self.package, self.table, 0)?));
+            }
+            stops.push((
+                1.0,
+                color(node.attr("endColor")?, self.package, self.table, 0)?,
+            ));
+        } else {
+            for item in &node.children {
+                if item.tag != "item" || !item.children.is_empty() || item.attr("offset").is_none()
+                {
+                    return None;
+                }
+                let offset = item.number("offset", 0.0)?;
+                if !(0.0..=1.0).contains(&offset)
+                    || stops.last().is_some_and(|(previous, _)| offset < *previous)
+                {
+                    return None;
+                }
+                stops.push((
+                    offset,
+                    color(item.attr("color")?, self.package, self.table, 0)?,
+                ));
+            }
+        }
+        if stops.len() < 2 {
+            return None;
+        }
+        let id = self.id();
+        self.definitions.push_str(&format!("<linearGradient id=\"{id}\" gradientUnits=\"userSpaceOnUse\" x1=\"{x1}\" y1=\"{y1}\" x2=\"{x2}\" y2=\"{y2}\" spreadMethod=\"{spread}\">"));
+        for (offset, c) in stops {
+            self.definitions.push_str(&format!("<stop offset=\"{offset}\" stop-color=\"#{:02x}{:02x}{:02x}\" stop-opacity=\"{}\"/>", c[0], c[1], c[2], c[3] as f32 / 255.0));
+        }
+        self.definitions.push_str("</linearGradient>");
+        Some(format!("url(#{id})"))
+    }
+}
+
+// Android clips subsequent siblings within the current group; nesting the SVG
+// groups preserves clip intersections and restores the parent clip on exit.
+fn vector_children(node: &Node, out: &mut String, context: &mut VectorContext<'_>) -> Option<()> {
+    let mut clips = 0;
+    for child in &node.children {
+        if child.tag == "clip-path" && child.children.is_empty() {
+            let data = quick_xml::escape::escape(child.attr("pathData")?);
+            let rule = match child.attr("fillType").unwrap_or("0") {
+                "0" | "0x0" | "nonZero" => "nonzero",
+                "1" | "0x1" | "evenOdd" => "evenodd",
+                _ => return None,
+            };
+            let id = context.id();
+            context.definitions.push_str(&format!("<clipPath id=\"{id}\" clipPathUnits=\"userSpaceOnUse\"><path d=\"{data}\" clip-rule=\"{rule}\"/></clipPath>"));
+            out.push_str(&format!("<g clip-path=\"url(#{id})\">"));
+            clips += 1;
+        } else {
+            vector_node(child, out, context)?;
+        }
+    }
+    for _ in 0..clips {
+        out.push_str("</g>");
+    }
+    Some(())
+}
+fn vector_node(node: &Node, out: &mut String, context: &mut VectorContext<'_>) -> Option<()> {
     match node.tag.as_str() {
         "group" => {
             let px = node.number("pivotX", 0.0)?;
@@ -148,9 +271,7 @@ fn vector_node(node: &Node, out: &mut String, package: &str, table: &ResourceTab
             let sy = node.number("scaleY", 1.0)?;
             let rotation = node.number("rotation", 0.0)?;
             out.push_str(&format!("<g transform=\"translate({} {}) rotate({rotation}) scale({sx} {sy}) translate({} {})\">", tx+px, ty+py, -px, -py));
-            for child in &node.children {
-                vector_node(child, out, package, table)?;
-            }
+            vector_children(node, out, context)?;
             out.push_str("</g>");
         }
         "path" if node.children.is_empty() => {
@@ -162,8 +283,8 @@ fn vector_node(node: &Node, out: &mut String, package: &str, table: &ResourceTab
                 return None;
             }
             let data = quick_xml::escape::escape(node.attr("pathData")?);
-            let fill = paint(node, "fillColor", package, table)?;
-            let stroke = paint(node, "strokeColor", package, table)?;
+            let fill = context.paint(node, "fillColor")?;
+            let stroke = context.paint(node, "strokeColor")?;
             let fill_alpha = node.number("fillAlpha", 1.0)?.clamp(0.0, 1.0);
             let stroke_alpha = node.number("strokeAlpha", 1.0)?.clamp(0.0, 1.0);
             let width = node.number("strokeWidth", 0.0)?.max(0.0);
@@ -191,7 +312,13 @@ fn vector_node(node: &Node, out: &mut String, package: &str, table: &ResourceTab
     }
     Some(())
 }
-fn vector(node: &Node, package: &str, table: &ResourceTable) -> Option<RgbaImage> {
+fn vector(
+    node: &Node,
+    package: &str,
+    table: &ResourceTable,
+    container: Option<&PackageContainer>,
+    budget: &mut usize,
+) -> Option<RgbaImage> {
     if node.attr("tint").is_some() {
         return None;
     }
@@ -201,13 +328,20 @@ fn vector(node: &Node, package: &str, table: &ResourceTable) -> Option<RgbaImage
         return None;
     }
     let alpha = node.number("alpha", 1.0)?.clamp(0.0, 1.0);
-    let mut svg = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{SIZE}\" height=\"{SIZE}\" viewBox=\"0 0 {w} {h}\"><g opacity=\"{alpha}\">"
+    let mut context = VectorContext {
+        package,
+        table,
+        container,
+        budget,
+        definitions: String::new(),
+        next_id: 0,
+    };
+    let mut body = String::new();
+    vector_children(node, &mut body, &mut context)?;
+    let svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{SIZE}\" height=\"{SIZE}\" viewBox=\"0 0 {w} {h}\"><defs>{}</defs><g opacity=\"{alpha}\">{body}</g></svg>",
+        context.definitions
     );
-    for child in &node.children {
-        vector_node(child, &mut svg, package, table)?;
-    }
-    svg.push_str("</g></svg>");
     let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default()).ok()?;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(SIZE, SIZE)?;
     resvg::render(
@@ -330,7 +464,7 @@ fn render_node(
         return None;
     }
     match node.tag.as_str() {
-        "vector" => vector(node, package, table),
+        "vector" => vector(node, package, table, Some(container), budget),
         "shape" => shape(node, package, table),
         "adaptive-icon" => {
             let mut layers = Vec::new();
@@ -394,6 +528,72 @@ fn render_node(
 mod tests {
     use super::*;
     #[test]
+    fn vector_gradient_resource_and_group_clips_preserve_pixels() {
+        use std::io::Write;
+        let path =
+            std::env::temp_dir().join(format!("rdx-gradient-icon-{}.apk", std::process::id()));
+        let gradient = r##"<gradient xmlns:a="http://schemas.android.com/apk/res/android" a:startX="0" a:endX="100"><item a:offset="0" a:color="#ff0000"/><item a:offset="1" a:color="#0000ff"/></gradient>"##;
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        for (name, bytes) in [
+            (
+                "classes.dex",
+                include_bytes!("../../tests/fixtures/hello.dex").as_slice(),
+            ),
+            ("res/drawable/gradient.xml", gradient.as_bytes()),
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        let container = PackageContainer::open(&path).unwrap();
+        let mut table = ResourceTable::default();
+        table.entries.insert(
+            0x7f010001,
+            crate::resource_table::Resource {
+                id: 0x7f010001,
+                package: "demo".into(),
+                kind: "drawable".into(),
+                name: "gradient".into(),
+                variants: vec![crate::resource_table::Variant {
+                    configuration: "default".into(),
+                    value: String::new(),
+                    reference: None,
+                    file: Some("res/drawable/gradient.xml".into()),
+                }],
+            },
+        );
+        let xml = r##"<vector xmlns:a="http://schemas.android.com/apk/res/android" a:viewportWidth="100" a:viewportHeight="100"><group><clip-path a:pathData="M20,0h60v100h-60z"/><clip-path a:pathData="M0,20h100v60h-100z"/><path a:fillColor="@drawable/gradient" a:pathData="M0,0h100v100h-100z"/></group><path a:fillColor="#00ff00" a:pathData="M0,90h100v10h-100z"/></vector>"##;
+        let node = parse(xml).unwrap();
+        let icon = vector(&node, "demo", &table, Some(&container), &mut 64).unwrap();
+        assert_eq!(icon.get_pixel(5, 54).0[3], 0);
+        assert_eq!(icon.get_pixel(54, 5).0[3], 0);
+        assert_eq!(icon.get_pixel(5, 104).0, [0, 255, 0, 255]);
+        let left = icon.get_pixel(30, 54).0;
+        let right = icon.get_pixel(78, 54).0;
+        assert!(left[0] > left[2] && right[2] > right[0]);
+        assert_eq!(left[3], 255);
+        assert!(vector(&node, "demo", &table, Some(&container), &mut 0).is_none());
+        let mut context = VectorContext {
+            package: "demo",
+            table: &table,
+            container: None,
+            budget: &mut 64,
+            definitions: String::new(),
+            next_id: 0,
+        };
+        for invalid in [
+            gradient.replace("a:startX=", "a:type=\"2\" a:startX="),
+            gradient.replace("a:endX=\"100\"", "a:endX=\"NaN\""),
+            gradient.replace("a:offset=\"1\"", "a:offset=\"-1\""),
+            gradient.replace("a:offset=\"1\"", ""),
+        ] {
+            assert!(context.linear_gradient(&parse(&invalid).unwrap()).is_none());
+        }
+        drop(container);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
     fn radial_shape_background_retains_center_edge_and_rejects_unsupported_effects() {
         let xml = r##"<shape xmlns:a="http://schemas.android.com/apk/res/android" a:shape="0"><gradient a:startColor="#d0e7f8" a:endColor="#aad0f3" a:type="1" a:centerX="0.5" a:centerY="0.5" a:gradientRadius="50%"/></shape>"##;
         let icon = shape(&parse(xml).unwrap(), "demo", &ResourceTable::default()).unwrap();
@@ -420,7 +620,14 @@ mod tests {
     #[test]
     fn app_icon_vector_colors_groups_and_alpha() {
         let xml = r##"<vector xmlns:a="http://schemas.android.com/apk/res/android" a:viewportWidth="10" a:viewportHeight="10"><path a:fillColor="#ff8652ff" a:pathData="M0,0h10v10H0z"/><group a:translateX="2" a:translateY="2"><path a:fillColor="#80ffffff" a:pathData="M0,0h6v6H0z"/></group></vector>"##;
-        let icon = vector(&parse(xml).unwrap(), "demo", &ResourceTable::default()).unwrap();
+        let icon = vector(
+            &parse(xml).unwrap(),
+            "demo",
+            &ResourceTable::default(),
+            None,
+            &mut 64,
+        )
+        .unwrap();
         assert_eq!(icon.get_pixel(5, 5).0, [134, 82, 255, 255]);
         let center = icon.get_pixel(54, 54).0;
         assert!(
@@ -433,7 +640,7 @@ mod tests {
         );
         assert!(parse("<vector><path></vector>").is_none());
         let trimmed = parse(r##"<vector xmlns:a="http://schemas.android.com/apk/res/android" a:viewportWidth="10" a:viewportHeight="10"><path a:fillColor="#fff" a:trimPathEnd="0.5" a:pathData="M0 0h10v10z"/></vector>"##).unwrap();
-        assert!(vector(&trimmed, "", &ResourceTable::default()).is_none());
+        assert!(vector(&trimmed, "", &ResourceTable::default(), None, &mut 64).is_none());
     }
     #[test]
     fn app_icon_adaptive_inline_layers_and_reference_cycle() {

@@ -623,6 +623,7 @@ fn try_region_staging_mode(
     } else {
         crate::native_ir::DecodedMethod::decode(method.code.as_ref().unwrap())?
     };
+    let mut guarded_receivers = std::collections::BTreeSet::new();
     let block_plan = if argument_block {
         let plan = if let Some(projection) = &proof_projection {
             projection.prove(class, method, pc, constructor_pc)
@@ -631,8 +632,9 @@ fn try_region_staging_mode(
         }
         .context("no exact structured argument-region proof")?;
         // A region renderer may choose a source cast from a broad Java local.
-        // Every original reference input must already satisfy the raw DEX
-        // invocation domain; fresh positive proof cannot repair an invalid call.
+        // Arguments retain positive raw DEX domain proofs. An Object-typed
+        // interface getter receiver instead needs an exact declaration and a
+        // checked emission preserving ICCE rather than a bare narrowing cast.
         let mut reference_inputs = Vec::new();
         for call in &plan.calls {
             if call.pc != constructor_pc
@@ -642,7 +644,11 @@ fn try_region_staging_mode(
                     .any(|(_, pc)| *pc == call.pc)
                 && call.receiver.is_some()
             {
-                reference_inputs.push((call.pc, None));
+                if graph.guardable_interface_receiver(class, method, call.pc) {
+                    guarded_receivers.insert(call.pc);
+                } else {
+                    reference_inputs.push((call.pc, None));
+                }
             }
             for (index, input) in call.arguments.iter().enumerate() {
                 if super::reference(&input.descriptor) {
@@ -796,6 +802,20 @@ fn try_region_staging_mode(
             instructions: staged_words,
             offset: code.offset,
         }),
+    };
+    let _receiver_guards = if guarded_receivers.is_empty() {
+        None
+    } else {
+        let mut active = graph
+            .guarded_interface_receivers
+            .borrow()
+            .clone()
+            .unwrap_or_default();
+        active.extend(guarded_receivers);
+        Some(super::OwnedInstructionBoundary {
+            active: &graph.guarded_interface_receivers,
+            previous: graph.guarded_interface_receivers.replace(Some(active)),
+        })
     };
     let _owned = if let Some(plan) = &block_plan {
         let owned: std::collections::BTreeSet<_> = plan.owned.iter().copied().collect();

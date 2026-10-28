@@ -13,13 +13,30 @@ pub(super) fn member_selector(
 ) -> Result<String> {
     let id_key = if method { "method_id" } else { "field_id" };
     let name_key = if method { "method_name" } else { "field_name" };
-    if let Some(id) = args[id_key].as_str() {
+    ensure!(
+        method || args.get("field").is_none() || args.get("field_id").is_none(),
+        "Use only one of field or field_id"
+    );
+    if let Some(id) = args[id_key]
+        .as_str()
+        .or_else(|| (!method).then(|| args["field"].as_str()).flatten())
+    {
         ensure!(
             args.get(name_key).is_none()
                 && args.get("class_name").is_none()
                 && args.get("descriptor").is_none(),
             "Use either {id_key} or class_name plus {name_key}"
         );
+        if !method && let Some((owner, member)) = id.split_once(";->") {
+            let owner = owner
+                .strip_prefix('L')
+                .context("Expected Lowner;->name:type")?;
+            ensure!(
+                !owner.is_empty() && member.contains(':') && !member.contains("->"),
+                "Expected Lowner;->name:type"
+            );
+            return Ok(format!("{}.{}", owner.replace('/', "."), member));
+        }
         return Ok(id.into());
     }
     let mut owner = resolve_class_id(project, required(args, "class_name")?)?.to_owned();

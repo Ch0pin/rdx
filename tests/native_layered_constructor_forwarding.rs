@@ -490,3 +490,49 @@ fn layered_pinned_phonepe_jvm_oracle() {
         "phonepe",
     );
 }
+
+#[test]
+fn retained_public_forwarder_requires_unchanged_arguments_and_complete_body() {
+    let (base, _, _, _) = fixture();
+    let make = || {
+        let mut child = empty("Lsample/Retained;", "Lsample/Base;");
+        child.access_flags = 1;
+        child.symbols = Arc::new(DexSymbols {
+            types: vec![base.descriptor.clone()],
+            strings: vec!["<init>".into()],
+            protos: vec![("V".into(), args())],
+            methods: vec![(0, 0, 0)],
+            ..Default::default()
+        });
+        child.methods.push(method(
+            &child.descriptor,
+            args(),
+            vec![0x5470, 0, 0x3210, 14],
+        ));
+        child
+    };
+    let child = make();
+    let admits = |c: &DexClass| {
+        TypeHierarchy::from_classes([&base, c])
+            .unwrap()
+            .equivalent_constructor(&c.descriptor, &base.descriptor, &args())
+    };
+    assert!(admits(&child));
+    for flags in [2, 4, 9, 0x101, 0x401] {
+        let mut c = make();
+        c.methods[0].access_flags = flags;
+        assert!(!admits(&c), "access {flags:x}");
+    }
+    for words in [
+        vec![0x5470, 0, 0x3120, 14],
+        vec![0x1012, 0x5470, 0, 0x3210, 14],
+        vec![0x5470, 0, 0x3210, 0x1071, 0, 0, 14],
+    ] {
+        let mut c = make();
+        c.methods[0].code.as_mut().unwrap().instructions = words;
+        assert!(!admits(&c));
+    }
+    let mut c = make();
+    c.methods.push(make().methods.remove(0));
+    assert!(!admits(&c));
+}

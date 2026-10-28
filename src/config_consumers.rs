@@ -23,6 +23,7 @@ struct Flow {
     path: String,
     kind: Kind,
     transforms: BTreeSet<String>,
+    may: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -32,33 +33,78 @@ enum Kind {
     Element,
     Pattern,
     Matcher,
+    List,
+    Iterator,
+    Uri,
+    Predicate,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Origin {
     Unknown,
     Literal(Arc<str>),
     Allocation(usize),
+    Ambiguous,
     Flow(Flow),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct State {
     registers: Vec<Origin>,
     result: Origin,
+    collections: BTreeMap<usize, Flow>,
+    invalid_collections: BTreeSet<usize>,
 }
 impl State {
     fn unknown(count: usize) -> Self {
         Self {
             registers: vec![Origin::Unknown; count],
             result: Origin::Unknown,
+            collections: BTreeMap::new(),
+            invalid_collections: BTreeSet::new(),
         }
     }
     fn merge(&mut self, incoming: &Self) -> bool {
         let before = self.clone();
         for (a, b) in self.registers.iter_mut().zip(&incoming.registers) {
             if a != b {
-                *a = Origin::Unknown;
+                *a = match (&*a, b) {
+                    (Origin::Unknown, Origin::Flow(f)) | (Origin::Flow(f), Origin::Unknown)
+                        if f.may =>
+                    {
+                        Origin::Flow(f.clone())
+                    }
+                    (Origin::Unknown, Origin::Allocation(n))
+                    | (Origin::Allocation(n), Origin::Unknown) => Origin::Allocation(*n),
+                    (Origin::Flow(a), Origin::Flow(b))
+                        if a.may
+                            && b.may
+                            && a.read == b.read
+                            && a.path == b.path
+                            && a.kind == b.kind =>
+                    {
+                        let mut f = a.clone();
+                        f.transforms.extend(b.transforms.iter().cloned());
+                        Origin::Flow(f)
+                    }
+                    _ => Origin::Ambiguous,
+                };
             }
         }
+        self.invalid_collections
+            .extend(incoming.invalid_collections.iter().copied());
+        for (allocation, flow) in &incoming.collections {
+            if let Some(old) = self.collections.get_mut(allocation) {
+                if old.read == flow.read && old.path == flow.path && old.kind == flow.kind {
+                    old.transforms.extend(flow.transforms.iter().cloned());
+                    old.may |= flow.may;
+                } else {
+                    self.invalid_collections.insert(*allocation);
+                }
+            } else {
+                self.collections.insert(*allocation, flow.clone());
+            }
+        }
+        self.collections
+            .retain(|a, _| !self.invalid_collections.contains(a));
         if self.result != incoming.result {
             self.result = Origin::Unknown;
         }
@@ -223,6 +269,16 @@ impl Analysis<'_> {
             0x22 => Origin::Allocation(i.pc),
             _ => Origin::Unknown,
         };
+        if emit && matches!(i.opcode, 0x32..=0x3d) {
+            for r in &i.reads {
+                if let Origin::Flow(f) = &state.registers[r.register as usize]
+                    && f.kind == Kind::Predicate
+                {
+                    let record = json!({"read_call_site_offset":f.read,"method_id":method_id(frame.method),"call_site_offset":i.pc,"operation":"conditional_on_comparison","array_path":f.path,"transforms":f.transforms,"via":frame.via,"proof":"comparison result reaches conditional operand; branch feasibility and downstream sinks are not inferred"});
+                    self.evidence.operations.insert(record.to_string(), record);
+                }
+            }
+        }
         state.result = Origin::Unknown;
         if invoke(i) {
             if let Some(target) = method_symbol(class, i) {
@@ -249,9 +305,130 @@ impl Analysis<'_> {
         let depth = frame.depth;
         let via = frame.via;
         let args: Vec<_> = (0..i.reads.len()).map(|n| argument(state, i, n)).collect();
-        let get = |n: usize| args.get(n).cloned().unwrap_or(Origin::Unknown);
+        let get = |n: usize| {
+            let origin = args.get(n).cloned().unwrap_or(Origin::Unknown);
+            if let Origin::Allocation(a) = origin
+                && let Some(f) = state.collections.get(&a)
+            {
+                return Origin::Flow(f.clone());
+            }
+            origin
+        };
         let static_call = matches!(i.opcode, 0x71 | 0x77);
         let start = usize::from(!static_call);
+        if depth == 0
+            && get(1) == Origin::Literal(Arc::from(self.key))
+            && [
+                "java.util.Map",
+                "java.util.HashMap",
+                "java.util.LinkedHashMap",
+            ]
+            .iter()
+            .any(|o| named(target, o, "get"))
+            && target.ends_with("(Ljava/lang/Object;)Ljava/lang/Object;")
+        {
+            if emit {
+                self.evidence.reads.insert(i.pc,json!({"call_site_offset":i.pc,"reader_method_id":target,"default_raw":Value::Null,"default_status":"not_supplied","contract":"keyed map lookup; remote-setting origin requires caller verification"}));
+            }
+            return Ok(Origin::Flow(Flow {
+                read: i.pc,
+                path: String::new(),
+                kind: Kind::Raw,
+                transforms: BTreeSet::new(),
+                may: true,
+            }));
+        }
+        let tracked = matches!(get(0), Origin::Flow(_));
+        let kotlin_split = target.starts_with("kotlin.text.")
+            && target.contains("(Ljava/lang/CharSequence;[Ljava/lang/String;I)Ljava/util/List;");
+        if tracked && (named(target, "java.lang.String", "split") || kotlin_split) {
+            let value = transformed(
+                get(0),
+                &if kotlin_split {
+                    format!("signature model: {target}")
+                } else {
+                    target.to_owned()
+                },
+                Some(Kind::List),
+            );
+            if emit && let Origin::Flow(f) = &value {
+                self.record_array(f, method_id(method), i.pc);
+            }
+            return Ok(value);
+        }
+        if tracked
+            && (named(target, "java.lang.Object", "toString")
+                || named(target, "android.net.Uri", "parse")
+                || named(target, "android.net.Uri", "getHost")
+                || (target.starts_with("kotlin.text.")
+                    && target.ends_with("(Ljava/lang/CharSequence;)Ljava/lang/CharSequence;")))
+        {
+            let kind = if named(target, "android.net.Uri", "parse") {
+                Some(Kind::Uri)
+            } else if named(target, "android.net.Uri", "getHost") {
+                Some(Kind::Element)
+            } else {
+                None
+            };
+            let model = if target.starts_with("kotlin.text.") {
+                format!("signature model: {target}")
+            } else {
+                target.to_owned()
+            };
+            return Ok(transformed(get(0), &model, kind));
+        }
+        if tracked
+            && [
+                "java.lang.Iterable",
+                "java.util.Collection",
+                "java.util.List",
+                "java.util.ArrayList",
+            ]
+            .iter()
+            .any(|o| named(target, o, "iterator"))
+        {
+            return Ok(transformed(get(0), target, Some(Kind::Iterator)));
+        }
+        if tracked && named(target, "java.util.Iterator", "next") {
+            return Ok(transformed(get(0), target, Some(Kind::Element)));
+        }
+        if [
+            "java.util.Collection",
+            "java.util.List",
+            "java.util.ArrayList",
+        ]
+        .iter()
+        .any(|o| named(target, o, "add"))
+            && let (Some(Origin::Allocation(a)), Origin::Flow(mut f)) = (args.first(), get(1))
+        {
+            f.kind = Kind::List;
+            f.may = true;
+            f.transforms.insert(target.into());
+            if !state.invalid_collections.contains(a) {
+                if state
+                    .collections
+                    .get(a)
+                    .is_some_and(|old| old.read != f.read || old.path != f.path)
+                {
+                    state.collections.remove(a);
+                    state.invalid_collections.insert(*a);
+                } else {
+                    if let Some(old) = state.collections.get(a) {
+                        f.transforms.extend(old.transforms.iter().cloned());
+                    }
+                    state.collections.insert(*a, f);
+                }
+            }
+            return Ok(Origin::Unknown);
+        }
+        if tracked
+            && (named(target, "java.util.Iterator", "hasNext")
+                || named(target, "java.util.Collection", "isEmpty")
+                || (target.starts_with("kotlin.collections.")
+                    && target.contains(".collectionSizeOrDefault(")))
+        {
+            return Ok(Origin::Unknown);
+        }
         if depth == 0
             && get(start) == Origin::Literal(Arc::from(self.key))
             && target.ends_with("(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;")
@@ -275,6 +452,7 @@ impl Analysis<'_> {
                 path: String::new(),
                 kind: Kind::Raw,
                 transforms: BTreeSet::new(),
+                may: false,
             }));
         }
         if (named(target, "org.json.JSONObject", "<init>")
@@ -372,19 +550,37 @@ impl Analysis<'_> {
             if emit {
                 for (position, arg) in args.iter().enumerate() {
                     if let Origin::Flow(flow) = arg
-                        && matches!(flow.kind, Kind::Element | Kind::Matcher)
+                        && matches!(flow.kind, Kind::Element | Kind::Matcher | Kind::Raw)
                     {
-                        let record = json!({"read_call_site_offset":flow.read,"array_path":flow.path,"operation":operation,"method_id":method_id(method),"call_site_offset":i.pc,"target_method_id":target,"argument_word":position,"transforms":flow.transforms,"via":via,"proof":"DEX register provenance; static possible use, not runtime reachability"});
+                        let record = json!({"read_call_site_offset":flow.read,"array_path":flow.path,"operation":operation,"method_id":method_id(method),"call_site_offset":i.pc,"target_method_id":target,"argument_word":position,"transforms":flow.transforms,"via":via,"proof":if flow.may {"modeled possible DEX provenance; transforms may occur on alternative paths; not runtime reachability"} else {"DEX register provenance; static possible use, not runtime reachability"}});
                         self.evidence.operations.insert(record.to_string(), record);
                     }
                 }
             }
-            return Ok(Origin::Unknown);
+            return Ok(args
+                .iter()
+                .find_map(|a| {
+                    if matches!(a, Origin::Flow(_)) {
+                        Some(transformed(a.clone(), target, Some(Kind::Predicate)))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(Origin::Unknown));
         }
         if named(target, "org.json.JSONArray", "length")
             || named(target, "org.json.JSONObject", "has")
         {
             return Ok(Origin::Unknown);
+        }
+        // Escaping collection aliases can be mutated by the callee. Invalidation
+        // is absorbing at CFG joins, so later iterations cannot revive stale flow.
+        for arg in &args {
+            if let Origin::Allocation(a) = arg
+                && state.collections.remove(a).is_some()
+            {
+                state.invalid_collections.insert(*a);
+            }
         }
         // Unknown calls may mutate JSON containers. Retain immutable element strings,
         // but invalidate mutable aliases instead of propagating a stale array source.
@@ -448,6 +644,72 @@ impl Analysis<'_> {
     fn record_array(&mut self, flow: &Flow, method: String, pc: usize) {
         self.evidence.arrays.insert((flow.read,flow.path.clone()),json!({"read_call_site_offset":flow.read,"path":flow.path,"method_id":method,"call_site_offset":pc}));
     }
+}
+
+// Report exact enclosing-method caller context separately from value provenance.
+// A call edge does not establish that every branch in its callee affected a result.
+fn caller_context(engine: &NativeEngine, method: &DexMethod, cancel: &AtomicBool) -> Result<Value> {
+    let root = method_id(method);
+    let mut graph = engine.call_graph_query_by_id(
+        &root,
+        &json!({"direction":"callers","projection":"call_sites","depth":2,"limit":64}),
+        cancel,
+    )?;
+    if let Some(rows) = graph["call_sites"].as_array_mut() {
+        for row in rows {
+            let id = row["caller_method_id"].as_str().unwrap_or("").to_owned();
+            let pc = row["call_site_offset"].as_u64().unwrap_or(u64::MAX) as usize;
+            let usage = crate::call_graph::owner(&id)
+                .and_then(|o| engine.dex_class(o))
+                .and_then(|c| c.methods.iter().find(|m| method_id(m) == id))
+                .and_then(|m| m.code.as_ref())
+                .and_then(|code| DecodedMethod::decode(code).ok())
+                .and_then(|ir| result_use(&ir, pc));
+            row["result_use"] = usage.unwrap_or_else(|| json!({"status":"unresolved"}));
+            for key in [
+                "invoke_words",
+                "caller_signature",
+                "caller_code_offset_bytes",
+            ] {
+                row.as_object_mut().unwrap().remove(key);
+            }
+        }
+    }
+    graph["scope"] = json!(
+        "Exact declared callers of the enclosing consumer method, depth 2; immediate result use is proven separately. This is call context, not an interprocedural taint or runtime reachability claim. Resume omitted sites with get_call_graph using the same root and depth."
+    );
+    Ok(graph)
+}
+fn result_use(ir: &DecodedMethod, pc: usize) -> Option<Value> {
+    let index = ir.instructions.iter().position(|i| i.pc == pc)?;
+    let next = ir.instructions.get(index + 1)?;
+    if !matches!(next.opcode, 0x0a..=0x0c) {
+        return None;
+    }
+    let mut aliases = BTreeSet::from([next.writes.first()?.register]);
+    for i in ir.instructions.iter().skip(index + 2).take(16) {
+        if i.reads.iter().any(|r| aliases.contains(&r.register)) {
+            let operation = match i.opcode {
+                0x0f..=0x11 => "returned",
+                0x32..=0x3d => "conditional",
+                _ => "other_use",
+            };
+            if matches!(i.opcode, 0x01..=0x09) {
+                aliases.insert(i.writes.first()?.register);
+                continue;
+            }
+            return Some(
+                json!({"status":"exact_register_use","operation":operation,"offset":i.pc,"branch_target":i.branch_target}),
+            );
+        }
+        for w in &i.writes {
+            aliases.remove(&w.register);
+        }
+        if aliases.is_empty() || matches!(i.opcode,0x0e..=0x11|0x27..=0x2c|0x32..=0x3d) {
+            break;
+        }
+    }
+    None
 }
 
 pub fn search(
@@ -567,7 +829,18 @@ pub fn search(
                 array
             })
             .collect();
-        let item = json!({"method_id":method_id(method),"dex_entry":class.symbols.origin.get(),"reads":e.reads.values().collect::<Vec<_>>(),"arrays":arrays,"analysis_error":error,"unresolved_uses":e.unresolved,
+        let callers = if !e.reads.is_empty() {
+            match caller_context(engine, method, cancel) {
+                Ok(value) => value,
+                Err(error) => {
+                    ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+                    json!({"status":"unavailable","reason":error.to_string()})
+                }
+            }
+        } else {
+            Value::Null
+        };
+        let item = json!({"caller_context":callers,"operations":e.operations.values().collect::<Vec<_>>(),"method_id":method_id(method),"dex_entry":class.symbols.origin.get(),"reads":e.reads.values().collect::<Vec<_>>(),"arrays":arrays,"analysis_error":error,"unresolved_uses":e.unresolved,
             "status":if error.is_some(){"partial"}else if e.reads.is_empty(){"literal_only"}else{"candidate_consumer"}});
         let size = serde_json::to_vec(&item)?.len();
         ensure!(
@@ -583,7 +856,7 @@ pub fn search(
     }
     Ok(
         json!({"key":key,"items":items,"total":candidates.len(),"offset":offset,"next_offset":(next<candidates.len()).then_some(next),"scan_errors":scan_errors,
-        "coverage":"Exact const-string/jumbo key sites; two-string argument/string-return retrieval candidates; local register flow, org.json arrays, selected String/regex APIs and static/direct helpers up to depth 2. Field flows, dynamic keys, collection adapters, reflection and virtual helper dispatch remain unresolved.",
+        "coverage":"Exact const-string/jumbo key sites; two-string argument/string-return retrieval candidates; local register flow, org.json arrays, selected String/regex APIs and static/direct helpers up to depth 2. Also models map-key reads, String/Kotlin split signatures, local collection iteration and URI host extraction as possible flows. Field flows, dynamic keys, arbitrary collection adapters, reflection and virtual helper dispatch remain unresolved.",
         "defaults_scope":"Packaged literal arguments only; runtime remote values are unknown. Reader semantics are inferred, not asserted from method names.","offset_unit":"DEX code units"}),
     )
 }
@@ -921,5 +1194,136 @@ mod tests {
                 .to_string()
                 .contains("CANCELLED")
         );
+    }
+    #[test]
+    fn map_key_split_uri_host_and_comparison_reaches_conditional() {
+        let mut f = Fixture::new();
+        f.literal(0, "hosts.key");
+        f.call(
+            "Ljava/util/HashMap;",
+            "get",
+            &["Ljava/lang/Object;"],
+            "Ljava/lang/Object;",
+            &[5, 0],
+            false,
+        );
+        f.result(0);
+        f.call(
+            "Ljava/lang/Object;",
+            "toString",
+            &[],
+            "Ljava/lang/String;",
+            &[0],
+            false,
+        );
+        f.result(0);
+        f.words.extend([0x0112, 0x0212]);
+        f.call(
+            "Lkotlin/text/Obfuscated;",
+            "x",
+            &["Ljava/lang/CharSequence;", "[Ljava/lang/String;", "I"],
+            "Ljava/util/List;",
+            &[0, 1, 2],
+            true,
+        );
+        f.result(0);
+        f.call(
+            "Ljava/util/List;",
+            "iterator",
+            &[],
+            "Ljava/util/Iterator;",
+            &[0],
+            false,
+        );
+        f.result(0);
+        f.call(
+            "Ljava/util/Iterator;",
+            "next",
+            &[],
+            "Ljava/lang/Object;",
+            &[0],
+            false,
+        );
+        f.result(0);
+        f.call(
+            "Landroid/net/Uri;",
+            "parse",
+            &["Ljava/lang/String;"],
+            "Landroid/net/Uri;",
+            &[0],
+            true,
+        );
+        f.result(0);
+        f.call(
+            "Landroid/net/Uri;",
+            "getHost",
+            &[],
+            "Ljava/lang/String;",
+            &[0],
+            false,
+        );
+        f.result(0);
+        f.call(
+            "Ljava/lang/String;",
+            "equalsIgnoreCase",
+            &["Ljava/lang/String;"],
+            "Z",
+            &[5, 0],
+            false,
+        );
+        f.words.extend([0x010a, 0x0138, 2]);
+        let c = f.finish("app.Root");
+        let e = analyze(&c, None);
+        assert_eq!(e.reads.len(), 1);
+        assert_eq!(
+            e.reads.values().next().unwrap()["default_status"],
+            "not_supplied"
+        );
+        assert!(
+            e.operations
+                .values()
+                .any(|v| v["operation"] == "conditional_on_comparison")
+        );
+        assert!(e.operations.values().any(|v| {
+            v["operation"] == "equalsIgnoreCase"
+                && v["transforms"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.as_str().unwrap().starts_with("signature model:"))
+        }));
+    }
+    #[test]
+    fn collection_join_invalidation_is_absorbing_and_order_independent() {
+        let f = Flow {
+            read: 1,
+            path: String::new(),
+            kind: Kind::List,
+            transforms: BTreeSet::new(),
+            may: true,
+        };
+        let mut a = State::unknown(2);
+        a.collections.insert(10, f.clone());
+        let mut b = a.clone();
+        b.collections.get_mut(&10).unwrap().read = 2;
+        for (mut first, second) in [(a.clone(), b.clone()), (b, a.clone())] {
+            first.merge(&second);
+            assert!(!first.collections.contains_key(&10));
+            first.merge(&a);
+            assert!(!first.collections.contains_key(&10));
+            assert!(first.invalid_collections.contains(&10));
+        }
+    }
+    #[test]
+    fn caller_result_use_tracks_moves_and_stops_at_overwrite() {
+        let mut f = Fixture::new();
+        let pc = f.call("Lapp/Root;", "gate", &[], "Z", &[], true);
+        f.words.extend([0x000a, 0x0101, 0x0138, 2]);
+        let mut c = f.finish("app.Caller");
+        let ir = DecodedMethod::decode(c.methods[0].code.as_ref().unwrap()).unwrap();
+        assert_eq!(result_use(&ir, pc).unwrap()["operation"], "conditional");
+        c.methods[0].code.as_mut().unwrap().instructions[4] = 0x0112;
+        let ir = DecodedMethod::decode(c.methods[0].code.as_ref().unwrap()).unwrap();
+        assert!(result_use(&ir, pc).is_none());
     }
 }

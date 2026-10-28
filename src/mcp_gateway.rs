@@ -321,6 +321,7 @@ fn asynchronous_tool(name: &str) -> bool {
             | "search_code"
             | "resolve_switch_case_callers"
             | "find_network_stacks"
+            | "find_config_key_consumers"
             | "get_call_graph"
             | "get_call_graph_batch"
             | "resolve_reference"
@@ -345,6 +346,8 @@ mod controlled_reader_tests {
             address: listener.local_addr().unwrap(),
             token: "local-test-token".into(),
             owner_pid: None,
+            apk_path: None,
+            registered_at_unix_ms: None,
         };
         let message = message.to_owned();
         let server = thread::spawn(move || {

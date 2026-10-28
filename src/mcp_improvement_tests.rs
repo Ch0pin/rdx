@@ -69,12 +69,16 @@ fn discovery_preserves_live_results_and_reports_gui_disconnect_separately() {
         address,
         token: "token".into(),
         owner_pid: None,
+        apk_path: None,
+        registered_at_unix_ms: None,
     };
     let closed = Registration {
         instance_id: "closed".into(),
         address,
         token: "token".into(),
         owner_pid: None,
+        apk_path: None,
+        registered_at_unix_ms: None,
     };
     let peer = thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -251,6 +255,8 @@ fn discovery_registration_batches_are_stable_across_record_pagination() {
             address,
             token: "batch-token".into(),
             owner_pid: None,
+            apk_path: None,
+            registered_at_unix_ms: None,
         })
         .collect();
     let peer = thread::spawn(move || {
@@ -286,10 +292,10 @@ fn discovery_registration_batches_are_stable_across_record_pagination() {
     )
     .unwrap();
     assert_eq!(first["total"], 16);
-    assert_eq!(
-        first["items"],
-        json!([{"instance_id":"instance-15","state":"Running","package_name":"example"}])
-    );
+    assert_eq!(first["items"].as_array().unwrap().len(), 1);
+    assert_eq!(first["items"][0]["instance_id"], "instance-15");
+    assert_eq!(first["items"][0]["reachability"], "reachable");
+    assert!(first["items"][0]["last_seen_unix_ms"].is_u64());
     assert_eq!(first["next_registration_offset"], 16);
     assert_eq!(first["discovery_complete"], false);
     assert_eq!(first["next_offset"], Value::Null);
@@ -908,6 +914,8 @@ fn forget_instance_checks_reachability_and_preserves_other_records() {
         address: listener.local_addr().unwrap(),
         token: "test-token".into(),
         owner_pid: None,
+        apk_path: None,
+        registered_at_unix_ms: None,
     };
     fs::write(&path, serde_json::to_vec(&entry).unwrap()).unwrap();
     let reply_id = id.clone();
@@ -958,4 +966,45 @@ fn config_and_hierarchy_tool_schemas_expose_evidence_contracts() {
         &json!({"instance_id":"i","project_id":"p","class_name":"Landroid/webkit/WebView;"}),
     )
     .unwrap();
+}
+
+#[test]
+fn smali_field_alias_normalizes_without_changing_owner_or_type() {
+    let engine = NativeEngine::default();
+    let project = Project {
+        classes: vec![],
+        resources: vec![],
+    };
+    for key in ["field", "field_id"] {
+        let args =
+            json!({key:"Lpkg/Owner;->value:Ljava/lang/String;","instance_id":"i","project_id":"p"});
+        validate("find_field_references", &args).unwrap();
+        assert_eq!(
+            review::member_selector(&engine, &project, &args, false).unwrap(),
+            "pkg.Owner.value:Ljava/lang/String;"
+        );
+    }
+    assert!(
+        review::member_selector(
+            &engine,
+            &project,
+            &json!({"field":"Lpkg/A;->x:I","field_id":"pkg.B.x:I"}),
+            false
+        )
+        .is_err()
+    );
+    assert_eq!(
+        source_search::page_status(true, true, false)["complete"],
+        false
+    );
+    assert!(
+        source_search::page_status(true, true, false)["message"]
+            .as_str()
+            .unwrap()
+            .contains("mode=identifiers")
+    );
+    assert_eq!(
+        source_search::page_status(true, false, true)["complete"],
+        false
+    );
 }

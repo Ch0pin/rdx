@@ -94,6 +94,10 @@ struct Registration {
     token: String,
     #[serde(default)]
     owner_pid: Option<u32>,
+    #[serde(default)]
+    apk_path: Option<PathBuf>,
+    #[serde(default)]
+    registered_at_unix_ms: Option<u64>,
 }
 #[derive(Default, Clone)]
 pub struct Status {
@@ -178,6 +182,8 @@ impl Server {
             address: listener.local_addr()?,
             token: random_id()?,
             owner_pid: Some(std::process::id()),
+            apk_path: Some(path.clone()),
+            registered_at_unix_ms: Some(unix_ms()),
         };
         private_write(&registration, &serde_json::to_value(&entry)?)?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -859,6 +865,14 @@ fn instance_matches(info: &Value, args: &Value) -> bool {
             .is_some_and(|h| !h.is_empty() && info["apk_sha256"] == h)
 }
 
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
 fn discover(entries: &[Registration], args: &Value) -> Result<Value> {
     let start = args["registration_offset"].as_u64().unwrap_or(0) as usize;
     ensure!(start <= entries.len(), "Invalid registration_offset");
@@ -867,9 +881,17 @@ fn discover(entries: &[Registration], args: &Value) -> Result<Value> {
     let mut diagnostics = Vec::new();
     for entry in &entries[start..end] {
         match remote(entry, "get_instance_info", &json!({})) {
-            Ok(info) => { let info = normalize_instance_info(info); if instance_matches(&info,args) { items.push(info); } },
+            Ok(info) => { let mut info = normalize_instance_info(info);
+                info["reachability"] = json!("reachable");
+                info["last_seen_unix_ms"] = json!(unix_ms());
+                info["owner_pid"] = json!(entry.owner_pid);
+                info["registered_at_unix_ms"] = json!(entry.registered_at_unix_ms);
+                if instance_matches(&info,args) { items.push(info); } },
             Err(error) => diagnostics.push(json!({"instance_id":entry.instance_id,
                 "status":"instance_unreachable", "error":format!("{error:#}"),
+                "checked_at_unix_ms":unix_ms(),"last_seen_unix_ms":Value::Null,
+                "owner_pid":entry.owner_pid,"apk_path":entry.apk_path,"registered_at_unix_ms":entry.registered_at_unix_ms,
+                "recovery":{"tool":"open_apk","arguments":{"path":entry.apk_path,"request_key":format!("recovery-{}",entry.instance_id),"headless":true},"requires_explicit_call":true},
                 "action":"Check the GUI MCP status and retry. If the GUI has closed, reopen it; an unreachable registration alone does not prove a stale process."})),
         }
     }
@@ -878,6 +900,30 @@ fn discover(entries: &[Registration], args: &Value) -> Result<Value> {
     result["discovery_complete"] = json!(end == entries.len());
     result["next_registration_offset"] = json!((end < entries.len()).then_some(end));
     result["registered_instances"] = json!(entries.len());
+    let pinned = args["apk_sha256"].as_str().is_some_and(|s| !s.is_empty())
+        || args["apk_path"]
+            .as_str()
+            .is_some_and(|s| Path::new(s).is_absolute());
+    let candidates: Vec<_> = result["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| {
+            i["state"] == "Running" && i["project_id"].as_str().is_some_and(|s| !s.is_empty())
+        })
+        .map(|i| json!({"instance_id":i["instance_id"],"project_id":i["project_id"]}))
+        .collect();
+    result["selection"] = if pinned
+        && start == 0
+        && end == entries.len()
+        && result["next_offset"].is_null()
+        && args["offset"].as_u64().unwrap_or(0) == 0
+        && candidates.len() == 1
+    {
+        json!({"status":"unique_healthy_match","selected":candidates[0],"routing":"Pass these explicit IDs on subsequent calls"})
+    } else {
+        json!({"status":if !pinned {"identity_filter_required"} else if candidates.len()>1 {"ambiguous"} else {"no_unique_complete_match"},"selected":Value::Null,"hint":"Filter by absolute apk_path or exact apk_sha256 and complete discovery; select an explicit instance/project when ambiguous"})
+    };
     Ok(result)
 }
 
@@ -988,7 +1034,7 @@ fn search_code(
         }
     }
     Ok(
-        json!({"items":items,"scope":"generated Java and mixed DEX; case-sensitive literal plus exact numeric aliases for resolved resource links; resource files excluded","offset":offset,"scanned_classes":scanned,"total_classes":classes.len(),"errors":errors,"next_offset":next,"next_source_offset":next.map(|_|next_source),"exhausted":next.is_none()}),
+        json!({"items":items,"scope":"generated Java and mixed DEX; case-sensitive literal plus exact numeric aliases for resolved resource links; resource files excluded","offset":offset,"scanned_classes":scanned,"total_classes":classes.len(),"page_status":source_search::page_status(items.is_empty(),next.is_some(),!errors.is_empty()),"errors":errors,"next_offset":next,"next_source_offset":next.map(|_|next_source),"exhausted":next.is_none()}),
     )
 }
 
@@ -1458,7 +1504,7 @@ fn tools_list() -> Value {
         ),
         (
             "list_nav_deeplinks",
-            "Inventory navigation XML deep links, destination arguments, nested graph paths and include edges. Resolves scalar resource attributes and lists configuration overrides. Includes graph references without flattening cycles or guessing runtime configuration.",
+            "Inventory navigation XML deep links and Hotwire destination URI annotations. Includes destination arguments, graph includes, resource configurations, and bounded ordered class-array evidence. Candidate array indexes and conditional route strings are distinct from proven runtime registration.",
             vec![],
             true,
         ),
@@ -1518,7 +1564,7 @@ fn tools_list() -> Value {
         ),
         (
             "find_field_references",
-            "Find DEX iget/iput/sget/sput accesses by field_id (owner.name:descriptor), or class_name plus field_name and optional descriptor. A subclass owner is resolved to its declaring field when provable; returns requested_field_id and resolved_field_id, preserving shadowing and unresolved status. Includes inherited operand aliases. access=all/read/write; returns method IDs, opcodes, read/write counts and code-unit offsets. Scans original DEX without decompilation; complete=false identifies unresolved relevant hierarchy accesses. No inference about reflection/native consumers. Pagination limit <=500.",
+            "Find DEX iget/iput/sget/sput accesses by field_id or field (owner.name:descriptor or Lowner;->name:descriptor), or class_name plus field_name and optional descriptor. A subclass owner is resolved to its declaring field when provable; returns requested_field_id and resolved_field_id, preserving shadowing and unresolved status. Includes inherited operand aliases. access=all/read/write; returns method IDs, opcodes, read/write counts and code-unit offsets. Scans original DEX without decompilation; complete=false identifies unresolved relevant hierarchy accesses. No inference about reflection/native consumers. Pagination limit <=500.",
             vec!["field_id"],
             true,
         ),
@@ -1554,7 +1600,7 @@ fn tools_list() -> Value {
         ),
         (
             "open_apk",
-            "Open a local APK, XAPK, or APKS in a new RDX GUI instance with MCP enabled. Required request_key identifies one launch within this gateway connection: reuse it to retry the same canonical path; use a new unique key for another window.",
+            "Open a local APK, XAPK, or APKS in a new RDX GUI instance, or headless=true in this gateway until its connection closes. Poll get_instance_info for readiness and pin the returned project_id. Required request_key identifies one launch within this gateway connection: reuse it to retry the same canonical path; use a new unique key for another window.",
             vec!["path", "request_key"],
             false,
         ),
@@ -1718,6 +1764,7 @@ fn tools_list() -> Value {
             properties.insert("class_name".into(),json!({"type":"string","minLength":1,"description":"Alias for class_id: exact FQCN, DEX descriptor or unique short name"}));
         }
         if name=="open_apk" {
+            properties.insert("headless".into(),json!({"type":"boolean","default":false,"description":"Host the project in this MCP gateway without a GUI. Closing the gateway stops this service and cancels work. Poll get_instance_info for Running and project_id."}));
             properties.insert("request_key".into(),json!({"type":"string","minLength":1,"description":"Unique launch key within this gateway connection, e.g. review-temu-1. Reuse for retries of the same canonical path; a new key opens another window. Reusing it for a different path is rejected."}));
         }
         if ["get_method_source","find_field_references","export_source"].contains(&name) {
@@ -1726,7 +1773,7 @@ fn tools_list() -> Value {
             required.retain(|k| *k!=id);
             for key in [id,"class_name",member,"descriptor"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
         }
-        if ["find_type_references","search_kotlin_metadata","find_webview_chooser_flows","find_network_stacks"].contains(&name) { properties.insert("package_prefix".into(),json!({"type":"string"})); }
+        if ["find_type_references","search_kotlin_metadata","find_webview_chooser_flows","find_network_stacks","list_nav_deeplinks"].contains(&name) { properties.insert("package_prefix".into(),json!({"type":"string"})); }
         if ["get_all_classes","search_classes_by_keyword","search_kotlin_metadata","search_resource_xml"].contains(&name) { properties.insert("case_sensitive".into(),json!({"type":"boolean","default":true})); }
         if ["search_resource_xml","list_nav_deeplinks","find_layout_references"].contains(&name) { properties.insert("resource_prefix".into(),json!({"type":"string"})); }
         if name=="find_annotation_usages" {
@@ -1746,6 +1793,7 @@ fn tools_list() -> Value {
             properties.insert("format".into(),json!({"type":"string","enum":["auto","dex"],"default":"auto","description":"auto attempts Java with explicit DEX fallback; dex requests native RDX DEX disassembly directly"}));
         }
         if name=="find_field_references" {
+            properties.insert("field".into(),json!({"type":"string","minLength":1,"description":"Alias for field_id; accepts Lpkg/Class;->name:type and pkg.Class.name:type"}));
             properties.insert("access".into(),json!({"type":"string","enum":["all","read","write"],"default":"all"}));
         }
         if name=="resolve_switch_case_callers" {
@@ -1842,6 +1890,7 @@ fn tools_list() -> Value {
             let (id,member)=if name=="get_method_source" {("method_id","method_name")}else{("field_id","field_name")};
             schema["anyOf"]=json!([{"required":[id]},{"required":["class_name",member]}]);
         }
+        if name=="find_field_references" { schema["anyOf"].as_array_mut().unwrap().push(json!({"required":["field"]})); }
         if name=="export_source" {schema["anyOf"]=json!([{"required":["class_name"]},{"required":["method_id"]}]);}
         if name=="get_resource_value" {schema["anyOf"]=json!([{"required":["resource_id"]},{"required":["resource_name"]}]);}
         json!({"name":name,"description":description,"inputSchema":schema,"annotations":{"readOnlyHint":!["open_apk","forget_instance","export_source","export_package_source"].contains(&name),"destructiveHint":name=="forget_instance","openWorldHint":false}})
@@ -2084,48 +2133,87 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
     }
     Ok(())
 }
+struct OpenedInstance {
+    path: PathBuf,
+    id: String,
+    // Own the headless service until the gateway closes; Drop cancels work and unregisters.
+    server: Option<Server>,
+}
+
+fn open_apk_request(
+    args: &Value,
+    opened: &mut std::collections::HashMap<String, OpenedInstance>,
+    directory: PathBuf,
+) -> Result<Value> {
+    let path = PathBuf::from(required(args, "path")?).canonicalize()?;
+    ensure!(
+        path.is_file()
+            && path.extension().is_some_and(|e| {
+                ["apk", "xapk", "apks"]
+                    .iter()
+                    .any(|format| e.eq_ignore_ascii_case(format))
+            }),
+        "Expected a local APK, XAPK, or APKS file"
+    );
+    let key = required(args, "request_key")?;
+    let headless = args["headless"].as_bool().unwrap_or(false);
+    if let Some(existing) = opened.get(key) {
+        ensure!(
+            existing.path == path && existing.server.is_some() == headless,
+            "request_key belongs to a different package or launch mode"
+        );
+        return Ok(
+            json!({"instance_id":existing.id,"state":"launching","apk_path":path,"headless":headless}),
+        );
+    }
+    let id = random_id()?;
+    if headless {
+        let server = Server::start_in(path.clone(), directory, id.clone())?;
+        opened.insert(
+            key.into(),
+            OpenedInstance {
+                path: path.clone(),
+                id: id.clone(),
+                server: Some(server),
+            },
+        );
+        return Ok(
+            json!({"instance_id":id,"state":"launching","apk_path":path,"headless":true,"lifetime":"this MCP gateway connection","next_action":"Poll get_instance_info until Running, then pin its project_id"}),
+        );
+    }
+    let mut child = std::process::Command::new(std::env::current_exe()?)
+        .arg(&path)
+        .env("RDX_MCP_AUTO_START", "1")
+        .env("RDX_MCP_INSTANCE", &id)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    opened.insert(
+        key.into(),
+        OpenedInstance {
+            path: path.clone(),
+            id: id.clone(),
+            server: None,
+        },
+    );
+    Ok(json!({"instance_id":id,"state":"launching","apk_path":path}))
+}
+
 fn gateway_call(
     name: &str,
     args: &Value,
-    opened: &mut std::collections::HashMap<String, (PathBuf, String)>,
+    opened: &mut std::collections::HashMap<String, OpenedInstance>,
 ) -> Result<Value> {
     validate(name, args)?;
     if name == "forget_instance" {
         return forget_instance_in(&registry()?, required(args, "instance_id")?);
     }
     if name == "open_apk" {
-        let path = PathBuf::from(required(args, "path")?).canonicalize()?;
-        ensure!(
-            path.is_file()
-                && path.extension().is_some_and(|e| {
-                    ["apk", "xapk", "apks"]
-                        .iter()
-                        .any(|format| e.eq_ignore_ascii_case(format))
-                }),
-            "Expected a local APK, XAPK, or APKS file"
-        );
-        let key = required(args, "request_key")?;
-        if let Some((existing, id)) = opened.get(key) {
-            ensure!(
-                existing == &path,
-                "request_key belongs to a different package"
-            );
-            return Ok(json!({"instance_id":id,"state":"launching","apk_path":path}));
-        }
-        let id = random_id()?;
-        let mut child = std::process::Command::new(std::env::current_exe()?)
-            .arg(&path)
-            .env("RDX_MCP_AUTO_START", "1")
-            .env("RDX_MCP_INSTANCE", &id)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        thread::spawn(move || {
-            let _ = child.wait();
-        });
-        opened.insert(key.into(), (path.clone(), id.clone()));
-        return Ok(json!({"instance_id":id,"state":"launching","apk_path":path}));
+        return open_apk_request(args, opened, registry()?);
     }
     let entries = registrations()?;
     if name == "list_instances" || name == "get_health" {
@@ -2148,7 +2236,7 @@ fn gateway_call(
 }
 #[path = "mcp_gateway.rs"]
 mod gateway;
-/// Newline-delimited stdio MCP. This process never owns a GUI project.
+/// Newline-delimited stdio MCP. May own explicitly opened headless services.
 pub fn run_stdio() -> Result<()> {
     gateway::run()
 }
@@ -3389,3 +3477,6 @@ mod method_format_tests;
 #[cfg(test)]
 #[path = "mcp_reviewer_tests.rs"]
 mod reviewer_tests;
+
+#[path = "mcp_hotwire.rs"]
+mod hotwire;

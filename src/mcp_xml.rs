@@ -259,7 +259,20 @@ pub(super) fn search(
             } else {
                 if tool == "list_nav_deeplinks" {
                     for row in nav_rows(engine, &nodes, path, package, &configs) {
-                        page.add(row)?;
+                        let destination = row["destination_class"]["value"]
+                            .as_str()
+                            .or_else(|| row["destination_class"].as_str())
+                            .unwrap_or("");
+                        let destination = if destination.starts_with('.') {
+                            format!("{package}{destination}")
+                        } else if !destination.contains('.') && !destination.is_empty() {
+                            format!("{package}.{destination}")
+                        } else {
+                            destination.to_owned()
+                        };
+                        if scan::package_matches(&destination, args) {
+                            page.add(row)?;
+                        }
                     }
                 } else {
                     for (i, n) in nodes.iter().enumerate() {
@@ -306,8 +319,30 @@ pub(super) fn search(
             }
         }
     }
+    let hotwire = if tool == "list_nav_deeplinks"
+        && args["resource_prefix"].as_str().is_none_or(str::is_empty)
+    {
+        Some(super::hotwire::append(
+            engine, project, args, cancel, &mut page,
+        )?)
+    } else {
+        None
+    };
     let mut result = page.finish()?;
-    result["complete"] = json!(failed == 0);
+    if let Some(coverage) = hotwire {
+        result["hotwire_coverage"] = coverage;
+    }
+    result["complete"] = json!(
+        failed == 0
+            && result["hotwire_coverage"]["failed_array_methods"]
+                .as_u64()
+                .unwrap_or(0)
+                == 0
+            && result["hotwire_coverage"]["truncated_array_evidence"]
+                .as_u64()
+                .unwrap_or(0)
+                == 0
+    );
     result["scanned_files"] = json!(scanned);
     result["failed_files"] = json!(failed);
     result["unresolved_attribute_count"] = json!(unresolved_attribute_count);

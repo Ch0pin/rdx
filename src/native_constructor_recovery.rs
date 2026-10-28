@@ -2074,6 +2074,64 @@ fn own_early_field_write(
             == 1
 }
 
+/// Retained public constructors whose complete body forwards unchanged words to
+/// the immediate superclass. Calling the retained constructor preserves the
+/// optimized allocation's initialization and argument evaluation order.
+pub(super) fn retained_forwarders(classes: &[&DexClass]) -> HashSet<String> {
+    let mut owners = HashMap::new();
+    let mut duplicates = HashSet::new();
+    for c in classes {
+        if owners.insert(c.descriptor.as_ref(), *c).is_some() {
+            duplicates.insert(c.descriptor.as_ref());
+        }
+    }
+    let mut result = HashSet::new();
+    for c in classes {
+        let Some(parent) = c.superclass.as_deref() else {
+            continue;
+        };
+        if duplicates.contains(c.descriptor.as_ref()) || duplicates.contains(parent) {
+            continue;
+        }
+        let Some(p) = owners.get(parent) else {
+            continue;
+        };
+        for m in &c.methods {
+            if m.name.as_ref() != "<init>"
+                || m.access_flags & 7 != 1
+                || m.access_flags & (8 | 0x100 | 0x400) != 0
+                || m.declaring_type != c.descriptor
+                || m.return_type.as_ref() != "V"
+                || m.parameters.is_empty()
+                || m.parameters.len() > 16
+                || m.code
+                    .as_ref()
+                    .is_none_or(|code| code.instructions.len() > 128)
+                || forwarding_target(c, p, &m.parameters).is_none()
+            {
+                continue;
+            }
+            if c.methods
+                .iter()
+                .filter(|other| other.name == m.name && other.parameters == m.parameters)
+                .count()
+                != 1
+            {
+                continue;
+            }
+            if transparent_forwarding_path(c, m, parent, &m.parameters, &owners, &duplicates) {
+                result.insert(format!(
+                    "{}|{}|{}",
+                    c.descriptor,
+                    parent,
+                    m.parameters.join("")
+                ));
+            }
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod layered_noarg_certificate_tests {
     use super::*;

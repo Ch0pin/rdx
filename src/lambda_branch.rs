@@ -134,7 +134,45 @@ pub(crate) fn analyze(
 ) -> Value {
     match prove(classes, caller_method_id, call_site_offset, cancelled) {
         Ok(v) => v,
-        Err(e) => unresolved(e),
+        Err(e) => {
+            let mut result = unresolved(&e);
+            if e == "call site is not an instruction boundary"
+                || e == "call site must be invoke-direct constructor"
+            {
+                let methods: Vec<_> = classes
+                    .iter()
+                    .flat_map(|c| c.methods.iter().map(move |m| (*c, m)))
+                    .filter(|(_, m)| method_id(m) == caller_method_id)
+                    .collect();
+                if let [(class, method)] = methods.as_slice()
+                    && let Some(code) = &method.code
+                    && let Ok(ir) = DecodedMethod::decode(code)
+                {
+                    let mut sites: Vec<_> = ir
+                        .instructions
+                        .iter()
+                        .filter(|i| matches!(i.opcode, 0x70 | 0x76))
+                        .filter_map(|i| {
+                            symbol(&class.symbols, i, false)
+                                .filter(|s| s.contains(".<init>("))
+                                .map(|s| (i.pc, s))
+                        })
+                        .collect();
+                    sites.sort_by_key(|(pc, _)| (pc.abs_diff(call_site_offset), *pc));
+                    result["nearby_constructor_sites"] = json!(
+                        sites
+                            .iter()
+                            .take(8)
+                            .map(|(pc, id)| json!({"call_site_offset":pc,"method_id":id}))
+                            .collect::<Vec<_>>()
+                    );
+                }
+                result["hint"] = json!(
+                    "Use the exact invoke-direct offset in 16-bit DEX code units, not bytes or a source line. For a discriminator case use resolve_switch_case_callers(class_name, case, method_id). Offsets are never snapped automatically."
+                );
+            }
+            result
+        }
     }
 }
 fn prove(
@@ -798,6 +836,13 @@ mod tests {
             }],
             methods: vec![ctor, dispatcher, caller],
         };
+        let invalid = analyze(&[&class], "Lambda.factory()V", 4, &|| false);
+        assert_eq!(invalid["status"], "unresolved");
+        assert_eq!(
+            invalid["nearby_constructor_sites"][0]["call_site_offset"],
+            3
+        );
+        assert!(invalid["hint"].as_str().unwrap().contains("16-bit DEX"));
         let result = analyze(&[&class], "Lambda.factory()V", 3, &|| false);
         assert_eq!(result["status"], "resolved", "{result}");
         assert_eq!(result["dispatchers"][0]["selected_target_offset"], 6);

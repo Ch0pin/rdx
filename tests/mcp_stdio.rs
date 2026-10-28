@@ -146,7 +146,7 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     );
     assert_eq!(
         schema("find_field_references")["anyOf"],
-        json!([{"required":["field_id"]},{"required":["class_name","field_name"]}])
+        json!([{"required":["field_id"]},{"required":["class_name","field_name"]},{"required":["field"]}])
     );
     assert_eq!(
         schema("find_annotation_usages")["properties"]["element"]["enum"],

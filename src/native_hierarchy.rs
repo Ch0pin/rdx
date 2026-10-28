@@ -877,6 +877,7 @@ pub struct TypeHierarchy {
     trivial_constructors: Arc<HashMap<Arc<str>, Arc<str>>>,
     fresh_null_constructors: Arc<HashSet<Arc<str>>>,
     recovered_constructors: Arc<HashMap<Arc<str>, Vec<RecoveredConstructor>>>,
+    retained_forwarders: Arc<HashSet<String>>,
     accessible_noarg_superclasses: Arc<HashSet<Arc<str>>>,
     object_varargs: Arc<HashSet<String>>,
     object_calls: Arc<HashSet<String>>,
@@ -3085,7 +3086,9 @@ impl TypeHierarchy {
         invoked: &str,
         args: &[Arc<str>],
     ) -> bool {
-        (args.is_empty() && self.equivalent_noarg_constructor(allocated, invoked))
+        self.retained_forwarders
+            .contains(&format!("{}|{}|{}", allocated, invoked, args.join("")))
+            || (args.is_empty() && self.equivalent_noarg_constructor(allocated, invoked))
             || (!self.ambiguous.contains(allocated)
                 && !self.ambiguous.contains(invoked)
                 && self
@@ -3937,6 +3940,7 @@ impl TypeHierarchy {
             trivial_constructors: Arc::new(trivial_constructors),
             fresh_null_constructors: Arc::new(fresh_null_constructors),
             recovered_constructors: Arc::new(recovered_constructors),
+            retained_forwarders: Arc::new(constructor_recovery::retained_forwarders(&classes)),
             accessible_noarg_superclasses: Arc::new(accessible_noarg_superclasses),
             object_varargs: Arc::new(object_varargs),
             object_calls: Arc::new(object_calls),

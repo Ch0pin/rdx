@@ -3281,3 +3281,107 @@ for(boolean branch:new boolean[]{false,true}) for(int kind=0;kind<4;kind++) for(
     assert_eq!(run.stdout, b"ok:16");
     fs::remove_dir_all(dir).unwrap();
 }
+
+fn nested_object_getter_fixture(flags: u32) -> DexClass {
+    let mut c = object_interface_getter_fixture(flags);
+    let symbols = Arc::get_mut(&mut c.symbols).unwrap();
+    symbols.types.push("Lsample/B;".into());
+    symbols.methods.push((2, 1, 1));
+    c.methods[0].parameters = vec!["Ljava/lang/Object;".into()];
+    let code = c.methods[0].code.as_mut().unwrap();
+    code.registers = 4;
+    code.ins = 1;
+    code.instructions = vec![
+        0x0022, 0, 0x0122, 2, 0x1072, 0, 3, 0x020a, 0x2070, 2, 0x0021, 0x2070, 1, 0x0020, 0x0011,
+    ];
+    c
+}
+#[test]
+fn nested_object_getter_reuses_only_verified_original_receiver_certificate() {
+    let c = nested_object_getter_fixture(0x401);
+    let text = native_java::render_method("sample.Test", &c, &c.methods[0])
+        .unwrap()
+        .source;
+    assert!(
+        text.find("new sample.A").unwrap() < text.find("new sample.B").unwrap(),
+        "{text}"
+    );
+    assert!(
+        text.find("new sample.B").unwrap() < text.find("instanceof sample.Source").unwrap(),
+        "{text}"
+    );
+    assert_eq!(text.matches(".value()").count(), 1, "{text}");
+    assert_eq!(
+        text.matches("IncompatibleClassChangeError()").count(),
+        1,
+        "{text}"
+    );
+    for flags in [0x409, 0x402] {
+        let c = nested_object_getter_fixture(flags);
+        assert!(native_java::render_method("sample.Test", &c, &c.methods[0]).is_err());
+    }
+}
+
+#[test]
+#[ignore = "requires JDK17+ via RDX_JAVA_HOME"]
+fn nested_object_getter_jvm_preserves_initialization_and_fault_order() {
+    let c = nested_object_getter_fixture(0x401);
+    let text = native_java::render_method("sample.Test", &c, &c.methods[0])
+        .unwrap()
+        .source;
+    let dir = std::env::temp_dir().join(format!(
+        "rdx-nested-interface-getter-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(dir.join("sample")).unwrap();
+    fs::write(dir.join("sample/Test.java"),format!(r#"package sample;
+public class Test {{
+{text}
+public static String run(int kind,int init){{State.init=init;
+Object input=switch(kind){{case 0->(Source)()->{{State.trace+="G";return 42;}};case 1->null;case 2->new Object();default->(Source)()->{{State.trace+="G";throw State.fault;}};}};
+try{{A a=make(input);return State.trace+":"+a.value;}}
+catch(NullPointerException e){{return State.trace+":null";}}
+catch(IncompatibleClassChangeError e){{return State.trace+":interface";}}
+catch(AssertionError e){{if(e!=State.initFault)throw e;return State.trace+":init";}}
+catch(RuntimeException e){{if(e!=State.fault)throw e;return State.trace+":getter";}}
+}}
+}}
+interface Source{{int value();}}
+class State{{static String trace="";static int init;static final RuntimeException fault=new RuntimeException();static final AssertionError initFault=new AssertionError();}}
+class A{{static{{State.trace+="A";if(State.init==1)throw State.initFault;}} final int value;A(int n){{State.trace+="a";value=n;}}}}
+class B{{static{{State.trace+="B";if(State.init==2)throw State.initFault;}} B(int n){{State.trace+="b";}}}}
+"#)).unwrap();
+    fs::write(dir.join("Runner.java"),r#"import java.net.*;import java.nio.file.*;
+public class Runner{public static void main(String[] args)throws Exception{int count=0;
+for(int init=0;init<3;init++)for(int kind=0;kind<4;kind++)try(URLClassLoader loader=new URLClassLoader(new URL[]{Path.of(args[0]).toUri().toURL()},null)){
+String actual=(String)Class.forName("sample.Test",true,loader).getMethod("run",int.class,int.class).invoke(null,kind,init);
+String expected=init==1?"A:init":init==2?"AB:init":switch(kind){case 0->"ABGba:42";case 1->"AB:null";case 2->"AB:interface";default->"ABG:getter";};
+if(!actual.equals(expected))throw new AssertionError(actual+" != "+expected);count++;
+}System.out.print("ok:"+count);}}
+"#).unwrap();
+    let home = std::env::var("RDX_JAVA_HOME").unwrap();
+    let result = Command::new(format!("{home}/bin/javac"))
+        .arg(dir.join("sample/Test.java"))
+        .arg(dir.join("Runner.java"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{text}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let result = Command::new(format!("{home}/bin/java"))
+        .args(["-Xverify:all", "-cp"])
+        .arg(&dir)
+        .arg("Runner")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(result.stdout, b"ok:12");
+    fs::remove_dir_all(dir).unwrap();
+}

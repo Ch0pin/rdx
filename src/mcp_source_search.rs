@@ -7,6 +7,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Empty pages with remaining work must never read as an APK-wide negative.
+pub(super) fn page_status(empty: bool, more: bool, errors: bool) -> Value {
+    json!({"complete":!more && !errors,
+        "message":if more && empty {"No matches on this page; the scan is incomplete. Follow next_offset and next_source_offset, or use mode=identifiers for method/type/field names."}
+            else if more {"More source remains; follow both continuation offsets."}
+            else if errors {"Scan finished with class errors; absence is inconclusive."}
+            else {"Scan complete."}})
+}
+
 /// `offset` remains a filtered-class cursor; `limit` bounds returned occurrences.
 /// A time boundary returns the next untouched class so empty pages are resumable.
 pub(super) fn search_hits(
@@ -123,7 +132,7 @@ fn search_with(
         }
     }
     Ok(
-        json!({"items":items,"pagination":"hits","scope":"generated Java and mixed DEX; case-sensitive literal plus exact numeric aliases for resolved resource links; resource files excluded","offset":offset,"limit":limit,"scanned_classes":scanned,"total_classes":classes.len(),"errors":errors,"next_offset":next,"next_source_offset":next.map(|_| next_source),"exhausted":next.is_none(),"scan_boundary":boundary,"page_error_count":error_count,"errors_truncated":error_count > errors.len(),"scan_budget_ms":20000,"elapsed_ms":started.elapsed().as_millis()}),
+        json!({"items":items,"pagination":"hits","scope":"generated Java and mixed DEX; case-sensitive literal plus exact numeric aliases for resolved resource links; resource files excluded","offset":offset,"limit":limit,"scanned_classes":scanned,"total_classes":classes.len(),"page_status":page_status(items.is_empty(),next.is_some(),error_count>0),"errors":errors,"next_offset":next,"next_source_offset":next.map(|_| next_source),"exhausted":next.is_none(),"scan_boundary":boundary,"page_error_count":error_count,"errors_truncated":error_count > errors.len(),"scan_budget_ms":20000,"elapsed_ms":started.elapsed().as_millis()}),
     )
 }
 

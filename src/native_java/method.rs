@@ -5099,6 +5099,34 @@ impl Graph {
             native_calls::{CallKind, CallTarget},
             native_types::AssignmentBound,
         };
+        // Nested argument rendering keeps the parent's checked receiver certificate.
+        // Only reuse it for an unchanged instruction inside its certified ownership.
+        if self
+            .guarded_interface_receivers
+            .borrow()
+            .as_ref()
+            .is_some_and(|set| set.contains(&pc))
+            && self
+                .owned_entry_copy_instructions
+                .borrow()
+                .as_ref()
+                .is_some_and(|set| set.contains(&pc))
+            && self
+                .argument_projection
+                .borrow()
+                .as_ref()
+                .is_none_or(|projection| projection.checked_ir(class, method).is_some())
+            && let Some(original) = self.loop_types.get().and_then(Option::as_ref)
+            && let Some(code) = method.code.as_ref()
+            && let Ok(current) = crate::native_ir::DecodedMethod::decode(code)
+            && current
+                .instructions
+                .iter()
+                .find(|i| i.pc == pc)
+                .is_some_and(|i| original.ir.instructions.iter().any(|o| o == i))
+        {
+            return true;
+        }
         if self.loop_entry_copy.is_some()
             || self.parent_prefix.is_some()
             || self.argument_projection.borrow().is_some()
@@ -5444,6 +5472,83 @@ impl Graph {
             .any(|&(start, stop, mask)| mask.is_none() && start <= pc && pc < stop)
     }
     // A closed arm is rendered with this masked; the terminal frame is discarded.
+    fn outside_throw_island(&self, words: &[u16], entry: usize, stop: usize) -> Option<usize> {
+        if entry <= stop
+            || words.get(stop).copied().map(|w| w as u8) != Some(0x0e)
+            || !self.switches.iter().any(Option::is_some)
+            || !self.protected.is_empty()
+            || !self.synchronized.is_empty()
+            || self.argument_projection.borrow().is_some()
+            || self.owned_entry_copy_instructions.borrow().is_some()
+            || self.widths.get(entry).copied().unwrap_or(0) == 0
+        {
+            return None;
+        }
+        let mut pc = entry;
+        for _ in 0..256 {
+            let width = *self.widths.get(pc)?;
+            if width == 0 || *self.payloads.get(pc)? {
+                return None;
+            }
+            let op = *words.get(pc)? as u8;
+            if matches!(op,0x0d..=0x11|0x1d..=0x1e|0x28..=0x2c|0x32..=0x3d) {
+                return None;
+            }
+            if op == 0x27 {
+                return Some(pc + width);
+            }
+            pc = pc.checked_add(width)?;
+        }
+        None
+    }
+
+    // A switch's shared bare return can sit physically inside a loop. Extend
+    // this arm only when every reachable edge remains in the loop or reaches a
+    // closed throwing tail. The arm then terminates; no frame escapes its scope.
+    fn crossing_terminal_loop_end(
+        &self,
+        words: &[u16],
+        region: Loop,
+        stop: usize,
+    ) -> Option<usize> {
+        if !(region.start < stop && stop < region.exit)
+            || words.get(stop).copied()? as u8 != 0x0e
+            || self.widths.get(stop).copied()? != 1
+            || region.tail.is_some()
+        {
+            return None;
+        }
+        let end = self.outside_throw_island(words, region.exit, stop)?;
+        let mut pending = vec![region.start];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(pc) = pending.pop() {
+            if seen.len() >= 4096
+                || !(region.start..end).contains(&pc)
+                || self.widths.get(pc).copied().unwrap_or(0) == 0
+                || *self.payloads.get(pc)?
+            {
+                return None;
+            }
+            if !seen.insert(pc) {
+                continue;
+            }
+            let op = words[pc] as u8;
+            if matches!(op, 0x0d | 0x1d..=0x1e | 0x2b..=0x2c) {
+                return None;
+            }
+            if matches!(op, 0x0e..=0x11 | 0x27) {
+                continue;
+            }
+            if let Some(target) = self.targets[pc] {
+                pending.push(target);
+            }
+            if !matches!(op, 0x28..=0x2a) {
+                pending.push(pc + self.widths[pc]);
+            }
+        }
+        Some(end)
+    }
+
     fn argument_terminal_island(
         &self,
         words: &[u16],
@@ -7803,7 +7908,9 @@ impl Graph {
                 seen[pc] = true;
                 continue;
             }
-            if self.terminal_loop_escape(pc, stop, words) {
+            if self.terminal_loop_escape(pc, stop, words)
+                || self.outside_throw_island(words, pc, stop).is_some()
+            {
                 continue;
             }
             ensure!(
@@ -7828,7 +7935,11 @@ impl Graph {
                 continue;
             }
             if let Some(region) = self.loops.iter().find(|l| l.start == pc) {
-                if !self.terminal_loop_body(region.start, region.latch, words)? {
+                if self
+                    .crossing_terminal_loop_end(words, *region, stop)
+                    .is_none()
+                    && !self.terminal_loop_body(region.start, region.latch, words)?
+                {
                     pending.push(region.exit);
                 }
                 continue;
@@ -7885,11 +7996,16 @@ impl Graph {
                 pc = region.exit;
                 continue;
             }
-            // A shared exit located inside a loop's address interval cannot
-            // split the loop when either arm starts before its header.
+            // Keep whole-loop ownership when a join lies physically inside it.
+            // A shared bare switch return is valid only with a closed terminal
+            // extension which the renderer can emit without an escaping frame.
             if let Some(region) = self.loops.iter().find(|region| {
                 region.start < pc && pc < region.exit && (a <= region.start || b <= region.start)
-            }) {
+            }) && (pc != stop
+                || self
+                    .crossing_terminal_loop_end(words, *region, stop)
+                    .is_none())
+            {
                 pc = region.exit;
                 continue;
             }
@@ -7919,7 +8035,9 @@ impl Graph {
             if self.constructor_throw_tails.iter().any(|p| p.start == pc) {
                 continue;
             }
-            if self.bare_return_after(pc, stop, words) || self.terminal_loop_escape(pc, stop, words)
+            if self.bare_return_after(pc, stop, words)
+                || self.terminal_loop_escape(pc, stop, words)
+                || self.outside_throw_island(words, pc, stop).is_some()
             {
                 continue;
             }
@@ -7944,7 +8062,11 @@ impl Graph {
                 continue;
             }
             if let Some(region) = self.loops.iter().find(|l| l.start == pc) {
-                if !self.terminal_loop_body(region.start, region.latch, words)? {
+                if self
+                    .crossing_terminal_loop_end(words, *region, stop)
+                    .is_none()
+                    && !self.terminal_loop_body(region.start, region.latch, words)?
+                {
                     pending.push(region.exit);
                 }
                 continue;
@@ -14706,8 +14828,9 @@ fn render(
                 pending.is_none() && allocation.is_none(),
                 "loop interrupts instruction state"
             );
+            let terminal_extension = graph.crossing_terminal_loop_end(words, *region, stop);
             ensure!(
-                region.exit <= stop,
+                region.exit <= stop || terminal_extension.is_some(),
                 "loop crosses region boundary: loop={region:x?}; pc={pc:#x}; stop={stop:#x}; in_try={}; parent={:x?}",
                 exception_slots.is_some(),
                 suppressed_loop.map(|context| (context.start, context.exit))
@@ -14821,6 +14944,23 @@ fn render(
                         regs[r] = before[r].clone();
                     }
                 }
+            }
+            if let Some(end) = terminal_extension {
+                let result = render(
+                    class,
+                    method,
+                    graph,
+                    region.exit,
+                    end,
+                    regs,
+                    out,
+                    depth + 1,
+                    initialized,
+                    None,
+                    exception_slots,
+                )?;
+                ensure!(result.1, "extended loop exit does not terminate");
+                return Ok(result);
             }
             if region.exit == words.len()
                 || graph.terminal_loop_body(region.start, region.latch, words)?
@@ -16165,7 +16305,10 @@ fn render(
                 pc += width;
                 continue;
             }
-            if let Some(end) = graph.argument_terminal_island(words, target, stop) {
+            if let Some(end) = graph
+                .argument_terminal_island(words, target, stop)
+                .or_else(|| graph.outside_throw_island(words, target, stop))
+            {
                 ensure!(
                     initialized && pending.is_none() && allocation.is_none(),
                     "argument terminal island interrupts instruction state"

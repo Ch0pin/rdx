@@ -1046,3 +1046,71 @@ are explicit; `total` is null when scanning is incomplete. Paging retrieves only
 the candidates found within that scan budget. Inherited-only contracts, removed
 members, unsupported library families and runtime-loaded classes can be missed.
 `runtime_verified` always remains false for this static query.
+
+### Recovery and reviewer query diagnostics
+
+`list_instances` reports `reachability`, `owner_pid`, `registered_at_unix_ms`
+and the timestamp of this successful health check as `last_seen_unix_ms`.
+Unreachable records retain a separate error, check timestamp and explicit
+`open_apk` recovery arguments. Historical last-seen time is unknown when the
+current check fails. With an absolute `apk_path` or exact `apk_sha256`, a complete
+single-batch discovery can return `selection.selected` for one healthy match.
+Use those explicit instance/project IDs; ambiguous or paginated discovery never
+changes the active target.
+
+For a closed MCP transport, reconnect the client's RDX connector using the
+configured absolute executable path and `mcp` argument. Then:
+
+1. Call `list_instances` with the intended absolute APK path.
+2. If no healthy project exists, call `open_apk` with that path, a new
+   `request_key`, and `headless: true`.
+3. Poll `get_instance_info(instance_id)` until `state: "Running"`, then pass
+   its `project_id` with the instance ID on project queries.
+
+Headless mode hosts the project for the lifetime of that MCP gateway connection;
+closing the connector cancels the service and removes its registration. Use a
+persistent MCP connector: a one-shot `rdx call` exits and closes its headless
+service immediately. GUI mode
+remains the default. A request key identifies both canonical path and launch
+mode, so retries cannot accidentally launch the other mode. A new connector
+requires a new headless open. This recovery does not terminate another GUI.
+
+`find_field_references` also accepts `field`, including
+`Lsample/Owner;->name:Ljava/lang/String;`, as an alternative to `field_id`.
+Conflicting selector forms are rejected with accepted-parameter details.
+`get_lambda_branch` reports nearby constructor instruction offsets on an invalid
+call site, in 16-bit DEX code units. Choose an exact listed site; a switch-case
+query uses `resolve_switch_case_callers`. Source lines and byte offsets are
+not interchangeable with instruction offsets.
+
+Source-mode `search_code` includes `page_status.complete` and an explanatory
+message when a zero-hit page still has unscanned classes or occurrences. Resume
+its cursors or choose `mode: "identifiers"` for DEX symbol searches. Identifier
+filters require that mode. `format: "dex"` returns RDX's labeled DEX listing;
+it is not advertised as assemblable Smali.
+
+`list_nav_deeplinks` includes `hotwire_annotation` records for exact
+`HotwireDestinationDeepLink.uri` class annotations. Bounded class-array analysis
+adds construction method, call offset, argument word and zero-based array index.
+The library's ordinal route-string loop is verified separately when supported;
+conditional route strings are labeled with their registration-order assumption.
+Array evidence alone establishes neither runtime registration nor numeric Android
+destination IDs. `hotwire_coverage` records analysis failures and unsupported
+flow boundaries. A `resource_prefix` selects only XML resources; a package prefix
+selects destination classes.
+
+Config consumers additionally recognize literal map-key reads, split signatures,
+local list accumulation/iteration and URI host extraction. Map reads have no
+implied default. Operations distinguish modeled possible flow at joins from
+unanimous register provenance, and retain explicit conditional-use offsets.
+Signature-based Kotlin library models are labeled. Arbitrary mutable-container
+calls invalidate the tracked collection. Remote settings values and runtime
+branch feasibility remain outside this static evidence.
+
+Config `caller_context` adds up to 64 exact invoke sites over two caller levels,
+including an immediate `result_use` (`conditional`, `returned`, or `other_use`)
+when straight-line register use proves it. This makes the enclosing method's
+caller chain inspectable while keeping value provenance separate from call
+reachability. Follow its `next_offset` with `get_call_graph` using the same root,
+`direction: "callers"`, `projection: "call_sites"`, and `depth: 2`. The query runs
+as a cancellable background MCP request; health checks remain available.

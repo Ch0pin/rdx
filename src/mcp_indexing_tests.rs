@@ -408,3 +408,57 @@ fn idle_parsed_requests_do_not_wait_on_socket_timeouts_or_hide_disconnects() {
     poll_requests(&requests);
     assert_eq!(requests.lock().unwrap().len(), 7);
 }
+
+#[test]
+fn headless_owned_service_is_queryable_and_unregisters_on_drop() {
+    let fixture = Fixture::new();
+    let info = remote(&fixture.registration, "get_instance_info", &json!({})).unwrap();
+    assert_eq!(info["state"], "Running");
+    let record = fixture.registration.clone();
+    drop(fixture);
+    assert!(remote(&record, "get_instance_info", &json!({})).is_err());
+}
+
+#[test]
+fn headless_open_request_deduplicates_mode_and_path_and_releases_registration() {
+    let directory =
+        std::env::temp_dir().join(format!("rdx-headless-open-{}", random_id().unwrap()));
+    fs::create_dir_all(&directory).unwrap();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+    let args = json!({"path":path,"headless":true,"request_key":"recover"});
+    let mut opened = std::collections::HashMap::new();
+    let first = open_apk_request(&args, &mut opened, directory.clone()).unwrap();
+    let second = open_apk_request(&args, &mut opened, directory.clone()).unwrap();
+    assert_eq!(first["instance_id"], second["instance_id"]);
+    assert_eq!(opened.len(), 1);
+    assert!(
+        open_apk_request(
+            &json!({"path":path,"headless":false,"request_key":"recover"}),
+            &mut opened,
+            directory.clone()
+        )
+        .is_err()
+    );
+    let server = opened["recover"].server.as_ref().unwrap();
+    until(|| server.status().state == "Running");
+    let registration: Registration =
+        serde_json::from_slice(&fs::read(&server.registration).unwrap()).unwrap();
+    let info = remote(&registration, "get_instance_info", &json!({})).unwrap();
+    assert_eq!(info["state"], "Running");
+    let selected = discover(
+        std::slice::from_ref(&registration),
+        &json!({"apk_path":path}),
+    )
+    .unwrap();
+    assert_eq!(selected["selection"]["status"], "unique_healthy_match");
+    let later = discover(
+        std::slice::from_ref(&registration),
+        &json!({"apk_path":path,"offset":1}),
+    )
+    .unwrap();
+    assert!(later["selection"]["selected"].is_null());
+    let record = server.registration.clone();
+    drop(opened);
+    assert!(!record.exists());
+    fs::remove_dir_all(directory).unwrap();
+}

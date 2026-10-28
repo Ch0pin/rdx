@@ -14,8 +14,12 @@ use crate::{
 use eframe::egui;
 use rdx::{
     apk::{Archive, Preview},
-    engine::{DecompiledCode, DecompilerEngine, NativeEngine, NavigationResult, Project},
+    engine::{
+        DecompiledCode, DecompilerEngine, NativeEngine, Project, SharedCode,
+        SharedNavigationResult as NavigationResult,
+    },
     plugin::Plugin,
+    project_snapshot::ProjectSnapshot,
 };
 use std::{
     path::PathBuf,
@@ -51,13 +55,13 @@ enum Event {
     Archive(u64, Arc<Archive>),
     AppIcon(u64, image::RgbaImage),
     PackageName(u64, String),
-    Opened(u64, Result<(NativeEngine, Project), String>),
+    Opened(u64, Result<ProjectSnapshot, String>),
     Source(
         u64,
         String,
         Option<usize>,
         NativeEngine,
-        Result<DecompiledCode, String>,
+        Result<Arc<SharedCode>, String>,
     ),
     Navigated(
         u64,
@@ -78,7 +82,7 @@ enum Event {
         String,
         String,
         Option<NativeEngine>,
-        Result<DecompiledCode, String>,
+        Result<Arc<SharedCode>, String>,
     ),
     InteractiveReady(u64, NativeEngine),
     UsagesUpdate(u64, u64, UsageUpdate),
@@ -117,14 +121,12 @@ impl InteractiveRequest {
     ) {
         let event = match self {
             Self::Metadata(name, hash) => {
-                let result = engine
-                    .decompile_with_metadata(&name)
-                    .map_err(|e| format!("{e:#}"));
+                let result = engine.decompile_shared(&name).map_err(|e| format!("{e:#}"));
                 Event::SearchMetadata(generation, name, hash, None, result)
             }
             Self::Navigate(class, position, hash) => {
                 let result = engine
-                    .navigate(&class, position, &hash)
+                    .navigate_shared(&class, position, &hash)
                     .map_err(|e| format!("{e:#}"));
                 Event::Navigated(
                     generation,
@@ -138,7 +140,9 @@ impl InteractiveRequest {
                 )
             }
             Self::NavigateClass(class, origin) => {
-                let result = engine.navigate_class(&class).map_err(|e| format!("{e:#}"));
+                let result = engine
+                    .navigate_class_shared(&class)
+                    .map_err(|e| format!("{e:#}"));
                 Event::Navigated(generation, origin, None, result)
             }
         };
@@ -382,8 +386,9 @@ impl Tab {
     fn attach_search_metadata(
         &mut self,
         expected_hash: &str,
-        code: DecompiledCode,
+        code: impl Into<SharedCode>,
     ) -> Result<(), String> {
+        let code = code.into();
         let Content::Text(document) = &mut self.content else {
             return Err("Navigation metadata requires a source tab".into());
         };
@@ -391,17 +396,20 @@ impl Tab {
             return Err("Navigation response belongs to an older tab.".into());
         }
         if code.source_hash != expected_hash {
-            let relocated = document.refresh_search_source(code.source, code.links);
+            let relocated = document.refresh_search_source(
+                Arc::unwrap_or_clone(code.source),
+                Arc::unwrap_or_clone(code.links),
+            );
             self.source_hash = Some(code.source_hash);
             self.loading_navigation = false;
             self.note = (!relocated).then(|| "Source updated. Navigation is ready; the previous search match could not be uniquely relocated.".into());
             return Ok(());
         }
-        if document.text() != code.source {
+        if document.text() != code.source.as_str() {
             return Err("Navigation response has inconsistent source identity.".into());
         }
         // Attach links in place: never replace the matched text, selection or scroll position.
-        document.set_links(code.links);
+        document.set_shared_links(code.links);
         self.note = None;
         self.loading_navigation = false;
         Ok(())
@@ -473,7 +481,8 @@ pub struct App {
     rx: mpsc::Receiver<Event>,
     generation: u64,
     engine: Option<NativeEngine>,
-    project: Option<Project>,
+    shared_project: Option<ProjectSnapshot>,
+    project: Option<Arc<Project>>,
     archive: Option<Arc<Archive>>,
     tree: Node,
     asset_grouping: AssetGrouping,
@@ -598,6 +607,7 @@ impl App {
             rx,
             generation: 0,
             engine: None,
+            shared_project: None,
             project: None,
             archive: None,
             tree: Node::default(),
@@ -643,8 +653,8 @@ impl App {
         }
     }
     fn start_mcp(&mut self) {
-        if let Some(path) = self.path.clone() {
-            match rdx::mcp::Server::start(path) {
+        if let Some(snapshot) = self.shared_project.clone() {
+            match rdx::mcp::Server::start_shared(snapshot) {
                 Ok(server) => {
                     self.mcp_server = Some(server);
                     self.mcp_error.clear();
@@ -732,6 +742,7 @@ impl App {
         );
     }
     fn stop(&mut self) {
+        self.mcp_server = None;
         if let Some(index) = self.usage_index.take() {
             index.cancel_project();
         }
@@ -759,6 +770,7 @@ impl App {
         self.application_icon = None;
         self.search_cache = Arc::new(Mutex::new(search::SearchCache::default()));
         self.engine = None;
+        self.shared_project = None;
         self.busy = false;
         self.loading_project = false;
         self.loading_progress = 0.0;
@@ -766,7 +778,6 @@ impl App {
         self.export_busy = false;
     }
     fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
-        self.mcp_server = None;
         self.stop();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(WINDOW_TITLE.into()));
         self.project = None;
@@ -794,8 +805,7 @@ impl App {
         self.status = "Indexing Android package or DEX with native Rust…".into();
         let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
         thread::spawn(move || {
-            let result = (|| {
-                let mut engine = NativeEngine::start()?;
+            let result = ProjectSnapshot::open_with(&path, |engine| {
                 ctx.request_repaint();
                 let project = if path
                     .extension()
@@ -821,8 +831,8 @@ impl App {
                 {
                     let _ = tx.send(Event::AppIcon(generation, icon));
                 }
-                Ok((engine, project))
-            })()
+                Ok(project)
+            })
             .map_err(|e: anyhow::Error| format!("{e:#}"));
             let _ = tx.send(Event::Opened(generation, result));
             ctx.request_repaint();
@@ -863,9 +873,7 @@ impl App {
         self.status = format!("Decompiling {name}…");
         let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
         thread::spawn(move || {
-            let result = engine
-                .decompile_with_metadata(&name)
-                .map_err(|e| format!("{e:#}"));
+            let result = engine.decompile_shared(&name).map_err(|e| format!("{e:#}"));
             let _ = tx.send(Event::Source(generation, name, position, engine, result));
             ctx.request_repaint();
         });
@@ -873,14 +881,15 @@ impl App {
     fn display_code(
         &mut self,
         name: String,
-        code: DecompiledCode,
+        code: impl Into<SharedCode>,
         position: Option<usize>,
     ) -> Result<(), String> {
+        let code = code.into();
         let target = Target::Class(name.clone());
         if let Some(index) = self.tabs.iter().position(|tab| {
             tab.target == target
                 && tab.source_hash.as_ref() == Some(&code.source_hash)
-                && matches!(&tab.content, Content::Text(document) if document.text() == code.source)
+                && matches!(&tab.content, Content::Text(document) if document.text() == code.source.as_str())
         }) {
             let tab = &mut self.tabs[index];
             if let Content::Text(document) = &mut tab.content {
@@ -889,7 +898,7 @@ impl App {
                 if let Some(position) = position {
                     document.jump_to(position)?;
                 }
-                document.set_links(code.links);
+                document.set_shared_links(code.links);
             }
             tab.loading_navigation = false;
             self.selected = index;
@@ -897,8 +906,12 @@ impl App {
             return Ok(());
         }
         let resource = name.starts_with(rdx::resource_table::PREFIX);
-        let mut document = CodeDocument::new(code.source, if resource { "xml" } else { "java" });
-        document.set_links(code.links);
+        let mut document = CodeDocument::from_shared(
+            code.source,
+            code.links.clone(),
+            if resource { "xml" } else { "java" },
+        );
+        document.set_shared_links(code.links);
         if let Some(position) = position {
             document.jump_to(position)?;
         }
@@ -962,7 +975,7 @@ impl App {
         let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
         thread::spawn(move || {
             let result = engine
-                .navigate_graph_method(&method)
+                .navigate_graph_method_shared(&method)
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Event::Navigated(generation, origin, Some(engine), result));
             ctx.request_repaint();
@@ -1059,7 +1072,7 @@ impl App {
         let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
         thread::spawn(move || {
             let result = engine
-                .navigate(&class, position, &hash)
+                .navigate_shared(&class, position, &hash)
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Event::Navigated(
                 generation,
@@ -1094,7 +1107,9 @@ impl App {
         self.status = format!("Opening {class}…");
         let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
         thread::spawn(move || {
-            let result = engine.navigate_class(&class).map_err(|e| format!("{e:#}"));
+            let result = engine
+                .navigate_class_shared(&class)
+                .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Event::Navigated(generation, origin, Some(engine), result));
             ctx.request_repaint();
         });
@@ -1425,8 +1440,7 @@ impl App {
         if reused {
             return;
         }
-        let mut document = CodeDocument::new(snapshot.source.clone(), &snapshot.syntax);
-        document.set_links(snapshot.links.clone());
+        let mut document = CodeDocument::from_search(snapshot.clone());
         if let Err(error) = document.jump_to_range(hit.start, hit.end) {
             self.error(error);
             return;
@@ -1649,6 +1663,36 @@ impl App {
             self.finish_history();
         }
         Ok(())
+    }
+    fn trim_tab_sources(&mut self, budget: usize) {
+        let mut retained = self.tabs.iter().map(Tab::source_bytes).sum::<usize>();
+        if retained <= budget {
+            return;
+        }
+        if let Some(engine) = &mut self.engine {
+            engine.trim_source_cache(0);
+        }
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            if retained <= budget {
+                break;
+            }
+            if index == self.selected || tab.loading_navigation {
+                continue;
+            }
+            if let Content::Text(document) = &mut tab.content {
+                let before = document.source_bytes();
+                match document.page_out_source() {
+                    Ok(_) => retained = retained.saturating_sub(before - document.source_bytes()),
+                    Err(error) => {
+                        let message = format!("Could not page inactive source to disk: {error}");
+                        if !self.diagnostics.contains(&message) {
+                            self.diagnostics.push(message);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
     fn trim_tab_layouts(&mut self, budget: usize) {
         let mut retained: usize = self
@@ -1930,7 +1974,10 @@ impl App {
                     self.loading_project = false;
                     self.loading_progress = 1.0;
                     match result {
-                        Ok((engine, project)) => {
+                        Ok(snapshot) => {
+                            let engine = snapshot.engine().clone();
+                            let project = snapshot.project().clone();
+                            self.shared_project = Some(snapshot);
                             self.usage_index = engine.usage_index_handle();
                             self.status = format!(
                                 "{} top-level classes · {} archive files · Decompilation engine: RDX Native DEX (alpha)",
@@ -3363,6 +3410,7 @@ impl eframe::App for App {
             self.navigate(class, position, hash, ctx);
         }
         self.trim_tab_layouts(64 * 1024 * 1024);
+        self.trim_tab_sources(128 * 1024 * 1024);
         self.plugins_window(ctx);
         let actions = self.search.show(
             ctx,
@@ -3540,8 +3588,7 @@ mod settings_tests {
                 .index;
             let preview = archive.preview(index).unwrap();
             assert!(matches!(preview, Preview::Text { .. }));
-            let mut engine = NativeEngine::start().unwrap();
-            let project = engine.open(&fixture).unwrap();
+            let snapshot = ProjectSnapshot::open(&fixture).unwrap();
             let mut app = navigation_test_app();
             app.archive = Some(archive);
             if manifest_first {
@@ -3551,9 +3598,7 @@ mod settings_tests {
                 app.events(&ctx);
                 assert_eq!(app.tabs.len(), 1);
             }
-            app.tx
-                .send(Event::Opened(0, Ok((engine, project))))
-                .unwrap();
+            app.tx.send(Event::Opened(0, Ok(snapshot))).unwrap();
             app.events(&ctx);
             if !manifest_first {
                 app.tx.send(Event::Asset(0, index, Ok(preview))).unwrap();
@@ -3601,7 +3646,7 @@ mod settings_tests {
         let project = engine
             .open(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk"))
             .unwrap();
-        app.project = Some(project);
+        app.project = Some(Arc::new(project));
         app.search.begin();
         app.busy = true;
         app.search_cancel = Some(Arc::new(AtomicBool::new(true)));
@@ -3658,6 +3703,100 @@ mod settings_tests {
         assert!(app.application_icon.is_none());
     }
 
+    #[test]
+    fn shared_project_survives_busy_worker_and_stale_open_cannot_replace_it() {
+        let ctx = egui::Context::default();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let snapshot = ProjectSnapshot::open(&path).unwrap();
+        let class = snapshot.project().classes[0].clone();
+        let mut app = navigation_test_app();
+        app.tx.send(Event::Opened(0, Ok(snapshot.clone()))).unwrap();
+        app.events(&ctx);
+        let mut worker = app.engine.take().unwrap();
+        app.busy = true;
+        let shared = app.shared_project.as_ref().unwrap();
+        assert!(std::ptr::eq(
+            shared.engine().dex_class(&class).unwrap(),
+            worker.dex_class(&class).unwrap()
+        ));
+        assert!(!worker.decompile(&class).unwrap().is_empty());
+        app.stop();
+        assert!(app.shared_project.is_none());
+        app.tx.send(Event::Opened(0, Ok(snapshot))).unwrap();
+        app.events(&ctx);
+        assert!(
+            app.shared_project.is_none(),
+            "Stale loader restored the old project"
+        );
+        assert!(app.engine.is_none());
+        let next = ProjectSnapshot::open(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hello.apk"),
+        )
+        .unwrap();
+        let classes = next.project().classes.clone();
+        app.tx
+            .send(Event::Opened(app.generation, Ok(next)))
+            .unwrap();
+        app.events(&ctx);
+        assert_eq!(
+            app.shared_project.as_ref().unwrap().project().classes,
+            classes
+        );
+    }
+
+    #[test]
+    fn memory_paging_keeps_open_tabs_bookmarks_and_active_source() {
+        let mut app = navigation_test_app();
+        for i in 0..12 {
+            app.push_tab(sample_tab(i, 128 * 1024)).unwrap();
+        }
+        app.tabs[0].pinned = true;
+        app.tabs[1].bookmarked = true;
+        let selected = app.selected;
+        let before = app.tabs.iter().map(Tab::source_bytes).sum::<usize>();
+        app.trim_tab_sources(256 * 1024);
+        let after = app.tabs.iter().map(Tab::source_bytes).sum::<usize>();
+        assert!(after < before / 4);
+        assert_eq!(app.tabs.len(), 12);
+        assert_eq!(app.selected, selected);
+        assert!(app.tabs[0].pinned && app.tabs[1].bookmarked);
+        for tab in &app.tabs {
+            assert_eq!(tab.text().unwrap().len(), 128 * 1024);
+        }
+    }
+
+    #[test]
+    #[ignore = "Explicit 192 MiB inactive-tab paging measurement"]
+    fn memory_large_tab_paging_measurement() {
+        let mut app = navigation_test_app();
+        for i in 0..24 {
+            app.push_tab(sample_tab(i, 8 * 1024 * 1024)).unwrap();
+        }
+        let before = app.tabs.iter().map(Tab::source_bytes).sum::<usize>();
+        let started = std::time::Instant::now();
+        app.trim_tab_sources(32 * 1024 * 1024);
+        let seconds = started.elapsed().as_secs_f64();
+        let after = app.tabs.iter().map(Tab::source_bytes).sum::<usize>();
+        assert!(before >= 192 * 1024 * 1024);
+        assert!(after <= 32 * 1024 * 1024);
+        assert_eq!(app.tabs.len(), 24);
+        assert_eq!(app.selected, 23);
+        for tab in &app.tabs {
+            let text = tab.text().unwrap();
+            assert_eq!(text.len(), 8 * 1024 * 1024);
+            assert!(text.bytes().all(|b| b == b'x'));
+        }
+        println!(
+            "paging_measurement: {}",
+            serde_json::json!({
+                "before_source_heap_bytes": before,
+                "after_source_heap_bytes": after,
+                "tabs_preserved": app.tabs.len(), "seconds": seconds,
+                "all_source_bytes_verified": true
+            })
+        );
+    }
+
     fn navigation_test_app() -> App {
         let (tx, rx) = mpsc::channel();
         App {
@@ -3685,6 +3824,7 @@ mod settings_tests {
             rx,
             generation: 0,
             engine: None,
+            shared_project: None,
             project: None,
             archive: None,
             tree: Node::default(),
@@ -3839,17 +3979,14 @@ mod settings_tests {
                 }
                 let mut app = navigation_test_app();
                 app.archive = Some(archive);
-                let mut engine = NativeEngine::start().unwrap();
-                let project = engine.open(&fixture).unwrap();
+                let snapshot = ProjectSnapshot::open(&fixture).unwrap();
                 if manifest_first {
                     app.tx
                         .send(Event::Asset(0, index, Ok(preview.clone())))
                         .unwrap();
                     app.events(&ctx);
                 }
-                app.tx
-                    .send(Event::Opened(0, Ok((engine, project))))
-                    .unwrap();
+                app.tx.send(Event::Opened(0, Ok(snapshot))).unwrap();
                 app.events(&ctx);
                 if !manifest_first {
                     app.tx.send(Event::Asset(0, index, Ok(preview))).unwrap();
@@ -4350,7 +4487,7 @@ mod settings_tests {
         let code = engine.decompile_with_metadata("sample.Target").unwrap();
         let mut app = navigation_test_app();
         app.archive = Some(archive);
-        app.project = Some(project);
+        app.project = Some(Arc::new(project));
         app.engine = Some(engine);
         app.display_code("sample.Target".into(), code, Some(7))
             .unwrap();
@@ -4444,7 +4581,7 @@ mod settings_tests {
                 "sample.Target".into(),
                 Some(usize::MAX),
                 engine,
-                Ok(code),
+                Ok(Arc::new(code.into())),
             ))
             .unwrap();
         app.events(&ctx);
@@ -4461,7 +4598,7 @@ mod settings_tests {
         wait_for_history(&mut app, &ctx);
         let origin = app.current_location().unwrap();
         let mut engine = app.engine.take().unwrap();
-        let target = engine.navigate_class("sample.Target").unwrap();
+        let target = engine.navigate_class_shared("sample.Target").unwrap();
         app.tx
             .send(Event::Navigated(0, origin, Some(engine), Ok(target)))
             .unwrap();
@@ -4828,7 +4965,7 @@ mod settings_tests {
                 None,
                 Ok(NavigationResult {
                     class: target.into(),
-                    code,
+                    code: Arc::new(code.into()),
                     position: 0,
                 }),
             ))

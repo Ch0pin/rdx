@@ -250,13 +250,13 @@ pub struct CodeDocument {
     find: FileFind,
     word_wrap: bool,
     code_font: CodeFont,
-    source: String,
+    source: rdx::source_text::SourceText,
     metadata_fold: Option<MetadataFolds>,
     syntax: String,
     preview_end: usize,
     preview_start: usize,
     line_start: usize,
-    links: Vec<CodeLink>,
+    links: Arc<Vec<CodeLink>>,
     exported_components: Vec<Range<usize>>,
     jump: Option<usize>,
     navigation_position: usize,
@@ -283,9 +283,28 @@ pub struct CodeDocument {
 }
 impl CodeDocument {
     pub fn new(text: String, syntax: &str) -> Self {
+        Self::from_shared(Arc::new(text), Arc::new(Vec::new()), syntax)
+    }
+    pub fn from_shared(text: Arc<String>, links: Arc<Vec<CodeLink>>, syntax: &str) -> Self {
+        Self::from_backing(rdx::source_text::SourceText::new(text), links, syntax)
+    }
+    pub fn from_search(document: Arc<crate::search::SearchDocument>) -> Self {
+        let links = Arc::new(document.links.clone());
+        let syntax = document.syntax.clone();
+        Self::from_backing(
+            rdx::source_text::SourceText::Owner(document),
+            links,
+            &syntax,
+        )
+    }
+    fn from_backing(
+        text: rdx::source_text::SourceText,
+        links: Arc<Vec<CodeLink>>,
+        syntax: &str,
+    ) -> Self {
         let end = text.len();
         let metadata_fold = MetadataFolds::detect(&text, syntax);
-        Self {
+        let mut document = Self {
             link_tooltip: link_tooltip::LinkTooltip::default(),
             selection_key: None,
             selection_occurrences: Vec::new(),
@@ -299,7 +318,7 @@ impl CodeDocument {
             preview_end: end,
             preview_start: 0,
             line_start: 1,
-            links: Vec::new(),
+            links: Arc::new(Vec::new()),
             exported_components: Vec::new(),
             jump: None,
             navigation_position: 0,
@@ -323,7 +342,9 @@ impl CodeDocument {
             #[cfg(test)]
             last_editor_visible_rect: None,
             cache: None,
-        }
+        };
+        document.set_shared_links(links);
+        document
     }
     pub fn open_find(&mut self) {
         self.find.open = true;
@@ -535,9 +556,25 @@ impl CodeDocument {
         let count = self.source.chars().count();
         links.retain(|link| link.start < link.end && link.end <= count);
         links.sort_by_key(|link| link.start);
-        self.links = links;
+        self.links = Arc::new(links);
     }
 
+    pub fn set_shared_links(&mut self, links: Arc<Vec<CodeLink>>) {
+        let count = self.source.chars().count();
+        if links
+            .iter()
+            .all(|link| link.start < link.end && link.end <= count)
+            && links.windows(2).all(|pair| pair[0].start <= pair[1].start)
+        {
+            self.links = links;
+        } else {
+            self.set_links((*links).clone());
+        }
+    }
+    pub fn page_out_source(&mut self) -> std::io::Result<bool> {
+        self.discard_layout_cache();
+        self.source.page_out()
+    }
     pub fn set_exported_components(&mut self, mut ranges: Vec<Range<usize>>) {
         let count = self.source.chars().count();
         ranges.retain(|range| range.start < range.end && range.end <= count);
@@ -717,7 +754,7 @@ impl CodeDocument {
 
     /// Source and navigation state survive eviction of rendered glyphs.
     pub fn source_bytes(&self) -> usize {
-        self.source.capacity()
+        self.source.heap_bytes()
             + self.syntax.capacity()
             + self.find.query.capacity()
             + self.selection_occurrences.capacity() * std::mem::size_of::<Range<usize>>()
@@ -1140,7 +1177,7 @@ impl CodeDocument {
                                 source.enabled(),
                             ));
                             if source.clicked() {
-                                ui.ctx().copy_text(self.source.clone());
+                                ui.ctx().copy_text(self.source.to_string());
                                 ui.close_menu();
                             }
                         });
@@ -1463,6 +1500,41 @@ impl CodeDocument {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_paging_preserves_text_links_find_folds_and_selection() {
+        use super::*;
+        let source =
+            Arc::new("import a.A;\nimport b.B;\nclass Café { String value; }\n".repeat(1000));
+        let links = Arc::new(vec![CodeLink {
+            start: 7,
+            end: 10,
+            label: "a.A".into(),
+        }]);
+        let mut doc = CodeDocument::from_shared(source.clone(), links.clone(), "java");
+        assert!(
+            matches!(&doc.source, rdx::source_text::SourceText::Heap(s) if Arc::ptr_eq(s, &source))
+        );
+        assert!(Arc::ptr_eq(&doc.links, &links));
+        doc.find.query = "Café".into();
+        doc.update_find();
+        doc.jump_to_range(7, 10).unwrap();
+        let position = doc.navigation_position();
+        let selected = doc.highlight.clone();
+        let folds = format!("{:?}", doc.metadata_fold);
+        let before = doc.source_bytes();
+        assert!(doc.page_out_source().unwrap());
+        assert_eq!(doc.text(), source.as_str());
+        assert_eq!(doc.navigation_position(), position);
+        assert_eq!(doc.highlight, selected);
+        assert_eq!(format!("{:?}", doc.metadata_fold), folds);
+        assert_eq!(doc.link_at(7).unwrap().label, "a.A");
+        assert_eq!(doc.find_ranges().count(), 1000);
+        assert!(before - doc.source_bytes() >= source.len());
+        assert!(!doc.page_out_source().unwrap());
+        // Rendering and copying continue to read the original UTF-8 text.
+        assert!(!doc.job(CodeTheme::Ocean, 14.0).text.is_empty());
+        assert_eq!(doc.text().to_owned(), *source);
+    }
     #[test]
     fn cached_glyphs_follow_replaced_font_atlas_at_unchanged_scale() {
         use super::*;

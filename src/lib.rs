@@ -21,6 +21,7 @@ pub mod transport;
 
 pub mod native_method;
 pub mod package_container;
+pub mod project_snapshot;
 
 pub mod resource_search;
 pub mod resource_table;
@@ -50,3 +51,6 @@ mod identifier_search;
 mod call_arguments;
 
 mod network_stacks;
+
+mod retained_budget;
+pub mod source_text;

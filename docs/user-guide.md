@@ -55,7 +55,7 @@ Theme and font attribution is in [third_party/themes](../third_party/themes/READ
 and [third_party/fonts](../third_party/fonts/README.md). Redistributed application
 bundles must include these license notices alongside the embedded assets.
 
-The **▾ Open views** menu at the right edge of the tab strip lists every open view by full name, including offscreen tabs. Right-click a tab to copy its name, pin/unpin it, bookmark it, or close views. Pins protect tabs from automatic eviction and **Close Others / Close All**; explicit **Close** still works. Pins and bookmarks last for the current session. The 8-view / 64 MiB admission budget remains enforced; unpin or close a view when pinned tabs prevent opening another.
+The **▾ Open views** menu at the right edge of the tab strip lists every open view by full name, including offscreen tabs. Right-click a tab to copy its name, pin/unpin it, bookmark it, or close views. Pins protect tabs from **Close Others / Close All**; explicit **Close** still works. Pins and bookmarks last for the current session. There is no open-tab count limit.
 
 **Find usages** reuses a reference index built in the background for the loaded
 project. Searching a different symbol does not rebuild that index. The results
@@ -85,7 +85,7 @@ Use the toolbar arrows or **Navigate → Back / Forward** (**Alt+Left / Alt+Righ
 
 Source tabs show the alpha native engine label. Links are enabled only where native metadata provides a target; unavailable symbol operations remain disabled or report an explicit unsupported operation. Full JADX navigation, usage-analysis, and Java reconstruction parity are still porting work.
 
-The code viewer displays the complete loaded text without a byte or line cutoff. **Copy source** includes the full loaded document. Up to eight tabs are retained against an estimated 64 MiB tab budget; this is not a total application memory ceiling.
+The code viewer displays the complete loaded text without a byte or line cutoff. **Copy source** includes the full loaded document. Source documents are shared with interactive cache hits. Above a 128 MiB source-heap target, inactive views use private anonymous file-backed text. Tabs, pins, bookmarks, selection and navigation remain available; the operating system pages text back on demand. The active source and view metadata can exceed this target. A failed disk write preserves the original text and records a diagnostic. Disposable rendered layouts have a separate 64 MiB target. These targets are not a total application memory ceiling.
 
 To select beyond the visible area, hold the left mouse button and drag toward or
 past the top or bottom edge of the viewer. It scrolls while extending the selection,
@@ -123,7 +123,7 @@ copied/exported text retain their original positions and content.
 
 **Excluded packages** contains editable defaults for Android, AndroidX, Kotlin, Java, and related namespaces. Remove an entry to include that package, add another pattern, restore defaults, or include all. Preferences save automatically. Nonstandard packages are searched first.
 
-Cold code searches use DEX string and symbol references to search likely matches first, then check the remaining source for complete coverage. Uncached classes render on up to twelve workers, leaving a CPU core available on multicore hosts. A deeper work queue keeps workers busy when individual classes take longer. Workers also prepare search filters and compressed cache records. Results remain ordered and can be opened while scanning continues. Cancellation also stops pending rendering. Repeat searches reuse the session source index; adaptive trigram filters skip unrelated source while preserving Unicode matching and numeric resource aliases. A first exhaustive search of a large APK can still take substantially longer than the first results take to appear.
+Cold code searches use DEX string and symbol references to search likely matches first, then check the remaining source for complete coverage. Uncached classes render on up to twelve workers, leaving a CPU core available on multicore hosts. A deeper work queue keeps workers busy when individual classes take longer. Workers also prepare search filters and compressed cache records. Results remain ordered and can be opened while scanning continues. Cancellation also stops pending rendering. Repeat searches reuse the session source index; adaptive trigram filters skip unrelated source while preserving Unicode matching and numeric resource aliases. A first exhaustive search of a large APK can still take substantially longer than the first results take to appear. Workers reserve estimated rendering memory before starting a class, against a 128 MiB in-flight target. The next required class can exceed the target to guarantee progress. This limits queued work without reducing the normal worker count; it is an estimate rather than an allocator cap.
 
 The Node/Code divider is draggable. Auto search and Keep open appear in the bottom bar. Selecting a result brings the main window forward. Results are capped at 1,000 matches / 32 MiB retained matching source; skipped content and errors indicate partial coverage.
 

@@ -1,4 +1,44 @@
 use super::*;
+#[test]
+#[ignore = "requires RDX_HEY_APK for the build-248 obfuscated annotation regression"]
+fn reviewer_hey_annotation_absence_diagnostic() {
+    let path = PathBuf::from(std::env::var("RDX_HEY_APK").unwrap());
+    let mut engine = NativeEngine::default();
+    let project = engine.open(&path).unwrap();
+    let cancel = AtomicBool::new(false);
+    let start = Instant::now();
+    let absent = dispatch(
+        &mut engine,
+        &project,
+        "find_annotation_usages",
+        &json!({"annotation_type":"retrofit2.http.POST"}),
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(absent["requested_type_present"], false);
+    assert_eq!(absent["total"], 0);
+    assert_eq!(absent["warnings"][0]["code"], "ANNOTATION_TYPE_ABSENT");
+    let actual = dispatch(
+        &mut engine,
+        &project,
+        "find_annotation_usages",
+        &json!({"annotation_type":"qj.o", "limit":1}),
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(actual["requested_type_present"], true);
+    assert!(actual["total"].as_u64().unwrap() > 0);
+    assert_eq!(actual["warnings"], json!([]));
+    println!(
+        "annotation_presence_probe: {}",
+        json!({
+            "apk_sha256":digest(&path).unwrap(), "classes":project.classes.len(),
+            "queries_ms": start.elapsed().as_millis(),
+            "requested_original":absent, "actual_dex_annotation":actual
+        })
+    );
+}
+
 fn fixture() -> (NativeEngine, Project) {
     let mut engine = NativeEngine::default();
     let project = engine

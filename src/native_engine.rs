@@ -51,6 +51,30 @@ pub struct NativeDexEngine {
     opened: bool,
 }
 impl NativeDexEngine {
+    /// Conservative admission estimate, including nested classes rendered in this document.
+    pub(crate) fn search_work_bytes(&self, name: &str) -> usize {
+        let mut pending = vec![name];
+        let mut seen = std::collections::HashSet::new();
+        let mut units = 0usize;
+        while let Some(name) = pending.pop() {
+            if !seen.insert(name) {
+                continue;
+            }
+            if let Some(class) = self.classes.get(name) {
+                for method in &class.methods {
+                    if let Some(code) = &method.code {
+                        units = units.saturating_add(code.instructions.len());
+                    }
+                }
+            }
+            if let Some(children) = self.nested_children.get(name) {
+                pending.extend(children.iter().map(String::as_str));
+            }
+        }
+        // SSA, control-flow recovery, source metadata and compressed index output
+        // coexist during rendering. This is admission accounting, not a heap limit.
+        units.saturating_mul(256).saturating_add(1024 * 1024)
+    }
     fn nested_children(&self, name: &str) -> Vec<&DexClass> {
         self.nested_children
             .get(name)

@@ -1,5 +1,6 @@
 //! Local authenticated GUI service and stdio MCP gateway.
 use crate::engine::{DecompilerEngine, NativeEngine, Project};
+use crate::project_snapshot::ProjectSnapshot;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -133,6 +134,38 @@ struct LoadedProject {
     package_selection: String,
     literals: literals::Controller,
 }
+impl LoadedProject {
+    fn from_snapshot(snapshot: ProjectSnapshot, stop: Arc<AtomicBool>) -> Result<Self> {
+        let ProjectSnapshot {
+            mut engine,
+            project,
+            identity,
+        } = snapshot;
+        let package_name = engine
+            .read_resource_with_metadata("AndroidManifest.xml")
+            .ok()
+            .and_then(|r| crate::manifest_summary::package_name(&r.source).ok())
+            .unwrap_or_default();
+        let package_selection = engine
+            .prepared_container()
+            .and_then(|source| source.selection_summary().map(str::to_owned))
+            .unwrap_or_default();
+        let analysis_snapshot = Arc::new(engine.clone());
+        let literals = literals::Controller::new(analysis_snapshot.clone(), project.clone(), stop);
+        Ok(Self {
+            engine: Mutex::new(engine),
+            analysis_snapshot,
+            project,
+            path: identity.path.clone(),
+            hash: identity.hash.clone(),
+            metadata: identity.metadata.clone(),
+            project_id: random_id()?,
+            package_name,
+            package_selection,
+            literals,
+        })
+    }
+}
 struct CompletedRequest(Arc<AtomicBool>);
 impl Drop for CompletedRequest {
     fn drop(&mut self) {
@@ -171,7 +204,35 @@ impl Server {
             .unwrap_or(random_id()?);
         Self::start_in(path, registry()?, instance_id)
     }
+    /// Serve the GUI's immutable loaded project without parsing another copy.
+    pub fn start_shared(snapshot: ProjectSnapshot) -> Result<Self> {
+        let instance_id = std::env::var("RDX_MCP_INSTANCE")
+            .ok()
+            .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .unwrap_or(random_id()?);
+        Self::start_shared_in(snapshot, registry()?, instance_id)
+    }
+    fn start_shared_in(
+        snapshot: ProjectSnapshot,
+        directory: PathBuf,
+        instance_id: String,
+    ) -> Result<Self> {
+        Self::start_source(
+            snapshot.identity.path.clone(),
+            directory,
+            instance_id,
+            Some(snapshot),
+        )
+    }
     fn start_in(path: PathBuf, directory: PathBuf, instance_id: String) -> Result<Self> {
+        Self::start_source(path, directory, instance_id, None)
+    }
+    fn start_source(
+        path: PathBuf,
+        directory: PathBuf,
+        instance_id: String,
+        snapshot: Option<ProjectSnapshot>,
+    ) -> Result<Self> {
         let path = path.canonicalize().context("Cannot resolve APK path")?;
         let build = build_identity();
         let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -205,40 +266,17 @@ impl Server {
             let loading_stop = stopped.clone();
             thread::spawn(move || {
                 let loaded = (|| -> Result<_> {
-                    let path = loading_path.canonicalize()?;
-                    let hash = digest(&path)?;
-                    let mut engine = NativeEngine::start()?;
-                    let project = Arc::new(engine.open(&path)?);
-                    ensure!(hash == digest(&path)?, "APK changed while opening");
-                    let metadata = fs::metadata(&path)?;
-                    let package_name = engine
-                        .read_resource_with_metadata("AndroidManifest.xml")
-                        .ok()
-                        .and_then(|r| crate::manifest_summary::package_name(&r.source).ok())
-                        .unwrap_or_default();
-                    let package_selection = engine
-                        .prepared_container()
-                        .and_then(|source| source.selection_summary().map(str::to_owned))
-                        .unwrap_or_default();
-                    // NativeEngine clones share immutable DEX/resource/source documents.
-                    let analysis_snapshot = Arc::new(engine.clone());
-                    let literals = literals::Controller::new(
-                        analysis_snapshot.clone(),
-                        project.clone(),
+                    let snapshot = match snapshot {
+                        Some(snapshot) => {
+                            snapshot.verify_current()?;
+                            snapshot
+                        }
+                        None => ProjectSnapshot::open(&loading_path)?,
+                    };
+                    Ok(Arc::new(LoadedProject::from_snapshot(
+                        snapshot,
                         loading_stop,
-                    );
-                    Ok(Arc::new(LoadedProject {
-                        engine: Mutex::new(engine),
-                        analysis_snapshot,
-                        project,
-                        path,
-                        hash,
-                        project_id: random_id()?,
-                        metadata,
-                        package_name,
-                        package_selection,
-                        literals,
-                    }))
+                    )?))
                 })();
                 let _ = tx.send(loaded);
             });
@@ -1528,7 +1566,7 @@ fn tools_list() -> Value {
         ),
         (
             "find_annotation_usages",
-            "Find explicit DEX annotation usages on classes, fields, methods and parameters, with decoded values and original IDs. annotation_type accepts FQCN or descriptor. Pagination counts matching annotations; parameter_index excludes receiver.",
+            "Find explicit exact-descriptor DEX annotation usages on classes, fields, methods and parameters, with decoded values and original IDs. annotation_type accepts FQCN or descriptor. Returns requested_type_present and an ANNOTATION_TYPE_ABSENT warning when the type is absent from loaded DEX tables; zero matches do not exclude obfuscated equivalents. Pagination counts matching annotations; parameter_index excludes receiver.",
             vec!["annotation_type"],
             true,
         ),
@@ -2354,6 +2392,210 @@ mod tests {
     }
     fn start(dir: &TestDir, name: &str) -> (Server, Registration, Value) {
         start_path(dir, fixture(name))
+    }
+
+    fn wait_shared(server: &Server) -> (Registration, Value) {
+        let record: Registration =
+            serde_json::from_slice(&fs::read(&server.registration).unwrap()).unwrap();
+        for _ in 0..6000 {
+            let status = server.status();
+            assert_ne!(status.state, "Failed", "{}", status.last_error);
+            if status.state == "Running" {
+                return (
+                    record,
+                    json!({"instance_id": server.instance_id, "project_id": status.project_id}),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("Shared instance did not become ready")
+    }
+
+    #[test]
+    fn shared_project_reuses_dex_resources_archive_and_releases_service_ownership() {
+        let snapshot = ProjectSnapshot::open(&fixture("navigation.apk")).unwrap();
+        let owner = Arc::downgrade(&snapshot.project);
+        let loaded =
+            LoadedProject::from_snapshot(snapshot.clone(), Arc::new(AtomicBool::new(false)))
+                .unwrap();
+        let gui = snapshot.engine();
+        let service = loaded.engine.lock().unwrap();
+        for class in &snapshot.project().classes {
+            assert!(std::ptr::eq(
+                gui.dex_class(class).unwrap(),
+                service.dex_class(class).unwrap()
+            ));
+            assert!(std::ptr::eq(
+                gui.dex_class(class).unwrap(),
+                loaded.analysis_snapshot.dex_class(class).unwrap()
+            ));
+        }
+        assert!(std::ptr::eq(gui.resource_table(), service.resource_table()));
+        assert!(Arc::ptr_eq(
+            &gui.prepared_container().unwrap(),
+            &service.prepared_container().unwrap()
+        ));
+        assert!(Arc::ptr_eq(&snapshot.project, &loaded.project));
+        drop(service);
+        drop(loaded);
+        assert!(owner.upgrade().is_some());
+        drop(snapshot);
+        assert!(owner.upgrade().is_none());
+    }
+
+    #[test]
+    fn shared_project_service_restart_preserves_gui_and_rejects_stale_identity() {
+        let dir = TestDir::new();
+        let mut opens = 0;
+        let path = fixture("navigation.apk");
+        let snapshot = ProjectSnapshot::open_with(&path, |engine| {
+            opens += 1;
+            engine.open(&path)
+        })
+        .unwrap();
+        let class = snapshot.project().classes[0].clone();
+        let mut gui = snapshot.engine().clone();
+        let expected = gui.decompile(&class).unwrap();
+        let usage = gui.usage_index_handle().unwrap();
+        let server =
+            Server::start_shared_in(snapshot.clone(), dir.0.clone(), random_id().unwrap()).unwrap();
+        let (record, mut args) = wait_shared(&server);
+        args["class_id"] = json!(class);
+        let source = remote(&record, "get_class_source", &args).unwrap();
+        assert_eq!(source["data"]["text"], expected);
+        server.cancel_request();
+        drop(server);
+        assert_eq!(gui.decompile(&class).unwrap(), expected);
+        let restarted =
+            Server::start_shared_in(snapshot.clone(), dir.0.clone(), record.instance_id.clone())
+                .unwrap();
+        let (record, fresh) = wait_shared(&restarted);
+        assert_ne!(fresh["project_id"], args["project_id"]);
+        assert!(
+            remote(&record, "get_class_source", &args)
+                .unwrap_err()
+                .to_string()
+                .contains("PROJECT_CHANGED")
+        );
+        assert!(remote(&record, "get_all_classes", &fresh).is_ok());
+        for _ in 0..1000 {
+            if usage.stats().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            usage.stats().is_some(),
+            "Stopping MCP cancelled the GUI usage index"
+        );
+        assert!(!usage.stats().unwrap().fallback);
+        drop(restarted);
+        for _ in 0..1000 {
+            if Arc::strong_count(&snapshot.project) == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            Arc::strong_count(&snapshot.project),
+            1,
+            "Stopped service retained the project"
+        );
+        assert_eq!(opens, 1);
+    }
+
+    #[test]
+    fn shared_project_rejects_file_changes_and_mismatched_loader_paths() {
+        let dir = TestDir::new();
+        let path = dir.0.join("project.apk");
+        fs::copy(fixture("navigation.apk"), &path).unwrap();
+        let snapshot = ProjectSnapshot::open(&path).unwrap();
+        fs::copy(fixture("hello.apk"), &path).unwrap();
+        assert!(
+            snapshot
+                .verify_current()
+                .unwrap_err()
+                .to_string()
+                .contains("PROJECT_CHANGED")
+        );
+        let server =
+            Server::start_shared_in(snapshot, dir.0.clone(), random_id().unwrap()).unwrap();
+        for _ in 0..1000 {
+            if server.status().state != "Loading" {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(server.status().state, "Failed");
+        assert!(server.status().last_error.contains("PROJECT_CHANGED"));
+        let mismatch =
+            ProjectSnapshot::open_with(&path, |engine| engine.open(&fixture("hello.apk")));
+        assert!(
+            mismatch
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("does not match")
+        );
+        let changed = ProjectSnapshot::open_with(&path, |engine| {
+            let project = engine.open(&path)?;
+            fs::copy(fixture("navigation.apk"), &path)?;
+            Ok(project)
+        });
+        assert!(
+            changed
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("PROJECT_CHANGED")
+        );
+    }
+
+    #[test]
+    #[ignore = "Manual isolated-process memory comparison; requires RDX_MEMORY_APK and RDX_MEMORY_MODE"]
+    fn shared_project_memory_comparison() {
+        let path = PathBuf::from(std::env::var("RDX_MEMORY_APK").unwrap());
+        let mode = std::env::var("RDX_MEMORY_MODE").unwrap();
+        let snapshot = ProjectSnapshot::open(&path).unwrap();
+        let dir = TestDir::new();
+        let service_snapshot = match mode.as_str() {
+            "shared" => snapshot.clone(),
+            "duplicate" => ProjectSnapshot::open(&path).unwrap(),
+            _ => panic!("Expected shared or duplicate mode"),
+        };
+        let indexes = [
+            snapshot.engine().usage_index_handle().unwrap(),
+            service_snapshot.engine().usage_index_handle().unwrap(),
+        ];
+        let server =
+            Server::start_shared_in(service_snapshot, dir.0.clone(), random_id().unwrap()).unwrap();
+        let (record, args) = wait_shared(&server);
+        for index in indexes {
+            for _ in 0..6000 {
+                if index.stats().is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!index.stats().expect("Usage index did not settle").fallback);
+        }
+        let health = remote(&record, "get_all_classes", &args).unwrap();
+        let marker = PathBuf::from(std::env::var("RDX_MEMORY_READY").unwrap());
+        fs::write(
+            &marker,
+            serde_json::to_vec(&json!({"pid": std::process::id(), "mode": mode,
+            "classes": snapshot.project().classes.len(), "sha256": server.status().apk_sha256,
+            "service_total": health["data"]["total"]}))
+            .unwrap(),
+        )
+        .unwrap();
+        for _ in 0..300 {
+            if marker.with_extension("release").exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        panic!("Memory sampler did not release the benchmark");
     }
 
     #[test]

@@ -75,6 +75,56 @@ pub struct DecompiledCode {
     pub source_hash: String,
 }
 
+/// Immutable source payload shared by the cache, GUI and service consumers.
+#[derive(Clone, Debug)]
+pub struct SharedCode {
+    retention: Option<std::sync::Arc<crate::retained_budget::Reservation>>,
+    pub source: std::sync::Arc<String>,
+    pub links: std::sync::Arc<Vec<CodeLink>>,
+    pub definitions: std::sync::Arc<Vec<CodeDefinition>>,
+    pub source_hash: String,
+}
+impl From<DecompiledCode> for SharedCode {
+    fn from(code: DecompiledCode) -> Self {
+        Self {
+            retention: None,
+            source: code.source.into(),
+            links: code.links.into(),
+            definitions: code.definitions.into(),
+            source_hash: code.source_hash,
+        }
+    }
+}
+impl From<std::sync::Arc<SharedCode>> for SharedCode {
+    fn from(code: std::sync::Arc<SharedCode>) -> Self {
+        (*code).clone()
+    }
+}
+impl SharedCode {
+    pub fn retained_bytes(&self) -> usize {
+        self.source.capacity()
+            + self.source_hash.capacity()
+            + self.links.capacity() * std::mem::size_of::<CodeLink>()
+            + self.definitions.capacity() * std::mem::size_of::<CodeDefinition>()
+            + self.links.iter().map(|l| l.label.capacity()).sum::<usize>()
+            + self
+                .definitions
+                .iter()
+                .map(|d| d.name.capacity() + d.kind.capacity())
+                .sum::<usize>()
+            + std::mem::size_of::<Self>()
+    }
+
+    pub fn into_owned(self) -> DecompiledCode {
+        DecompiledCode {
+            source: std::sync::Arc::unwrap_or_clone(self.source),
+            links: std::sync::Arc::unwrap_or_clone(self.links),
+            definitions: std::sync::Arc::unwrap_or_clone(self.definitions),
+            source_hash: self.source_hash,
+        }
+    }
+}
+
 /// Requested representation for one exact method; Auto preserves Java-first recovery.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MethodSourceFormat {
@@ -114,6 +164,22 @@ pub struct NavigationResult {
     pub position: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct SharedNavigationResult {
+    pub class: String,
+    pub code: std::sync::Arc<SharedCode>,
+    pub position: usize,
+}
+impl SharedNavigationResult {
+    fn into_owned(self) -> NavigationResult {
+        NavigationResult {
+            class: self.class,
+            code: (*self.code).clone().into_owned(),
+            position: self.position,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct UsageTarget {
     pub id: String,
@@ -147,6 +213,7 @@ pub trait DecompilerEngine: Send {
 #[derive(Clone, Default)]
 pub struct NativeEngine {
     native: NativeDexEngine,
+    pub(crate) retained_budget: std::sync::Arc<crate::retained_budget::RetainedBudget>,
     source_cache: source_cache::SourceCache,
     input: Option<PathBuf>,
     prepared: Option<std::sync::Arc<crate::package_container::PackageContainer>>,
@@ -166,6 +233,10 @@ pub fn source_identity(source: &str) -> String {
 }
 
 impl NativeEngine {
+    pub(crate) fn opened_path(&self) -> Option<&Path> {
+        self.input.as_deref()
+    }
+
     pub fn open_prepared(
         &mut self,
         container: std::sync::Arc<crate::package_container::PackageContainer>,
@@ -182,7 +253,9 @@ impl NativeEngine {
         self.prepared = None;
         self.native = NativeDexEngine::default();
         self.source_cache = Default::default();
-        self.identifier_index = Default::default();
+        self.retained_budget = Default::default();
+        self.identifier_index =
+            crate::identifier_search::Cache::with_budget(self.retained_budget.clone());
         self.invoke_index = Default::default();
         self.classes = Default::default();
         self.resources = Default::default();
@@ -400,11 +473,28 @@ impl NativeEngine {
         self.native.definition_names(classes)
     }
     pub fn decompile_with_metadata(&mut self, class: &str) -> Result<DecompiledCode> {
+        Ok((*self.decompile_shared(class)?).clone().into_owned())
+    }
+    pub fn trim_source_cache(&mut self, bytes: usize) {
+        self.source_cache.trim(bytes);
+    }
+    pub fn source_cache_bytes(&self) -> usize {
+        self.source_cache.bytes()
+    }
+    pub fn decompile_shared(&mut self, class: &str) -> Result<std::sync::Arc<SharedCode>> {
         if let Some(code) = self.source_cache.get(class) {
-            return Ok((*code).clone());
+            return Ok(code);
         }
-        let code = self.render_with_metadata(class)?;
-        self.source_cache.insert(class, &code);
+        let mut code = SharedCode::from(self.render_with_metadata(class)?);
+        code.retention = self.retained_budget.reserve(code.retained_bytes());
+        if code.retention.is_none() {
+            self.source_cache.trim(0);
+            code.retention = self.retained_budget.reserve(code.retained_bytes());
+        }
+        let code = std::sync::Arc::new(code);
+        if code.retention.is_some() {
+            self.source_cache.insert(class, code.clone());
+        }
         Ok(code)
     }
     fn render_with_metadata(&mut self, class: &str) -> Result<DecompiledCode> {
@@ -422,6 +512,9 @@ impl NativeEngine {
             .decorate_java(&mut code, &self.native.shared_classes());
         code.source_hash = source_identity(&code.source);
         Ok(code)
+    }
+    pub fn search_work_bytes(&self, class: &str) -> usize {
+        self.native.search_work_bytes(class)
     }
     pub fn decompile_for_search(&mut self, class: &str) -> Result<DecompiledCode> {
         self.render_with_metadata(class)
@@ -562,13 +655,17 @@ impl NativeEngine {
         })
     }
     pub fn navigate_class(&mut self, class: &str) -> Result<NavigationResult> {
-        let code = self.decompile_with_metadata(class)?;
+        self.navigate_class_shared(class)
+            .map(SharedNavigationResult::into_owned)
+    }
+    pub fn navigate_class_shared(&mut self, class: &str) -> Result<SharedNavigationResult> {
+        let code = self.decompile_shared(class)?;
         let position = code
             .definitions
             .iter()
             .find(|d| d.kind == "class")
             .map_or(0, |d| d.start);
-        Ok(NavigationResult {
+        Ok(SharedNavigationResult {
             class: class.into(),
             code,
             position,
@@ -577,23 +674,20 @@ impl NativeEngine {
     fn definition_symbol(
         &self,
         class: &str,
-        code: &DecompiledCode,
+        source: &str,
+        links: &[CodeLink],
         def: &CodeDefinition,
     ) -> Option<String> {
         let class = class.strip_prefix("dex://").unwrap_or(class);
         if def.kind == "method" {
-            let declaration_byte = code
-                .source
+            let declaration_byte = source
                 .char_indices()
                 .nth(def.start)
-                .map_or(code.source.len(), |(byte, _)| byte);
-            let declaration_prefix = code.source[..declaration_byte]
-                .rsplit('\n')
-                .next()
-                .unwrap_or("");
+                .map_or(source.len(), |(byte, _)| byte);
+            let declaration_prefix = source[..declaration_byte].rsplit('\n').next().unwrap_or("");
             if declaration_prefix.trim_start() == ".method " {
                 return Some(
-                    code.source
+                    source
                         .chars()
                         .skip(def.start)
                         .take(def.end - def.start)
@@ -604,15 +698,13 @@ impl NativeEngine {
         if def.kind == "class" {
             return Some(class.into());
         }
-        if let Some(link) = code
-            .links
+        if let Some(link) = links
             .iter()
             .find(|link| link.start == def.start && link.end == def.end)
         {
             return Some(link.label.clone());
         }
-        let span: String = code
-            .source
+        let span: String = source
             .chars()
             .skip(def.start)
             .take(def.end - def.start)
@@ -644,7 +736,7 @@ impl NativeEngine {
             .map(|f| format!("{class}.{}:{}", f.name, f.field_type))
     }
     fn symbol(&mut self, class: &str, offset: usize, hash: &str) -> Result<String> {
-        let code = self.decompile_with_metadata(class)?;
+        let code = self.decompile_shared(class)?;
         ensure!(
             code.source_hash == hash,
             "Source changed; reopen this class"
@@ -657,7 +749,7 @@ impl NativeEngine {
                 code.definitions
                     .iter()
                     .find(|d| d.start <= offset && offset < d.end)
-                    .and_then(|d| self.definition_symbol(class, &code, d))
+                    .and_then(|d| self.definition_symbol(class, &code.source, &code.links, d))
             })
             .context("No native symbol at this position")
     }
@@ -673,11 +765,20 @@ impl NativeEngine {
         }
     }
     pub fn navigate(&mut self, class: &str, offset: usize, hash: &str) -> Result<NavigationResult> {
+        self.navigate_shared(class, offset, hash)
+            .map(SharedNavigationResult::into_owned)
+    }
+    pub fn navigate_shared(
+        &mut self,
+        class: &str,
+        offset: usize,
+        hash: &str,
+    ) -> Result<SharedNavigationResult> {
         let symbol = self.symbol(class, offset, hash)?;
         if symbol.starts_with(crate::resource_table::PREFIX) {
             let target = symbol.split(" | ").next().unwrap().to_owned();
-            let code = self.resource_document(&target)?;
-            return Ok(NavigationResult {
+            let code = std::sync::Arc::new(SharedCode::from(self.resource_document(&target)?));
+            return Ok(SharedNavigationResult {
                 class: target,
                 code,
                 position: 0,
@@ -695,16 +796,18 @@ impl NativeEngine {
             declaration_symbol = format!("{declaring_owner}.{member}");
             owner = declaring_owner;
         }
-        let code = self.decompile_with_metadata(&owner)?;
+        let code = self.decompile_shared(&owner)?;
         let position = code
             .definitions
             .iter()
             .find(|d| {
-                self.definition_symbol(&owner, &code, d).as_deref() == Some(&declaration_symbol)
+                self.definition_symbol(&owner, &code.source, &code.links, d)
+                    .as_deref()
+                    == Some(&declaration_symbol)
             })
             .context("Native declaration mapping unavailable")?
             .start;
-        Ok(NavigationResult {
+        Ok(SharedNavigationResult {
             class: owner,
             code,
             position,
@@ -827,6 +930,10 @@ impl NativeEngine {
     }
 
     pub fn navigate_graph_method(&mut self, symbol: &str) -> Result<NavigationResult> {
+        self.navigate_graph_method_shared(symbol)
+            .map(SharedNavigationResult::into_owned)
+    }
+    pub fn navigate_graph_method_shared(&mut self, symbol: &str) -> Result<SharedNavigationResult> {
         let owner = self
             .owner(symbol)
             .context("Method is external to this project")?;
@@ -836,14 +943,18 @@ impl NativeEngine {
         let owner = inherited_method_owner(&owner, member, |name| self.native.class(name))?
             .unwrap_or(owner);
         let declaration = format!("{owner}.{member}");
-        let code = self.decompile_with_metadata(&owner)?;
+        let code = self.decompile_shared(&owner)?;
         let position = code
             .definitions
             .iter()
-            .find(|d| self.definition_symbol(&owner, &code, d).as_deref() == Some(&declaration))
+            .find(|d| {
+                self.definition_symbol(&owner, &code.source, &code.links, d)
+                    .as_deref()
+                    == Some(&declaration)
+            })
             .context("Method declaration unavailable")?
             .start;
-        Ok(NavigationResult {
+        Ok(SharedNavigationResult {
             class: owner,
             code,
             position,
@@ -881,7 +992,7 @@ impl NativeEngine {
                 .iter()
                 .filter(|d| d.kind == "method")
                 .filter_map(|d| {
-                    self.definition_symbol(class, &code, d)
+                    self.definition_symbol(class, &code.source, &code.links, d)
                         .map(|id| (d.start, d.end, id))
                 })
                 .collect();
@@ -1053,7 +1164,10 @@ impl NativeEngine {
             .iter()
             .find(|d| {
                 d.kind == "method"
-                    && self.definition_symbol(&owner, &code, d).as_deref() == Some(symbol)
+                    && self
+                        .definition_symbol(&owner, &code.source, &code.links, d)
+                        .as_deref()
+                        == Some(symbol)
             })
             .context("Implementation declaration unavailable")?;
         let occurrence = UsageOccurrence {
@@ -1376,6 +1490,40 @@ mod navigation_cache_tests {
     use std::sync::Arc;
 
     #[test]
+    fn memory_shared_navigation_uses_the_cached_payload_and_owned_compatibility_is_isolated() {
+        let mut engine = NativeEngine::start().unwrap();
+        engine
+            .open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk"))
+            .unwrap();
+        let shared = engine.decompile_shared("sample.Target").unwrap();
+        let hit = engine.decompile_shared("sample.Target").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&shared, &hit));
+        let navigation = engine.navigate_class_shared("sample.Target").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&shared, &navigation.code));
+        let mut owned = engine.decompile_with_metadata("sample.Target").unwrap();
+        owned.source.clear();
+        owned.links.clear();
+        assert!(!shared.source.is_empty());
+        engine.trim_source_cache(0);
+        assert_eq!(engine.source_cache_bytes(), 0);
+        assert!(!navigation.code.source.is_empty());
+    }
+    #[test]
+    fn memory_retention_pressure_serves_complete_uncached_source() {
+        let mut engine = NativeEngine::start().unwrap();
+        engine
+            .open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk"))
+            .unwrap();
+        let expected = engine.decompile_shared("sample.Target").unwrap();
+        engine.trim_source_cache(0);
+        engine.retained_budget =
+            std::sync::Arc::new(crate::retained_budget::RetainedBudget::new(0));
+        let actual = engine.decompile_shared("sample.Target").unwrap();
+        assert_eq!(actual.source, expected.source);
+        assert_eq!(actual.source_hash, expected.source_hash);
+        assert_eq!(engine.source_cache_bytes(), 0);
+    }
+    #[test]
     fn raw_method_identity_uses_declaration_line_after_diagnostic_header() {
         let id = "sample.Caller.f()V";
         let source = format!(
@@ -1397,7 +1545,12 @@ mod navigation_cache_tests {
         };
         assert_eq!(
             NativeEngine::default()
-                .definition_symbol("sample.Caller", &code, &code.definitions[0])
+                .definition_symbol(
+                    "sample.Caller",
+                    &code.source,
+                    &code.links,
+                    &code.definitions[0]
+                )
                 .as_deref(),
             Some(id)
         );

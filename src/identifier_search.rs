@@ -94,22 +94,40 @@ struct Index {
     dynamic_sites: usize,
 }
 
+struct HeldIndex {
+    index: Index,
+    _reservation: Arc<crate::retained_budget::Reservation>,
+}
+impl std::ops::Deref for HeldIndex {
+    type Target = Index;
+    fn deref(&self) -> &Index {
+        &self.index
+    }
+}
 /// Clones share one completed index. Opening a project creates a fresh cache.
 /// The current request builds outside the interactive engine lock; cancellation
 /// drops an incomplete build, and another waiter may retry. Memory overflow
 /// remembers streaming mode; other failures aren't cached.
 #[derive(Clone, Default)]
 pub(crate) struct Cache {
-    index: Arc<Mutex<Option<Arc<Index>>>>,
+    index: Arc<Mutex<Option<Arc<HeldIndex>>>>,
     streaming: Arc<AtomicBool>,
+    budget: Arc<crate::retained_budget::RetainedBudget>,
     scan_session: Arc<std::sync::OnceLock<String>>,
 }
 impl Cache {
+    pub(crate) fn with_budget(budget: Arc<crate::retained_budget::RetainedBudget>) -> Self {
+        Self {
+            budget,
+            ..Self::default()
+        }
+    }
+
     fn get_or_build(
         &self,
         cancel: &AtomicBool,
         build: impl FnOnce() -> Result<Index>,
-    ) -> Result<(Arc<Index>, bool)> {
+    ) -> Result<(Arc<HeldIndex>, bool)> {
         let mut slot = loop {
             ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
             match self.index.try_lock() {
@@ -127,7 +145,14 @@ impl Cache {
         let index = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build))
             .map_err(|_| anyhow::anyhow!("IDENTIFIER_INDEX_BUILD_FAILED: retry the query"))??;
         ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-        let index = Arc::new(index);
+        let Some(reservation) = self.budget.reserve(index.estimated_bytes) else {
+            self.streaming.store(true, Ordering::Relaxed);
+            return Err(IndexLimit.into());
+        };
+        let index = Arc::new(HeldIndex {
+            index,
+            _reservation: reservation,
+        });
         *slot = Some(index.clone());
         Ok((index, false))
     }
@@ -907,6 +932,18 @@ mod tests {
         index
             .search(&Query::parse(&args).unwrap(), &AtomicBool::new(false))
             .unwrap()
+    }
+    #[test]
+    fn memory_shared_cache_pressure_uses_complete_streaming_results() {
+        let cancel = AtomicBool::new(false);
+        let args = json!({"query":"parseUri"});
+        let expected = Cache::default().search(classes(), &args, &cancel).unwrap();
+        let cache = Cache::with_budget(Arc::new(crate::retained_budget::RetainedBudget::new(0)));
+        let actual = cache.search(classes(), &args, &cancel).unwrap();
+        assert_eq!(actual["items"], expected["items"]);
+        assert_eq!(actual["total"], expected["total"]);
+        assert_eq!(actual["coverage_complete"], true);
+        assert!(cache.index.lock().unwrap().is_none());
     }
     #[test]
     fn scoped_search_bypasses_global_budget_and_unrelated_invalid_dex() {

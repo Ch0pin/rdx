@@ -12,9 +12,9 @@ enum Prepared {
     Rendering,
 }
 
-// Reservations cover the result channel and coordinator's out-of-order map.
-// The required head may exceed the budget to guarantee forward progress. Each
-// worker can additionally hold one rendered document while awaiting reservation.
+// Reservations cover estimated in-progress work, the result channel and the
+// coordinator's out-of-order map. The required head can exceed the target to
+// guarantee progress; estimates cannot impose an exact allocator limit.
 struct ResultBudget {
     state: Mutex<(usize, usize, bool)>, // reserved bytes, required index, stopped
     wake: Condvar,
@@ -36,6 +36,27 @@ impl ResultBudget {
             }
             if index == state.1 || bytes <= self.limit.saturating_sub(state.0) {
                 state.0 = state.0.saturating_add(bytes);
+                return true;
+            }
+            state = self
+                .wake
+                .wait_timeout(state, Duration::from_millis(20))
+                .unwrap()
+                .0;
+        }
+    }
+    fn finish(&self, index: usize, reserved: usize, actual: usize, cancel: &AtomicBool) -> bool {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if state.2 || cancel.load(Ordering::Relaxed) {
+                state.0 = state.0.saturating_sub(reserved);
+                self.wake.notify_all();
+                return false;
+            }
+            let without = state.0.saturating_sub(reserved);
+            if index == state.1 || actual <= self.limit.saturating_sub(without) {
+                state.0 = without.saturating_add(actual);
+                self.wake.notify_all();
                 return true;
             }
             state = self
@@ -168,12 +189,16 @@ pub(super) fn run_with_workers(
                     if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
                         break;
                     }
+                    let estimate = worker.search_work_bytes(classes[index]).min(budget.limit);
+                    if !budget.reserve(index, estimate, cancel) {
+                        break;
+                    }
                     started.fetch_add(1, Ordering::Relaxed);
                     let result = render_job(&mut worker, classes[index], legacy, || {
                         stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed)
                     });
                     let bytes = rendered_bytes(&result);
-                    if !budget.reserve(index, bytes, cancel) {
+                    if !budget.finish(index, estimate, bytes, cancel) {
                         break;
                     }
                     if results_tx.send((index, result, bytes)).is_err() {
@@ -257,12 +282,16 @@ pub(super) fn run_with_workers(
                             let stop = &stop;
                             let started = &started;
                             handles.push(scope.spawn(move || {
+                                let estimate = worker.search_work_bytes(name).min(budget.limit);
+                                if !budget.reserve(index, estimate, cancel) {
+                                    return;
+                                }
                                 started.fetch_add(1, Ordering::Relaxed);
                                 let result = render_job(&mut worker, name, legacy, || {
                                     stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed)
                                 });
                                 let bytes = rendered_bytes(&result);
-                                if budget.reserve(index, bytes, cancel)
+                                if budget.finish(index, estimate, bytes, cancel)
                                     && results_tx.send((index, result, bytes)).is_err()
                                 {
                                     budget.release(bytes);
@@ -387,6 +416,31 @@ pub(super) fn run_with_workers(
 mod tests {
     use super::*;
 
+    #[test]
+    fn memory_admission_blocks_work_before_render_and_reconciles_finished_bytes() {
+        let budget = ResultBudget::new(10);
+        let cancel = AtomicBool::new(false);
+        assert!(budget.reserve(0, 8, &cancel));
+        std::thread::scope(|scope| {
+            let (tx, rx) = mpsc::channel();
+            let budget = &budget;
+            let cancel = &cancel;
+            scope.spawn(move || {
+                assert!(budget.reserve(1, 8, cancel));
+                tx.send(()).unwrap();
+                assert!(budget.finish(1, 8, 2, cancel));
+            });
+            assert!(rx.recv_timeout(Duration::from_millis(30)).is_err());
+            assert!(budget.finish(0, 8, 2, cancel));
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        });
+        assert_eq!(budget.state.lock().unwrap().0, 4);
+        budget.release(4);
+        assert!(budget.reserve(0, 10, &cancel));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(!budget.finish(0, 10, 20, &cancel));
+        assert_eq!(budget.state.lock().unwrap().0, 0);
+    }
     #[test]
     fn result_budget_blocks_future_results_but_required_head_bypasses_limit() {
         let budget = ResultBudget::new(10);

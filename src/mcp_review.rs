@@ -218,6 +218,25 @@ pub(super) fn annotations(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
+    annotation_classes(
+        project.classes.iter().map(|name| {
+            Ok((
+                name.as_str(),
+                engine
+                    .dex_class(name)
+                    .context("Missing class during annotation scan")?,
+            ))
+        }),
+        args,
+        cancel,
+    )
+}
+
+fn annotation_classes<'a>(
+    classes: impl IntoIterator<Item = Result<(&'a str, &'a crate::native_dex::DexClass)>>,
+    args: &Value,
+    cancel: &AtomicBool,
+) -> Result<Value> {
     let requested = required(args, "annotation_type")?;
     let descriptor = if requested.starts_with('L') && requested.ends_with(';') {
         requested.to_owned()
@@ -226,14 +245,19 @@ pub(super) fn annotations(
     };
     let element = args["element"].as_str().unwrap_or("all");
     let mut page = scan::Page::new(args)?;
-    for name in &project.classes {
+    let mut seen_tables = std::collections::HashSet::new();
+    let mut type_present = false;
+    for class in classes {
         ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+        let (name, c) = class?;
+        // Presence is project-wide, independent of result filters. Each shared
+        // DEX type table is checked once; no Java reconstruction or index build.
+        if !type_present && seen_tables.insert(Arc::as_ptr(&c.symbols)) {
+            type_present = c.symbols.types.iter().any(|ty| ty.as_ref() == descriptor);
+        }
         if !scan::package_matches(name, args) {
             continue;
         }
-        let c = engine
-            .dex_class(name)
-            .context("Missing class during annotation scan")?;
         scan::annotation_sets(c, name, |owner, set| {
             if element != "all" && owner["element"] != element {
                 return Ok(());
@@ -258,9 +282,23 @@ pub(super) fn annotations(
             Ok(())
         })?;
     }
+    ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
     let mut result = page.finish()?;
+    result["annotation_type"] = json!(descriptor);
+    result["match_mode"] = json!("exact_descriptor");
+    result["requested_type_present"] = json!(type_present);
+    result["type_presence_scope"] =
+        json!("DEX type tables of all loaded classes, before result filters");
+    result["warnings"] = if type_present {
+        json!([])
+    } else {
+        json!([{
+            "code": "ANNOTATION_TYPE_ABSENT",
+            "message": "The requested annotation descriptor is absent from the loaded DEX type tables. Obfuscation, removal, or an incorrect name may explain this. Zero exact-descriptor usages do not establish that equivalent annotations or API endpoints are absent. Query the actual DEX annotation name; no semantic alias was inferred."
+        }])
+    };
     result["scope"] = json!(
-        "Explicit DEX declaration annotations; parameter_index excludes the receiver. No inherited annotations or annotation defaults inferred."
+        "Complete covers explicit exact-descriptor DEX annotation usages within the supplied filters, not semantic equivalents under obfuscation. Parameter_index excludes the receiver. No inherited annotations or annotation defaults inferred."
     );
     Ok(result)
 }
@@ -508,6 +546,109 @@ pub(super) fn call_arguments(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn annotation_presence_distinguishes_absence_unused_types_and_filtered_matches() {
+        use crate::native_dex::{self, DexAnnotation, DexAnnotationDirectory};
+        let mut classes = native_dex::parse(include_bytes!("../tests/fixtures/hello.dex"))
+            .unwrap()
+            .classes;
+        let c = &mut classes[0];
+        c.annotations_offset = 1;
+        let mut symbols = DexSymbols {
+            types: vec!["Lqj/o;".into(), "Lqj/p;".into()],
+            ..Default::default()
+        };
+        symbols.annotations.insert(
+            1,
+            Arc::new(DexAnnotationDirectory {
+                class: Some(
+                    vec![Arc::new(DexAnnotation {
+                        visibility: 1,
+                        type_idx: 0,
+                        elements: vec![],
+                    })]
+                    .into(),
+                ),
+                ..Default::default()
+            }),
+        );
+        c.symbols = Arc::new(symbols);
+        let cancel = AtomicBool::new(false);
+        let query = |args: Value| {
+            annotation_classes(
+                [
+                    Ok(("sample.One", &classes[0])),
+                    Ok(("sample.Two", &classes[0])),
+                ],
+                &args,
+                &cancel,
+            )
+            .unwrap()
+        };
+        let absent = query(json!({"annotation_type":"retrofit2.http.POST"}));
+        assert_eq!(absent["total"], 0);
+        assert_eq!(absent["complete"], true);
+        assert_eq!(absent["requested_type_present"], false);
+        assert_eq!(absent["annotation_type"], "Lretrofit2/http/POST;");
+        assert_eq!(absent["warnings"][0]["code"], "ANNOTATION_TYPE_ABSENT");
+        assert_eq!(absent["match_mode"], "exact_descriptor");
+        let unused = query(json!({"annotation_type":"qj.p"}));
+        assert_eq!(unused["total"], 0);
+        assert_eq!(unused["requested_type_present"], true);
+        assert_eq!(unused["warnings"], json!([]));
+        for args in [
+            json!({"annotation_type":"qj.o", "package_prefix":"other"}),
+            json!({"annotation_type":"qj.o", "element":"parameter"}),
+        ] {
+            let filtered = query(args);
+            assert_eq!(filtered["total"], 0);
+            assert_eq!(filtered["requested_type_present"], true);
+            assert_eq!(filtered["warnings"], json!([]));
+        }
+        let first = query(json!({"annotation_type":"qj.o", "limit":1}));
+        assert_eq!(first["total"], 2);
+        assert_eq!(first["next_offset"], 1);
+        assert_eq!(first["requested_type_present"], true);
+        assert_eq!(first["items"][0]["annotation_type"], "Lqj/o;");
+        assert_eq!(first, query(json!({"annotation_type":"Lqj/o;", "limit":1})));
+        let second = query(json!({"annotation_type":"qj.o", "offset":1, "limit":1}));
+        assert_eq!(second["total"], 2);
+        assert!(second["next_offset"].is_null());
+        assert_ne!(first["items"], second["items"]);
+        assert!(
+            annotation_classes(
+                [Ok(("sample.One", &classes[0]))],
+                &json!({"annotation_type":"qj.o"}),
+                &AtomicBool::new(true)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn annotation_type_presence_checks_other_dex_tables_before_package_filter() {
+        let first =
+            crate::native_dex::parse(include_bytes!("../tests/fixtures/hello.dex")).unwrap();
+        let mut second =
+            crate::native_dex::parse(include_bytes!("../tests/fixtures/hello.dex")).unwrap();
+        second.classes[0].symbols = Arc::new(DexSymbols {
+            types: vec!["Lexternal/Marker;".into()],
+            ..Default::default()
+        });
+        let result = annotation_classes(
+            [
+                Ok(("sample.One", &first.classes[0])),
+                Ok(("other.Two", &second.classes[0])),
+            ],
+            &json!({"annotation_type":"external.Marker", "package_prefix":"sample"}),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result["total"], 0);
+        assert_eq!(result["requested_type_present"], true);
+        assert_eq!(result["warnings"], json!([]));
+    }
+
     #[test]
     fn resource_alias_configurations_cycles_and_selection_are_explicit() {
         use crate::resource_table::{Resource, ResourceTable, Variant};

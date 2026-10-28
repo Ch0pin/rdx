@@ -19,6 +19,8 @@ quick-xml = "0.42"
 regex = "1"
 getrandom = "0.3"
 sha2 = "0.10"
+memmap2 = "0.9.11"
+tempfile = "3.27"
 resvg = { version = "0.48.1", default-features = false }
 
 [target.'cfg(windows)'.build-dependencies]

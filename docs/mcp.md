@@ -11,8 +11,17 @@ source reconstruction, literal indexing/search, and graph batches.
 The native `rdx mcp` command is the stdio gateway. No Python, JVM or separate
 server install is required. Each enabled GUI instance has an authenticated
 loopback service; the gateway discovers it through a private per-user registry.
-The instance backend loads independently of the GUI engine, using additional
-memory while enabled. Opening/reloading a GUI project stops that service.
+The instance backend shares the GUI's parsed DEX, hierarchy, resources, archive
+and project indexes. Starting or restarting MCP does not parse a second project.
+Interactive and service workers keep separate bounded source-cache LRU state and
+request cancellation state; cache clones share immutable document allocations.
+Source-cache documents, identifier postings and literal postings share a 384 MiB
+retention admission budget per parsed project. When an analysis index cannot be
+retained, its complete streaming scan remains available. This budget covers
+optional caches, not the parsed DEX or total process memory.
+The original file identity is checked before serving; a
+changed input requires reopening the project. Opening/reloading a GUI project
+stops its old service. Standalone/headless services load their own project once.
 
 ## Agent flow
 
@@ -921,6 +930,16 @@ It searches explicit declarations, including obfuscated annotation names. It doe
 not infer inherited annotations or fill in annotation defaults. Pages count
 matching annotations; follow `next_offset`. Oversized individual annotation
 values fail explicitly instead of being silently truncated.
+
+The response includes the canonical `annotation_type`, `match_mode:
+"exact_descriptor"`, and `requested_type_present`. Type presence checks DEX type
+tables of all loaded classes before applying package or element filters; it does
+not require an annotation class definition. An absent type returns a structured
+`warnings` entry with code `ANNOTATION_TYPE_ABSENT`. Obfuscation, removal, or an
+incorrect name can explain absence. A present type with zero filtered usages
+returns an empty warnings array. `complete: true` describes the exact-descriptor
+scan within the supplied filters, not coverage of semantic equivalents under
+obfuscation. Use the actual DEX annotation name; semantic aliases are not inferred.
 
 `get_method_source` also accepts `class_name` plus `method_name` and optional
 `descriptor` (for example `(Ljava/lang/String;)V`). `find_field_references`

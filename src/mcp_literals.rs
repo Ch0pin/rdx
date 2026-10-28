@@ -17,6 +17,16 @@ use std::{
 
 type Scanner = dyn Fn(&Value, &AtomicBool) -> Result<Value> + Send + Sync;
 type Builder = dyn Fn(&AtomicBool, &AtomicUsize) -> Result<Index> + Send + Sync;
+struct HeldIndex {
+    index: Index,
+    _reservation: Arc<crate::retained_budget::Reservation>,
+}
+impl std::ops::Deref for HeldIndex {
+    type Target = Index;
+    fn deref(&self) -> &Index {
+        &self.index
+    }
+}
 struct BuildState {
     phase: &'static str,
     attempt: u64,
@@ -25,7 +35,7 @@ struct BuildState {
     cancel: Arc<AtomicBool>,
     started: Instant,
     error: String,
-    index: Option<Arc<Index>>,
+    index: Option<Arc<HeldIndex>>,
 }
 #[derive(Clone)]
 pub(super) struct Controller {
@@ -33,6 +43,7 @@ pub(super) struct Controller {
     state: Arc<Mutex<BuildState>>,
     builder: Arc<Mutex<Arc<Builder>>>,
     total: usize,
+    budget: Arc<crate::retained_budget::RetainedBudget>,
     stop: Arc<AtomicBool>,
 }
 impl Controller {
@@ -41,6 +52,7 @@ impl Controller {
         project: Arc<Project>,
         stop: Arc<AtomicBool>,
     ) -> Self {
+        let budget = engine.retained_budget.clone();
         let total = project.classes.len();
         let scan_engine = engine.clone();
         let scan_project = project.clone();
@@ -49,6 +61,7 @@ impl Controller {
             stop,
             Arc::new(move |cancel, progress| Index::build(&engine, &project, cancel, progress)),
         );
+        controller.budget = budget;
         controller.scanner = Some(Arc::new(move |args, cancel| {
             super::scan::literals(&scan_engine, &scan_project, args, cancel)
         }));
@@ -57,6 +70,7 @@ impl Controller {
     fn with_builder(total: usize, stop: Arc<AtomicBool>, builder: Arc<Builder>) -> Self {
         Self {
             scanner: None,
+            budget: Arc::default(),
             state: Arc::new(Mutex::new(BuildState {
                 phase: "idle",
                 attempt: 0,
@@ -179,6 +193,7 @@ impl Controller {
                     self.builder.lock().unwrap().clone(),
                     self.stop.clone(),
                 );
+                let budget = self.budget.clone();
                 std::thread::spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         builder(&job_cancel, &progress)
@@ -202,8 +217,16 @@ impl Controller {
                     } else {
                         match result {
                             Ok(index) => {
-                                state.index = Some(Arc::new(index));
-                                state.phase = "ready";
+                                if let Some(reservation) = budget.reserve(index.estimated_bytes) {
+                                    state.index = Some(Arc::new(HeldIndex {
+                                        index,
+                                        _reservation: reservation,
+                                    }));
+                                    state.phase = "ready";
+                                } else {
+                                    state.phase = "failed";
+                                    state.error = "LITERAL_INDEX_LIMIT: shared project retention budget reached".into();
+                                }
                             }
                             Err(error) => {
                                 state.phase = "failed";
@@ -909,6 +932,27 @@ mod tests {
                 .unwrap();
         }
         index
+    }
+    #[test]
+    fn memory_shared_cache_pressure_preserves_literal_results_via_streaming() {
+        let mut controller = Controller::with_builder(
+            1,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(|_, _| Ok(index(&[fixture("sample/One", "needle")]))),
+        );
+        controller.budget = Arc::new(crate::retained_budget::RetainedBudget::new(0));
+        controller.scanner = Some(Arc::new(|args, cancel| {
+            index(&[fixture("sample/One", "needle")]).search(args, cancel)
+        }));
+        let args = json!({"query":"needle"});
+        let cancel = AtomicBool::new(false);
+        let expected = index(&[fixture("sample/One", "needle")])
+            .search(&args, &cancel)
+            .unwrap();
+        let actual = controller.search(&args, &cancel).unwrap();
+        assert_eq!(actual["items"], expected["items"]);
+        assert_eq!(actual["total"], expected["total"]);
+        assert_eq!(controller.status()["state"], "streaming");
     }
     #[test]
     fn owners_include_instructions_static_and_nested_annotation_values() {

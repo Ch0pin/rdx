@@ -161,6 +161,7 @@ pub enum SearchTarget {
     Class(String),
     Resource(usize),
 }
+#[derive(Debug)]
 pub struct SearchDocument {
     pub target: SearchTarget,
     pub name: String,
@@ -169,6 +170,14 @@ pub struct SearchDocument {
     pub links: Vec<CodeLink>,
     pub source_hash: Option<String>,
     pub metadata_complete: bool,
+}
+impl rdx::source_text::TextOwner for SearchDocument {
+    fn text(&self) -> &str {
+        &self.source
+    }
+    fn heap_bytes(&self) -> usize {
+        self.source.capacity()
+    }
 }
 #[derive(Clone)]
 pub struct SearchHit {

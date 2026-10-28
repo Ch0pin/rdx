@@ -21,11 +21,17 @@ impl RetainedBudget {
         }
     }
     pub(crate) fn reserve(self: &Arc<Self>, bytes: usize) -> Option<Arc<Reservation>> {
-        self.used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(bytes).filter(|next| *next <= self.limit)
-            })
-            .ok()?;
+        let mut used = self.used.load(Ordering::Relaxed);
+        loop {
+            let next = used.checked_add(bytes).filter(|next| *next <= self.limit)?;
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(actual) => used = actual,
+            }
+        }
         Some(Arc::new(Reservation {
             owner: self.clone(),
             bytes,

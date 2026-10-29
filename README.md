@@ -88,6 +88,11 @@ Platform build requirements, macOS app packaging and CLI commands are in the
 [User guide](docs/user-guide.md) · [MCP tools](docs/mcp.md) ·
 [Validation](docs/validation.md) · [Plugins](docs/plugins.md)
 
-RDX uses JADX algorithms as a reference. See [JADX attribution](third_party/jadx/README.md),
+## License
+
+RDX is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE)
+for attribution. Third-party material retains its respective licenses.
+
+RDX includes adaptations of JADX algorithms. See [JADX attribution](third_party/jadx/README.md),
 [Android notices](third_party/android/README.md), [font licenses](third_party/fonts/README.md),
 [theme licenses](third_party/themes/README.md), and [icon rendering licenses](third_party/icon-rendering/README.md).

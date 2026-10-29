@@ -1,0 +1,13 @@
+RDX
+Copyright 2026 Ch0pin and RDX contributors.
+
+RDX is licensed under the Apache License, Version 2.0.
+
+RDX includes code adapted from JADX, copyright Skylot and its contributors,
+and Android Open Source Project material. Applicable upstream licenses,
+notices, source mappings, and descriptions of modifications are preserved in
+third_party/jadx/ and third_party/android/.
+
+Bundled fonts, themes, icon-rendering components, and other third-party
+material retain their respective licenses and notices under third_party/.
+In macOS application bundles, these files are in Contents/Resources/.

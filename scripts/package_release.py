@@ -40,6 +40,8 @@ def main():
             shutil.copy2(binary_dir / (executable + suffix), stage / (executable + suffix))
         shutil.copytree(ROOT / 'third_party', stage / 'third_party')
         shutil.copytree(ROOT / 'assets/icons', stage / 'icons')
+    for notice in ('LICENSE', 'NOTICE'):
+        shutil.copy2(ROOT / notice, stage / notice)
     shutil.copy2(ROOT / 'docs/install.md', stage / 'START-HERE.md')
     shutil.copytree(ROOT / 'docs', stage / 'docs', ignore=shutil.ignore_patterns('images'))
     (stage / 'VERSION').write_text(version + '\n')

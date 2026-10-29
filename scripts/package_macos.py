@@ -31,6 +31,8 @@ def main():
             shutil.copy2(source, temporary)
             os.replace(temporary, executable_dir / name)
     shutil.copy2(ROOT / 'assets/icons/rdx.icns', resources / 'rdx.icns')
+    for notice in ('LICENSE', 'NOTICE'):
+        shutil.copy2(ROOT / notice, resources / notice)
     shutil.copytree(ROOT / 'third_party', resources / 'third_party', dirs_exist_ok=True)
     info = {
         'CFBundleExecutable': 'rdx',

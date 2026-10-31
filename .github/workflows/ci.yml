@@ -5,6 +5,13 @@ on:
     branches: ['**']
   pull_request:
 
+env:
+  # Hundreds of test executables otherwise duplicate full debug information
+  # until hosted runners run out of disk while linking. Keep test checks intact.
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_INCREMENTAL: '0'
+
 jobs:
   check:
     strategy:
@@ -18,6 +25,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ci-no-debug-v1
       - name: Install Linux GUI build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev

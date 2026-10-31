@@ -984,3 +984,103 @@ fn network_detector_schema_dispatch_and_limits() {
     assert_eq!(result["coverage"]["complete"], true);
     assert_eq!(result["total"], 0);
 }
+
+#[test]
+fn manifest_launch_projection_errors_list_valid_fields() {
+    let args = json!({"instance_id":"i","project_id":"p","fields":"name,launchMode,exported,taskAffinity,allowTaskReparenting,documentLaunchMode,excludeFromRecents,permission,targetActivity"});
+    validate("get_manifest_components", &args).unwrap();
+    let mut invalid = args;
+    invalid["fields"] = json!("name,notAField");
+    let error = validate("get_manifest_components", &invalid).unwrap_err();
+    let error = error.downcast_ref::<ArgumentError>().unwrap();
+    assert_eq!(error.details["invalid_fields"], json!(["notAField"]));
+    assert!(
+        error.details["allowed_fields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("launchMode"))
+    );
+}
+
+#[test]
+#[ignore = "requires RDX_COSTCO_APK; static detector/projection regression only"]
+fn reviewer_costco_launch_projection_and_network_usage() {
+    let path = PathBuf::from(std::env::var("RDX_COSTCO_APK").unwrap());
+    let mut engine = NativeEngine::default();
+    let project = engine.open(&path).unwrap();
+    let xml = engine
+        .read_resource_with_metadata("AndroidManifest.xml")
+        .unwrap()
+        .source;
+    let args = json!({"instance_id":"i","project_id":"p","component_type":"activity","class_name":"com.costco.app.android.ui.main.MainActivity","match_mode":"exact","fields":"name,launchMode,exported,taskAffinity"});
+    validate("get_manifest_components", &args).unwrap();
+    let records =
+        crate::manifest_summary::query_resolved(&xml, &args, engine.resource_table(), true)
+            .unwrap();
+    let components = feedback::component_page(records, &args).unwrap();
+    assert_eq!(components["total"], 1);
+    assert!(components["items"][0]["launchMode"].is_object());
+    let cancel = AtomicBool::new(false);
+    let started = Instant::now();
+    let mut query = json!({"package_prefix":"com.costco","limit":100});
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    let mut roles = std::collections::BTreeMap::<String, usize>::new();
+    let mut total = 0;
+    let mut pages = 0;
+    let coverage = loop {
+        let page = crate::network_stacks::search(&engine, &project, &query, &cancel).unwrap();
+        pages += 1;
+        for row in page["items"].as_array().unwrap() {
+            total += 1;
+            *counts
+                .entry(row["detector"].as_str().unwrap().to_owned())
+                .or_default() += 1;
+            if let Some(role) = row["role"].as_str() {
+                *roles.entry(role.to_owned()).or_default() += 1;
+            }
+        }
+        if page["next_offset"].is_null() {
+            break page["coverage"].clone();
+        }
+        assert!(pages < 30, "unexpected detector page volume");
+        query["offset"] = page["next_offset"].clone();
+    };
+    let factory_calls: Vec<_> = project
+        .classes
+        .iter()
+        .filter(|n| n.starts_with("com.costco") && n.contains("RetrofitServiceImpl"))
+        .flat_map(|n| {
+            let class = engine.dex_class(n).unwrap();
+            class
+                .methods
+                .iter()
+                .flat_map(|m| {
+                    crate::native_xrefs::method_call_sites(class, m, &cancel).unwrap_or_default()
+                })
+                .filter(|site| {
+                    site.callee.starts_with("okhttp3.") || site.callee.starts_with("retrofit2.")
+                })
+                .map(|site| json!({"caller":site.caller,"callee":site.callee,"offset":site.pc}))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let factory_helpers:Vec<_>=project.classes.iter().filter(|n|n.starts_with("com.costco") && n.ends_with(".RetrofitServiceImpl"))
+        .flat_map(|n|engine.dex_class(n).unwrap().methods.iter().filter(|m|m.name.as_ref()=="allowAllCerts")
+            .map(|m|json!({"method_id":crate::native_engine::disassembly::method_id(m),"instructions":m.code.as_ref().map(|c|c.instructions.clone())})).collect::<Vec<_>>()).collect();
+    let report = json!({"apk_sha256":digest(&path).unwrap(),"loaded_classes":project.classes.len(),"manifest_projection":components,
+        "factory_calls":factory_calls,"factory_helpers":factory_helpers,"network":{"records":total,"pages":pages,"detectors":counts,"roles":roles,"coverage":coverage,"elapsed_ms":started.elapsed().as_millis()}});
+    if let Ok(out) = std::env::var("RDX_VALIDATION_OUTPUT") {
+        fs::write(out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+    println!("costco_manifest_network_probe: {report}");
+    assert!(total > 0);
+    assert!(counts.get("okhttp_contracts").copied().unwrap_or(0) > 0);
+    assert!(counts.get("retrofit_annotations").copied().unwrap_or(0) > 0);
+    assert!(
+        roles
+            .get("certificate_pinner_configuration")
+            .copied()
+            .unwrap_or(0)
+            > 0
+    );
+}

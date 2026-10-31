@@ -21,6 +21,11 @@ use std::{
 mod chooser;
 #[path = "mcp_discovery.rs"]
 mod discovery;
+#[path = "mcp_exports.rs"]
+mod exports;
+pub use exports::export_directory;
+#[path = "mcp_feedback.rs"]
+mod feedback;
 #[path = "mcp_registry.rs"]
 mod instance_registry;
 #[path = "mcp_literals.rs"]
@@ -133,6 +138,7 @@ struct LoadedProject {
     package_name: String,
     package_selection: String,
     literals: literals::Controller,
+    exports: exports::Controller,
 }
 impl LoadedProject {
     fn from_snapshot(snapshot: ProjectSnapshot, stop: Arc<AtomicBool>) -> Result<Self> {
@@ -163,6 +169,7 @@ impl LoadedProject {
             package_name,
             package_selection,
             literals,
+            exports: exports::Controller::default(),
         })
     }
 }
@@ -456,6 +463,7 @@ impl Server {
             }
             if let Some(project) = loaded {
                 project.literals.cancel();
+                project.exports.cancel_all();
             }
         });
         Ok(Self {
@@ -537,6 +545,18 @@ fn project_request(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
+    let normalized = feedback::method_aliases(name, args)?;
+    let args = &normalized;
+    if name == "get_export_status" || name == "cancel_export" {
+        return project
+            .exports
+            .status(required(args, "job_id")?, name == "cancel_export");
+    }
+    if name == "export_package_source" && args["background"] != false {
+        ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+        check_project_file(project)?;
+        return project.exports.start(project, args);
+    }
     if matches!(
         name,
         "get_android_manifest"
@@ -642,16 +662,13 @@ fn project_request(
         let xml = engine
             .read_resource_with_metadata("AndroidManifest.xml")?
             .source;
-        let mut records =
+        let records =
             crate::manifest_summary::query_resolved(&xml, args, engine.resource_table(), true)
                 .map_err(anyhow::Error::msg)?;
-        crate::manifest_summary::project_records(&mut records, args);
+        let mut result = feedback::component_page(records, args)?;
         ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
         check_project_file(project)?;
-        let hash = crate::engine::source_identity(&serde_json::to_string(&records)?);
-        let mut result = page(records, args)?;
         result["format"] = json!("records");
-        result["source_hash"] = json!(hash);
         result["offset_unit"] = json!("matching component records");
         result["coverage"] = crate::manifest_summary::component_coverage(
             &crate::manifest_summary::resolved_xml(&xml, engine.resource_table())
@@ -725,6 +742,7 @@ fn component_filters(args: &Value) -> Value {
     let mut filters = serde_json::Map::new();
     for key in [
         "class_name",
+        "exported_state",
         "match_mode",
         "component",
         "component_type",
@@ -933,35 +951,13 @@ fn discover(entries: &[Registration], args: &Value) -> Result<Value> {
                 "action":"Check the GUI MCP status and retry. If the GUI has closed, reopen it; an unreachable registration alone does not prove a stale process."})),
         }
     }
+    let selection = feedback::selection(&items, args, start == 0 && end == entries.len());
     let mut result = page(items, args)?;
     result["diagnostics"] = json!(diagnostics);
     result["discovery_complete"] = json!(end == entries.len());
     result["next_registration_offset"] = json!((end < entries.len()).then_some(end));
     result["registered_instances"] = json!(entries.len());
-    let pinned = args["apk_sha256"].as_str().is_some_and(|s| !s.is_empty())
-        || args["apk_path"]
-            .as_str()
-            .is_some_and(|s| Path::new(s).is_absolute());
-    let candidates: Vec<_> = result["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|i| {
-            i["state"] == "Running" && i["project_id"].as_str().is_some_and(|s| !s.is_empty())
-        })
-        .map(|i| json!({"instance_id":i["instance_id"],"project_id":i["project_id"]}))
-        .collect();
-    result["selection"] = if pinned
-        && start == 0
-        && end == entries.len()
-        && result["next_offset"].is_null()
-        && args["offset"].as_u64().unwrap_or(0) == 0
-        && candidates.len() == 1
-    {
-        json!({"status":"unique_healthy_match","selected":candidates[0],"routing":"Pass these explicit IDs on subsequent calls"})
-    } else {
-        json!({"status":if !pinned {"identity_filter_required"} else if candidates.len()>1 {"ambiguous"} else {"no_unique_complete_match"},"selected":Value::Null,"hint":"Filter by absolute apk_path or exact apk_sha256 and complete discovery; select an explicit instance/project when ambiguous"})
-    };
+    result["selection"] = selection;
     Ok(result)
 }
 
@@ -1163,7 +1159,7 @@ fn dispatch(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
-    let mut normalized = args.clone();
+    let mut normalized = feedback::method_aliases(name, args)?;
     if class_scoped(name)
         && (name != "find_instantiations"
             || args.get("class_id").is_some()
@@ -1199,6 +1195,7 @@ fn dispatch(
     }
     if name == "get_call_graph" {
         navigation::enrich(engine, &mut result, args, cancel)?;
+        feedback::caller_status(&mut result);
     }
     if class_scoped(name) {
         result["class_id"] = normalized["class_id"].clone();
@@ -1553,8 +1550,20 @@ fn tools_list() -> Value {
             true,
         ),
         (
+            "get_export_status",
+            "Poll a project-owned source export job by job_id. Progress is also persisted in export-status.json; after a restart use export_package_source with resume=true and the original out_path/package_prefix.",
+            vec!["job_id"],
+            true,
+        ),
+        (
+            "cancel_export",
+            "Request cooperative cancellation of an export job. Poll until status is terminal; files and durable checkpoints remain available for continuation.",
+            vec!["job_id"],
+            true,
+        ),
+        (
             "export_package_source",
-            "Export all matching package classes to a NEW absolute directory with collision-safe numeric paths and a descriptor-to-path manifest.jsonl including source hashes and reconstruction coverage. Never overwrites; errors/cancellation retain explicitly incomplete manifest.",
+            "Start a background source export (default) and return job_id immediately. Poll get_export_status; cancel with cancel_export. Durable export-status.json and completion.json describe progress, errors and interruption; resume=true validates and continues the same out_path with the same APK, renderer and package_prefix. Empty package_prefix selects all classes. Numeric paths and manifest.jsonl preserve case-colliding identities. background=false waits synchronously and remains subject to the transport deadline.",
             vec!["out_path", "package_prefix"],
             true,
         ),
@@ -1614,7 +1623,7 @@ fn tools_list() -> Value {
         ),
         (
             "find_network_stacks",
-            "Find OkHttp-compatible structural candidates across relocated/obfuscated namespaces. Returns linked request/response/URL/headers/chain roles, exact interceptor/proceed member selectors and an observer redaction policy. Static metadata only: no runtime values, hook installation, version certainty or runtime verification. Unsupported/inherited-only layouts may be missed; coverage and unresolved roles are explicit. package_prefix filters interceptor owners while retaining cross-package dependencies. offset/limit page candidates; max limit 100.",
+            "Find networking evidence owned by package_prefix (dependencies may be outside it): exact OkHttp contract relationships, selected client/TLS/interceptor configuration invokes and exact typed builder-field writes, Retrofit method/parameter annotations, plus relocated OkHttp-compatible structural maps. kind distinguishes api_usage from structural_stack; only structural maps contain hook_map. Records retain exact declarations or DEX-local invoke offsets. @Url/@HeaderMap identify argument-supplied values, not external control. Detector coverage and empty-result limitations are explicit: scan completion does not establish absence of networking. Runtime activity, effective pinning and interceptor order are not inferred. Named evidence precedes structural maps; offset/limit page evidence records, max 100.",
             vec![],
             true,
         ),
@@ -1801,6 +1810,11 @@ fn tools_list() -> Value {
             required.retain(|key| *key != "class_id");
             properties.insert("class_name".into(),json!({"type":"string","minLength":1,"description":"Alias for class_id: exact FQCN, DEX descriptor or unique short name"}));
         }
+        if name=="export_package_source" {
+            properties.insert("background".into(),json!({"type":"boolean","default":true}));
+            properties.insert("resume".into(),json!({"type":"boolean","default":false}));
+            properties["package_prefix"]["minLength"] = json!(0);
+        }
         if name=="open_apk" {
             properties.insert("headless".into(),json!({"type":"boolean","default":false,"description":"Host the project in this MCP gateway without a GUI. Closing the gateway stops this service and cancels work. Poll get_instance_info for Running and project_id."}));
             properties.insert("request_key".into(),json!({"type":"string","minLength":1,"description":"Unique launch key within this gateway connection, e.g. review-temu-1. Reuse for retries of the same canonical path; a new key opens another window. Reusing it for a different path is rejected."}));
@@ -1869,9 +1883,11 @@ fn tools_list() -> Value {
         }
         if ["get_manifest_summary", "get_manifest_components"].contains(&name) {
             properties.insert("projection".into(),json!({"type":"string","enum":["full","compact"],"default":"full"}));
-            properties.insert("fields".into(),json!({"type":"string","minLength":1,"description":"Comma-separated record field names; overrides projection. Validated against manifest record fields."}));
+            properties.insert("fields".into(),json!({"type":"string","minLength":1,"description":"Comma-separated record field names; overrides projection. Activity launch fields preserve declared/default/inherited/unresolved state; unknown fields return allowed_fields.","x-allowed-fields":crate::manifest_summary::RECORD_FIELDS}));
         }
         if name=="get_manifest_components" {
+            properties.insert("exported_state".into(),json!({"type":"string","enum":["true","false","unresolved"]}));
+            properties.insert("max_bytes".into(),json!({"type":"integer","minimum":1024,"maximum":1048576,"default":32768,"description":"Maximum serialized items bytes; pagination preserves complete records. Metadata is additional."}));
             for key in ["class_name", "host", "scheme", "path", "permission", "query"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
             properties.insert("match_mode".into(),json!({"type":"string","enum":["exact","contains"],"default":"contains"}));
             properties.insert("component_type".into(),json!({"type":"string","enum":["activity","activity-alias","service","receiver","provider"]}));
@@ -1921,6 +1937,9 @@ fn tools_list() -> Value {
             properties.remove("offset");properties.remove("limit");
         }
         if ["get_all_classes","get_all_resource_file_names","get_strings","get_dex_strings"].contains(&name){properties.insert("query".into(),json!({"type":"string"}));}
+        if properties.contains_key("method_id") {
+            for alias in ["method_signature","signature"] { properties.insert(alias.into(),json!({"type":"string","minLength":1,"description":"Alias for method_id; conflicting selectors are rejected"})); }
+        }
         let mut schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
         if class_scoped(name) { schema["anyOf"] = json!([{"required":["class_id"]},{"required":["class_name"]}]); }
         if name=="find_instantiations" { schema["anyOf"]=json!([{"required":["class_id"]},{"required":["class_name"]},{"required":["allocating_class"]},{"required":["allocating_method_id"]}]); }
@@ -1931,7 +1950,19 @@ fn tools_list() -> Value {
         if name=="find_field_references" { schema["anyOf"].as_array_mut().unwrap().push(json!({"required":["field"]})); }
         if name=="export_source" {schema["anyOf"]=json!([{"required":["class_name"]},{"required":["method_id"]}]);}
         if name=="get_resource_value" {schema["anyOf"]=json!([{"required":["resource_id"]},{"required":["resource_name"]}]);}
-        json!({"name":name,"description":description,"inputSchema":schema,"annotations":{"readOnlyHint":!["open_apk","forget_instance","export_source","export_package_source"].contains(&name),"destructiveHint":name=="forget_instance","openWorldHint":false}})
+        if schema["properties"].get("method_id").is_some() {
+            if schema["required"].as_array().unwrap().iter().any(|v| v=="method_id") {
+                schema["required"].as_array_mut().unwrap().retain(|v|v!="method_id");
+                schema["anyOf"]=json!([{"required":["method_id"]}]);
+            }
+            if let Some(alternatives)=schema["anyOf"].as_array_mut() {
+                let originals=alternatives.clone();
+                for option in originals { if option["required"].as_array().is_some_and(|a|a.iter().any(|v|v=="method_id")) {
+                    for alias in ["method_signature","signature"] { let mut variant=option.clone(); for key in variant["required"].as_array_mut().unwrap() { if key=="method_id" { *key=json!(alias); } } alternatives.push(variant); }
+                } }
+            }
+        }
+        json!({"name":name,"description":description,"inputSchema":schema,"annotations":{"readOnlyHint":!["open_apk","forget_instance","export_source","export_package_source","cancel_export"].contains(&name),"destructiveHint":name=="forget_instance","openWorldHint":false}})
     }).collect::<Vec<_>>()})
 }
 #[derive(Debug)]
@@ -1961,6 +1992,8 @@ fn validate(name: &str, args: &Value) -> Result<()> {
 }
 
 fn validate_arguments(name: &str, args: &Value) -> Result<()> {
+    let normalized = feedback::method_aliases(name, args)?;
+    let args = &normalized;
     let tools = tools_list();
     let tool = tools["tools"]
         .as_array()
@@ -2112,33 +2145,18 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
 
     if ["get_manifest_summary", "get_manifest_components"].contains(&name) {
         if let Some(fields) = args["fields"].as_str() {
-            let allowed = [
-                "record_type",
-                "component_type",
-                "name",
-                "target",
-                "exported",
-                "exported_state",
-                "enabled",
-                "launcher",
-                "permission",
-                "read_permission",
-                "write_permission",
-                "aliases",
-                "details",
-                "intent_filters",
-                "matching_filter_indexes",
-                "declaration",
-                "attributes",
-                "resource_resolution",
-                "authorities",
-            ];
-            ensure!(
-                fields
-                    .split(',')
-                    .all(|field| allowed.contains(&field.trim())),
-                "Unknown manifest record field"
-            );
+            let allowed = crate::manifest_summary::RECORD_FIELDS;
+            let invalid: Vec<_> = fields
+                .split(',')
+                .map(str::trim)
+                .filter(|field| !allowed.contains(field))
+                .collect();
+            if !invalid.is_empty() {
+                return Err(ArgumentError {
+                    message: format!("Unknown manifest record field(s): {}; allowed fields: {}", invalid.join(", "), allowed.join(", ")),
+                    details: json!({"tool":name,"parameter":"fields","invalid_fields":invalid,"allowed_fields":allowed}),
+                }.into());
+            }
         }
         if name == "get_manifest_summary" {
             ensure!(
@@ -2938,6 +2956,7 @@ mod tests {
         let project = Arc::new(engine.open(&path).unwrap());
         let analysis_snapshot = Arc::new(engine.clone());
         let loaded = Arc::new(LoadedProject {
+            exports: exports::Controller::default(),
             engine: Mutex::new(engine),
             analysis_snapshot: analysis_snapshot.clone(),
             project: project.clone(),

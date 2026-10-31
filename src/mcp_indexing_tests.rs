@@ -456,7 +456,14 @@ fn headless_open_request_deduplicates_mode_and_path_and_releases_registration() 
         &json!({"apk_path":path,"offset":1}),
     )
     .unwrap();
-    assert!(later["selection"]["selected"].is_null());
+    // Selection uses the fully checked registration batch, independently of
+    // the requested result slice.
+    assert_eq!(later["items"], json!([]));
+    assert_eq!(
+        later["selection"]["selected"],
+        selected["selection"]["selected"]
+    );
+    assert_eq!(later["selection"]["exact_match_unique"], true);
     let record = server.registration.clone();
     drop(opened);
     assert!(!record.exists());

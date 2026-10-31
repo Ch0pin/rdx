@@ -1,4 +1,5 @@
 mod call_graph_window;
+mod cli_export;
 mod code_fonts;
 mod code_view;
 mod icons;
@@ -24,7 +25,7 @@ use rdx::engine::{DecompilerEngine, NativeEngine};
 use rdx::engines::ENGINES;
 use std::path::Path;
 
-fn main() -> Result<()> {
+fn main() -> Result<std::process::ExitCode> {
     rdx::mcp::capture_build_identity();
     let _search_cleanup = search_index::SessionCleanup::new();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -42,9 +43,15 @@ fn main() -> Result<()> {
         anyhow::ensure!(
             matches!(
                 args.first().map(String::as_str),
-                Some("--list" | "--decompile" | "--native-coverage" | "--native-cfg-audit")
+                Some(
+                    "--list"
+                        | "--decompile"
+                        | "--export-source"
+                        | "--native-coverage"
+                        | "--native-cfg-audit"
+                )
             ),
-            "Use --engine native with --list, --decompile, --native-coverage, or --native-cfg-audit; the GUI also uses native Rust"
+            "Use --engine native with --list, --decompile, --export-source, --native-coverage, or --native-cfg-audit; the GUI also uses native Rust"
         );
     }
     match args.first().map(String::as_str) {
@@ -75,6 +82,9 @@ fn main() -> Result<()> {
             engine.open(Path::new(&args[1]))?;
             println!("{}", engine.decompile(&args[2])?);
         }
+        Some("--export-source") => {
+            return cli_export::execute(&args[1..]).map(std::process::ExitCode::from);
+        }
         Some("--native-coverage") if (2..=3).contains(&args.len()) => {
             native_coverage::execute(Path::new(&args[1]), args.get(2).map(String::as_str))?;
         }
@@ -94,7 +104,7 @@ fn main() -> Result<()> {
             search_benchmark::execute(Path::new(&args[1]), &args[2], limit)?;
         }
         Some("--help") => println!(
-            "RDX\n  rdx mcp  (stdio MCP gateway)\n  rdx [FILE.apk|FILE.xapk|FILE.apks|FILE.dex]\n  rdx --engines\n  rdx [--engine native] --list FILE\n  rdx [--engine native] --decompile FILE CLASS\n  rdx [--engine native] --native-coverage FILE [CLASS_PREFIX]\n  rdx [--engine native] --native-cfg-audit FILE [CLASS_PREFIX]\n  rdx --benchmark-search FILE QUERY [CLASS_LIMIT]\n  rdx --benchmark-search-current FILE QUERY [CLASS_LIMIT]\n\nGUI and CLI use the native Rust engine for APK, XAPK, APKS, and DEX. Java reconstruction is alpha; unsupported methods are displayed as explicitly labeled DEX disassembly."
+            "RDX\n  rdx mcp  (stdio MCP gateway)\n  rdx [FILE.apk|FILE.xapk|FILE.apks|FILE.dex]\n  rdx --engines\n  rdx [--engine native] --list FILE\n  rdx [--engine native] --decompile FILE CLASS\n  rdx [--engine native] --export-source FILE OUTPUT_DIRECTORY [--package-prefix PREFIX] [--resume]\n  rdx [--engine native] --native-coverage FILE [CLASS_PREFIX]\n  rdx [--engine native] --native-cfg-audit FILE [CLASS_PREFIX]\n  rdx --benchmark-search FILE QUERY [CLASS_LIMIT]\n  rdx --benchmark-search-current FILE QUERY [CLASS_LIMIT]\n\nGUI and CLI use the native Rust engine for APK, XAPK, APKS, and DEX. Java reconstruction is alpha; unsupported methods are displayed as explicitly labeled DEX disassembly."
         ),
         _ if args.len() <= 1 && !args.first().is_some_and(|a| a.starts_with('-')) => {
             let initial = args.first().map(std::path::PathBuf::from);
@@ -115,5 +125,5 @@ fn main() -> Result<()> {
         }
         _ => anyhow::bail!("Invalid arguments. Use rdx --help"),
     }
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
 }

@@ -40,13 +40,41 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     assert_eq!(replies[0]["error"]["code"], -32600);
     assert_eq!(replies[1]["result"]["protocolVersion"], "2025-06-18");
     let tools = replies[2]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 45);
+    assert_eq!(tools.len(), 47);
     let schema = |name: &str| {
         &tools
             .iter()
             .find(|tool| tool["name"] == name)
             .unwrap_or_else(|| panic!("{name} must be advertised over stdio"))["inputSchema"]
     };
+    for name in ["get_export_status", "cancel_export"] {
+        assert!(
+            schema(name)["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("job_id"))
+        );
+    }
+    assert_eq!(
+        schema("export_package_source")["properties"]["background"]["default"],
+        true
+    );
+    assert_eq!(
+        schema("export_package_source")["properties"]["resume"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        schema("export_package_source")["properties"]["package_prefix"]["minLength"],
+        0
+    );
+    assert_eq!(
+        schema("get_manifest_components")["properties"]["exported_state"]["enum"],
+        json!(["true", "false", "unresolved"])
+    );
+    assert_eq!(
+        schema("get_manifest_components")["properties"]["max_bytes"]["default"],
+        32768
+    );
     let health = schema("get_health");
     let batch = schema("get_call_graph_batch");
     assert_eq!(batch["properties"]["method_ids"]["maxItems"], 16);
@@ -142,7 +170,7 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     }
     assert_eq!(
         method_source["anyOf"],
-        json!([{"required":["method_id"]},{"required":["class_name","method_name"]}])
+        json!([{"required":["method_id"]},{"required":["class_name","method_name"]},{"required":["method_signature"]},{"required":["signature"]}])
     );
     assert_eq!(
         schema("find_field_references")["anyOf"],
@@ -225,6 +253,21 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     }
     assert_eq!(manifest["additionalProperties"], false);
     let components = schema("get_manifest_components");
+    for field in [
+        "launchMode",
+        "taskAffinity",
+        "allowTaskReparenting",
+        "documentLaunchMode",
+        "excludeFromRecents",
+        "targetActivity",
+    ] {
+        assert!(
+            components["properties"]["fields"]["x-allowed-fields"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(field))
+        );
+    }
     assert_eq!(
         components["properties"]["match_mode"]["enum"],
         json!(["exact", "contains"])
@@ -311,6 +354,7 @@ fn invalid_limits_return_structured_bounds_and_gateway_stays_responsive() {
         )
         .unwrap();
     }
+    writeln!(input,"{}",json!({"jsonrpc":"2.0","id":98,"method":"tools/call","params":{"name":"get_manifest_components","arguments":{"instance_id":"unused","project_id":"unused","fields":"name,unknownLaunchField"}}})).unwrap();
     writeln!(
         input,
         "{}",
@@ -329,7 +373,7 @@ fn invalid_limits_return_structured_bounds_and_gateway_stays_responsive() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(replies.len(), 7);
+    assert_eq!(replies.len(), 8);
     for (i, received) in invalid.iter().enumerate() {
         let result = &replies[i + 1]["result"];
         assert_eq!(result["isError"], true);
@@ -344,6 +388,19 @@ fn invalid_limits_return_structured_bounds_and_gateway_stays_responsive() {
             *data
         );
     }
+    let field_error = &replies.iter().find(|reply| reply["id"] == 98).unwrap()["result"]["structuredContent"]
+        ["error"];
+    assert_eq!(field_error["code"], "INVALID_ARGUMENT");
+    assert_eq!(
+        field_error["details"]["invalid_fields"],
+        json!(["unknownLaunchField"])
+    );
+    assert!(
+        field_error["details"]["allowed_fields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("launchMode"))
+    );
     assert_eq!(replies.last().unwrap()["id"], 99);
     assert_eq!(replies.last().unwrap()["result"], json!({}));
 }

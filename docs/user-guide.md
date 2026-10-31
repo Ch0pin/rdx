@@ -32,6 +32,53 @@ cargo run --release -- --engine native --decompile tests/fixtures/hello.dex samp
 cargo run --release -- --native-coverage tests/fixtures/hello.apk
 ```
 
+## Export source to files
+
+Export an entire APK (or another supported input format) and exit, without a GUI
+or MCP connection:
+
+```sh
+rdx --export-source /absolute/path/app.apk /absolute/path/new-output-directory
+```
+
+The output parent must exist. The final directory must be new so existing files
+are preserved. Relative input and output paths are also accepted. Optional
+`--package-prefix com.example` limits exported classes to that package boundary;
+the default includes all classes, including obfuscated top-level packages.
+`--engine native` can precede the command.
+
+Progress and errors go to stderr. The final stdout line is a JSON summary with
+status, counts, paths and APK SHA-256, suitable for scripts. Files contain Java
+where reconstruction succeeds and explicitly labeled DEX where it falls back.
+`manifest.jsonl` maps collision-safe numeric class filenames to exact class IDs
+and includes each file's SHA-256 and reconstruction coverage.
+
+Exit status `0` means every selected class was written; it does not mean every
+method reconstructed as Java. Status `1` means argument/setup/loading failure.
+Status `2` means an export started but is incomplete (including integrity or
+write errors). Inspect `export-status.json`, `completion.json` and manifest error
+records for details. Interruptions such as Ctrl+C retain checkpoints; operating
+system signal exit codes apply.
+
+Resume interrupted work with the same APK, executable, directory and package
+prefix:
+
+```sh
+rdx --export-source /absolute/path/app.apk /absolute/path/new-output-directory --resume
+```
+
+Resume verifies committed files before continuing and preserves existing source
+files. A changed APK, renderer or class selection is rejected. Previously
+recorded per-class failures remain listed; continuation does not automatically
+retry them. Use a new directory for a fresh run. For all options:
+
+```sh
+rdx --export-source --help
+```
+
+The existing `rdx --decompile INPUT CLASS` command still prints one class to
+stdout.
+
 ## Package formats
 
 Open APK, XAPK, APKS, or DEX files through the GUI, drag and drop, or the CLI. AAB files are not supported. Java is not required. For XAPK and APKS, RDX keeps the base APK and split files under separate paths in the project tree. It requires one base APK and matching package/version identities across selected splits.

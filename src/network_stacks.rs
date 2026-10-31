@@ -12,6 +12,9 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+#[path = "network_usage.rs"]
+mod usage;
+
 const STRING: &str = "Ljava/lang/String;";
 const STRINGS: &str = "[Ljava/lang/String;";
 const MAX_MODELS: usize = 512;
@@ -184,6 +187,82 @@ pub(crate) fn search(
     detect(&classes, args, cancel, MAX_WORK)
 }
 fn detect(
+    classes: &[&DexClass],
+    args: &Value,
+    cancel: &AtomicBool,
+    budget: usize,
+) -> Result<Value> {
+    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+    let limit = args["limit"].as_u64().unwrap_or(25) as usize;
+    ensure!((1..=100).contains(&limit), "limit must be 1..100");
+    let known = usage::scan(classes, args, cancel, budget)?;
+    let known_total = known["matching_candidates_so_far"].as_u64().unwrap() as usize;
+    let mut items = known["items"].as_array().unwrap().clone();
+    let mut structural_args = args.clone();
+    structural_args["offset"] = json!(offset.saturating_sub(known_total));
+    structural_args["limit"] = json!(limit.saturating_sub(items.len()).max(1));
+    let mut result = structural(classes, &structural_args, cancel, budget)?;
+    let structural_total = result["matching_candidates_so_far"].as_u64().unwrap() as usize;
+    if items.len() < limit && offset + items.len() >= known_total {
+        items.extend(result["items"].as_array().unwrap().iter().cloned());
+    }
+    let mut bytes = 0usize;
+    let mut keep = 0;
+    for item in &items {
+        let size = serde_json::to_vec(item)?.len();
+        if bytes.saturating_add(size) > 850_000 {
+            break;
+        }
+        bytes += size;
+        keep += 1;
+    }
+    items.truncate(keep);
+    let end = offset + items.len();
+    let total = known_total + structural_total;
+    let structural_coverage = result["coverage"].clone();
+    let complete = known["coverage"]["complete"] == true && structural_coverage["complete"] == true;
+    result["items"] = json!(items);
+    result["offset"] = json!(offset);
+    result["next_offset"] = json!((end < total).then_some(end));
+    result["total"] = if complete { json!(total) } else { Value::Null };
+    result["matching_candidates_so_far"] = json!(total);
+    result["coverage"]["complete"] = json!(complete);
+    result["coverage"]["scan_complete"] = json!(complete);
+    result["coverage"]["detector"] = json!("combined_network_inventory");
+    result["coverage"]["package_prefix"] = json!(
+        args["package_prefix"]
+            .as_str()
+            .unwrap_or("")
+            .trim_end_matches('.')
+    );
+    result["coverage"]["work_budget_exhausted"] = json!(
+        known["coverage"]["work_budget_exhausted"] == true
+            || structural_coverage["work_budget_exhausted"] == true
+    );
+    result["coverage"]["detector_coverage"] = json!([known["coverage"], structural_coverage]);
+    result["coverage"]["supported_families"] = json!([
+        "okhttp3-named-usage",
+        "retrofit2-named-usage",
+        "okhttp-compatible-structural"
+    ]);
+    result["coverage"]["scope"] = json!(
+        "Completion means the configured detector scans finished within their budgets; it does not establish absence of networking. Exact API usage and structural maps are separate evidence records, not unique runtime stacks."
+    );
+    result["empty_result_note"] = if total == 0 {
+        json!(
+            "No evidence matched the named-API and structural detectors in this scope. Unsupported/renamed libraries, reflection, unavailable hierarchy definitions or unmodeled layouts may still provide networking."
+        )
+    } else {
+        Value::Null
+    };
+    result["hook_map_kind"] = json!(
+        "Static member maps occur only on structural_stack records; api_usage records identify declarations or call sites. No runtime data is collected."
+    );
+    ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+    Ok(result)
+}
+
+fn structural(
     classes: &[&DexClass],
     args: &Value,
     cancel: &AtomicBool,
@@ -389,7 +468,7 @@ fn detect(
                     .iter()
                     .any(|g| entry_accessor(model.headers, g) == Some(1));
                 let names_proven = names.len() == 1 && values_proven;
-                let item = json!({"family":"okhttp-compatible","identification":"structural_candidate","version":Value::Null,
+                let item = json!({"kind":"structural_stack","detector":"okhttp_structural_roles","family":"okhttp-compatible","identification":"structural_candidate","version":Value::Null,
                     "standard_namespace":model.request.descriptor.starts_with("Lokhttp3/"),
                     "roles":{"request":type_name(&model.request.descriptor),"response":type_name(&model.response.descriptor),"url":type_name(&model.url.descriptor),"headers":type_name(&model.headers.descriptor),"chain":type_name(&chain.descriptor)},
                     "hook_map":{"interceptor_method_id":method_id(m),"interceptor_contract_method_id":method_id(contract),"chain_proceed_method_id":method_id(proceed),"chain_argument_index":0,
@@ -409,7 +488,7 @@ fn detect(
     }
     Ok(
         json!({"items":items,"total":if complete {Some(total)}else{None},"matching_candidates_so_far":total,"offset":offset,"next_offset":next,
-        "coverage":{"complete":complete,"profiled_classes":examined,"loaded_classes":classes.len(),"work_budget_exhausted":work.remaining==0,"candidate_graph_limit":MAX_MODELS,"supported_families":["okhttp-compatible"],"scope":"Loaded declared fields, method descriptors and direct interface contracts. Structural candidates require review; unsupported, inherited-only or aggressively optimized layouts can be missed. No exact library version or runtime activity is inferred."},
+        "coverage":{"detector":"okhttp_structural_roles","complete":complete,"profiled_classes":examined,"loaded_classes":classes.len(),"work_budget_exhausted":work.remaining==0,"candidate_graph_limit":MAX_MODELS,"supported_families":["okhttp-compatible"],"scope":"Loaded declared fields, method descriptors and direct interface contracts. Structural candidates require review; unsupported, inherited-only or aggressively optimized layouts can be missed. No exact library version or runtime activity is inferred."},
         "runtime_values_included":false,"observer_redaction_requirements":{"url":"Emit scheme, host and port only; omit userinfo, path, query and fragment","http_method":"Emit a validated HTTP method token only","headers":"Emit header names only; never values","credential_presence":"Boolean membership of lowercase header names: authorization, proxy-authorization, cookie, x-api-key","request_and_response_bodies":"Omit"},
         "hook_map_kind":"Static member selectors and observer policy; no hooks are installed or runtime data collected"}),
     )
@@ -628,5 +707,179 @@ mod tests {
         assert_eq!(partial["coverage"]["complete"], false);
         assert!(partial["total"].is_null());
         assert!(detect(&refs, &json!({"limit":101}), &false.into(), MAX_WORK).is_err());
+    }
+    fn named_factory(owner: &str, correct: bool) -> DexClass {
+        let builder = "Lokhttp3/OkHttpClient$Builder;";
+        let mut c = class(
+            owner,
+            &[],
+            vec![method(
+                owner,
+                "create",
+                &["Ljavax/net/ssl/HostnameVerifier;"],
+                "V",
+                Some(vec![
+                    0x0022, 0, 0x1070, 2, 0, 0x206e, 0, 0x0030, 0x106e, 1, 0, 0x000e,
+                ]),
+            )],
+            &[],
+        );
+        c.symbols = Arc::new(DexSymbols {
+            types: vec![builder.into()],
+            strings: vec![
+                if correct {
+                    "hostnameVerifier"
+                } else {
+                    "unrelated"
+                }
+                .into(),
+                "build".into(),
+                "<init>".into(),
+            ],
+            protos: vec![
+                (
+                    builder.into(),
+                    vec!["Ljavax/net/ssl/HostnameVerifier;".into()],
+                ),
+                ("Lokhttp3/OkHttpClient;".into(), vec![]),
+                ("V".into(), vec![]),
+            ],
+            methods: vec![(0, 0, 0), (0, 1, 1), (0, 2, 2)],
+            ..Default::default()
+        });
+        c
+    }
+    #[test]
+    fn named_usage_works_without_library_definitions_and_is_dex_local() {
+        let classes = vec![
+            named_factory("Lapp/Factory;", true),
+            named_factory("Lapp/OtherDex;", false),
+            class("Lapp/Base;", &[], vec![], &["Lokhttp3/Interceptor;"]),
+        ];
+        let result = run(&classes, json!({"package_prefix":"app"}));
+        let sites = result["items"].as_array().unwrap();
+        assert_eq!(
+            sites
+                .iter()
+                .filter(|s| s["role"] == "hostname_verifier_configuration")
+                .count(),
+            1
+        );
+        let site = sites
+            .iter()
+            .find(|s| s["role"] == "hostname_verifier_configuration")
+            .unwrap();
+        assert_eq!(site["class_id"], "app.Factory");
+        assert_eq!(site["code_unit_offset"], 5);
+        assert_eq!(site["effective_pinning"], "not_analyzed");
+        assert!(sites.iter().any(|s| s["contract"] == "okhttp3.Interceptor"));
+        assert_eq!(result["coverage"]["scan_complete"], true);
+        let empty = run(&classes, json!({"package_prefix":"absent"}));
+        assert_eq!(empty["total"], 0);
+        assert!(empty["empty_result_note"].is_string());
+        assert!(empty["coverage"]["detector_coverage"][0]["detectors_run"].is_array());
+    }
+    #[test]
+    fn retrofit_parameters_are_evidence_not_attacker_control() {
+        use crate::native_dex::{DexAnnotation, DexAnnotationDirectory};
+        let annotation = |index| {
+            Arc::from(vec![Arc::new(DexAnnotation {
+                visibility: 1,
+                type_idx: index,
+                elements: vec![],
+            })])
+        };
+        let mut c = class(
+            "Lapp/Api;",
+            &[],
+            vec![method(
+                "Lapp/Api;",
+                "call",
+                &[STRING, "Ljava/util/Map;"],
+                "Ljava/lang/Object;",
+                None,
+            )],
+            &[],
+        );
+        c.access_flags = 0x601;
+        c.annotations_offset = 1;
+        c.symbols = Arc::new(DexSymbols {
+            types: vec![
+                "Lretrofit2/http/GET;".into(),
+                "Lretrofit2/http/Url;".into(),
+                "Lretrofit2/http/HeaderMap;".into(),
+            ],
+            annotations: BTreeMap::from([(
+                1,
+                Arc::new(DexAnnotationDirectory {
+                    methods: vec![Some(annotation(0))],
+                    parameters: vec![vec![Some(annotation(1)), Some(annotation(2))]],
+                    ..Default::default()
+                }),
+            )]),
+            ..Default::default()
+        });
+        let result = run(&[c], json!({"package_prefix":"app"}));
+        assert_eq!(result["total"], 3);
+        assert_eq!(result["items"][1]["parameter_index"], 0);
+        assert_eq!(result["items"][1]["role"], "url_parameter");
+        assert_eq!(result["items"][2]["role"], "header_map_parameter");
+        assert_eq!(result["items"][2]["external_control"], "not_analyzed");
+    }
+    #[test]
+    fn merged_detector_paging_is_lossless_and_payloads_are_not_invokes() {
+        let mut classes = fixture();
+        classes.push(named_factory("Lapp/Factory;", true));
+        let full = run(&classes, json!({"package_prefix":"app"}));
+        let mut items = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = run(
+                &classes,
+                json!({"package_prefix":"app","offset":offset,"limit":1}),
+            );
+            assert_eq!(page["total"], full["total"]);
+            items.extend(page["items"].as_array().unwrap().iter().cloned());
+            let Some(next) = page["next_offset"].as_u64() else {
+                break;
+            };
+            offset = next;
+        }
+        assert_eq!(json!(items), full["items"]);
+        let mut payload = named_factory("Lapp/Payload;", true);
+        payload.methods[0].code.as_mut().unwrap().instructions =
+            vec![0x000e, 0, 0x0300, 2, 3, 0, 0x206e, 0, 0x0030];
+        assert_eq!(run(&[payload], json!({}))["total"], 0);
+    }
+    #[test]
+    fn inlined_builder_setters_are_field_write_evidence_with_exact_types() {
+        let mut factory = named_factory("Lapp/Factory;", true);
+        let symbols = Arc::get_mut(&mut factory.symbols).unwrap();
+        symbols.types.extend([
+            Arc::from("Ljavax/net/ssl/HostnameVerifier;"),
+            Arc::from(STRING),
+        ]);
+        symbols.strings.push("hostnameVerifier".into());
+        symbols.fields.push((0, 1, 3));
+        factory.methods[0].code.as_mut().unwrap().instructions =
+            vec![0x0022, 0, 0x1070, 2, 0, 0x035b, 0, 0x106e, 1, 0, 0x000e];
+        let result = run(std::slice::from_ref(&factory), json!({}));
+        let rows = result["items"].as_array().unwrap();
+        let writes: Vec<_> = rows
+            .iter()
+            .filter(|r| r["detector"] == "named_network_fields")
+            .collect();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0]["role"], "hostname_verifier_configuration");
+        assert_eq!(writes[0]["code_unit_offset"], 5);
+        assert_eq!(writes[0]["access"], "write");
+        Arc::get_mut(&mut factory.symbols).unwrap().fields[0].1 = 2;
+        assert!(
+            !run(&[factory], json!({}))["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["detector"] == "named_network_fields")
+        );
     }
 }

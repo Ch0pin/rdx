@@ -9,6 +9,38 @@ use std::{
     path::Path,
 };
 
+#[path = "manifest_launch.rs"]
+mod launch;
+
+/// Shared by projection validation and its machine-readable error details.
+pub(crate) const RECORD_FIELDS: &[&str] = &[
+    "record_type",
+    "component_type",
+    "name",
+    "target",
+    "exported",
+    "exported_state",
+    "enabled",
+    "launcher",
+    "permission",
+    "read_permission",
+    "write_permission",
+    "aliases",
+    "details",
+    "intent_filters",
+    "matching_filter_indexes",
+    "declaration",
+    "attributes",
+    "resource_resolution",
+    "authorities",
+    "launchMode",
+    "taskAffinity",
+    "allowTaskReparenting",
+    "documentLaunchMode",
+    "excludeFromRecents",
+    "targetActivity",
+];
+
 const ANDROID: &str = "http://schemas.android.com/apk/res/android";
 
 #[derive(Default)]
@@ -794,13 +826,20 @@ pub fn query_components(
             None if component.kind == "provider" => "target_sdk_default",
             None => "intent_filter_default",
         };
-        let record = json!({"record_type":"component","component_type":component.kind,"name":component.name,
+        let mut record = json!({"record_type":"component","component_type":component.kind,"name":component.name,
             "target":component.target,"exported":component.exported,
             "exported_state":{"declared":node.get("exported"),"effective":effective_exported,"reason":reason},
             "enabled":component.enabled,"launcher":component.launcher,"permission":permission,
             "read_permission":read_permission,"write_permission":write_permission,
             "aliases":aliases.get(component.name.as_str()).filter(|_| component.kind == "activity").cloned().unwrap_or_default(),
             "details":component.details,"intent_filters":filters,"matching_filter_indexes":matching_filter_indexes});
+        let launch_target = activities
+            .get(component.target.as_str())
+            .filter(|targets| targets.len() == 1)
+            .map(|targets| component_indexes[targets[0]])
+            .filter(|target| *target < index);
+        launch::attach(&mut record, &nodes, index, app_index, launch_target);
+
         if query_lower
             .as_ref()
             .is_none_or(|query| record.to_string().to_lowercase().contains(query))
@@ -1084,6 +1123,12 @@ pub fn query_resolved(
                 })
             {
                 for field in [
+                    "launchMode",
+                    "taskAffinity",
+                    "allowTaskReparenting",
+                    "documentLaunchMode",
+                    "excludeFromRecents",
+                    "targetActivity",
                     "permission",
                     "read_permission",
                     "write_permission",
@@ -1133,6 +1178,11 @@ pub fn query_resolved(
                 // Shared configuration contributes only attributes actually inherited by
                 // component reachability/permission state. Sibling metadata is unrelated.
                 if component.is_some() {
+                    if launch::FIELDS.contains(&attribute)
+                        && record[attribute]["source_node_index"].as_u64() == Some(original as u64)
+                    {
+                        return true;
+                    }
                     if source.tag == "application" {
                         return matches!(
                             attribute,
@@ -1169,34 +1219,50 @@ pub fn query_resolved(
             })
             .cloned()
             .collect();
+        for field in launch::FIELDS {
+            if let Some(resolution) = selected.iter().find(|r| {
+                r["attribute"] == *field
+                    && r["node_index"] == record[*field]["source_node_index"]
+                    && !record[*field]["source_node_index"].is_null()
+            }) {
+                record[*field]["raw"] = resolution["raw"].clone();
+                if record[*field]["source"] == "activity" {
+                    record[*field]["declared"] = resolution["raw"].clone();
+                }
+                record[*field]["resource_status"] = resolution["status"].clone();
+                record[*field]["configuration"] = serde_json::json!("default");
+            }
+        }
         record["resource_resolution"] = serde_json::json!({"selection":"default; per-configuration values retained; device configuration not selected","attributes":selected});
     }
     Ok(records)
 }
 
 fn exposure_attribute(attribute: &str) -> bool {
-    matches!(
-        attribute,
-        "scheme"
-            | "host"
-            | "port"
-            | "name"
-            | "authorities"
-            | "enabled"
-            | "exported"
-            | "permission"
-            | "readPermission"
-            | "writePermission"
-            | "targetActivity"
-            | "targetSdkVersion"
-            | "minSdkVersion"
-            | "maxSdkVersion"
-            | "sharedUserId"
-            | "directBootAware"
-            | "protectionLevel"
-            | "autoVerify"
-            | "allow"
-    ) || attribute.starts_with("path")
+    launch::FIELDS.contains(&attribute)
+        || matches!(
+            attribute,
+            "scheme"
+                | "host"
+                | "port"
+                | "name"
+                | "authorities"
+                | "enabled"
+                | "exported"
+                | "permission"
+                | "readPermission"
+                | "writePermission"
+                | "targetActivity"
+                | "targetSdkVersion"
+                | "minSdkVersion"
+                | "maxSdkVersion"
+                | "sharedUserId"
+                | "directBootAware"
+                | "protectionLevel"
+                | "autoVerify"
+                | "allow"
+        )
+        || attribute.starts_with("path")
         || attribute.starts_with("ssp")
 }
 
@@ -1206,6 +1272,12 @@ pub fn project_records(records: &mut [serde_json::Value], args: &serde_json::Val
         .as_str()
         .map(|v| v.split(',').map(str::trim).collect::<Vec<_>>());
     let compact = [
+        "launchMode",
+        "taskAffinity",
+        "allowTaskReparenting",
+        "documentLaunchMode",
+        "excludeFromRecents",
+        "targetActivity",
         "record_type",
         "component_type",
         "name",

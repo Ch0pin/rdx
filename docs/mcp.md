@@ -51,14 +51,14 @@ For example, `com.baogong.app_login.activity.LoginActivity` can suggest
 `com.baogong.app_login.LoginActivity`. Retry explicitly with the intended ID;
 suggestions preserve exact FQCN and unique short-name selection rules.
 
-## Currently available (45 tools)
+## Currently available (47 tools)
 
 | Area | Tools |
 | --- | --- |
 | Instances | `list_instances`, `get_health`, `get_instance_info`, `open_apk`, `forget_instance` |
 | Classes | `get_all_classes`, `search_classes_by_keyword`, `find_direct_subclasses`, `find_implementations`, `get_class_hierarchy` |
 | Code search | `search_code` (source text or indexed identifiers) |
-| Source and metadata | `get_class_source`, `get_method_source`, `get_class_disassembly`, `get_methods_of_class`, `get_fields_of_class`, `export_source`, `export_package_source`, `resolve_reference`, `search_kotlin_metadata` |
+| Source and metadata | `get_class_source`, `get_method_source`, `get_class_disassembly`, `get_methods_of_class`, `get_fields_of_class`, `export_source`, `export_package_source`, `get_export_status`, `cancel_export`, `resolve_reference`, `search_kotlin_metadata` |
 | Resources | `get_all_resource_file_names`, `get_android_manifest`, `get_manifest_summary`, `get_manifest_components`, `get_resource_file`, `get_strings`, `get_resource_value`, `search_resources`, `search_resource_xml`, `list_nav_deeplinks`, `find_layout_references` |
 | Call graphs | `get_call_graph_batch`, `get_call_graph` (exact `method_id`, `direction`: `callers` / `callees` / `both`, `depth`: 1–100, default 20 for graph / 1 for call sites) |
 | DEX analysis | `find_field_references`, `get_lambda_branch`, `resolve_switch_case_callers`, `find_network_stacks`, `find_config_key_consumers`, `find_instantiations`, `find_integer_references`, `find_annotation_usages`, `find_type_references`, `find_webview_chooser_flows` |
@@ -474,6 +474,36 @@ inheritance follows its target activity. An explicit empty permission clears
 inheritance. `effective: null` with `resolved: true` means no permission is
 required by that declaration; `resolved: false` means the value or target could
 not be resolved. These fields describe manifest configuration.
+
+### Activity launch fields
+
+Component records expose `launchMode`, `taskAffinity`, `allowTaskReparenting`,
+`documentLaunchMode`, and `excludeFromRecents` as projectable state objects.
+Each contains `declared`, `raw`, `value`, `source`, and `resolved`. Sources
+identify an activity declaration, application inheritance, a default, or a
+unique preceding alias target. Missing/ambiguous alias targets and unresolved
+resource references retain unknown values. Explicit empty task affinity stays
+empty. `targetActivity` mirrors the alias target name or unresolved reference
+(null for activities); the existing `target` and `permission` fields remain available.
+
+```json
+{"instance_id":"INSTANCE","project_id":"PROJECT","component_type":"activity","class_name":"com.example.MainActivity","match_mode":"exact","fields":"name,launchMode,exported,taskAffinity"}
+```
+
+`value` describes manifest configuration with defaults, not observed runtime
+launch behavior. Intent flags, document-launch interactions, existing task state,
+API level and runtime control flow still matter. Resource-backed states preserve
+the raw reference and indicate default-configuration resolution; request
+`resource_resolution` for the existing configuration inventory.
+
+Unknown projection fields return `invalid_fields` and `allowed_fields` in error
+details. The input schema also lists `x-allowed-fields` for `fields`.
+
+The declaration rules follow Android's [activity](https://developer.android.com/guide/topics/manifest/activity-element),
+[application](https://developer.android.com/guide/topics/manifest/application-element),
+and [activity-alias](https://developer.android.com/guide/topics/manifest/activity-alias-element)
+documentation. These records do not establish `onNewIntent` delivery or a task
+hijacking vulnerability.
 
 ### Permission protection levels and component coverage
 
@@ -986,7 +1016,46 @@ All queries below require `instance_id` and `project_id`. New scans support canc
 - `find_type_references(class_name, package_prefix?)` wraps the native identifier scanner with exact type-reference matching. Use FQCN or a DEX descriptor. Array component matches preserve the actual array operand in results. Includes class literals, casts, type checks, allocations, inheritance and field/parameter/return declaration types. Scope exclusions from the identifier scanner remain explicit.
 - `search_kotlin_metadata(query, case_sensitive?, package_prefix?)` searches `kotlin.Metadata.d2`, returning owning DEX class, table index and matched string. These are discovery evidence, **not verified original-name aliases**: a d2 entry may describe a referenced type or member. Canonical lookup continues to use DEX identities.
 
-`export_source` now reports the full missing parent path before rendering. Create the parent explicitly; the final export directory must be new. `export_package_source(out_path, package_prefix)` writes complete class documents to numeric filenames (`class-00000000.txt`, etc.), plus `manifest.jsonl` mapping each exact descriptor to its actual absolute output path, source hash and reconstruction coverage. This remains unambiguous on case-insensitive filesystems. `completion.json` is written after scanning finishes and reports class failures. Cancellation retains partial files and the manifest; absence of completion.json identifies an unfinished export. Existing paths are never overwritten. This manifest describes RDX exports, not apktool's filesystem renaming rules.
+`export_source` reports the full missing parent path before rendering. Create the
+parent explicitly; a new export directory must not already exist.
+
+`export_package_source(out_path, package_prefix)` starts a background job by
+default and returns `job_id` immediately. Poll `get_export_status(job_id)` and
+use `cancel_export(job_id)` for cooperative cancellation. Both tools require the
+same instance/project IDs. One export runs per project; at most eight recent job
+statuses are retained. Source rendering shares the parsed project and runs off
+the interactive engine mutex. Closing the hosting GUI/headless service cancels
+its jobs. A one-shot headless connector must stay alive for the export.
+
+An empty `package_prefix` exports every loaded class, including top-level
+obfuscated packages. Files retain collision-safe numeric names
+(`class-00000000.txt`, etc.); `manifest.jsonl` maps exact descriptors to absolute
+paths, source hashes and reconstruction coverage. This manifest describes RDX
+exports, not apktool's filesystem renaming rules.
+
+`export-status.json` is an atomically replaced checkpoint with job identity,
+`status`, `next_class`, `exported`, `failed`, `total`, and any terminal error.
+`completion.json` records termination, including cancellation or incomplete
+output: check `status` and `complete`, not just file existence. After a crash,
+a persisted `running` state without a live job denotes interrupted work.
+
+Continue with the same `out_path` and `package_prefix`, setting `resume:true`.
+Resume requires the exact APK hash, renderer executable hash and class selection;
+it verifies committed source hashes before continuing. File locking excludes
+concurrent writers. An uncommitted manifest tail is discarded; a source file
+published just before interruption is reused only if re-rendering matches its
+hash. Existing source files are never overwritten. Previously recorded class
+failures remain explicit and are not automatically retried. Completed exports
+reject resume. Job IDs belong to a project session; after reopening, resume by
+path to obtain a new job ID. Pre-checkpoint exports from older versions cannot
+be resumed by this mechanism.
+
+`background:false` retains synchronous export for small workloads and remains
+subject to request timeouts. Use the default background mode for large packages.
+
+For standalone use, `rdx --export-source INPUT OUTPUT_DIRECTORY` uses the same
+exporter without a GUI or MCP connection. It prints progress/errors to stderr,
+returns terminal JSON on stdout, and supports `--package-prefix` and `--resume`.
 
 `search_resource_xml(query, resource_prefix?, case_sensitive?)` searches decoded XML lines, including binary XML and resource files whose archive names were obfuscated. Stripped application attribute names are recovered by exact resource-map IDs against ARSC; names removed from the table retain explicit resource-ID identities. A request-local ZIP reader reuses the central directory without caching decompressed documents. Results carry archive path, decoded line number, source hash and stored configurations. Each line is one occurrence; previews longer than 4096 characters are explicitly truncated. Fetch the resource for full text. Failed XML files are counted and listed separately (first 50 diagnostics).
 
@@ -1030,41 +1099,60 @@ is unchanged and assets have no ARSC configuration selector.
 
 The rule emits candidates and unresolved flows, never a vulnerability verdict. Field aliasing/object identity, helper-method transfer, heap containers, exceptional paths, path feasibility, and validation dominance/adequacy remain explicit analysis boundaries. External results can refer to private `file://` paths or target-owned content authorities even without a FileProvider producer call. Runtime proof must establish accepted URI, actual read and delivery to the web origin. A reported validation call alone does not establish that a candidate is safe.
 
-## Relocated networking member maps
+## Networking usage and relocated member maps
 
-`find_network_stacks` detects **OkHttp-compatible structural candidates** using
-linked declarations, independently of package and member names. The supported
-shape connects request, response, URL, headers, chain and interceptor types.
-It requires a concrete interceptor matching a direct interface contract, a
-chain that consumes the request and returns the response, and compatible
-request/response fields. It does not identify an exact library version.
+`find_network_stacks` returns two distinct kinds of static evidence:
+
+- `kind:"api_usage"`: exact named OkHttp/Retrofit declarations and invoke sites.
+  Detectors cover loaded hierarchy paths to `okhttp3.Interceptor` or
+  `okhttp3.Authenticator`, selected builder/configuration signatures, exact typed
+  builder-field writes (including optimized setters), and known
+  Retrofit method/parameter annotation descriptors. Definitions of external
+  library classes are not required for an exact referenced descriptor to match.
+- `kind:"structural_stack"`: the existing OkHttp-compatible request/response/URL/
+  headers/chain/interceptor profile, independent of package/member renaming.
+  These records carry `hook_map` and unresolved-role information.
 
 ```json
-{"instance_id":"INSTANCE","project_id":"PROJECT","package_prefix":"hu","limit":25}
+{"instance_id":"INSTANCE","project_id":"PROJECT","package_prefix":"com.example","limit":25}
 ```
 
-`package_prefix` filters interceptor owners at package boundaries while retaining
-cross-package dependencies. Omit it for an app-wide scan. Results provide exact
-method and field IDs under `hook_map`, role descriptors, matching evidence and
-`unresolved_roles`. `offset` / `next_offset` page candidate maps, with `limit`
-default 25 and maximum 100. Ordering is stable for an unchanged project and query.
+The package prefix selects evidence owners at package boundaries; dependencies
+may be anywhere in the loaded DEX set. Named API evidence is ordered before
+structural maps. `offset`/`next_offset` page the combined evidence list (default
+25, maximum 100). Counts represent evidence records, not unique runtime clients
+or stacks. The same class may have multiple distinct records.
 
-The header array field is included when the structural profile matches. Header
-name/value slot ordering is an **inference** from that profile. Simple accessors
-that return array entries at `2 * index` and `2 * index + 1` additionally get a
-DEX indexing proof; delegated or unsupported accessors remain unresolved. The
-static map requires runtime validation before use as an observer configuration.
-It installs no hooks and returns no observed URLs, headers, bodies or credentials.
-The included observer policy permits redacted URL origins, validated HTTP method
-tokens, header names and credential-header presence booleans; it excludes header
-values, URL userinfo/path/query/fragment and request/response bodies.
+Invoke records include the exact caller/callee IDs, DEX entry, DEX-local method
+index, code-unit offset and a configuration role. Supported roles include client
+construction, application/network interceptor registration, authenticators,
+certificate-pinner configuration, hostname verifiers, TLS socket factories and
+Retrofit client construction. Instruction payload data is excluded. These are
+configuration observations; `client_identity`, `execution_order` and
+`effective_pinning` remain `not_analyzed`. Field-write evidence carries the exact
+field ID, DEX-local field index, opcode and code-unit offset. Field reads alone
+are not treated as configuration writes.
 
-`coverage.complete` describes the bounded scan of supported declaration shapes,
-not exhaustive networking-library identification. Work and candidate-graph limits
-are explicit; `total` is null when scanning is incomplete. Paging retrieves only
-the candidates found within that scan budget. Inherited-only contracts, removed
-members, unsupported library families and runtime-loaded classes can be missed.
-`runtime_verified` always remains false for this static query.
+Retrofit evidence includes the annotated method and, where applicable, the
+zero-based parameter index excluding the receiver. `@Url` and `@HeaderMap`
+identify argument-supplied URL/header-map values. `external_control` remains
+`not_analyzed`: the argument may be constant, validated or externally influenced.
+Annotation literal values and runtime credentials are not returned.
+
+`coverage.scan_complete`/`complete` describe whether the configured detector
+scans finished within their budgets. `detector_coverage` describes the known-API
+and structural passes, including detectors run, selected/visited classes,
+errors and work limits. `total` is null if either pass is incomplete. Pagination
+retrieves observed evidence; it does not resume an unfinished detector pass. An empty
+result explicitly states that unsupported/renamed libraries, reflection,
+unavailable hierarchy definitions and unmodeled layouts may still provide
+networking. Scan completion is not exhaustive networking-library identification.
+
+Structural maps retain their original evidence requirements and redaction
+policy. Header name/value ordering is inferred from the structural profile;
+recognized accessor bytecode additionally provides an indexing proof. Static
+maps require runtime validation before instrumentation. No hooks are installed
+and no runtime values are collected; `runtime_verified` remains false.
 
 ### Recovery and reviewer query diagnostics
 
@@ -1133,3 +1221,32 @@ caller chain inspectable while keeping value provenance separate from call
 reachability. Follow its `next_offset` with `get_call_graph` using the same root,
 `direction: "callers"`, `projection: "call_sites"`, and `depth: 2`. The query runs
 as a cancellable background MCP request; health checks remain available.
+
+### Reviewer query reliability
+
+Method-addressed tools with a singular `method_id` also accept
+`method_signature` or `signature`. Matching selector values are accepted;
+conflicting selectors fail explicitly. Batch `method_ids` and constructor
+`caller_method_id` remain distinct selectors.
+
+Instance selection lists reachable running `candidates` independently of result
+pagination. `matching_candidate_discovery_incomplete` means a matching pair can
+be explicitly pinned, while global uniqueness is not yet established.
+`exact_match_unique` is null until uniqueness is known, false for multiple
+candidates, and true only after all registrations were checked from offset zero.
+Multiple instances may open the same APK path/hash. Registration continuation
+pages are not accumulated into an implicit selection.
+
+`get_manifest_components` accepts `exported_state:"true"|"false"|"unresolved"`,
+filtering effective exported state before projection and pagination. Existing
+class/type/route filters compose with it. `max_bytes` bounds the serialized
+items array (default 32768, maximum 1048576; response metadata is additional).
+Follow `next_offset` even when fewer than `limit` records are returned. A single
+oversized record gives `MANIFEST_RECORD_TOO_LARGE` with advice to use compact
+projection, field selection or a larger budget. Records are never silently cut.
+
+Call-site projections always include `caller_reconstruction` and a reminder that
+an invoke does not establish absence of caller guards. Without source enrichment,
+the status is `not_attempted`. `include_source_locations:true` supplies bounded
+reconstruction status, reasons and source/DEX locations as already documented.
+This feedback adds no source rendering to default call-graph queries.

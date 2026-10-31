@@ -149,57 +149,5 @@ pub(super) fn export_package(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
-    let out = Path::new(required(args, "out_path")?);
-    ensure!(out.is_absolute(), "out_path must be absolute");
-    check_export_parent(out)?;
-    let names: Vec<_> = project
-        .classes
-        .iter()
-        .filter(|n| scan::package_matches(n, args))
-        .collect();
-    ensure!(!names.is_empty(), "No classes match package_prefix");
-    fs::create_dir(out)?;
-    let manifest_path = out.join("manifest.jsonl");
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut manifest = options.open(&manifest_path)?;
-    let mut errors = 0;
-    let mut exported = 0;
-    let result = (|| -> Result<()> {
-        for (index, name) in names.iter().enumerate() {
-            ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-            let path = out.join(format!("class-{index:08}.txt"));
-            let record = match engine.decompile_class_source_report(name, cancel) {
-                Ok((code, coverage)) => {
-                    let mut file = options.open(&path)?;
-                    file.write_all(code.source.as_bytes())?;
-                    file.sync_all()?;
-                    exported += 1;
-                    json!({"class_id":name,"descriptor":format!("L{};",name.replace('.',"/")),"source_path":path,"sha256":format!("{:x}",Sha256::digest(code.source.as_bytes())),"size_bytes":code.source.len(),"coverage":coverage})
-                }
-                Err(e) => {
-                    ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-                    errors += 1;
-                    json!({"class_id":name,"error":format!("{e:#}")})
-                }
-            };
-            serde_json::to_writer(&mut manifest, &record)?;
-            manifest.write_all(b"\n")?;
-        }
-        manifest.sync_all()?;
-        private_write(
-            &out.join("completion.json"),
-            &json!({"complete":errors==0,"exported":exported,"failed":errors,"selected":names.len(),"instance_id":args["instance_id"],"project_id":args["project_id"],"manifest_sha256":digest(&manifest_path)?}),
-        )?;
-        Ok(())
-    })();
-    result.with_context(||format!("Export incomplete; retained files and manifest at {}. completion.json is written only after the scan finishes",out.display()))?;
-    Ok(
-        json!({"manifest_path":manifest_path,"completion_path":out.join("completion.json"),"exported":exported,"failed":errors,"complete":errors==0,"manifest_sha256":digest(&manifest_path)?,"path_semantics":"Numeric filenames preserve distinct DEX identities on case-insensitive filesystems; manifest maps descriptors to actual RDX files"}),
-    )
+    exports::synchronous(engine, project, args, cancel)
 }

@@ -84,16 +84,66 @@ pub fn selection(anchor: Pos2, current: Pos2, bounds: Rect) -> Option<Rect> {
         .then_some(rect)
 }
 
-/// Derives a filesystem-safe file stem from a tab name such as
-/// `com.example.LoginActivity`, `dex://com.example.Foo` or `res/layout/main.xml`.
-pub fn file_stem(tab_name: &str) -> String {
+/// Height of the caption bar appended to every capture, in UI points.
+pub const CAPTION_HEIGHT: f32 = 22.0;
+/// Horizontal padding of the caption text inside the bar.
+pub const CAPTION_PADDING: f32 = 6.0;
+
+/// The class or file name shown in the caption: the tab name without the
+/// `dex://` / resource scheme and without any ` | ` suffix.
+pub fn display_name(tab_name: &str) -> String {
     let name = tab_name
         .strip_prefix("dex://")
         .or_else(|| tab_name.strip_prefix(rdx::resource_table::PREFIX))
         .unwrap_or(tab_name);
-    let name = name.split(" | ").next().unwrap_or(name);
-    let mut stem: String = name
-        .trim()
+    name.split(" | ").next().unwrap_or(name).trim().to_owned()
+}
+
+/// Places the caption bar next to `selection`: below it when there is room,
+/// otherwise above, otherwise over its bottom edge. Returns
+/// `(capture_rect, caption_rect)`, where `capture_rect` covers both.
+pub fn caption_layout(selection: Rect, screen: Rect) -> (Rect, Rect) {
+    let below = Rect::from_min_size(
+        selection.left_bottom(),
+        egui::vec2(selection.width(), CAPTION_HEIGHT),
+    );
+    if below.max.y <= screen.max.y {
+        return (selection.union(below), below);
+    }
+    let above = Rect::from_min_size(
+        selection.left_top() - egui::vec2(0.0, CAPTION_HEIGHT),
+        egui::vec2(selection.width(), CAPTION_HEIGHT),
+    );
+    if above.min.y >= screen.min.y {
+        return (selection.union(above), above);
+    }
+    let height = CAPTION_HEIGHT.min(selection.height());
+    let inside = Rect::from_min_size(
+        egui::pos2(selection.min.x, selection.max.y - height),
+        egui::vec2(selection.width(), height),
+    );
+    (selection, inside)
+}
+
+/// Caption bar colours as `(background, text)`.
+pub fn caption_colors(dark_mode: bool) -> (Color32, Color32) {
+    if dark_mode {
+        (
+            Color32::from_rgb(30, 30, 30),
+            Color32::from_rgb(230, 230, 230),
+        )
+    } else {
+        (
+            Color32::from_rgb(235, 235, 235),
+            Color32::from_rgb(25, 25, 25),
+        )
+    }
+}
+
+/// Derives a filesystem-safe file stem from a tab name such as
+/// `com.example.LoginActivity`, `dex://com.example.Foo` or `res/layout/main.xml`.
+pub fn file_stem(tab_name: &str) -> String {
+    let mut stem: String = display_name(tab_name)
         .trim_matches(|c| c == '/' || c == '\\')
         .chars()
         .map(|c| match c {
@@ -244,6 +294,67 @@ mod tests {
         let mut events = vec![click(PointerButton::Primary, true, Modifiers::MAC_CMD)];
         remap_modifier_primary(&mut events, &mut remapped);
         assert_eq!(button_of(&events[0]), PointerButton::Secondary);
+    }
+
+    #[test]
+    fn display_name_strips_schemes_and_suffixes() {
+        assert_eq!(
+            display_name("dex://com.example.Foo$Bar"),
+            "com.example.Foo$Bar"
+        );
+        assert_eq!(
+            display_name(&format!(
+                "{}res/layout/main.xml",
+                rdx::resource_table::PREFIX
+            )),
+            "res/layout/main.xml"
+        );
+        assert_eq!(display_name("a.b.C | smali"), "a.b.C");
+        assert_eq!(
+            display_name("  AndroidManifest.xml "),
+            "AndroidManifest.xml"
+        );
+    }
+
+    #[test]
+    fn caption_goes_below_then_above_then_inside() {
+        let screen = Rect::from_min_max(pos2(0.0, 0.0), pos2(800.0, 600.0));
+        let selection = Rect::from_min_max(pos2(100.0, 100.0), pos2(300.0, 250.0));
+        let (capture, bar) = caption_layout(selection, screen);
+        assert_eq!(
+            bar,
+            Rect::from_min_max(pos2(100.0, 250.0), pos2(300.0, 272.0))
+        );
+        assert_eq!(
+            capture,
+            Rect::from_min_max(pos2(100.0, 100.0), pos2(300.0, 272.0))
+        );
+        // No room below: the bar goes above.
+        let low = Rect::from_min_max(pos2(100.0, 400.0), pos2(300.0, 590.0));
+        let (capture, bar) = caption_layout(low, screen);
+        assert_eq!(
+            bar,
+            Rect::from_min_max(pos2(100.0, 378.0), pos2(300.0, 400.0))
+        );
+        assert_eq!(
+            capture,
+            Rect::from_min_max(pos2(100.0, 378.0), pos2(300.0, 590.0))
+        );
+        // Full-height selection: the bar overlays the bottom edge.
+        let tall = Rect::from_min_max(pos2(100.0, 10.0), pos2(300.0, 590.0));
+        let (capture, bar) = caption_layout(tall, screen);
+        assert_eq!(capture, tall);
+        assert_eq!(
+            bar,
+            Rect::from_min_max(pos2(100.0, 568.0), pos2(300.0, 590.0))
+        );
+        // A selection shorter than the bar never produces a bar taller than itself.
+        let short = Rect::from_min_max(pos2(100.0, 0.0), pos2(300.0, 600.0));
+        let (_, bar) = caption_layout(
+            short,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(800.0, 600.0)),
+        );
+        assert!(bar.height() <= CAPTION_HEIGHT);
     }
 
     #[test]

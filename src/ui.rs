@@ -1315,9 +1315,33 @@ impl App {
                 }
                 // Released (or the button state was lost): capture if the drag was deliberate.
                 self.screenshot = RegionCapture::Idle;
-                let rect = screenshot::selection(anchor, current, screen)?;
+                let selected = screenshot::selection(anchor, current, screen)?;
                 let tab = self.tabs.get(self.selected)?;
                 let stem = screenshot::file_stem(&tab.name);
+                // Paint the caption into this frame: eframe captures the screen
+                // after it is drawn, so the bar ends up in the image.
+                let (rect, bar) = screenshot::caption_layout(selected, screen);
+                let (background, text) = screenshot::caption_colors(ctx.style().visuals.dark_mode);
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("region_screenshot_caption"),
+                ));
+                painter.rect_filled(bar, 0.0, background);
+                let mut job = egui::text::LayoutJob::simple_singleline(
+                    screenshot::display_name(&tab.name),
+                    egui::FontId::monospace(12.0),
+                    text,
+                );
+                job.wrap.max_width = (bar.width() - 2.0 * screenshot::CAPTION_PADDING).max(0.0);
+                job.wrap.max_rows = 1;
+                job.wrap.break_anywhere = true;
+                job.wrap.overflow_character = Some('…');
+                let galley = ctx.fonts(|fonts| fonts.layout_job(job));
+                let text_pos = egui::pos2(
+                    bar.min.x + screenshot::CAPTION_PADDING,
+                    bar.center().y - galley.size().y / 2.0,
+                );
+                painter.galley(text_pos, galley, text);
                 self.screenshot = RegionCapture::Pending;
                 self.status = "Capturing screenshot…".into();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
@@ -4141,6 +4165,19 @@ mod settings_tests {
         assert!(captured.is_none());
         assert_eq!(app.screenshot, RegionCapture::Pending);
         assert_eq!(app.status, "Capturing screenshot…");
+        // The captured frame carries a caption bar naming the class.
+        let captions: Vec<String> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            captions.iter().any(|c| c == "sample.Target"),
+            "{captions:?}"
+        );
         let request = output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
@@ -4155,9 +4192,10 @@ mod settings_tests {
                 _ => None,
             })
             .expect("screenshot command");
+        // Selection plus the 22 pt caption bar below it.
         assert_eq!(
             request.rect,
-            egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(300.0, 250.0))
+            egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(300.0, 272.0))
         );
         assert_eq!(request.stem, "sample.Target");
         // Unrelated screenshot replies are ignored; ours is cropped and handed back.
@@ -4181,7 +4219,7 @@ mod settings_tests {
             egui::Modifiers::NONE,
         );
         let (image, stem) = captured.expect("cropped capture");
-        assert_eq!(image.size, [200, 150]);
+        assert_eq!(image.size, [200, 172]);
         assert_eq!(stem, "sample.Target");
         assert_eq!(app.screenshot, RegionCapture::Idle);
         assert!(

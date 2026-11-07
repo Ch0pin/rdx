@@ -261,6 +261,8 @@ pub struct CodeDocument {
     jump: Option<usize>,
     navigation_position: usize,
     last_navigation_cursor: Option<usize>,
+    /// Rendered document body, below the find bar.
+    document_body_rect: Option<egui::Rect>,
     highlight: Option<Range<usize>>,
     export_requested: bool,
     usages_requested: Option<usize>,
@@ -323,6 +325,7 @@ impl CodeDocument {
             jump: None,
             navigation_position: 0,
             last_navigation_cursor: None,
+            document_body_rect: None,
             highlight: None,
             export_requested: false,
             usages_requested: None,
@@ -887,7 +890,7 @@ impl CodeDocument {
             .unwrap_or(Color32::LIGHT_GRAY);
         let galley = Arc::clone(&self.cache.as_ref().expect("cache populated").galley);
         let display = &galley.job.text;
-        egui::Frame::NONE
+        let document_body = egui::Frame::NONE
             .fill(background)
             .inner_margin(8)
             .show(ui, |ui| {
@@ -1499,7 +1502,12 @@ impl CodeDocument {
                     });
                 });
             });
+        self.document_body_rect = Some(document_body.response.rect.intersect(ui.clip_rect()));
         clicked
+    }
+
+    pub fn document_body_rect(&self) -> Option<egui::Rect> {
+        self.document_body_rect
     }
 }
 

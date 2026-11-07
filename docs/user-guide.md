@@ -99,14 +99,18 @@ choice saves automatically. Click a word in the source viewer to highlight its o
 Find results and navigation highlights remain separate.
 
 **Region screenshot.** Hold `Ctrl` (or `Cmd` on macOS), press the right
-mouse button over the content area and drag a rectangle; the live outline shows the
+mouse button anywhere in the RDX window and drag a rectangle; the live outline shows the
 capture size in pixels. On macOS the left button works as well while the modifier is
 held, so the gesture also suits one-button mice and trackpads. Releasing captures that region of the window at native
-display resolution, adds a caption bar naming the class or file shown (below the
-selection when there is room, otherwise above or along its bottom edge), and opens a save dialog with the file name prefilled from
-the active tab (for example `com.example.LoginActivity.png` or
-`res_layout_main.xml.png`). Drags smaller than a few points are ignored, and the
-right button without the modifier still opens the code context menu.
+display resolution and opens a PNG save dialog. A region entirely inside the active
+document body receives a caption naming its class or file and a matching suggested
+name (for example `com.example.LoginActivity.png` or `res_layout_main.xml.png`).
+Selections that include the sidebar, toolbar, tab strip, or another part of the
+window keep the exact selected bounds and use `RDX-screenshot.png`. The same
+default applies when no document is open. If a chosen save name lacks a PNG
+extension, RDX asks for the corrected `.png` destination in a second save dialog
+before writing. Drags smaller than a few points are ignored, and the right button
+without the modifier still opens the code context menu.
 
 Theme and font attribution is in [third_party/themes](../third_party/themes/README.md)
 and [third_party/fonts](../third_party/fonts/README.md). Redistributed application

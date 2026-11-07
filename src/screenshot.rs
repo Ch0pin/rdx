@@ -1,12 +1,13 @@
-//! Region screenshots of the viewer.
+//! Region screenshots of the RDX window.
 //!
 //! The user holds the platform command modifier (Cmd on macOS, Ctrl elsewhere),
-//! presses the right mouse button over the content area and drags a rectangle.
-//! On release RDX asks eframe for a frame capture, crops it to the selection and
-//! offers a save dialog named after the class or file shown in the active tab.
+//! presses the right mouse button and drags a rectangle. A selection wholly
+//! inside the active document body receives a class/file caption; other regions
+//! retain their exact bounds and use the default RDX screenshot name.
 
 use eframe::egui::{self, Color32, ColorImage, Pos2, Rect};
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 
 /// Selections narrower or shorter than this (in points) are treated as an
 /// accidental click and ignored.
@@ -74,7 +75,10 @@ pub enum RegionCapture {
     /// A frame capture was requested; waiting for `egui::Event::Screenshot`.
     /// eframe reads the pixels one frame after the request, so the caption is
     /// painted every frame until the reply arrives.
-    Pending { caption: Caption, since: f64 },
+    Pending {
+        caption: Option<Caption>,
+        since: f64,
+    },
 }
 
 /// Attached to the viewport screenshot command so unrelated screenshot replies
@@ -98,7 +102,62 @@ pub fn selection(anchor: Pos2, current: Pos2, bounds: Rect) -> Option<Rect> {
         .then_some(rect)
 }
 
-/// Height of the caption bar appended to every capture, in UI points.
+/// The frame crop, optional caption, and suggested file stem for a selection.
+pub fn capture_plan(
+    selected: Rect,
+    screen: Rect,
+    document: Option<(Rect, &str)>,
+) -> (Rect, Option<Caption>, String) {
+    if let Some((body, name)) = document
+        && body.is_positive()
+        && selected.min.x >= body.min.x
+        && selected.min.y >= body.min.y
+        && selected.max.x <= body.max.x
+        && selected.max.y <= body.max.y
+    {
+        let (rect, bar) = caption_layout(selected, screen);
+        return (
+            rect,
+            Some(Caption {
+                bar,
+                text: display_name(name),
+            }),
+            file_stem(name),
+        );
+    }
+    (selected, None, "RDX-screenshot".to_owned())
+}
+
+/// A save choice is writable only when the dialog approved this exact PNG path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PngDestination {
+    Approved(PathBuf),
+    Reconfirm(PathBuf),
+}
+
+pub fn png_destination(path: &Path) -> PngDestination {
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+    {
+        PngDestination::Approved(path.to_owned())
+    } else {
+        let mut corrected = path.to_owned();
+        corrected.set_extension("png");
+        PngDestination::Reconfirm(corrected)
+    }
+}
+
+/// Persist only the exact PNG path returned by the native save dialog.
+pub fn save_png(image: &ColorImage, path: &Path) -> anyhow::Result<PngDestination> {
+    let destination = png_destination(path);
+    if let PngDestination::Approved(path) = &destination {
+        std::fs::write(path, encode_png(image)?)?;
+    }
+    Ok(destination)
+}
+
+/// Height of the caption bar added to document-only captures, in UI points.
 pub const CAPTION_HEIGHT: f32 = 22.0;
 /// Horizontal padding of the caption text inside the bar.
 pub const CAPTION_PADDING: f32 = 6.0;
@@ -257,6 +316,69 @@ mod tests {
         assert!(selection(pos2(10.0, 10.0), pos2(12.0, 40.0), bounds).is_none());
         assert!(selection(pos2(10.0, 10.0), pos2(10.0, 10.0), bounds).is_none());
         assert!(selection(pos2(200.0, 200.0), pos2(300.0, 300.0), bounds).is_none());
+    }
+
+    #[test]
+    fn caption_requires_the_whole_region_inside_the_document_body() {
+        let screen = Rect::from_min_max(pos2(0.0, 0.0), pos2(800.0, 600.0));
+        let body = Rect::from_min_max(pos2(260.0, 100.0), pos2(800.0, 560.0));
+        let inside = Rect::from_min_max(pos2(300.0, 120.0), pos2(500.0, 240.0));
+        let (rect, caption, stem) = capture_plan(inside, screen, Some((body, "sample.Target")));
+        assert_eq!(rect.max.y, 262.0);
+        assert_eq!(caption.unwrap().text, "sample.Target");
+        assert_eq!(stem, "sample.Target");
+
+        for mixed in [
+            Rect::from_min_max(pos2(200.0, 120.0), pos2(500.0, 240.0)), // sidebar
+            Rect::from_min_max(pos2(300.0, 60.0), pos2(500.0, 240.0)),  // tabs/find bar
+            Rect::from_min_max(pos2(300.0, 120.0), pos2(500.0, 580.0)), // status bar
+        ] {
+            let (rect, caption, stem) = capture_plan(mixed, screen, Some((body, "sample.Target")));
+            assert_eq!(rect, mixed);
+            assert_eq!(caption, None);
+            assert_eq!(stem, "RDX-screenshot");
+        }
+        assert_eq!(
+            capture_plan(inside, screen, None),
+            (inside, None, "RDX-screenshot".into())
+        );
+    }
+
+    #[test]
+    fn png_save_reconfirms_other_extensions_without_touching_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let chosen = dir.path().join("report.txt");
+        let corrected = dir.path().join("report.png");
+        std::fs::write(&chosen, b"original txt").unwrap();
+        std::fs::write(&corrected, b"original png").unwrap();
+        let image = ColorImage::new([1, 1], Color32::RED);
+        assert_eq!(
+            save_png(&image, &chosen).unwrap(),
+            PngDestination::Reconfirm(corrected.clone())
+        );
+        assert_eq!(std::fs::read(&chosen).unwrap(), b"original txt");
+        assert_eq!(std::fs::read(&corrected).unwrap(), b"original png");
+    }
+
+    #[test]
+    fn png_save_preserves_the_exact_approved_uppercase_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let chosen = dir.path().join("report.PNG");
+        let image = ColorImage::new([1, 1], Color32::BLUE);
+        assert_eq!(
+            save_png(&image, &chosen).unwrap(),
+            PngDestination::Approved(chosen.clone())
+        );
+        assert!(
+            std::fs::read(&chosen)
+                .unwrap()
+                .starts_with(b"\x89PNG\r\n\x1a\n")
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("report.PNG")]);
     }
 
     #[test]

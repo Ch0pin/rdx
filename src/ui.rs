@@ -95,6 +95,8 @@ enum DialogResult {
     Plugin(Option<PathBuf>),
     /// `None`: the save dialog was cancelled.
     Screenshot(Option<Result<PathBuf, String>>),
+    /// Reopen the native save dialog for the corrected path before writing.
+    ScreenshotRetry(egui::ColorImage, PathBuf),
 }
 
 enum InteractiveRequest {
@@ -1246,12 +1248,12 @@ impl App {
             }
         }
     }
-    /// Cmd/Ctrl + right-drag over the content area selects a region to save as PNG.
+    /// Cmd/Ctrl + right-drag anywhere in the RDX viewport selects a region to save as PNG.
     /// Returns the cropped capture and proposed file stem once a frame reply arrives.
     fn region_screenshot(
         &mut self,
         ctx: &egui::Context,
-        content_area: egui::Rect,
+        document_area: Option<egui::Rect>,
     ) -> Option<(egui::ColorImage, String)> {
         use crate::screenshot::{self, RegionCapture};
         let screen = ctx.screen_rect();
@@ -1269,9 +1271,8 @@ impl App {
                 if modifier
                     && pressed
                     && self.pending_dialog.is_none()
-                    && self.tabs.get(self.selected).is_some()
                     && let Some(anchor) = pointer
-                    && content_area.contains(anchor)
+                    && screen.contains(anchor)
                 {
                     self.screenshot = RegionCapture::Dragging { anchor };
                 }
@@ -1316,15 +1317,15 @@ impl App {
                 // Released (or the button state was lost): capture if the drag was deliberate.
                 self.screenshot = RegionCapture::Idle;
                 let selected = screenshot::selection(anchor, current, screen)?;
-                let tab = self.tabs.get(self.selected)?;
-                let stem = screenshot::file_stem(&tab.name);
-                // The caption is painted from this frame on (see `Pending`).
-                let (rect, bar) = screenshot::caption_layout(selected, screen);
-                let caption = screenshot::Caption {
-                    bar,
-                    text: screenshot::display_name(&tab.name),
-                };
-                Self::paint_caption(ctx, &caption);
+                let document = document_area.and_then(|area| {
+                    self.tabs
+                        .get(self.selected)
+                        .map(|tab| (area, tab.name.as_str()))
+                });
+                let (rect, caption, stem) = screenshot::capture_plan(selected, screen, document);
+                if let Some(caption) = &caption {
+                    Self::paint_caption(ctx, caption);
+                }
                 self.screenshot = RegionCapture::Pending {
                     caption,
                     since: ctx.input(|i| i.time),
@@ -1339,7 +1340,9 @@ impl App {
             RegionCapture::Pending { caption, since } => {
                 // eframe reads the pixels one frame after the request, so keep
                 // the caption on screen until the reply arrives.
-                Self::paint_caption(ctx, &caption);
+                if let Some(caption) = &caption {
+                    Self::paint_caption(ctx, caption);
+                }
                 ctx.request_repaint();
                 let reply = ctx.input(|i| {
                     i.events.iter().find_map(|event| match event {
@@ -1398,30 +1401,53 @@ impl App {
             return;
         };
         self.status = "Choose where to save the screenshot…".into();
-        let future = rfd::AsyncFileDialog::new()
-            .set_title("Save screenshot")
+        self.open_screenshot_dialog(id, image, PathBuf::from(format!("{stem}.png")), false, ctx);
+    }
+    fn open_screenshot_dialog(
+        &mut self,
+        id: u64,
+        image: egui::ColorImage,
+        proposed: PathBuf,
+        reconfirm: bool,
+        ctx: &egui::Context,
+    ) {
+        let mut dialog = rfd::AsyncFileDialog::new()
+            .set_title(if reconfirm {
+                "Confirm corrected PNG destination"
+            } else {
+                "Save screenshot"
+            })
             .add_filter("PNG image", &["png"])
-            .set_file_name(format!("{stem}.png"))
-            .save_file();
+            .set_file_name(proposed.file_name().map_or_else(
+                || "RDX-screenshot.png".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            ));
+        if let Some(parent) = proposed
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            dialog = dialog.set_directory(parent);
+        }
+        // Build the native dialog future on the UI thread (required by rfd on macOS).
+        let future = dialog.save_file();
         let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
         thread::spawn(move || {
-            let result = pollster::block_on(future).map(|handle| {
-                let mut path = handle.path().to_owned();
-                if path
-                    .extension()
-                    .is_none_or(|ext| !ext.eq_ignore_ascii_case("png"))
-                {
-                    path.set_extension("png");
-                }
-                crate::screenshot::encode_png(&image)
-                    .and_then(|png| Ok(std::fs::write(&path, png)?))
-                    .map(|()| path)
-                    .map_err(|error| format!("{error:#}"))
-            });
+            let result =
+                pollster::block_on(future).map(|handle| {
+                    match crate::screenshot::save_png(&image, handle.path()) {
+                        Ok(crate::screenshot::PngDestination::Approved(path)) => {
+                            DialogResult::Screenshot(Some(Ok(path)))
+                        }
+                        Ok(crate::screenshot::PngDestination::Reconfirm(corrected)) => {
+                            DialogResult::ScreenshotRetry(image, corrected)
+                        }
+                        Err(error) => DialogResult::Screenshot(Some(Err(format!("{error:#}")))),
+                    }
+                });
             let _ = tx.send(Event::Dialog(
                 generation,
                 id,
-                DialogResult::Screenshot(result),
+                result.unwrap_or(DialogResult::Screenshot(None)),
             ));
             ctx.request_repaint();
         });
@@ -2115,6 +2141,13 @@ impl App {
             match event {
                 Event::Dialog(generation, id, result) => {
                     if self.pending_dialog != Some(id) {
+                        continue;
+                    }
+                    if generation == self.generation
+                        && let DialogResult::ScreenshotRetry(image, corrected) = result
+                    {
+                        self.status = format!("Confirm PNG destination {}", corrected.display());
+                        self.open_screenshot_dialog(id, image, corrected, true, ctx);
                         continue;
                     }
                     self.pending_dialog = None;
@@ -3376,9 +3409,8 @@ impl eframe::App for App {
         let mut manifest_summary_request = None;
         let mut usage_request = None;
         let mut graph_request = None;
-        let mut content_area = egui::Rect::NOTHING;
+        let mut document_area = None;
         egui::CentralPanel::default().show(ctx, |ui| {
-            content_area = ui.max_rect();
             if self.tabs.is_empty() {
                 ui.add_space(75.0);
                 ui.vertical_centered(|ui| {
@@ -3461,7 +3493,11 @@ impl eframe::App for App {
                         return;
                     }
                     ui.push_id((&tab.name, self.generation), |ui| match &mut tab.content {
-                        Content::Summary(document) => document.show(ui, self.font_size),
+                        Content::Summary(document) => {
+                            document_area =
+                                Some(ui.available_rect_before_wrap().intersect(ui.clip_rect()));
+                            document.show(ui, self.font_size);
+                        }
                         Content::Text(document) => {
                             if let Some(view) = &mut tab.manifest_view {
                                 let action =
@@ -3490,7 +3526,9 @@ impl eframe::App for App {
                             document.set_usages_enabled(
                                 tab.source_hash.is_some() && self.engine.is_some() && !self.busy,
                             );
-                            if let Some(position) = document.show(ui, self.theme, self.font_size)
+                            let clicked = document.show(ui, self.theme, self.font_size);
+                            document_area = document.document_body_rect();
+                            if let Some(position) = clicked
                                 && (!self.busy || self.search_cancel.is_some())
                             {
                                 if let Some(hash) = &tab.source_hash {
@@ -3578,7 +3616,7 @@ impl eframe::App for App {
                             height,
                         } => {
                             ui.label(format!("{width} × {height} pixels"));
-                            egui::ScrollArea::both().show(ui, |ui| {
+                            let viewport = egui::ScrollArea::both().show(ui, |ui| {
                                 let available = ui.available_size();
                                 let scale = (available.x / *width as f32)
                                     .min(available.y / *height as f32)
@@ -3594,12 +3632,13 @@ impl eframe::App for App {
                                     }
                                 });
                             });
+                            document_area = Some(viewport.inner_rect);
                         }
                     });
                 }
             }
         });
-        if let Some((image, stem)) = self.region_screenshot(ctx, content_area) {
+        if let Some((image, stem)) = self.region_screenshot(ctx, document_area) {
             self.save_screenshot(image, stem, ctx);
         }
         if let Some(index) = manifest_summary_request {
@@ -4088,6 +4127,22 @@ mod settings_tests {
         assert!(app.begin_dialog().is_some());
     }
     #[test]
+    fn screenshot_save_cancel_releases_dialog_guard() {
+        let mut app = navigation_test_app();
+        let id = app.begin_dialog().unwrap();
+        app.tx
+            .send(Event::Dialog(
+                app.generation,
+                id,
+                DialogResult::Screenshot(None),
+            ))
+            .unwrap();
+        app.events(&egui::Context::default());
+        assert_eq!(app.pending_dialog, None);
+        assert_eq!(app.status, "Screenshot cancelled");
+        assert!(app.begin_dialog().is_some());
+    }
+    #[test]
     fn region_screenshot_gives_up_when_the_renderer_never_replies() {
         use crate::screenshot::RegionCapture;
         let (mut app, _, _) = history_fixture();
@@ -4103,7 +4158,7 @@ mod settings_tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    app.region_screenshot(ctx, screen);
+                    app.region_screenshot(ctx, Some(screen));
                 },
             )
         };
@@ -4142,6 +4197,61 @@ mod settings_tests {
     }
 
     #[test]
+    fn region_screenshot_works_without_an_active_document() {
+        use crate::screenshot::RegionCapture;
+        let mut app = navigation_test_app();
+        assert!(app.tabs.is_empty());
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        let frame = |app: &mut App, time, events| {
+            ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    screen_rect: Some(screen),
+                    modifiers: egui::Modifiers::COMMAND,
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.region_screenshot(ctx, None);
+                },
+            )
+        };
+        frame(&mut app, 0.0, vec![button(egui::pos2(15.0, 20.0), true)]);
+        assert!(matches!(app.screenshot, RegionCapture::Dragging { .. }));
+        let output = frame(&mut app, 0.1, vec![button(egui::pos2(300.0, 250.0), false)]);
+        assert!(matches!(
+            app.screenshot,
+            RegionCapture::Pending { caption: None, .. }
+        ));
+        let request = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .unwrap()
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                egui::ViewportCommand::Screenshot(user_data) => user_data
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.downcast_ref::<crate::screenshot::Request>().cloned()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            request.rect,
+            egui::Rect::from_min_max(egui::pos2(15.0, 20.0), egui::pos2(300.0, 250.0))
+        );
+        assert_eq!(request.stem, "RDX-screenshot");
+    }
+
+    #[test]
     fn region_screenshot_requests_capture_and_crops_reply() {
         use crate::screenshot::RegionCapture;
         let (mut app, _, _) = history_fixture();
@@ -4163,7 +4273,7 @@ mod settings_tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| captured = app.region_screenshot(ctx, screen),
+                |ctx| captured = app.region_screenshot(ctx, Some(screen)),
             );
             (captured, output)
         };

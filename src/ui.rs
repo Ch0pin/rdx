@@ -523,6 +523,8 @@ pub struct App {
     plugin_output: String,
     diagnostics: Vec<String>,
     screenshot: crate::screenshot::RegionCapture,
+    /// Pairs a remapped Ctrl/Cmd+primary press with its release (see `raw_input_hook`).
+    screenshot_remapped_primary: bool,
 }
 
 impl App {
@@ -654,6 +656,7 @@ impl App {
             plugin_output: String::new(),
             diagnostics: settings_error.into_iter().collect(),
             screenshot: crate::screenshot::RegionCapture::Idle,
+            screenshot_remapped_primary: false,
         }
     }
     fn start_mcp(&mut self) {
@@ -2866,6 +2869,13 @@ fn plain_menu_bar(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        crate::screenshot::remap_modifier_primary(
+            &mut raw_input.events,
+            &mut self.screenshot_remapped_primary,
+        );
+    }
+
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.render_recovery.update(ctx);
         self.events(ctx);
@@ -4019,6 +4029,7 @@ mod settings_tests {
             plugin_output: String::new(),
             diagnostics: Vec::new(),
             screenshot: crate::screenshot::RegionCapture::Idle,
+            screenshot_remapped_primary: false,
         }
     }
     #[test]

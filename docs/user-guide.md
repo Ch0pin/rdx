@@ -100,7 +100,8 @@ Find results and navigation highlights remain separate.
 
 **Region screenshot.** Hold `Ctrl` (or `Cmd` on macOS), press the right
 mouse button over the content area and drag a rectangle; the live outline shows the
-capture size in pixels. Releasing captures exactly that region of the window at
+capture size in pixels. On macOS the left button works as well while the modifier is
+held, so the gesture also suits one-button mice and trackpads. Releasing captures exactly that region of the window at
 native display resolution and opens a save dialog with the file name prefilled from
 the active tab (for example `com.example.LoginActivity.png` or
 `res_layout_main.xml.png`). Drags smaller than a few points are ignored, and the

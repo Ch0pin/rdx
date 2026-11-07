@@ -18,6 +18,40 @@ pub fn modifier_held(modifiers: &egui::Modifiers) -> bool {
     modifiers.command || modifiers.mac_cmd || modifiers.ctrl
 }
 
+/// macOS has no guaranteed right button: one-button mice and Ctrl+click are the
+/// platform's secondary click, but winit reports both as the primary button.
+/// Rewrites a primary press made with the gesture modifier into a secondary
+/// press (and its matching release), so the gesture works with any pointer.
+/// `remapped` carries the press/release pairing across frames.
+pub fn remap_modifier_primary(events: &mut [egui::Event], remapped: &mut bool) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    for event in events {
+        let egui::Event::PointerButton {
+            button,
+            pressed,
+            modifiers,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if *button != egui::PointerButton::Primary {
+            continue;
+        }
+        if *pressed {
+            if modifier_held(modifiers) {
+                *button = egui::PointerButton::Secondary;
+                *remapped = true;
+            }
+        } else if *remapped {
+            *button = egui::PointerButton::Secondary;
+            *remapped = false;
+        }
+    }
+}
+
 /// Gesture progress across frames.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum RegionCapture {
@@ -168,6 +202,48 @@ mod tests {
         assert!(!modifier_held(&egui::Modifiers::NONE));
         assert!(!modifier_held(&egui::Modifiers::SHIFT));
         assert!(!modifier_held(&egui::Modifiers::ALT));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn modifier_primary_press_and_release_become_secondary() {
+        use egui::{Event, Modifiers, PointerButton};
+        let click = |button, pressed, modifiers| Event::PointerButton {
+            pos: pos2(1.0, 1.0),
+            button,
+            pressed,
+            modifiers,
+        };
+        let button_of = |event: &Event| match event {
+            Event::PointerButton { button, .. } => *button,
+            _ => unreachable!(),
+        };
+        let mut remapped = false;
+        // Press with the modifier is remapped; the release is remapped even
+        // though the modifier was let go first.
+        let mut events = vec![click(PointerButton::Primary, true, Modifiers::CTRL)];
+        remap_modifier_primary(&mut events, &mut remapped);
+        assert_eq!(button_of(&events[0]), PointerButton::Secondary);
+        assert!(remapped);
+        let mut events = vec![click(PointerButton::Primary, false, Modifiers::NONE)];
+        remap_modifier_primary(&mut events, &mut remapped);
+        assert_eq!(button_of(&events[0]), PointerButton::Secondary);
+        assert!(!remapped);
+        // Plain clicks and real right clicks are untouched.
+        let mut events = vec![
+            click(PointerButton::Primary, true, Modifiers::NONE),
+            click(PointerButton::Primary, false, Modifiers::NONE),
+            click(PointerButton::Secondary, true, Modifiers::COMMAND),
+        ];
+        remap_modifier_primary(&mut events, &mut remapped);
+        assert_eq!(button_of(&events[0]), PointerButton::Primary);
+        assert_eq!(button_of(&events[1]), PointerButton::Primary);
+        assert_eq!(button_of(&events[2]), PointerButton::Secondary);
+        assert!(!remapped);
+        // Cmd works too.
+        let mut events = vec![click(PointerButton::Primary, true, Modifiers::MAC_CMD)];
+        remap_modifier_primary(&mut events, &mut remapped);
+        assert_eq!(button_of(&events[0]), PointerButton::Secondary);
     }
 
     #[test]

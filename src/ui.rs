@@ -1389,10 +1389,7 @@ impl App {
         job.wrap.break_anywhere = true;
         job.wrap.overflow_character = Some('…');
         let galley = ctx.fonts(|fonts| fonts.layout_job(job));
-        let text_pos = egui::pos2(
-            bar.min.x + screenshot::CAPTION_PADDING,
-            bar.center().y - galley.size().y / 2.0,
-        );
+        let text_pos = bar.center() - galley.size() / 2.0;
         painter.galley(text_pos, galley, text);
     }
     fn save_screenshot(&mut self, image: egui::ColorImage, stem: String, ctx: &egui::Context) {

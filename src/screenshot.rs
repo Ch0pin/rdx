@@ -139,17 +139,18 @@ pub fn caption_layout(selection: Rect, screen: Rect) -> (Rect, Rect) {
     (selection, inside)
 }
 
-/// Caption bar colours as `(background, text)`.
+/// Caption bar colours as `(background, text)`: a dark bar with light text in
+/// both themes so the name stands out from the captured content.
 pub fn caption_colors(dark_mode: bool) -> (Color32, Color32) {
     if dark_mode {
         (
-            Color32::from_rgb(30, 30, 30),
-            Color32::from_rgb(230, 230, 230),
+            Color32::from_rgb(18, 18, 18),
+            Color32::from_rgb(240, 240, 240),
         )
     } else {
         (
-            Color32::from_rgb(235, 235, 235),
-            Color32::from_rgb(25, 25, 25),
+            Color32::from_rgb(40, 40, 40),
+            Color32::from_rgb(245, 245, 245),
         )
     }
 }

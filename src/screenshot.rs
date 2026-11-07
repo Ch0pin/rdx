@@ -52,6 +52,18 @@ pub fn remap_modifier_primary(events: &mut [egui::Event], remapped: &mut bool) {
     }
 }
 
+/// Give up on a capture when the renderer has not replied within this long.
+pub const CAPTURE_TIMEOUT_SECONDS: f64 = 2.0;
+
+/// Caption bar painted into the captured frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Caption {
+    /// Bar area in UI points.
+    pub bar: Rect,
+    /// Class or file name shown in the bar.
+    pub text: String,
+}
+
 /// Gesture progress across frames.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum RegionCapture {
@@ -60,7 +72,9 @@ pub enum RegionCapture {
     /// Right button is held with the modifier; `anchor` is where it was pressed.
     Dragging { anchor: Pos2 },
     /// A frame capture was requested; waiting for `egui::Event::Screenshot`.
-    Pending,
+    /// eframe reads the pixels one frame after the request, so the caption is
+    /// painted every frame until the reply arrives.
+    Pending { caption: Caption, since: f64 },
 }
 
 /// Attached to the viewport screenshot command so unrelated screenshot replies

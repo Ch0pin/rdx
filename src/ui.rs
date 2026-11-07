@@ -1318,31 +1318,17 @@ impl App {
                 let selected = screenshot::selection(anchor, current, screen)?;
                 let tab = self.tabs.get(self.selected)?;
                 let stem = screenshot::file_stem(&tab.name);
-                // Paint the caption into this frame: eframe captures the screen
-                // after it is drawn, so the bar ends up in the image.
+                // The caption is painted from this frame on (see `Pending`).
                 let (rect, bar) = screenshot::caption_layout(selected, screen);
-                let (background, text) = screenshot::caption_colors(ctx.style().visuals.dark_mode);
-                let painter = ctx.layer_painter(egui::LayerId::new(
-                    egui::Order::Foreground,
-                    egui::Id::new("region_screenshot_caption"),
-                ));
-                painter.rect_filled(bar, 0.0, background);
-                let mut job = egui::text::LayoutJob::simple_singleline(
-                    screenshot::display_name(&tab.name),
-                    egui::FontId::monospace(12.0),
-                    text,
-                );
-                job.wrap.max_width = (bar.width() - 2.0 * screenshot::CAPTION_PADDING).max(0.0);
-                job.wrap.max_rows = 1;
-                job.wrap.break_anywhere = true;
-                job.wrap.overflow_character = Some('…');
-                let galley = ctx.fonts(|fonts| fonts.layout_job(job));
-                let text_pos = egui::pos2(
-                    bar.min.x + screenshot::CAPTION_PADDING,
-                    bar.center().y - galley.size().y / 2.0,
-                );
-                painter.galley(text_pos, galley, text);
-                self.screenshot = RegionCapture::Pending;
+                let caption = screenshot::Caption {
+                    bar,
+                    text: screenshot::display_name(&tab.name),
+                };
+                Self::paint_caption(ctx, &caption);
+                self.screenshot = RegionCapture::Pending {
+                    caption,
+                    since: ctx.input(|i| i.time),
+                };
                 self.status = "Capturing screenshot…".into();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
                     screenshot::Request { rect, stem },
@@ -1350,7 +1336,11 @@ impl App {
                 ctx.request_repaint();
                 None
             }
-            RegionCapture::Pending => {
+            RegionCapture::Pending { caption, since } => {
+                // eframe reads the pixels one frame after the request, so keep
+                // the caption on screen until the reply arrives.
+                Self::paint_caption(ctx, &caption);
+                ctx.request_repaint();
                 let reply = ctx.input(|i| {
                     i.events.iter().find_map(|event| match event {
                         egui::Event::Screenshot {
@@ -1363,7 +1353,13 @@ impl App {
                         _ => None,
                     })
                 });
-                let (request, image) = reply?;
+                let Some((request, image)) = reply else {
+                    if ctx.input(|i| i.time) - since > screenshot::CAPTURE_TIMEOUT_SECONDS {
+                        self.screenshot = RegionCapture::Idle;
+                        self.error("Screenshot capture is not supported by this renderer".into());
+                    }
+                    return None;
+                };
                 self.screenshot = RegionCapture::Idle;
                 let cropped = screenshot::crop(&image, request.rect, ctx.pixels_per_point());
                 if cropped.is_none() {
@@ -1372,6 +1368,32 @@ impl App {
                 cropped.map(|image| (image, request.stem))
             }
         }
+    }
+    /// Draws the caption bar above everything else so it lands in the capture.
+    fn paint_caption(ctx: &egui::Context, caption: &crate::screenshot::Caption) {
+        use crate::screenshot;
+        let bar = caption.bar;
+        let (background, text) = screenshot::caption_colors(ctx.style().visuals.dark_mode);
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("region_screenshot_caption"),
+        ));
+        painter.rect_filled(bar, 0.0, background);
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            caption.text.clone(),
+            egui::FontId::monospace(12.0),
+            text,
+        );
+        job.wrap.max_width = (bar.width() - 2.0 * screenshot::CAPTION_PADDING).max(0.0);
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        job.wrap.overflow_character = Some('…');
+        let galley = ctx.fonts(|fonts| fonts.layout_job(job));
+        let text_pos = egui::pos2(
+            bar.min.x + screenshot::CAPTION_PADDING,
+            bar.center().y - galley.size().y / 2.0,
+        );
+        painter.galley(text_pos, galley, text);
     }
     fn save_screenshot(&mut self, image: egui::ColorImage, stem: String, ctx: &egui::Context) {
         let Some(id) = self.begin_dialog() else {
@@ -4069,6 +4091,60 @@ mod settings_tests {
         assert!(app.begin_dialog().is_some());
     }
     #[test]
+    fn region_screenshot_gives_up_when_the_renderer_never_replies() {
+        use crate::screenshot::RegionCapture;
+        let (mut app, _, _) = history_fixture();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let frame = |app: &mut App, time, events| {
+            ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    screen_rect: Some(screen),
+                    modifiers: egui::Modifiers::COMMAND,
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.region_screenshot(ctx, screen);
+                },
+            )
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        frame(
+            &mut app,
+            0.0,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(100.0, 100.0)),
+                button(egui::pos2(100.0, 100.0), true),
+            ],
+        );
+        frame(
+            &mut app,
+            0.1,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(300.0, 250.0)),
+                button(egui::pos2(300.0, 250.0), false),
+            ],
+        );
+        assert!(matches!(app.screenshot, RegionCapture::Pending { .. }));
+        // Still waiting shortly after; the caption stays up.
+        frame(&mut app, 1.0, Vec::new());
+        assert!(matches!(app.screenshot, RegionCapture::Pending { .. }));
+        frame(&mut app, 3.0, Vec::new());
+        assert_eq!(app.screenshot, RegionCapture::Idle);
+        assert_eq!(
+            app.status,
+            "Screenshot capture is not supported by this renderer"
+        );
+    }
+
+    #[test]
     fn region_screenshot_requests_capture_and_crops_reply() {
         use crate::screenshot::RegionCapture;
         let (mut app, _, _) = history_fixture();
@@ -4163,17 +4239,20 @@ mod settings_tests {
             egui::Modifiers::COMMAND,
         );
         assert!(captured.is_none());
-        assert_eq!(app.screenshot, RegionCapture::Pending);
+        assert!(matches!(app.screenshot, RegionCapture::Pending { .. }));
         assert_eq!(app.status, "Capturing screenshot…");
-        // The captured frame carries a caption bar naming the class.
-        let captions: Vec<String> = output
-            .shapes
-            .iter()
-            .filter_map(|shape| match &shape.shape {
-                egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
-                _ => None,
-            })
-            .collect();
+        // The caption bar naming the class is painted from the release frame on.
+        let texts = |output: &egui::FullOutput| -> Vec<String> {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let captions = texts(&output);
         assert!(
             captions.iter().any(|c| c == "sample.Target"),
             "{captions:?}"
@@ -4204,14 +4283,20 @@ mod settings_tests {
             user_data,
             image: Arc::new(egui::ColorImage::new([800, 600], egui::Color32::RED)),
         };
-        let (captured, _) = frame(
+        let (captured, output) = frame(
             &mut app,
             0.5,
             vec![reply(egui::UserData::default())],
             egui::Modifiers::NONE,
         );
         assert!(captured.is_none());
-        assert_eq!(app.screenshot, RegionCapture::Pending);
+        assert!(matches!(app.screenshot, RegionCapture::Pending { .. }));
+        // eframe reads the pixels a frame later, so the caption is still painted.
+        let captions = texts(&output);
+        assert!(
+            captions.iter().any(|c| c == "sample.Target"),
+            "{captions:?}"
+        );
         let (captured, _) = frame(
             &mut app,
             0.6,

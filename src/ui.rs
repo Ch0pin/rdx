@@ -1295,7 +1295,7 @@ impl App {
                     painter.rect_stroke(
                         rect,
                         0.0,
-                        egui::Stroke::new(1.0, stroke),
+                        egui::Stroke::new(1.0_f32, stroke),
                         egui::StrokeKind::Outside,
                     );
                     let scale = ctx.pixels_per_point();

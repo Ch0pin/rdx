@@ -1254,7 +1254,7 @@ impl App {
         let screen = ctx.screen_rect();
         let (modifier, pressed, down, released, pointer) = ctx.input(|i| {
             (
-                i.modifiers.command,
+                screenshot::modifier_held(&i.modifiers),
                 i.pointer.secondary_pressed(),
                 i.pointer.secondary_down(),
                 i.pointer.secondary_released(),

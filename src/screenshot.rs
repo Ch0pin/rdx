@@ -5,12 +5,18 @@
 //! On release RDX asks eframe for a frame capture, crops it to the selection and
 //! offers a save dialog named after the class or file shown in the active tab.
 
-use eframe::egui::{Color32, ColorImage, Pos2, Rect};
+use eframe::egui::{self, Color32, ColorImage, Pos2, Rect};
 use std::io::Cursor;
 
 /// Selections narrower or shorter than this (in points) are treated as an
 /// accidental click and ignored.
 pub const MIN_SELECTION_POINTS: f32 = 4.0;
+
+/// The gesture modifier: the platform command key (Cmd on macOS, Ctrl elsewhere),
+/// with plain Ctrl also accepted on macOS so the shortcut reads the same everywhere.
+pub fn modifier_held(modifiers: &egui::Modifiers) -> bool {
+    modifiers.command || modifiers.mac_cmd || modifiers.ctrl
+}
 
 /// Gesture progress across frames.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -152,6 +158,16 @@ mod tests {
         assert!(selection(pos2(10.0, 10.0), pos2(12.0, 40.0), bounds).is_none());
         assert!(selection(pos2(10.0, 10.0), pos2(10.0, 10.0), bounds).is_none());
         assert!(selection(pos2(200.0, 200.0), pos2(300.0, 300.0), bounds).is_none());
+    }
+
+    #[test]
+    fn modifier_accepts_command_or_ctrl_only() {
+        assert!(modifier_held(&egui::Modifiers::COMMAND));
+        assert!(modifier_held(&egui::Modifiers::CTRL));
+        assert!(modifier_held(&egui::Modifiers::MAC_CMD));
+        assert!(!modifier_held(&egui::Modifiers::NONE));
+        assert!(!modifier_held(&egui::Modifiers::SHIFT));
+        assert!(!modifier_held(&egui::Modifiers::ALT));
     }
 
     #[test]

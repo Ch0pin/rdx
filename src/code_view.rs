@@ -1005,7 +1005,8 @@ impl CodeDocument {
                         // Cmd/Ctrl + right button is the region-screenshot gesture (see
                         // `screenshot.rs`); it must not open the context menu.
                         let screenshot_gesture =
-                            ui.input(|i| i.modifiers.command) && output.response.secondary_clicked();
+                            ui.input(|i| crate::screenshot::modifier_held(&i.modifiers))
+                                && output.response.secondary_clicked();
                         if output.response.secondary_clicked() && !screenshot_gesture {
                             self.menu_link = ui
                                 .ctx()

@@ -98,7 +98,7 @@ Fira Code and Source Code Pro. Fonts are bundled with Unicode fallbacks; the
 choice saves automatically. Click a word in the source viewer to highlight its other exact occurrences.
 Find results and navigation highlights remain separate.
 
-**Region screenshot.** Hold `Cmd` on macOS or `Ctrl` elsewhere, press the right
+**Region screenshot.** Hold `Ctrl` (or `Cmd` on macOS), press the right
 mouse button over the content area and drag a rectangle; the live outline shows the
 capture size in pixels. Releasing captures exactly that region of the window at
 native display resolution and opens a save dialog with the file name prefilled from

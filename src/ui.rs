@@ -93,6 +93,8 @@ enum DialogResult {
     Open(Option<PathBuf>),
     Export(Target, Option<PathBuf>),
     Plugin(Option<PathBuf>),
+    /// `None`: the save dialog was cancelled.
+    Screenshot(Option<Result<PathBuf, String>>),
 }
 
 enum InteractiveRequest {
@@ -520,6 +522,7 @@ pub struct App {
     plugin_busy: bool,
     plugin_output: String,
     diagnostics: Vec<String>,
+    screenshot: crate::screenshot::RegionCapture,
 }
 
 impl App {
@@ -650,6 +653,7 @@ impl App {
             plugin_busy: false,
             plugin_output: String::new(),
             diagnostics: settings_error.into_iter().collect(),
+            screenshot: crate::screenshot::RegionCapture::Idle,
         }
     }
     fn start_mcp(&mut self) {
@@ -1238,6 +1242,143 @@ impl App {
                 Target::ManifestSummary(index) => self.open_manifest_summary(index, ctx),
             }
         }
+    }
+    /// Cmd/Ctrl + right-drag over the content area selects a region to save as PNG.
+    /// Returns the cropped capture and proposed file stem once a frame reply arrives.
+    fn region_screenshot(
+        &mut self,
+        ctx: &egui::Context,
+        content_area: egui::Rect,
+    ) -> Option<(egui::ColorImage, String)> {
+        use crate::screenshot::{self, RegionCapture};
+        let screen = ctx.screen_rect();
+        let (modifier, pressed, down, released, pointer) = ctx.input(|i| {
+            (
+                i.modifiers.command,
+                i.pointer.secondary_pressed(),
+                i.pointer.secondary_down(),
+                i.pointer.secondary_released(),
+                i.pointer.latest_pos(),
+            )
+        });
+        match self.screenshot.clone() {
+            RegionCapture::Idle => {
+                if modifier
+                    && pressed
+                    && self.pending_dialog.is_none()
+                    && self.tabs.get(self.selected).is_some()
+                    && let Some(anchor) = pointer
+                    && content_area.contains(anchor)
+                {
+                    self.screenshot = RegionCapture::Dragging { anchor };
+                }
+                None
+            }
+            RegionCapture::Dragging { anchor } => {
+                let Some(current) = pointer else {
+                    self.screenshot = RegionCapture::Idle;
+                    return None;
+                };
+                if down && !released {
+                    // Draw the live selection. This frame is never captured.
+                    let (fill, stroke) = screenshot::overlay_colors(ctx.style().visuals.dark_mode);
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("region_screenshot_overlay"),
+                    ));
+                    let rect = egui::Rect::from_two_pos(anchor, current).intersect(screen);
+                    painter.rect_filled(rect, 0.0, fill);
+                    painter.rect_stroke(
+                        rect,
+                        0.0,
+                        egui::Stroke::new(1.0, stroke),
+                        egui::StrokeKind::Outside,
+                    );
+                    let scale = ctx.pixels_per_point();
+                    let label = format!(
+                        "{} × {} px",
+                        (rect.width() * scale).round() as u32,
+                        (rect.height() * scale).round() as u32
+                    );
+                    painter.text(
+                        rect.right_bottom() + egui::vec2(4.0, 4.0),
+                        egui::Align2::LEFT_TOP,
+                        label,
+                        egui::FontId::proportional(12.0),
+                        stroke,
+                    );
+                    ctx.request_repaint();
+                    return None;
+                }
+                // Released (or the button state was lost): capture if the drag was deliberate.
+                self.screenshot = RegionCapture::Idle;
+                let rect = screenshot::selection(anchor, current, screen)?;
+                let tab = self.tabs.get(self.selected)?;
+                let stem = screenshot::file_stem(&tab.name);
+                self.screenshot = RegionCapture::Pending;
+                self.status = "Capturing screenshot…".into();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
+                    screenshot::Request { rect, stem },
+                )));
+                ctx.request_repaint();
+                None
+            }
+            RegionCapture::Pending => {
+                let reply = ctx.input(|i| {
+                    i.events.iter().find_map(|event| match event {
+                        egui::Event::Screenshot {
+                            user_data, image, ..
+                        } => user_data
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.downcast_ref::<screenshot::Request>().cloned())
+                            .map(|request| (request, Arc::clone(image))),
+                        _ => None,
+                    })
+                });
+                let (request, image) = reply?;
+                self.screenshot = RegionCapture::Idle;
+                let cropped = screenshot::crop(&image, request.rect, ctx.pixels_per_point());
+                if cropped.is_none() {
+                    self.error("Screenshot region was empty".into());
+                }
+                cropped.map(|image| (image, request.stem))
+            }
+        }
+    }
+    fn save_screenshot(&mut self, image: egui::ColorImage, stem: String, ctx: &egui::Context) {
+        let Some(id) = self.begin_dialog() else {
+            self.status = "Another dialog is already open".into();
+            return;
+        };
+        self.status = "Choose where to save the screenshot…".into();
+        let future = rfd::AsyncFileDialog::new()
+            .set_title("Save screenshot")
+            .add_filter("PNG image", &["png"])
+            .set_file_name(format!("{stem}.png"))
+            .save_file();
+        let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
+        thread::spawn(move || {
+            let result = pollster::block_on(future).map(|handle| {
+                let mut path = handle.path().to_owned();
+                if path
+                    .extension()
+                    .is_none_or(|ext| !ext.eq_ignore_ascii_case("png"))
+                {
+                    path.set_extension("png");
+                }
+                crate::screenshot::encode_png(&image)
+                    .and_then(|png| Ok(std::fs::write(&path, png)?))
+                    .map(|()| path)
+                    .map_err(|error| format!("{error:#}"))
+            });
+            let _ = tx.send(Event::Dialog(
+                generation,
+                id,
+                DialogResult::Screenshot(result),
+            ));
+            ctx.request_repaint();
+        });
     }
     fn export_target(&mut self, target: Target, ctx: &egui::Context) {
         if self.export_busy || self.pending_dialog.is_some() {
@@ -1946,6 +2087,15 @@ impl App {
                             Ok(_) => self.error("This plugin is already loaded".into()),
                             Err(error) => self.error(format!("Plugin manifest: {error:#}")),
                         },
+                        DialogResult::Screenshot(Some(Ok(path))) => {
+                            self.status = format!("Saved screenshot {}", path.display());
+                        }
+                        DialogResult::Screenshot(Some(Err(error))) => {
+                            self.error(format!("Screenshot failed: {error}"));
+                        }
+                        DialogResult::Screenshot(None) => {
+                            self.status = "Screenshot cancelled".into();
+                        }
                         _ => {}
                     }
                 }
@@ -3173,7 +3323,9 @@ impl eframe::App for App {
         let mut manifest_summary_request = None;
         let mut usage_request = None;
         let mut graph_request = None;
+        let mut content_area = egui::Rect::NOTHING;
         egui::CentralPanel::default().show(ctx, |ui| {
+            content_area = ui.max_rect();
             if self.tabs.is_empty() {
                 ui.add_space(75.0);
                 ui.vertical_centered(|ui| {
@@ -3394,6 +3546,9 @@ impl eframe::App for App {
                 }
             }
         });
+        if let Some((image, stem)) = self.region_screenshot(ctx, content_area) {
+            self.save_screenshot(image, stem, ctx);
+        }
         if let Some(index) = manifest_summary_request {
             self.open_manifest_summary(index, ctx);
         }
@@ -3863,6 +4018,7 @@ mod settings_tests {
             plugin_busy: false,
             plugin_output: String::new(),
             diagnostics: Vec::new(),
+            screenshot: crate::screenshot::RegionCapture::Idle,
         }
     }
     #[test]
@@ -3876,6 +4032,181 @@ mod settings_tests {
         app.events(&egui::Context::default());
         assert_eq!(app.pending_dialog, None);
         assert!(app.begin_dialog().is_some());
+    }
+    #[test]
+    fn region_screenshot_requests_capture_and_crops_reply() {
+        use crate::screenshot::RegionCapture;
+        let (mut app, _, _) = history_fixture();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        let frame = |app: &mut App, time, events, modifiers| {
+            let mut captured = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    screen_rect: Some(screen),
+                    modifiers,
+                    events,
+                    ..Default::default()
+                },
+                |ctx| captured = app.region_screenshot(ctx, screen),
+            );
+            (captured, output)
+        };
+        // Without the modifier the right button is left to the context menu.
+        frame(
+            &mut app,
+            0.0,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(100.0, 100.0)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(100.0, 100.0),
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(app.screenshot, RegionCapture::Idle);
+        frame(
+            &mut app,
+            0.1,
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(100.0, 100.0),
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            egui::Modifiers::NONE,
+        );
+        // Modifier + right press starts a drag anchored at the pointer.
+        frame(
+            &mut app,
+            0.2,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(100.0, 100.0)),
+                button(egui::pos2(100.0, 100.0), true),
+            ],
+            egui::Modifiers::COMMAND,
+        );
+        assert_eq!(
+            app.screenshot,
+            RegionCapture::Dragging {
+                anchor: egui::pos2(100.0, 100.0)
+            }
+        );
+        // Dragging draws the live selection overlay with its pixel size.
+        let (captured, output) = frame(
+            &mut app,
+            0.3,
+            vec![egui::Event::PointerMoved(egui::pos2(300.0, 250.0))],
+            egui::Modifiers::COMMAND,
+        );
+        assert!(captured.is_none());
+        assert!(matches!(app.screenshot, RegionCapture::Dragging { .. }));
+        let labels: Vec<String> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.iter().any(|l| l == "200 × 150 px"), "{labels:?}");
+        // Release requests a frame capture tagged with the selection.
+        let (captured, output) = frame(
+            &mut app,
+            0.4,
+            vec![button(egui::pos2(300.0, 250.0), false)],
+            egui::Modifiers::COMMAND,
+        );
+        assert!(captured.is_none());
+        assert_eq!(app.screenshot, RegionCapture::Pending);
+        assert_eq!(app.status, "Capturing screenshot…");
+        let request = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .unwrap()
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                egui::ViewportCommand::Screenshot(user_data) => user_data
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.downcast_ref::<crate::screenshot::Request>().cloned()),
+                _ => None,
+            })
+            .expect("screenshot command");
+        assert_eq!(
+            request.rect,
+            egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(300.0, 250.0))
+        );
+        assert_eq!(request.stem, "sample.Target");
+        // Unrelated screenshot replies are ignored; ours is cropped and handed back.
+        let reply = |user_data| egui::Event::Screenshot {
+            viewport_id: egui::ViewportId::ROOT,
+            user_data,
+            image: Arc::new(egui::ColorImage::new([800, 600], egui::Color32::RED)),
+        };
+        let (captured, _) = frame(
+            &mut app,
+            0.5,
+            vec![reply(egui::UserData::default())],
+            egui::Modifiers::NONE,
+        );
+        assert!(captured.is_none());
+        assert_eq!(app.screenshot, RegionCapture::Pending);
+        let (captured, _) = frame(
+            &mut app,
+            0.6,
+            vec![reply(egui::UserData::new(request))],
+            egui::Modifiers::NONE,
+        );
+        let (image, stem) = captured.expect("cropped capture");
+        assert_eq!(image.size, [200, 150]);
+        assert_eq!(stem, "sample.Target");
+        assert_eq!(app.screenshot, RegionCapture::Idle);
+        assert!(
+            app.pending_dialog.is_none(),
+            "save dialog is the caller's job"
+        );
+        // A tiny drag is an accidental click and is dropped.
+        frame(
+            &mut app,
+            0.7,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(50.0, 50.0)),
+                button(egui::pos2(50.0, 50.0), true),
+            ],
+            egui::Modifiers::COMMAND,
+        );
+        let (captured, output) = frame(
+            &mut app,
+            0.8,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(52.0, 51.0)),
+                button(egui::pos2(52.0, 51.0), false),
+            ],
+            egui::Modifiers::COMMAND,
+        );
+        assert!(captured.is_none());
+        assert_eq!(app.screenshot, RegionCapture::Idle);
+        assert!(
+            output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_none_or(|v| !v
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, egui::ViewportCommand::Screenshot(_))))
+        );
     }
     #[test]
     fn stale_dialog_result_cannot_act_or_clear_new_guard() {

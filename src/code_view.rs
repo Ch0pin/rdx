@@ -1002,7 +1002,11 @@ impl CodeDocument {
                             output.state.cursor.set_char_range(previous_selection);
                             output.state.clone().store(ui.ctx(), editor_id);
                         }
-                        if output.response.secondary_clicked() {
+                        // Cmd/Ctrl + right button is the region-screenshot gesture (see
+                        // `screenshot.rs`); it must not open the context menu.
+                        let screenshot_gesture =
+                            ui.input(|i| i.modifiers.command) && output.response.secondary_clicked();
+                        if output.response.secondary_clicked() && !screenshot_gesture {
                             self.menu_link = ui
                                 .ctx()
                                 .pointer_interact_pos()
@@ -1027,7 +1031,7 @@ impl CodeDocument {
                                     self.metadata_fold.as_ref().map_or(range.start, |group| group.source_boundary(range.start, false))..self.metadata_fold.as_ref().map_or(range.end, |group| group.source_boundary(range.end, true))
                                 });
                         }
-                        output.response.context_menu(|ui| {
+                        if !screenshot_gesture { output.response.context_menu(|ui| {
                             // Popup text follows the interface theme, independently of code colors.
                             ui.visuals_mut().override_text_color = None;
                             #[cfg(test)]
@@ -1180,7 +1184,7 @@ impl CodeDocument {
                                 ui.ctx().copy_text(self.source.to_string());
                                 ui.close_menu();
                             }
-                        });
+                        }); }
                         #[cfg(test)]
                         {
                             self.last_galley_pos = Some(output.galley_pos);
@@ -2719,6 +2723,72 @@ mod tests {
         doc.jump_to_range(7, 11).unwrap();
         assert!(!doc.refresh_search_source("return different;\n".into(), vec![]));
         assert!(doc.highlight.is_none());
+    }
+    #[test]
+    fn modifier_right_click_is_reserved_for_region_screenshots() {
+        let context = egui::Context::default();
+        let mut doc = CodeDocument::new("🎯 café = 1; // café\n".into(), "java");
+        let render = |doc: &mut CodeDocument, time: f64, events, modifiers| {
+            context.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    modifiers,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        doc.show(ui, CodeTheme::Ocean, 14.0);
+                    });
+                },
+            )
+        };
+        render(&mut doc, 0.0, vec![], egui::Modifiers::NONE);
+        let point = doc.last_galley_pos.unwrap() + egui::vec2(10.0, 5.0);
+        for (round, (modifiers, menu_expected)) in [
+            (egui::Modifiers::COMMAND, false),
+            (egui::Modifiers::NONE, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Keep rounds far apart in time so clicks never pair into a double click.
+            let base = 1.0 + round as f64 * 5.0;
+            let button = |pressed| egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers,
+            };
+            doc.menu_items.clear();
+            render(
+                &mut doc,
+                base,
+                vec![egui::Event::PointerMoved(point), button(true)],
+                modifiers,
+            );
+            render(&mut doc, base + 0.1, vec![button(false)], modifiers);
+            render(&mut doc, base + 0.2, vec![], modifiers);
+            assert_eq!(
+                !doc.menu_items.is_empty(),
+                menu_expected,
+                "modifiers {modifiers:?}"
+            );
+            if menu_expected {
+                render(
+                    &mut doc,
+                    base + 0.3,
+                    vec![egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    egui::Modifiers::NONE,
+                );
+            }
+        }
     }
     #[test]
     fn context_menu_navigates_copies_and_preserves_selection() {

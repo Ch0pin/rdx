@@ -9,6 +9,7 @@ use rdx::manifest_summary;
 mod native_coverage;
 mod navigation;
 mod render_recovery;
+mod screenshot;
 mod search;
 mod search_benchmark;
 mod search_index;

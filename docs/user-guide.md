@@ -98,6 +98,14 @@ Fira Code and Source Code Pro. Fonts are bundled with Unicode fallbacks; the
 choice saves automatically. Click a word in the source viewer to highlight its other exact occurrences.
 Find results and navigation highlights remain separate.
 
+**Region screenshot.** Hold `Cmd` on macOS or `Ctrl` elsewhere, press the right
+mouse button over the content area and drag a rectangle; the live outline shows the
+capture size in pixels. Releasing captures exactly that region of the window at
+native display resolution and opens a save dialog with the file name prefilled from
+the active tab (for example `com.example.LoginActivity.png` or
+`res_layout_main.xml.png`). Drags smaller than a few points are ignored, and the
+right button without the modifier still opens the code context menu.
+
 Theme and font attribution is in [third_party/themes](../third_party/themes/README.md)
 and [third_party/fonts](../third_party/fonts/README.md). Redistributed application
 bundles must include these license notices alongside the embedded assets.

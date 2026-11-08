@@ -79,10 +79,18 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     let batch = schema("get_call_graph_batch");
     assert_eq!(batch["properties"]["method_ids"]["maxItems"], 16);
     assert!(
-        batch["required"]
+        !batch["required"]
             .as_array()
             .unwrap()
             .contains(&json!("method_ids"))
+    );
+    assert_eq!(
+        batch["anyOf"],
+        json!([{"required":["method_ids"]},{"required":["method_id"]},{"required":["method_signature"]},{"required":["signature"]}])
+    );
+    assert_eq!(
+        batch["properties"]["method_id"]["type"],
+        json!(["string", "array"])
     );
     for name in ["get_call_graph", "get_call_graph_batch"] {
         assert_eq!(
@@ -133,7 +141,7 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     }
 
     let integers = schema("find_integer_references");
-    for key in ["values", "instance_id", "project_id"] {
+    for key in ["instance_id", "project_id"] {
         assert!(
             integers["required"]
                 .as_array()
@@ -141,6 +149,16 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
                 .contains(&json!(key))
         );
     }
+    assert_eq!(
+        integers["anyOf"],
+        json!([{"required":["values"]},{"required":["value"]}])
+    );
+    assert!(
+        integers["properties"]["value"]["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("Alias for values")
+    );
     assert_eq!(integers["properties"]["values"]["maxItems"], 64);
     assert_eq!(integers["properties"]["bit_width"]["enum"], json!([32, 64]));
     assert_eq!(integers["properties"]["limit"]["maximum"], 500);
@@ -154,9 +172,13 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         500
     );
     let config = schema("find_config_key_consumers");
-    for key in ["key", "instance_id", "project_id"] {
+    for key in ["instance_id", "project_id"] {
         assert!(config["required"].as_array().unwrap().contains(&json!(key)));
     }
+    assert_eq!(
+        config["anyOf"],
+        json!([{"required":["key"]},{"required":["query"]},{"required":["value"]},{"required":["config_key"]}])
+    );
     assert_eq!(config["properties"]["limit"]["maximum"], 100);
     assert_eq!(
         schema("get_class_hierarchy")["anyOf"],
@@ -252,10 +274,44 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     assert_eq!(health["properties"]["limit"]["maximum"], 500);
     let literals = schema("find_string_references");
     let required = literals["required"].as_array().unwrap();
-    for key in ["query", "instance_id", "project_id"] {
+    for key in ["instance_id", "project_id"] {
         assert!(required.contains(&json!(key)));
     }
+    assert_eq!(
+        literals["anyOf"],
+        json!([{"required":["query"]},{"required":["value"]},{"required":["string"]},{"required":["literal"]},{"required":["text"]}])
+    );
     assert_eq!(literals["properties"]["query"]["minLength"], 1);
+    assert_eq!(literals["properties"]["value"]["minLength"], 1);
+    assert_eq!(
+        literals["properties"]["value"]["description"],
+        "Alias for query; conflicting values are rejected"
+    );
+    let types = schema("find_type_references");
+    assert_eq!(
+        types["anyOf"],
+        json!([{"required":["class_name"]},{"required":["type_name"]},{"required":["class_id"]},{"required":["type"]}])
+    );
+    assert_eq!(
+        types["properties"]["type_name"]["description"],
+        "Alias for class_name; conflicting values are rejected"
+    );
+    assert_eq!(
+        schema("search_code")["anyOf"],
+        json!([{"required":["query"]},{"required":["keyword"]},{"required":["text"]},{"required":["value"]}])
+    );
+    assert_eq!(
+        schema("get_dex_strings")["properties"]["keyword"]["description"],
+        "Alias for query; conflicting values are rejected"
+    );
+    assert_eq!(
+        method_source["properties"]["include_call_sites"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        method_source["properties"]["include_call_sites"]["default"],
+        false
+    );
     assert_eq!(
         literals["properties"]["match_mode"]["enum"],
         json!(["exact", "contains"])

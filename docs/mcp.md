@@ -44,6 +44,24 @@ stops its old service. Standalone/headless services load their own project once.
    `class_name`. Restarting the server changes project identity;
    stale project requests are rejected.
 
+Parameter aliases: every tool advertises the alias names it accepts in its
+schema, and an alias is rewritten to its canonical parameter before validation,
+so the pair never changes meaning. `find_string_references` takes `query` and
+accepts `value`, `string`, `literal`, or `text`; `find_type_references` and
+`find_layout_references` take `class_name` and accept `type_name`, `class_id`,
+or `type`; `find_integer_references` takes `values` and accepts `value` (one
+value or a list); `find_config_key_consumers` takes `key` and accepts `query`,
+`value`, or `config_key`; the `search_*` tools and the optional `query` of
+`get_all_classes`, `get_all_resource_file_names`, `get_strings`, and
+`get_dex_strings` accept `keyword`, `text`, or `value`; method tools accept
+`method_signature` or `signature` for `method_id`; and `get_call_graph_batch`
+accepts `method_id`, `method_signature`, or `signature` for `method_ids`,
+wrapping one selector into a one-element list. An alias supplied alongside its
+canonical parameter must carry the same value; otherwise the call fails with
+`CONFLICTING_ARGUMENTS` (method selectors: `CONFLICTING_METHOD_SELECTORS`). An
+unknown parameter name fails with `Unknown argument: <name>; accepted
+arguments: ...`, listing every accepted name, before any missing-selector check.
+
 A missing FQCN returns `SYMBOL_NOT_FOUND` with JSON-formatted `candidates`,
 `candidate_count`, and `candidates_truncated`. Suggestions list loaded classes
 with the same exact simple name, sorted by FQCN, capped at 20 IDs and 16 KiB.
@@ -201,15 +219,27 @@ selection remains exact.
 Use `direction: "callers"` to trace into a method, `"callees"` (default) to
 follow outgoing calls, or `"both"`. Edges always point from caller to callee.
 
-An incomplete selector such as `sample.Target.doubleValue` or
-`sample.Target.doubleValue(I)` returns bounded same-name declaration candidates,
-including their parameter and return descriptors. Candidates come from the
-requested class and known superclass chain; constructors use only their own
-class. Retry with an exact candidate. No overload is selected automatically.
-For example, `Lpkg/Class;->m()` is incomplete because it omits the return
-descriptor; a void method is `Lpkg/Class;->m()V` or `pkg.Class.m()V`.
-The error includes examples of both formats and explains the required return
-descriptor, even when no declaration candidates are available.
+Method selectors may be short. A missing return descriptor, as in
+`sample.Target.doubleValue(I)`, selects the one declaration with that name and
+those parameters; a bare name such as `sample.Caller.compute` selects the one
+declaration with that name. Candidates come from the requested class and its
+known superclass chain (up to 256 types); constructors use only their own
+class. The response then carries `requested_method_id`, the selected
+`method_id`, and `method_selection` with `status` (`exact` or
+`unique_candidate`), `owner_qualified`, and the selection `scope`. A short or
+unique simple-name owner such as `Target.doubleValue(I)I` or
+`LandingActivity.m2` resolves like a class selector first; ambiguous short
+owners fail with `AMBIGUOUS_CLASS`. Several matching overloads fail with
+`AMBIGUOUS_METHOD` and list them with parameter and return descriptors, so one
+can be retried exactly; no overload is chosen silently. No match fails with
+`SYMBOL_NOT_FOUND` and the bounded same-name declarations. Complete signatures
+of classes outside the loaded DEX set keep their external semantics. An
+incomplete selector for an unloaded class cannot be completed; the error shows
+both ID formats and the required return descriptor, for example
+`Lpkg/Class;->m()V` or `pkg.Class.m()V` for a void method.
+`get_call_graph_batch` applies the same selection per entry; an ambiguous entry
+is reported in that entry's `error` and counted in `failed_queries` while the
+other entries proceed.
 
 The response includes numbered nodes, method IDs, distance from the root,
 component classifications, available declarations, call-site counts, and
@@ -310,9 +340,12 @@ class-wide even when only a small source slice is returned.
 
 ### Method source
 
-`get_method_source` requires `instance_id`, `project_id`, and either an exact
+`get_method_source` requires `instance_id`, `project_id`, and either a
 `method_id` or `class_name` plus `method_name` (optional `descriptor`). For
-example, `sample.Target.doubleValue(I)I` selects that overload alone.
+example, `sample.Target.doubleValue(I)I` selects that overload alone. Short
+selectors such as `Target.doubleValue(I)` or `Caller.compute` resolve as
+described for `get_call_graph`; the response echoes `requested_method_id`, the
+selected `method_id`, and `method_selection`.
 
 The response renders only the requested method. It contains `method_id`, `text`,
 `format` (`java` or `rdx-dex`), `requested_format` (`auto` or `dex`),
@@ -345,6 +378,25 @@ a maximum of 128,000 characters. Every page carries the hash of the complete
 method. If a complete response exceeds the transport budget, request explicit
 pages using the same method and project IDs. Oversized responses report an
 error rather than silently truncating source.
+
+`include_call_sites: true` adds a `call_sites` table that ties the rendered
+text back to the bytecode. `items` lists every invoke instruction of the
+selected method in DEX order (bounded to 500; `total` and `truncated` report
+the rest) with `call_site_offset` (16-bit code units, the same unit as
+`get_call_graph` call sites and the rdx-dex line markers),
+`call_site_offset_hex`, `dispatch`, `callee_method_id`, `constant_arguments`,
+and `source_mapping`. `constant_arguments` names each argument's DEX `register`
+and the string or 32-bit constant proven to reach it on every path, so a folded
+Java argument such as `f3(true, true)` can be traced to `const/4 v0, 1` at a
+specific offset; anything not proven stays `unresolved`. `source_mapping`
+places the invoke in this response's text: `exact_dex_line` for rdx-dex text,
+`unique_target_reference` when the callee is referenced exactly once in both
+the DEX body and the Java text, otherwise `ambiguous` with up to eight
+`candidate_locations`. The Java mapping is a structural association, not an
+instruction emission trace; `reconstruction_status` reports `decompiled`,
+`dex-requested`, or `dex-fallback`. The table covers the whole method
+regardless of text paging. To find the callers that pass a specific constant,
+use `get_call_graph` with `direction: "callers"` and `argument_literal`.
 
 ## Bounded code search
 
@@ -865,14 +917,20 @@ format in both directions.
 parameter descriptor is accepted in both forms: `pkg.Class.method:(I)V` and
 `Lpkg/Class;->method:(I)V`. This separator is normalized to the canonical ID
 without guessing an overload. The response reports the canonical `method_id`
-and the original `requested_method_id`. A wrong/missing descriptor returns
-`SYMBOL_NOT_FOUND` with JSON-formatted `candidates`, `candidate_count` and
-`candidates_truncated` in the error message. Candidates are actual same-name
-declarations in the requested class; exact parameter matches rank first when
-only the return type differs. At most 20 IDs / 16 KiB of candidate text are
-included. Use `get_methods_of_class` for the full list. No candidate is selected
-automatically. Unknown names return an empty candidate list. This assistance is
-for source-method lookup; call graphs retain their external-symbol semantics.
+and the original `requested_method_id`. A missing return descriptor or a bare
+method name selects the one matching declaration
+(`method_selection.status: "unique_candidate"`); several matches return
+`AMBIGUOUS_METHOD` and a wrong descriptor returns `SYMBOL_NOT_FOUND`, both with
+JSON-formatted `candidates`, `candidate_count`, `candidates_truncated`, `scope`,
+and a `hint` in the error message. Candidates are actual same-name declarations
+in the requested class and its known superclass chain; exact parameter matches
+rank first when only the return type differs. At most 20 IDs / 16 KiB of
+candidate text are included. Use `get_methods_of_class` for the full list.
+Unknown names return an empty candidate list. The same selection applies to
+`get_call_graph`, `export_source`, `resolve_reference`,
+`resolve_switch_case_callers`, `get_lambda_branch` (`caller_method_id`), and
+`find_instantiations` (`allocating_method_id`); call graphs retain their
+external-symbol semantics for complete signatures.
 
 
 ## Integer constant references
@@ -1136,7 +1194,7 @@ accepted only with `projection: "call_sites"` and are not available on
 All queries below require `instance_id` and `project_id`. New scans support cancellation and stable occurrence pagination (`offset`, `limit <= 500`), bounded response pages, and explicit error coverage. `complete` describes the documented scan, never application security coverage.
 
 - `get_all_classes` and `search_classes_by_keyword` accept `case_sensitive:false`. Returned IDs preserve case; an empty case-sensitive search includes up to 20 case-insensitive near matches. Resolution never silently substitutes a case variant. Missing-class errors describe absence from the loaded DEX set, without asserting runtime loading. `package_prefix` accepts one prefix, an array of prefixes, or `obfuscated-root`; near-match `suggestions` ignore it and say so in `suggestions_scope`.
-- Validation errors include `accepted_parameters` containing the tool input schema and selector alternatives. Singular IDs and plural batch IDs retain their separate meanings.
+- Validation errors include `accepted_parameters` containing the tool input schema and selector alternatives; an unknown parameter name is reported with every accepted name. `get_call_graph_batch` wraps a single `method_id` alias into `method_ids`; the plural result shape is unchanged.
 - `find_type_references(class_name, package_prefix?)` pages exact original DEX type references. Use FQCN or a DEX descriptor. It includes class literals, casts, type checks, allocations, inheritance, field/parameter/return declaration types, and explicit class/field/method/parameter annotation types with decoded values. Annotation hits follow identifier hits; the combined source hash covers both. Array component matches preserve the actual array operand. Annotation defaults and nested value types are outside this projection.
 - `search_kotlin_metadata(query, case_sensitive?, package_prefix?)` searches `kotlin.Metadata.d2`, returning owning DEX class, table index and matched string. These are discovery evidence, **not verified original-name aliases**: a d2 entry may describe a referenced type or member. Canonical lookup continues to use DEX identities.
 
@@ -1382,9 +1440,14 @@ as a cancellable background MCP request; health checks remain available.
 ### Reviewer query reliability
 
 Method-addressed tools with a singular `method_id` also accept
-`method_signature` or `signature`. Matching selector values are accepted;
-conflicting selectors fail explicitly. Batch `method_ids` and constructor
-`caller_method_id` remain distinct selectors.
+`method_signature` or `signature`; `get_call_graph_batch` accepts one
+`method_id`, `method_signature`, or `signature` for `method_ids`. Reviewer
+query parameters accept the aliases listed under "Parameter aliases" at the top
+of this document (`value` for `query`, `type_name` for `class_name`, `value`
+for `values`, `query` for `key`, `keyword` for `query`). Matching values are
+accepted; conflicting values fail explicitly with
+`CONFLICTING_METHOD_SELECTORS` or `CONFLICTING_ARGUMENTS`. Constructor
+`caller_method_id` remains a distinct selector.
 
 Instance selection lists reachable running `candidates` independently of result
 pagination. `matching_candidate_discovery_incomplete` means a matching pair can

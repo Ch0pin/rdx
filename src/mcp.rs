@@ -545,7 +545,7 @@ fn project_request(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
-    let normalized = feedback::method_aliases(name, args)?;
+    let normalized = feedback::aliases(name, args)?;
     let args = &normalized;
     if name == "get_export_status" || name == "cancel_export" {
         return project
@@ -1174,7 +1174,15 @@ fn dispatch(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
-    let mut normalized = feedback::method_aliases(name, args)?;
+    let mut normalized = feedback::aliases(name, args)?;
+    let mut selection = None;
+    if let Some(key) = method_selector(name)
+        && let Some(requested) = normalized[key].as_str().map(str::to_owned)
+    {
+        let chosen = select_method(engine, project, &requested, name == "get_call_graph")?;
+        normalized[key] = json!(chosen.method_id);
+        selection = Some((key, requested, chosen));
+    }
     if class_scoped(name)
         && (name != "find_instantiations"
             || args.get("class_id").is_some()
@@ -1224,7 +1232,69 @@ fn dispatch(
             .cloned()
             .unwrap_or(Value::Null);
     }
+    if let Some((key, requested, chosen)) = selection {
+        if key == "method_id" {
+            result["requested_method_id"] = json!(requested);
+            if matches!(name, "get_method_source" | "get_call_graph") {
+                result["method_id"] = json!(chosen.method_id);
+            }
+        }
+        result["method_selection"] = json!({"parameter":key,"requested_method_id":requested,"method_id":chosen.method_id,
+            "status":if chosen.exact {"exact"} else {"unique_candidate"},"owner_qualified":chosen.owner_qualified,
+            "scope":crate::method_lookup::SELECTION_SCOPE});
+    }
     Ok(result)
+}
+/// Parameters that name one method and accept short owners or incomplete
+/// selectors.
+fn method_selector(name: &str) -> Option<&'static str> {
+    match name {
+        "get_method_source"
+        | "get_call_graph"
+        | "export_source"
+        | "resolve_reference"
+        | "resolve_switch_case_callers" => Some("method_id"),
+        "get_lambda_branch" => Some("caller_method_id"),
+        "find_instantiations" => Some("allocating_method_id"),
+        _ => None,
+    }
+}
+struct MethodSelection {
+    method_id: String,
+    exact: bool,
+    owner_qualified: bool,
+}
+/// A short or unloaded owner resolves like a class selector before overload
+/// selection. Complete signatures of unloaded owners stay exact only where the
+/// tool accepts targets outside the loaded DEX set.
+fn select_method(
+    engine: &NativeEngine,
+    project: &Project,
+    requested: &str,
+    external_allowed: bool,
+) -> Result<MethodSelection> {
+    let id = crate::method_lookup::normalize(requested)?;
+    let owner = crate::method_lookup::owner(&id)?.to_owned();
+    let qualified = if engine.dex_class(&owner).is_some() {
+        id.clone()
+    } else {
+        match resolve_class_id(project, &owner) {
+            Ok(resolved) => format!("{resolved}{}", &id[owner.len()..]),
+            Err(_) if external_allowed && crate::method_lookup::complete(&id) => id.clone(),
+            Err(error) if crate::method_lookup::complete(&id) => return Err(error),
+            Err(error) => bail!(
+                "{error:#}; an incomplete method selector needs a loaded declaring class to list overloads; otherwise supply the exact DEX signature, e.g. {} or {}, with parameter descriptors in parentheses and a return descriptor after ')' (V for void)",
+                crate::method_lookup::EXAMPLE,
+                crate::method_lookup::SMALI_EXAMPLE
+            ),
+        }
+    };
+    let selection = crate::method_lookup::select(&qualified, |name| engine.dex_class(name))?;
+    Ok(MethodSelection {
+        owner_qualified: qualified != id,
+        method_id: selection.method_id,
+        exact: selection.exact,
+    })
 }
 fn class_scoped(name: &str) -> bool {
     matches!(
@@ -1335,7 +1405,17 @@ fn dispatch_resolved(
                 },
             )?;
             let report = engine.method_source(&id, requested_format, cancel)?;
+            let call_sites = (args["include_call_sites"] == true)
+                .then(|| navigation::call_site_table(engine, &id, requested_format == crate::engine::MethodSourceFormat::Dex, &report, cancel))
+                .transpose()?;
             let mut result = method_source_page(report.code.source, args, report.format)?;
+            if let Some(call_sites) = call_sites {
+                result["call_sites"] = call_sites;
+                ensure!(
+                    serde_json::to_vec(&result)?.len() < MAX_FRAME as usize - 65536,
+                    "METHOD_SOURCE_TOO_LARGE: page the text with explicit limit and offset, or omit include_call_sites"
+                );
+            }
             result["method_id"] = json!(id);
             result["requested_method_id"] = json!(requested);
             result["offset_unit"] = json!("Unicode scalar characters relative to this method source");
@@ -1866,6 +1946,9 @@ fn tools_list() -> Value {
         if ["get_method_source","export_source"].contains(&name) {
             properties.insert("format".into(),json!({"type":"string","enum":["auto","dex"],"default":"auto","description":"auto attempts Java with explicit DEX fallback; dex requests native RDX DEX disassembly directly"}));
         }
+        if name=="get_method_source" {
+            properties.insert("include_call_sites".into(),json!({"type":"boolean","default":false,"description":"Add call_sites: every invoke of this method with its DEX offset, callee, argument registers with proven constants, and the position in this text when the callee is referenced once (rdx-dex text maps every offset)"}));
+        }
         if name=="find_field_references" {
             properties.insert("field".into(),json!({"type":"string","minLength":1,"description":"Alias for field_id; accepts Lpkg/Class;->name:type and pkg.Class.name:type"}));
             properties.insert("access".into(),json!({"type":"string","enum":["all","read","write"],"default":"all"}));
@@ -1969,8 +2052,15 @@ fn tools_list() -> Value {
             properties.remove("offset");properties.remove("limit");
         }
         if ["get_all_classes","get_all_resource_file_names","get_strings","get_dex_strings"].contains(&name){properties.insert("query".into(),json!({"type":"string"}));}
-        if properties.contains_key("method_id") {
-            for alias in ["method_signature","signature"] { properties.insert(alias.into(),json!({"type":"string","minLength":1,"description":"Alias for method_id; conflicting selectors are rejected"})); }
+        for (canonical, names) in feedback::argument_aliases(name) {
+            for alias in names {
+                let property = match canonical {
+                    "values" => json!({"anyOf":[{"type":"integer"},{"type":"string","minLength":1,"maxLength":32},{"type":"array","minItems":1,"maxItems":64,"items":{"anyOf":[{"type":"integer"},{"type":"string","minLength":1,"maxLength":32}]}}],"description":"Alias for values; one value or a list"}),
+                    "method_ids" => json!({"type":["string","array"],"description":"Alias for method_ids; one method selector or a list"}),
+                    _ => json!({"type":"string","minLength":1,"description":format!("Alias for {canonical}; conflicting values are rejected")}),
+                };
+                properties.insert((*alias).into(),property);
+            }
         }
         let mut schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
         if class_scoped(name) { schema["anyOf"] = json!([{"required":["class_id"]},{"required":["class_name"]}]); }
@@ -1982,15 +2072,18 @@ fn tools_list() -> Value {
         if name=="find_field_references" { schema["anyOf"].as_array_mut().unwrap().push(json!({"required":["field"]})); }
         if name=="export_source" {schema["anyOf"]=json!([{"required":["class_name"]},{"required":["method_id"]}]);}
         if name=="get_resource_value" {schema["anyOf"]=json!([{"required":["resource_id"]},{"required":["resource_name"]}]);}
-        if schema["properties"].get("method_id").is_some() {
-            if schema["required"].as_array().unwrap().iter().any(|v| v=="method_id") {
-                schema["required"].as_array_mut().unwrap().retain(|v|v!="method_id");
-                schema["anyOf"]=json!([{"required":["method_id"]}]);
+        for (canonical, names) in feedback::argument_aliases(name) {
+            if schema["required"].as_array().unwrap().iter().any(|v| v==canonical) {
+                schema["required"].as_array_mut().unwrap().retain(|v| v!=canonical);
+                match schema["anyOf"].as_array_mut() {
+                    None => schema["anyOf"]=json!([{"required":[canonical]}]),
+                    Some(alternatives) => for option in alternatives { option["required"].as_array_mut().unwrap().push(json!(canonical)); },
+                }
             }
             if let Some(alternatives)=schema["anyOf"].as_array_mut() {
                 let originals=alternatives.clone();
-                for option in originals { if option["required"].as_array().is_some_and(|a|a.iter().any(|v|v=="method_id")) {
-                    for alias in ["method_signature","signature"] { let mut variant=option.clone(); for key in variant["required"].as_array_mut().unwrap() { if key=="method_id" { *key=json!(alias); } } alternatives.push(variant); }
+                for option in originals { if option["required"].as_array().is_some_and(|a|a.iter().any(|v|v==canonical)) {
+                    for alias in names { let mut variant=option.clone(); for key in variant["required"].as_array_mut().unwrap() { if key==canonical { *key=json!(*alias); } } alternatives.push(variant); }
                 } }
             }
         }
@@ -2024,7 +2117,7 @@ fn validate(name: &str, args: &Value) -> Result<()> {
 }
 
 fn validate_arguments(name: &str, args: &Value) -> Result<()> {
-    let normalized = feedback::method_aliases(name, args)?;
+    let normalized = feedback::aliases(name, args)?;
     let args = &normalized;
     let tools = tools_list();
     let tool = tools["tools"]
@@ -2035,6 +2128,20 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
         .context("Unknown tool")?;
     let schema = &tool["inputSchema"];
     let object = args.as_object().context("Arguments must be an object")?;
+    // A misspelled parameter is reported before any missing selector, with the
+    // accepted names, so the retry needs no schema lookup.
+    for key in object.keys() {
+        if schema["properties"][key].is_null() {
+            let accepted = schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("Unknown argument: {key}; accepted arguments: {accepted}");
+        }
+    }
     for key in schema["required"].as_array().unwrap() {
         let key = key.as_str().unwrap();
         ensure!(object.contains_key(key), "Missing {key}");
@@ -2058,7 +2165,6 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
     }
     for (key, value) in object {
         let property = &schema["properties"][key];
-        ensure!(!property.is_null(), "Unknown argument: {key}");
         if name == "get_call_graph_batch" && key == "method_ids" {
             let methods = value.as_array().context("method_ids must be an array")?;
             ensure!(
@@ -3384,46 +3490,73 @@ mod tests {
         }
     }
     #[test]
-    fn call_graph_incomplete_selectors_return_candidates_in_both_projections() {
+    fn call_graph_incomplete_selectors_select_unique_overloads_or_list_candidates() {
         let dir = TestDir::new();
         let (_server, record, mut args) = start(&dir, "navigation.apk");
         for projection in [None, Some("graph"), Some("call_sites")] {
             if let Some(projection) = projection {
                 args["projection"] = json!(projection);
             }
-            for method in [
-                "sample.Target.doubleValue",
-                "Lsample/Target;->doubleValue",
-                "sample.Target.doubleValue(I)",
-                "Lsample/Target;->doubleValue(I)",
-            ] {
+            for method in ["sample.Target.doubleValue", "Lsample/Target;->doubleValue"] {
                 args["method_id"] = json!(method);
                 validate("get_call_graph", &args).unwrap();
                 let error = remote(&record, "get_call_graph", &args)
                     .unwrap_err()
                     .to_string();
+                assert!(error.contains("AMBIGUOUS_METHOD"), "{error}");
                 assert!(error.contains("sample.Target.doubleValue(I)I"), "{error}");
-                assert!(error.contains("no overload was selected"), "{error}");
                 assert!(
-                    error.contains("Lpkg/Class;->method(Ljava/lang/String;)V"),
+                    error.contains(
+                        "sample.Target.doubleValue(Ljava/lang/String;)Ljava/lang/String;"
+                    ),
                     "{error}"
                 );
-                assert!(
-                    error.contains("a return descriptor after ')' (V for void)"),
-                    "{error}"
-                );
+                assert!(error.contains("\"candidate_count\":2"), "{error}");
             }
             args["method_id"] = json!("sample.Target.doubleValue(I)I");
-            let dotted = remote(&record, "get_call_graph", &args).unwrap();
-            args["method_id"] = json!("Lsample/Target;->doubleValue(I)I");
-            let smali = remote(&record, "get_call_graph", &args).unwrap();
-            for key in ["nodes", "edges", "items"] {
-                assert_eq!(dotted["data"][key], smali["data"][key], "{key}");
+            let exact = remote(&record, "get_call_graph", &args).unwrap();
+            assert_eq!(exact["data"]["method_selection"]["status"], "exact");
+            assert_eq!(exact["data"]["method_selection"]["owner_qualified"], false);
+            for method in [
+                "sample.Target.doubleValue(I)",
+                "Lsample/Target;->doubleValue(I)",
+                "Target.doubleValue(I)",
+                "Target.doubleValue(I)I",
+                "Lsample/Target;->doubleValue(I)I",
+            ] {
+                args["method_id"] = json!(method);
+                let selected = remote(&record, "get_call_graph", &args).unwrap();
+                for key in ["nodes", "edges", "items", "root_method_id"] {
+                    assert_eq!(exact["data"][key], selected["data"][key], "{method} {key}");
+                }
+                let selection = &selected["data"]["method_selection"];
+                assert_eq!(selected["data"]["requested_method_id"], method);
+                assert_eq!(
+                    selected["data"]["method_id"],
+                    "sample.Target.doubleValue(I)I"
+                );
+                assert_eq!(selection["method_id"], "sample.Target.doubleValue(I)I");
+                assert_eq!(
+                    selection["status"],
+                    if method.ends_with('I') {
+                        "exact"
+                    } else {
+                        "unique_candidate"
+                    },
+                    "{method}"
+                );
+                assert_eq!(
+                    selection["owner_qualified"],
+                    method.starts_with("Target."),
+                    "{method}"
+                );
             }
             args["method_id"] = json!("Lpkg/Class;->m()");
             let error = remote(&record, "get_call_graph", &args)
                 .unwrap_err()
                 .to_string();
+            assert!(error.contains("SYMBOL_NOT_FOUND"), "{error}");
+            assert!(error.contains("pkg.Class"), "{error}");
             assert!(
                 error.contains("pkg.Class.method(Ljava/lang/String;)V"),
                 "{error}"
@@ -3436,6 +3569,17 @@ mod tests {
                 error.contains("a return descriptor after ')' (V for void)"),
                 "{error}"
             );
+            // Complete external selectors keep their call-graph semantics.
+            args["method_id"] = json!("Lpkg/Class;->m()V");
+            let external = remote(&record, "get_call_graph", &args).unwrap();
+            assert_eq!(external["data"]["method_selection"]["status"], "exact");
+            assert_eq!(external["data"]["root_method_id"], "pkg.Class.m()V");
+            args["method_id"] = json!("Target.missing");
+            let error = remote(&record, "get_call_graph", &args)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("SYMBOL_NOT_FOUND"), "{error}");
+            assert!(error.contains("get_methods_of_class"), "{error}");
         }
     }
 

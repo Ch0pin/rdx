@@ -1,6 +1,6 @@
 //! Source-symbol navigation and conservative call-site enrichment.
 use crate::{
-    engine::{DecompiledCode, MethodSourceFormat, NativeEngine, Project},
+    engine::{DecompiledCode, MethodSource, MethodSourceFormat, NativeEngine, Project},
     native_ir::DecodedMethod,
 };
 use anyhow::{Context, Result, ensure};
@@ -282,6 +282,119 @@ fn mapped_location(code: &DecompiledCode, start: usize) -> Value {
     let (line, column) = position(&code.source, start);
     json!({"source_hash":code.source_hash,"source_offset":start,"line":line,"column":column,"document_scope":"method","offset_unit":"unicode_scalar","line_column_base":1})
 }
+/// Position of one DEX invoke in the rendered method text. DEX text maps by
+/// its offset marker. Java text maps only when the callee is referenced once
+/// in both the DEX body and the text: a structural association, never an
+/// instruction emission trace. Otherwise every text reference to the callee is
+/// listed as a candidate.
+fn site_mapping(
+    report: &MethodSource,
+    method_id: &str,
+    target: &str,
+    pc: usize,
+    dex_occurrences: usize,
+    reconstruction_status: &str,
+) -> Value {
+    let mut mapping = json!({"status":"ambiguous","reconstruction_status":reconstruction_status,"fallback_reason":report.fallback_reason,"method_id":method_id,"source_hash":report.code.source_hash,"document_scope":"method"});
+    if report.format == "rdx-dex" {
+        let marker = format!("{pc:04x}:");
+        let mut offset = 0;
+        for line in report.code.source.lines() {
+            if line.trim_start().starts_with(&marker) {
+                mapping["status"] = json!("exact_dex_line");
+                mapping["location"] = mapped_location(&report.code, offset);
+                break;
+            }
+            offset += line.chars().count() + 1;
+        }
+        return mapping;
+    }
+    let links: Vec<_> = report
+        .code
+        .links
+        .iter()
+        .filter(|l| l.label == target)
+        .collect();
+    if links.len() == 1 && dex_occurrences == 1 {
+        mapping["status"] = json!("unique_target_reference");
+        mapping["location"] = mapped_location(&report.code, links[0].start);
+        mapping["precision"] = json!(
+            "Unique DEX target and source reference within this method; structural association, not an instruction emission trace"
+        );
+    } else {
+        mapping["reason"] =
+            json!("Repeated or rewritten calls cannot be assigned a unique Java location");
+        mapping["candidate_locations"] = json!(
+            links
+                .iter()
+                .take(8)
+                .map(|l| mapped_location(&report.code, l.start))
+                .collect::<Vec<_>>()
+        );
+        mapping["text_references"] = json!(links.len());
+        mapping["dex_invokes_of_callee"] = json!(dex_occurrences);
+    }
+    mapping
+}
+/// Every invoke of the selected method in DEX order: offset, callee, argument
+/// registers with proven constants, and its position in the rendered text where
+/// one is unambiguous. Bounded to 500 sites; constant proofs share the request
+/// work budget.
+pub(super) fn call_site_table(
+    engine: &NativeEngine,
+    id: &str,
+    requested_dex: bool,
+    report: &MethodSource,
+    cancel: &AtomicBool,
+) -> Result<Value> {
+    let owner = crate::method_lookup::owner(id)?;
+    let class = engine
+        .dex_class(owner)
+        .with_context(|| format!("SYMBOL_NOT_FOUND: class_id={owner}"))?;
+    let method = crate::method_lookup::resolve(class, id)?;
+    let raw = crate::native_xrefs::method_call_sites(class, method, cancel)?;
+    let total = raw.len();
+    let shown = &raw[..total.min(500)];
+    let mut occurrences = BTreeMap::<&str, usize>::new();
+    for site in &raw {
+        *occurrences.entry(site.callee.as_str()).or_default() += 1;
+    }
+    let wanted: std::collections::BTreeSet<_> = shown.iter().map(|site| site.pc).collect();
+    let mut work = 0;
+    let constants = if wanted.is_empty() {
+        Ok(BTreeMap::new())
+    } else {
+        crate::call_arguments::analyze(class, method, cancel, &mut work, &wanted)
+            .map_err(|error| format!("{error:#}"))
+    };
+    check(cancel)?;
+    let reconstruction_status = if report.format == "java" {
+        "decompiled"
+    } else if requested_dex {
+        "dex-requested"
+    } else {
+        "dex-fallback"
+    };
+    let items: Vec<_> = shown
+        .iter()
+        .map(|site| {
+            let arguments = match &constants {
+                Ok(found) => found.get(&site.pc).cloned().unwrap_or_else(
+                    || json!({"status":"unresolved","reason":"Call site is unreachable or unsupported"}),
+                ),
+                Err(reason) => json!({"status":"unresolved","reason":reason}),
+            };
+            json!({"call_site_offset":site.pc,"call_site_offset_hex":format!("0x{:04x}",site.pc),"dispatch":site.dispatch,
+                "callee_method_id":site.callee,"constant_arguments":arguments,
+                "source_mapping":site_mapping(report,id,&site.callee,site.pc,occurrences[site.callee.as_str()],reconstruction_status)})
+        })
+        .collect();
+    Ok(
+        json!({"items":items,"total":total,"truncated":total>items.len(),
+        "offset_unit":"16-bit DEX code units from the start of the method's code; call_site_offset matches get_call_graph call_site_offset and the rdx-dex line markers",
+        "scope":"Every static invoke instruction of the selected method in DEX order, bounded to 500. constant_arguments lists each argument's DEX register and the string or 32-bit constant proven to reach it; anything else stays unresolved. source_mapping places the invoke in this response's text only when the callee is referenced exactly once in both the DEX body and the text, or on its rdx-dex offset line; it is a structural association, not an instruction emission trace."}),
+    )
+}
 pub(super) fn enrich(
     engine: &mut NativeEngine,
     result: &mut Value,
@@ -347,6 +460,11 @@ pub(super) fn enrich(
                 let class = engine.dex_class(owner).context("Missing caller")?;
                 let method = crate::method_lookup::resolve(class, &id)?;
                 let raw = crate::native_xrefs::method_call_sites(class, method, cancel)?;
+                let reconstruction_status = if report.format == "java" {
+                    "decompiled"
+                } else {
+                    "dex-fallback"
+                };
                 for i in indices {
                     let target = sites[i]["raw_callee_method_id"]
                         .as_str()
@@ -354,40 +472,9 @@ pub(super) fn enrich(
                     let pc = sites[i]["call_site_offset"]
                         .as_u64()
                         .context("Missing call offset")? as usize;
-                    let mut mapping = json!({"status":"ambiguous","reconstruction_status":if report.format=="java" {"decompiled"} else {"dex-fallback"},"fallback_reason":report.fallback_reason,"method_id":id,"source_hash":report.code.source_hash,"document_scope":"method"});
-                    if report.format == "rdx-dex" {
-                        let marker = format!("{pc:04x}:");
-                        let mut offset = 0;
-                        for line in report.code.source.lines() {
-                            if line.trim_start().starts_with(&marker) {
-                                mapping["status"] = json!("exact_dex_line");
-                                mapping["location"] = mapped_location(&report.code, offset);
-                                break;
-                            }
-                            offset += line.chars().count() + 1;
-                        }
-                    } else {
-                        let links: Vec<_> = report
-                            .code
-                            .links
-                            .iter()
-                            .filter(|l| l.label == target)
-                            .collect();
-                        if links.len() == 1
-                            && raw.iter().filter(|s| s.callee == target).count() == 1
-                        {
-                            mapping["status"] = json!("unique_target_reference");
-                            mapping["location"] = mapped_location(&report.code, links[0].start);
-                            mapping["precision"] = json!(
-                                "Unique DEX target and source reference within this method; structural association, not an instruction emission trace"
-                            );
-                        } else {
-                            mapping["reason"] = json!(
-                                "Repeated or rewritten calls cannot be assigned a unique Java location"
-                            );
-                        }
-                    }
-                    sites[i]["source_mapping"] = mapping;
+                    let occurrences = raw.iter().filter(|s| s.callee == target).count();
+                    sites[i]["source_mapping"] =
+                        site_mapping(&report, &id, target, pc, occurrences, reconstruction_status);
                 }
             }
         }
@@ -528,5 +615,72 @@ mod tests {
         assert_eq!(offset_at(text, 2, 5).unwrap(), 7);
         assert_eq!(position(text, 7), (2, 5));
         assert!(offset_at(text, 4, 1).is_err());
+    }
+    #[test]
+    fn site_mapping_lists_candidates_when_java_reference_is_not_unique() {
+        let source = "a.f(1);\nb.f(2);\nc.g();\n".to_owned();
+        let report = MethodSource {
+            code: DecompiledCode {
+                source_hash: crate::engine::source_identity(&source),
+                links: vec![
+                    crate::engine::CodeLink {
+                        start: 2,
+                        end: 3,
+                        label: "x.T.f(I)V".into(),
+                    },
+                    crate::engine::CodeLink {
+                        start: 10,
+                        end: 11,
+                        label: "x.T.f(I)V".into(),
+                    },
+                    crate::engine::CodeLink {
+                        start: 18,
+                        end: 19,
+                        label: "x.T.g()V".into(),
+                    },
+                ],
+                definitions: vec![],
+                source,
+            },
+            format: "java",
+            reconstruction_attempted: true,
+            fallback_reason: None,
+        };
+        let repeated = site_mapping(&report, "x.C.m()V", "x.T.f(I)V", 4, 2, "decompiled");
+        assert_eq!(repeated["status"], "ambiguous");
+        assert_eq!(repeated["text_references"], 2);
+        assert_eq!(repeated["dex_invokes_of_callee"], 2);
+        let candidates = repeated["candidate_locations"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0]["line"], 1);
+        assert_eq!(candidates[0]["column"], 3);
+        assert_eq!(candidates[1]["line"], 2);
+        assert_eq!(candidates[1]["column"], 3);
+        let unique = site_mapping(&report, "x.C.m()V", "x.T.g()V", 9, 1, "decompiled");
+        assert_eq!(unique["status"], "unique_target_reference");
+        assert_eq!(unique["location"]["line"], 3);
+        assert_eq!(unique["location"]["column"], 3);
+        assert!(unique.get("candidate_locations").is_none());
+        // One text reference for two DEX invokes is still ambiguous.
+        let folded = site_mapping(&report, "x.C.m()V", "x.T.g()V", 9, 2, "decompiled");
+        assert_eq!(folded["status"], "ambiguous");
+        assert_eq!(folded["candidate_locations"].as_array().unwrap().len(), 1);
+        let dex = MethodSource {
+            code: DecompiledCode {
+                source: "\n.method x.C.m()V\n    0000: nop\n    0004: invoke-static {}, x.T.f(I)V\n.end method\n".into(),
+                links: vec![],
+                definitions: vec![],
+                source_hash: "h".into(),
+            },
+            format: "rdx-dex",
+            reconstruction_attempted: false,
+            fallback_reason: None,
+        };
+        let exact = site_mapping(&dex, "x.C.m()V", "x.T.f(I)V", 4, 1, "dex-requested");
+        assert_eq!(exact["status"], "exact_dex_line");
+        assert_eq!(exact["location"]["line"], 4);
+        assert_eq!(exact["reconstruction_status"], "dex-requested");
+        let missing = site_mapping(&dex, "x.C.m()V", "x.T.f(I)V", 6, 1, "dex-requested");
+        assert_eq!(missing["status"], "ambiguous");
     }
 }

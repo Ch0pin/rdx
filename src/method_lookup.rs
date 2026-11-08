@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 
 pub(crate) const EXAMPLE: &str = "pkg.Class.method(Ljava/lang/String;)V";
-const SMALI_EXAMPLE: &str = "Lpkg/Class;->method(Ljava/lang/String;)V";
+pub(crate) const SMALI_EXAMPLE: &str = "Lpkg/Class;->method(Ljava/lang/String;)V";
 
 // Use the DEX 040+ SimpleNameChar grammar, including Zs spaces, rather than
 // Java identifier rules. Selector identity must preserve legal obfuscation.
@@ -118,37 +118,41 @@ pub(crate) fn owner(id: &str) -> Result<&str> {
     Ok(owner)
 }
 
-/// Call graphs keep exact external/inherited selectors intact. Incomplete
-/// selectors receive declaration-backed choices and never select an overload.
-pub(crate) fn graph_selector<'a>(
-    requested: &str,
-    class_for: impl Fn(&str) -> Option<&'a DexClass>,
-) -> Result<String> {
-    let id = normalize(requested)?;
-    let owner_name = owner(&id)?;
-    if id
-        .split_once('(')
+/// A selector is complete when it carries parameter and return descriptors.
+pub(crate) fn complete(id: &str) -> bool {
+    id.split_once('(')
         .is_some_and(|(_, tail)| tail.split_once(')').is_some_and(|(_, ret)| !ret.is_empty()))
-    {
-        return Ok(id);
-    }
-    let head = id.split_once('(').map_or(id.as_str(), |(head, _)| head);
+}
+
+/// Parameter descriptors of a selector, when parentheses are present.
+fn parameters(id: &str) -> Option<&str> {
+    id.split_once('(')
+        .and_then(|(_, tail)| tail.split_once(')'))
+        .map(|(parameters, _)| parameters)
+}
+
+/// Same-name declarations in the owner and its known superclass chain, in
+/// sorted order. Constructors and class initializers use their own class only.
+/// The flag reports whether the owner itself was loaded.
+fn same_name_declarations<'a>(
+    id: &str,
+    class_for: &impl Fn(&str) -> Option<&'a DexClass>,
+) -> Result<(std::collections::BTreeSet<String>, bool)> {
+    let owner_name = owner(id)?;
+    let head = id.split_once('(').map_or(id, |(head, _)| head);
     let name = head.rsplit('.').next().unwrap();
     let mut current = owner_name.to_owned();
     let mut seen = std::collections::HashSet::new();
     let mut candidates = std::collections::BTreeSet::new();
-    let mut total = 0usize;
+    let mut owner_loaded = false;
     while seen.len() < 256 && seen.insert(current.clone()) {
         let Some(class) = class_for(&current) else {
             break;
         };
+        owner_loaded |= current == owner_name;
         for method in &class.methods {
             if method.name.as_ref() == name {
-                total += 1;
                 candidates.insert(method_id(method));
-                if candidates.len() > 20 {
-                    candidates.pop_last();
-                }
             }
         }
         if matches!(name, "<init>" | "<clinit>") {
@@ -159,14 +163,38 @@ pub(crate) fn graph_selector<'a>(
         };
         current = crate::native_engine::disassembly::type_name(parent);
     }
+    Ok((candidates, owner_loaded))
+}
+
+/// At most 20 IDs and 16 KiB of candidate text.
+fn bounded<'a>(candidates: impl IntoIterator<Item = &'a String>) -> Vec<String> {
     let mut bytes = 0;
-    let candidates: Vec<_> = candidates
+    candidates
         .into_iter()
+        .take(20)
         .take_while(|candidate| {
             bytes += candidate.len();
             bytes <= 16384
         })
-        .collect();
+        .cloned()
+        .collect()
+}
+
+pub(crate) const SELECTION_SCOPE: &str = "same-name declarations in the requested class and known superclass chain (up to 256 types); constructors use their own class only";
+
+/// Call graphs keep exact external/inherited selectors intact. Incomplete
+/// selectors receive declaration-backed choices and never select an overload.
+pub(crate) fn graph_selector<'a>(
+    requested: &str,
+    class_for: impl Fn(&str) -> Option<&'a DexClass>,
+) -> Result<String> {
+    let id = normalize(requested)?;
+    if complete(&id) {
+        return Ok(id);
+    }
+    let (candidates, _) = same_name_declarations(&id, &class_for)?;
+    let total = candidates.len();
+    let candidates = bounded(&candidates);
     let detail = serde_json::json!({"candidates": candidates, "candidate_count": total,
         "candidates_truncated": candidates.len() < total,
         "scope":"same-name declarations in requested class and known superclass chain (up to 256 types)",
@@ -174,6 +202,73 @@ pub(crate) fn graph_selector<'a>(
     anyhow::bail!(
         "Expected exact DEX method signature, e.g. {EXAMPLE} or {SMALI_EXAMPLE}; include parameter descriptors in parentheses and a return descriptor after ')' (V for void); {detail}"
     )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Selection {
+    pub method_id: String,
+    /// False when an incomplete selector matched exactly one declaration.
+    pub exact: bool,
+}
+
+/// Complete selectors stay exact without lookup. An incomplete selector
+/// (no return descriptor) selects the single same-name declaration that
+/// matches its parameters, if any. Several matches return `AMBIGUOUS_METHOD`
+/// with the overloads; none returns `SYMBOL_NOT_FOUND` with the same-name
+/// declarations. Nothing is guessed when the owner is not loaded.
+pub(crate) fn select<'a>(
+    requested: &str,
+    class_for: impl Fn(&str) -> Option<&'a DexClass>,
+) -> Result<Selection> {
+    let id = normalize(requested)?;
+    if complete(&id) {
+        return Ok(Selection {
+            method_id: id,
+            exact: true,
+        });
+    }
+    let (candidates, owner_loaded) = same_name_declarations(&id, &class_for)?;
+    ensure!(
+        owner_loaded,
+        "SYMBOL_NOT_FOUND: class_id={}; an incomplete method selector requires a loaded declaring class; supply the complete signature with a return descriptor, e.g. {EXAMPLE}",
+        owner(&id)?
+    );
+    let requested_parameters = parameters(&id);
+    let matching: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| requested_parameters.is_none_or(|p| parameters(candidate) == Some(p)))
+        .collect();
+    if let [only] = matching.as_slice() {
+        return Ok(Selection {
+            method_id: (*only).clone(),
+            exact: false,
+        });
+    }
+    let (code, shown, hint) = if matching.is_empty() {
+        (
+            "SYMBOL_NOT_FOUND",
+            bounded(&candidates),
+            if candidates.is_empty() {
+                "No declaration has this name; get_methods_of_class lists declarations"
+            } else {
+                "No declaration matches the supplied parameters; retry with one listed candidate"
+            },
+        )
+    } else {
+        (
+            "AMBIGUOUS_METHOD",
+            bounded(matching.iter().copied()),
+            "Several overloads share this name; retry with one exact candidate including parameter and return descriptors",
+        )
+    };
+    let total = if matching.is_empty() {
+        candidates.len()
+    } else {
+        matching.len()
+    };
+    let detail = serde_json::json!({"candidates": shown, "candidate_count": total,
+        "candidates_truncated": shown.len() < total, "scope": SELECTION_SCOPE, "hint": hint});
+    anyhow::bail!("{code}: method_id={id}; {detail}")
 }
 
 pub(crate) fn resolve<'a>(class: &'a DexClass, id: &str) -> Result<&'a DexMethod> {

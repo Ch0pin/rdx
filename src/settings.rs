@@ -73,6 +73,8 @@ pub struct Settings {
     pub tabs_auto_hide: bool,
     pub menu_auto_hide: bool,
     pub search: SearchPreferences,
+    /// Render pool size for Code searches; `0` sizes it automatically.
+    pub search_workers: usize,
 }
 
 impl Default for Settings {
@@ -88,6 +90,7 @@ impl Default for Settings {
             tabs_auto_hide: false,
             menu_auto_hide: false,
             search: SearchPreferences::default(),
+            search_workers: 0,
         }
     }
 }
@@ -106,6 +109,7 @@ impl Settings {
         if !self.font_size.is_finite() || !(10.0..=28.0).contains(&self.font_size) {
             self.font_size = 15.0;
         }
+        self.search_workers = self.search_workers.min(crate::search::MAX_WORKERS);
     }
 }
 
@@ -309,6 +313,7 @@ mod tests {
                 auto_search: true,
                 keep_open: true,
             },
+            search_workers: 4,
         };
         store.0.save(&settings).unwrap();
         assert_eq!(store.0.load().unwrap(), settings);
@@ -329,6 +334,28 @@ mod tests {
             store.0.save(&settings).unwrap();
             assert_eq!(store.0.load().unwrap().word_wrap, enabled);
         }
+    }
+
+    #[test]
+    fn search_workers_default_to_auto_persist_and_stay_within_the_pool_bound() {
+        let store = TemporaryStore::new();
+        store.0.save(&Settings::default()).unwrap();
+        fs::write(store.0.path.as_ref().unwrap(), br#"{"font_size":18.0}"#).unwrap();
+        let mut settings = store.0.load().unwrap();
+        assert_eq!(
+            settings.search_workers, 0,
+            "older settings files stay automatic"
+        );
+        for workers in [4, 1, 0] {
+            settings.search_workers = workers;
+            store.0.save(&settings).unwrap();
+            assert_eq!(store.0.load().unwrap().search_workers, workers);
+        }
+        fs::write(store.0.path.as_ref().unwrap(), br#"{"search_workers":99}"#).unwrap();
+        assert_eq!(
+            store.0.load().unwrap().search_workers,
+            crate::search::MAX_WORKERS
+        );
     }
 
     #[test]

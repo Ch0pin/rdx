@@ -98,6 +98,8 @@ Adaptive negative filters survive source-storage admission limits; possible
 matches without cached source are rendered again. Records contain a small
 metadata frame and UTF-8 source, using fast DEFLATE compression when it saves
 space. Compressed and expanded records both retain the 32 MiB document bound.
+The render pool defaults to one fewer than the cores (at most 12) and can be set
+from Search → Scan → Workers; the preference persists with the other settings.
 Results are not capped: every match is reported and the scan runs to the end.
 Hits do not retain source: each carries its target, offsets and the source hash
 the scan recorded, so result memory stays small however broad the query. Opening

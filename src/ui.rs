@@ -540,6 +540,8 @@ pub struct App {
     revealed_tab: Option<Target>,
     tabs_auto_hide: bool,
     menu_auto_hide: bool,
+    /// Requested Code search pool size; `0` is automatic.
+    search_workers: usize,
     menu_hovered: bool,
     tabs_hovered: bool,
     #[cfg(test)]
@@ -621,6 +623,7 @@ impl App {
         );
         last_preferences.tabs_auto_hide = preferences.tabs_auto_hide;
         last_preferences.menu_auto_hide = preferences.menu_auto_hide;
+        last_preferences.search_workers = preferences.search_workers;
         crate::ui_style::install(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
         Self {
@@ -676,6 +679,7 @@ impl App {
             revealed_tab: None,
             tabs_auto_hide: preferences.tabs_auto_hide,
             menu_auto_hide: preferences.menu_auto_hide,
+            search_workers: preferences.search_workers,
             menu_hovered: false,
             tabs_hovered: false,
             #[cfg(test)]
@@ -764,11 +768,13 @@ impl App {
         );
         preferences.tabs_auto_hide = self.tabs_auto_hide;
         preferences.menu_auto_hide = self.menu_auto_hide;
+        preferences.search_workers = self.search_workers;
         if preferences == self.last_preferences {
             return;
         }
-        // Commit a font drag when released rather than syncing disk for every pixel moved.
-        if preferences.font_size != self.last_preferences.font_size
+        // Commit a drag when released rather than syncing disk for every pixel moved.
+        if (preferences.font_size != self.last_preferences.font_size
+            || preferences.search_workers != self.last_preferences.search_workers)
             && ctx.input(|input| input.pointer.primary_down())
         {
             return;
@@ -1678,10 +1684,11 @@ impl App {
         };
         let classes = project.classes.clone();
         let archive = self.archive.clone();
+        let workers = search::resolve_workers(self.search_workers);
         self.search_id += 1;
         self.search.begin();
         self.busy = true;
-        self.status = "Searching project…".into();
+        self.status = searching_status(workers);
         let search_cache = self.search_cache.clone();
         let interactive_requests = self.interactive_requests.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1725,6 +1732,7 @@ impl App {
                             );
                         }
                     },
+                    workers,
                 )
             });
             if summary.is_err() {
@@ -3359,6 +3367,16 @@ impl eframe::App for App {
                                 self.open_analysis(AnalysisKind::Annotations);
                                 ui.close_menu();
                             }
+                            ui.separator();
+                            ui.strong("Scan");
+                            ui.horizontal(|ui| {
+                                ui.label("Workers");
+                                ui.add(search_workers_control(&mut self.search_workers));
+                            });
+                            ui.weak(format!(
+                                "Auto uses {} on this machine · applies to the next search",
+                                search::resolve_workers(0)
+                            ));
                         });
                         ui.menu_button("Tools", |ui| {
                             if ui.button("Retrofit services…").clicked() {
@@ -3966,9 +3984,48 @@ fn snapshot_preferences(
         usages_keep_open,
         tabs_auto_hide: false,
         menu_auto_hide: false,
+        search_workers: 0,
         search_keep_open: search.keep_open,
         search,
     }
+}
+
+/// Drag control for the Code search pool: `0` reads "Auto"; explicit counts run
+/// from one worker to the machine's cores, within the pool bound.
+fn search_workers_control(workers: &mut usize) -> egui::DragValue<'_> {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    egui::DragValue::new(workers)
+        .range(0..=cores.min(search::MAX_WORKERS))
+        .speed(0.05)
+        .custom_formatter(|value, _| format_workers(value))
+        .custom_parser(parse_workers)
+}
+
+/// Text shown by the workers control: zero reads "Auto".
+fn format_workers(value: f64) -> String {
+    if value == 0.0 {
+        "Auto".to_owned()
+    } else {
+        format!("{value:.0}")
+    }
+}
+
+/// Typed input for the workers control: "auto" (any case) means zero.
+fn parse_workers(text: &str) -> Option<f64> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("auto") {
+        Some(0.0)
+    } else {
+        text.parse::<f64>().ok()
+    }
+}
+
+/// Status line for a running scan: "Searching project · 8 workers".
+fn searching_status(workers: usize) -> String {
+    format!(
+        "Searching project · {workers} worker{}",
+        if workers == 1 { "" } else { "s" }
+    )
 }
 
 #[cfg(test)]
@@ -4297,6 +4354,7 @@ mod settings_tests {
             pending_search_metadata: Vec::new(),
             interactive_requests: Arc::new(Mutex::new(Vec::new())),
             settings_store: SettingsStore::new(),
+            search_workers: 0,
             last_preferences: Settings::default(),
             tx,
             rx,
@@ -5726,6 +5784,61 @@ mod settings_tests {
             panic!("reused view lost its document");
         };
         assert_eq!(document.navigation_position(), hit.start);
+    }
+
+    #[test]
+    fn search_worker_setting_sizes_the_scan_and_shows_in_the_status() {
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let mut engine = NativeEngine::start().unwrap();
+        let project = engine.open(&fixture).unwrap();
+        let mut app = navigation_test_app();
+        app.project = Some(Arc::new(project));
+        app.engine = Some(engine);
+        let ctx = egui::Context::default();
+        let query = || SearchQuery {
+            text: "doubleValue".into(),
+            ..Default::default()
+        };
+        let finish = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.engine.is_none() {
+                app.events(&ctx);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "search did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        for (requested, shown) in [(3, 3), (1, 1), (0, search::resolve_workers(0))] {
+            app.search_workers = requested;
+            app.start_search(query(), &ctx);
+            assert_eq!(app.status, searching_status(shown), "requested {requested}");
+            finish(&mut app);
+            assert!(
+                app.search.status.starts_with("Search complete:"),
+                "requested {requested}: {}",
+                app.search.status
+            );
+            assert!(
+                !app.search.status.contains(": 0 matches"),
+                "{}",
+                app.search.status
+            );
+        }
+        assert_eq!(searching_status(1), "Searching project · 1 worker");
+        assert_eq!(searching_status(8), "Searching project · 8 workers");
+    }
+
+    #[test]
+    fn workers_control_reads_auto_for_zero_and_parses_either_form() {
+        assert_eq!(format_workers(0.0), "Auto");
+        assert_eq!(format_workers(6.0), "6");
+        assert_eq!(parse_workers(" Auto "), Some(0.0));
+        assert_eq!(parse_workers("auto"), Some(0.0));
+        assert_eq!(parse_workers("4"), Some(4.0));
+        assert_eq!(parse_workers("many"), None);
     }
 
     #[test]

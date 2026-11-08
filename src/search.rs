@@ -16,6 +16,7 @@ mod candidates;
 #[cfg(test)]
 mod latency_tests;
 mod streaming;
+pub use streaming::{MAX_WORKERS, resolve_workers};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchQuery {
@@ -812,6 +813,7 @@ pub fn run_search(
         cancel,
         emit,
         |_, _| {},
+        0,
     )
 }
 
@@ -827,6 +829,7 @@ pub fn run_search_interactive(
     cancel: &AtomicBool,
     mut emit: impl FnMut(SearchUpdate),
     mut interactive: impl FnMut(&mut NativeEngine, &mut SearchCache),
+    workers: usize,
 ) -> SearchSummary {
     cache.reset(project_id, classes.len());
     let q = &query.query;
@@ -893,6 +896,7 @@ pub fn run_search_interactive(
                 });
             },
             &mut interactive,
+            workers,
         );
         if !q.resources || result.cancelled {
             result.total += resource_count;
@@ -1606,6 +1610,7 @@ mod tests {
                     cancel.store(true, Ordering::Relaxed);
                 }
             },
+            0,
         );
         eprintln!(
             "Phrase search: {:?}; scanned {}; source fetches {}; found {}; errors {:?}",

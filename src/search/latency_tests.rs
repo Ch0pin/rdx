@@ -83,6 +83,7 @@ fn ranked_search_preserves_complete_source_results_across_queries() {
             &cancel,
             |_| {},
             |_, _| {},
+            0,
         );
         assert_eq!(warm.hits, result.hits);
         assert_eq!(cache.source_fetches, fetched);
@@ -112,6 +113,7 @@ fn candidate_planning_is_interactive_and_cancellable() {
         &cancel,
         |_| {},
         |_, _| cancel.store(true, Ordering::Relaxed),
+        0,
     );
     assert!(summary.cancelled);
     assert_eq!(cache.source_fetches, 0);
@@ -394,6 +396,7 @@ fn apk_code_search_profile() {
             &cancel,
             &mut |_| {},
             &mut |_, _| {},
+            0,
         );
         let seconds = started.elapsed().as_secs_f64();
         let (entries, payloads, metadata, payload_bytes) = cache.index_stats();

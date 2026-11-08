@@ -227,9 +227,8 @@ pub(super) fn run(
     cancel: &AtomicBool,
     emit: &mut impl FnMut(SearchUpdate),
     interactive: &mut impl FnMut(&mut NativeEngine, &mut SearchCache),
+    workers: usize,
 ) -> SearchSummary {
-    let workers =
-        std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).clamp(1, 12));
     run_with_workers(
         engine,
         cache,
@@ -238,8 +237,22 @@ pub(super) fn run(
         cancel,
         emit,
         interactive,
-        workers,
+        resolve_workers(workers),
     )
+}
+
+/// Upper bound of the render pool; larger requests are clamped.
+pub const MAX_WORKERS: usize = 16;
+
+/// Pool size for a requested worker count. `0` is automatic: one fewer than
+/// the machine's cores, at most 12, which leaves a core for the UI. Explicit
+/// counts are kept within the pool bound.
+pub fn resolve_workers(requested: usize) -> usize {
+    if requested == 0 {
+        std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).clamp(1, 12))
+    } else {
+        requested.clamp(1, MAX_WORKERS)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -253,7 +266,7 @@ pub(super) fn run_with_workers(
     interactive: &mut impl FnMut(&mut NativeEngine, &mut SearchCache),
     workers: usize,
 ) -> SearchSummary {
-    let workers = workers.clamp(1, 16);
+    let workers = workers.clamp(1, MAX_WORKERS);
     let window = workers * 16;
     let budget = ResultBudget::new(128 * 1024 * 1024);
     let legacy = cache.legacy;
@@ -724,5 +737,16 @@ mod tests {
             assert_eq!(cache.source_fetches, 0);
             assert_eq!(summary.scanned, 0);
         }
+    }
+
+    #[test]
+    fn requested_workers_resolve_to_auto_or_a_bounded_count() {
+        let auto = resolve_workers(0);
+        assert!((1..=12).contains(&auto));
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert_eq!(auto, cores.saturating_sub(1).clamp(1, 12));
+        assert_eq!(resolve_workers(1), 1);
+        assert_eq!(resolve_workers(3), 3);
+        assert_eq!(resolve_workers(MAX_WORKERS + 50), MAX_WORKERS);
     }
 }

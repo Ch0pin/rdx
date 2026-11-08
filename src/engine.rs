@@ -1661,6 +1661,94 @@ mod navigation_cache_tests {
     }
 
     #[test]
+    fn gui_graph_builder_agrees_with_query_graph_projection() {
+        use std::collections::BTreeSet;
+        let engine = opened();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let roots: Vec<String> = engine
+            .native
+            .graph_classes()
+            .flat_map(|class| {
+                class
+                    .methods
+                    .iter()
+                    .map(crate::native_engine::disassembly::method_id)
+            })
+            .collect();
+        assert!(roots.len() > 4, "{roots:?}");
+        let mut edges_seen = 0;
+        for root in &roots {
+            for direction in ["callees", "callers", "both"] {
+                for depth in [1usize, 3] {
+                    let gui = engine
+                        .call_graph_by_id(root, depth, direction, &cancel)
+                        .unwrap();
+                    let args = serde_json::json!({"direction":direction,"depth":depth,"projection":"graph"});
+                    let query = engine.call_graph_query_by_id(root, &args, &cancel).unwrap();
+                    let context = format!("{root} {direction} depth {depth}");
+                    let gui_nodes: BTreeSet<(String, usize)> = gui
+                        .nodes
+                        .iter()
+                        .map(|n| (n.method.clone(), n.depth))
+                        .collect();
+                    let query_nodes: BTreeSet<(String, usize)> = query["nodes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|n| {
+                            (
+                                n["method_id"].as_str().unwrap().to_owned(),
+                                n["depth"].as_u64().unwrap() as usize,
+                            )
+                        })
+                        .collect();
+                    assert_eq!(gui_nodes, query_nodes, "{context}");
+                    let mut gui_edges: Vec<(String, String, usize)> = gui
+                        .edges
+                        .iter()
+                        .map(|e| {
+                            (
+                                gui.nodes[e.from].method.clone(),
+                                gui.nodes[e.to].method.clone(),
+                                e.sites,
+                            )
+                        })
+                        .collect();
+                    gui_edges.sort();
+                    let names: Vec<&str> = query["nodes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|n| n["method_id"].as_str().unwrap())
+                        .collect();
+                    let mut query_edges: Vec<(String, String, usize)> = query["edges"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|e| {
+                            (
+                                names[e["from"].as_u64().unwrap() as usize].to_owned(),
+                                names[e["to"].as_u64().unwrap() as usize].to_owned(),
+                                e["call_sites"].as_u64().unwrap() as usize,
+                            )
+                        })
+                        .collect();
+                    query_edges.sort();
+                    assert_eq!(gui_edges, query_edges, "{context}");
+                    assert_eq!(gui.truncated, query["truncated"], "{context}");
+                    assert_eq!(
+                        serde_json::json!(gui.dispatch_targets),
+                        query["dispatch_targets"],
+                        "{context}"
+                    );
+                    edges_seen += gui_edges.len();
+                }
+            }
+        }
+        assert!(edges_seen > 0);
+    }
+
+    #[test]
     fn reopening_detaches_project_cache_even_when_open_fails() {
         let mut engine = opened();
         let cancel = std::sync::atomic::AtomicBool::new(false);

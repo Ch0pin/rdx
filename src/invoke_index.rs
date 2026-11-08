@@ -1,5 +1,5 @@
 //! Project-owned disk postings. Fingerprints select candidates; raw DEX verifies each hit.
-use super::{Catalog, check_cancel};
+use super::{Catalog, ScanFailures, check_cancel, scan_method};
 use crate::native_xrefs::{self, CallSite};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -56,13 +56,14 @@ pub(crate) struct Cache {
     scanned: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
     sites: Arc<AtomicUsize>,
+    undecodable: Arc<AtomicUsize>,
     pub(crate) batches: Arc<Mutex<BTreeMap<String, Value>>>,
 }
 impl Cache {
     pub(crate) fn status(&self) -> Value {
         json!({"state":match self.state.load(Ordering::Relaxed) {1=>"building",2=>"ready",_=>"not_built"},
             "scanned_classes":self.scanned.load(Ordering::Relaxed),"total_classes":self.total.load(Ordering::Relaxed),
-            "invoke_sites":self.sites.load(Ordering::Relaxed),"storage":"project_owned_disk_shards",
+            "invoke_sites":self.sites.load(Ordering::Relaxed),"undecodable_methods":self.undecodable.load(Ordering::Relaxed),"storage":"project_owned_disk_shards",
             "active_batches":*self.batches.lock().unwrap()})
     }
     pub(super) fn get(&self, catalog: &Catalog<'_>) -> Result<(Arc<Index>, bool)> {
@@ -80,6 +81,7 @@ impl Cache {
         self.state.store(1, Ordering::Relaxed);
         self.scanned.store(0, Ordering::Relaxed);
         self.sites.store(0, Ordering::Relaxed);
+        self.undecodable.store(0, Ordering::Relaxed);
         self.total.store(catalog.classes.len(), Ordering::Relaxed);
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Index::build(catalog, self)))
@@ -87,6 +89,8 @@ impl Cache {
                 .and_then(|r| r);
         match result {
             Ok(index) => {
+                self.undecodable
+                    .store(index.failures.count(), Ordering::Relaxed);
                 self.state.store(2, Ordering::Relaxed);
                 let index = Arc::new(index);
                 *slot = Some(index.clone());
@@ -104,6 +108,7 @@ pub(super) struct Index {
     directory: Directory,
     names: Vec<String>,
     lengths: Vec<u64>,
+    pub(super) failures: ScanFailures,
 }
 impl Index {
     fn build(catalog: &Catalog<'_>, progress: &Cache) -> Result<Self> {
@@ -116,11 +121,12 @@ impl Index {
             .collect::<std::io::Result<Vec<_>>>()?;
         let mut names = Vec::new();
         let mut targets = HashMap::new();
+        let mut failures = ScanFailures::default();
         for (ci, (name, class)) in catalog.classes.iter().enumerate() {
             check_cancel(catalog.cancel)?;
             names.push(name.clone());
             for (mi, method) in class.methods.iter().enumerate() {
-                for site in native_xrefs::method_call_sites(class, method, catalog.cancel)? {
+                for site in scan_method(class, method, catalog.cancel, &mut failures)? {
                     let key = (Arc::as_ptr(&class.symbols) as usize, site.method_index);
                     if targets.len() >= 262144 {
                         targets.clear();
@@ -156,6 +162,7 @@ impl Index {
             directory,
             names,
             lengths,
+            failures,
         })
     }
     pub(super) fn neighbors(

@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -23,8 +23,8 @@ struct Options<'a> {
     depth: usize,
     direct_only: bool,
     projection: &'a str,
-    package_prefix: Option<&'a str>,
-    class_name: Option<&'a str>,
+    package_prefix: Option<String>,
+    class_name: Option<String>,
     annotation: Option<&'a str>,
     component_type: Option<Component>,
     offset: usize,
@@ -41,6 +41,23 @@ fn string_option<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
             Ok(s)
         })
         .transpose()
+}
+
+/// Package filters accept dotted or slash form, with or without a trailing dot.
+fn package_filter(prefix: &str) -> Result<String> {
+    let normalized = prefix.replace('/', ".");
+    let trimmed = normalized.trim_matches('.');
+    ensure!(!trimmed.is_empty(), "package_prefix must name a package");
+    Ok(trimmed.to_owned())
+}
+
+/// Class filters accept an exact FQCN, a slash-separated name, or a DEX descriptor.
+fn class_filter(name: &str) -> String {
+    if name.starts_with('L') && name.ends_with(';') {
+        crate::native_engine::disassembly::type_name(name)
+    } else {
+        name.replace('/', ".")
+    }
 }
 
 fn integer_option(args: &Value, key: &str, default: usize) -> Result<usize> {
@@ -121,8 +138,10 @@ impl<'a> Options<'a> {
             depth: if direct_only { 1 } else { requested_depth },
             direct_only,
             projection,
-            package_prefix: string_option(args, "package_prefix")?,
-            class_name: string_option(args, "class_name")?,
+            package_prefix: string_option(args, "package_prefix")?
+                .map(package_filter)
+                .transpose()?,
+            class_name: string_option(args, "class_name")?.map(class_filter),
             annotation: string_option(args, "annotation")?,
             component_type,
             offset,
@@ -222,6 +241,21 @@ impl<'a> Catalog<'a> {
         self.method_position(method).is_some()
     }
 
+    /// Whether a declaration is loaded and carries instructions to scan.
+    fn body_state(&self, method: &str) -> &'static str {
+        let Some(position) = self.method_position(method) else {
+            return "not_loaded";
+        };
+        let declared = owner(method)
+            .and_then(|name| self.class(name))
+            .and_then(|class| class.methods.get(position));
+        match declared {
+            Some(m) if m.code.is_some() => "code",
+            Some(_) => "no_code",
+            None => "not_loaded",
+        }
+    }
+
     fn component(&self, method: &str) -> Option<Component> {
         owner(method).and_then(|name| component(name.into(), |n| self.parent(n)))
     }
@@ -257,10 +291,14 @@ impl<'a> Catalog<'a> {
         let Some(class) = owner(method) else {
             return false;
         };
-        if options.class_name.is_some_and(|expected| class != expected) {
+        if options
+            .class_name
+            .as_deref()
+            .is_some_and(|expected| class != expected)
+        {
             return false;
         }
-        if options.package_prefix.is_some_and(|prefix| {
+        if options.package_prefix.as_deref().is_some_and(|prefix| {
             let package = class.rsplit_once('.').map_or("", |(package, _)| package);
             package != prefix
                 && !package
@@ -288,6 +326,52 @@ impl<'a> Catalog<'a> {
 fn check_cancel(cancel: &AtomicBool) -> Result<()> {
     ensure!(!cancel.load(Ordering::Relaxed), "Call graph cancelled");
     Ok(())
+}
+
+/// Method bodies whose instructions cannot be decoded contribute no call sites.
+/// They are reported with the result instead of failing or silently vanishing.
+#[derive(Debug, Default)]
+pub(super) struct ScanFailures {
+    count: usize,
+    samples: Vec<Value>,
+}
+impl ScanFailures {
+    const SAMPLE_LIMIT: usize = 25;
+    fn record(&mut self, method: &str, error: &anyhow::Error) {
+        self.count += 1;
+        if self.samples.len() < Self::SAMPLE_LIMIT {
+            self.samples
+                .push(json!({"method_id":method,"error":format!("{error:#}")}));
+        }
+    }
+    pub(super) fn count(&self) -> usize {
+        self.count
+    }
+    fn json(&self) -> Value {
+        json!({"count":self.count,"samples":self.samples,"sample_limit":Self::SAMPLE_LIMIT,
+            "semantics":"Method bodies whose DEX instructions could not be decoded (reserved opcodes, truncated instructions or invalid symbol indexes). Such bodies do not pass DEX verification, so they contribute no executable calls; they are listed here rather than failing the query. Counted within the scanned scope: every loaded method for caller or bidirectional queries, reachable bodies only for callee queries."})
+    }
+}
+
+/// Scan one body, converting malformed bytecode into a reported gap. Cancellation
+/// still propagates as an error.
+pub(super) fn scan_method(
+    class: &DexClass,
+    method: &crate::native_dex::DexMethod,
+    cancel: &AtomicBool,
+    failures: &mut ScanFailures,
+) -> Result<Vec<native_xrefs::CallSite>> {
+    match native_xrefs::method_call_sites(class, method, cancel) {
+        Ok(sites) => Ok(sites),
+        Err(error) => {
+            check_cancel(cancel)?;
+            failures.record(
+                &crate::native_engine::disassembly::method_id(method),
+                &error,
+            );
+            Ok(Vec::new())
+        }
+    }
 }
 
 /// Query static DEX metadata only; never decompiles Java or infers runtime dispatch.
@@ -324,14 +408,23 @@ fn query_cached_catalog(
     }
     let (index, cached) = cache.get(&catalog)?;
     let canonical = catalog.canonical(&normalized);
-    let aliases = interface_aliases(&catalog, &normalized, &options, cancel)?;
+    let dispatch = dispatch_aliases(&catalog, &normalized, &options, cancel)?;
     let mut queue = VecDeque::from([(canonical.clone(), 0)]);
     let mut visited = HashSet::from([canonical]);
     let mut seen_sites = HashSet::new();
     let mut sites = vec![];
-    for alias in &aliases {
-        for site in index.neighbors(&catalog, alias, true)? {
-            if matches!(site.opcode, 0x6e | 0x74 | 0x72 | 0x78)
+    // Reverse shards are keyed by the resolved declaration, so an alias naming a
+    // non-declaring ancestor is found through its own resolution. Only sites whose
+    // raw target names an ancestor type of the root class qualify.
+    let alias_keys: BTreeSet<String> = dispatch
+        .aliases
+        .iter()
+        .map(|alias| catalog.canonical(alias))
+        .collect();
+    for key in &alias_keys {
+        for site in index.neighbors(&catalog, key, true)? {
+            if dispatch.aliases.contains(&site.callee)
+                && matches!(site.opcode, 0x6e | 0x74 | 0x72 | 0x78)
                 && seen_sites.insert((site.caller.clone(), site.pc, site.callee.clone()))
             {
                 sites.push(site);
@@ -362,7 +455,13 @@ fn query_cached_catalog(
             }
         }
     }
-    let mut result = query_catalog_with_sites(catalog, &normalized, args, cancel, Some(sites))?;
+    let mut result = query_catalog_with_sites(
+        catalog,
+        &normalized,
+        args,
+        cancel,
+        Some((sites, &index.failures)),
+    )?;
     result["invoke_index_cached"] = json!(cached);
     result["invoke_index"] = cache.status();
     Ok(result)
@@ -373,6 +472,7 @@ fn callee_sites(
     root: &str,
     depth: usize,
     cancel: &AtomicBool,
+    failures: &mut ScanFailures,
 ) -> Result<Vec<native_xrefs::CallSite>> {
     let mut sites = Vec::new();
     let mut seen = HashSet::from([root.to_string()]);
@@ -389,7 +489,7 @@ fn callee_sites(
             check_cancel(cancel)?;
             continue;
         };
-        for site in native_xrefs::method_call_sites(class, &class.methods[position], cancel)? {
+        for site in scan_method(class, &class.methods[position], cancel, failures)? {
             check_cancel(cancel)?;
             let callee = catalog.canonical(&site.callee);
             if seen.insert(callee.clone()) {
@@ -401,44 +501,85 @@ fn callee_sites(
     Ok(sites)
 }
 
-fn interface_aliases(
+/// Ancestor-typed invokes that may dispatch to the root at runtime.
+struct Dispatch {
+    aliases: HashSet<String>,
+    status: &'static str,
+}
+
+/// Every known or unknown supertype of the root class is an alias owner for the
+/// root member, whether or not that type redeclares it: an `invoke-virtual` or
+/// `invoke-interface` whose receiver is statically typed as a supertype may run
+/// the root override. Siblings and unrelated types never qualify. Only a concrete
+/// instance method declared by its own class can be such a target.
+fn dispatch_aliases(
     catalog: &Catalog<'_>,
     root: &str,
     options: &Options<'_>,
     cancel: &AtomicBool,
-) -> Result<HashSet<String>> {
-    if !(options.interface_dispatch || options.superclass_dispatch) {
-        return Ok(HashSet::new());
-    }
-    if let Some(class) = owner(root).and_then(|name| catalog.class(name))
-        && (class.access_flags & 0x200 != 0
-            || class.methods.iter().any(|m| {
-                crate::native_engine::disassembly::method_id(m) == root
-                    && m.access_flags & 0x400 != 0
-            }))
-    {
-        return Ok(HashSet::new());
-    }
-    let (ancestors, truncated) = dispatch_targets_with(|name| catalog.class(name), root, cancel)?;
-    ensure!(
-        !truncated,
-        "Dispatch ancestry exceeds budget; query ancestor methods explicitly"
-    );
-    Ok(ancestors
-        .into_iter()
-        .filter(|id| {
-            owner(id).and_then(|n| catalog.class(n)).is_some_and(|c| {
-                if c.access_flags & 0x200 != 0 {
-                    options.interface_dispatch
-                } else {
-                    options.superclass_dispatch
-                }
-            })
+) -> Result<Dispatch> {
+    let none = |status| {
+        Ok(Dispatch {
+            aliases: HashSet::new(),
+            status,
         })
-        .collect())
+    };
+    if !(options.interface_dispatch || options.superclass_dispatch) {
+        return none("not_requested");
+    }
+    let Some((owner_name, class)) = owner(root).and_then(|name| Some((name, catalog.class(name)?)))
+    else {
+        return none("skipped_root_class_not_loaded");
+    };
+    let member = &root[owner_name.len() + 1..];
+    let Some(position) = catalog.method_position(root) else {
+        return none("skipped_root_not_declared_in_its_class");
+    };
+    let method = &class.methods[position];
+    if member.starts_with('<') || method.access_flags & 0xa != 0 {
+        return none("skipped_constructor_static_or_private_root");
+    }
+    if class.access_flags & 0x200 != 0 || method.access_flags & 0x400 != 0 {
+        return none("skipped_interface_or_abstract_root");
+    }
+    let mut queue: VecDeque<(std::sync::Arc<str>, bool)> = VecDeque::new();
+    queue.extend(class.interfaces.iter().cloned().map(|d| (d, true)));
+    queue.extend(class.superclass.iter().cloned().map(|d| (d, false)));
+    let mut seen = HashSet::from([class.descriptor.clone()]);
+    let mut aliases = HashSet::new();
+    while let Some((descriptor, via_interface)) = queue.pop_front() {
+        check_cancel(cancel)?;
+        if !seen.insert(descriptor.clone()) {
+            continue;
+        }
+        ensure!(
+            seen.len() <= 256 && queue.len() <= 4096,
+            "Dispatch ancestry exceeds budget; query ancestor methods explicitly"
+        );
+        let name = crate::native_engine::disassembly::type_name(&descriptor);
+        let ancestor = catalog.class(&name);
+        let interface = ancestor.map_or(via_interface, |c| c.access_flags & 0x200 != 0);
+        let wanted = if interface {
+            options.interface_dispatch
+        } else {
+            options.superclass_dispatch
+        };
+        if wanted {
+            aliases.insert(format!("{name}.{member}"));
+        }
+        if let Some(ancestor) = ancestor {
+            queue.extend(ancestor.interfaces.iter().cloned().map(|d| (d, true)));
+            queue.extend(ancestor.superclass.iter().cloned().map(|d| (d, false)));
+        }
+    }
+    Ok(Dispatch {
+        aliases,
+        status: "applied",
+    })
 }
-fn record(site: &native_xrefs::CallSite, depth: usize) -> Value {
-    json!({"caller_method_id":site.caller,"caller_signature":site.caller,"callee_method_id":site.callee,"raw_callee_method_id":site.callee,"call_site_offset":site.pc,"depth":depth,
+
+fn record(site: &native_xrefs::CallSite, depth: usize, resolved: &str) -> Value {
+    json!({"caller_method_id":site.caller,"caller_signature":site.caller,"callee_method_id":site.callee,"raw_callee_method_id":site.callee,"resolved_callee_method_id":resolved,"call_site_offset":site.pc,"depth":depth,
         "invoke_instruction":crate::native_engine::disassembly::invoke_text(&site.words, site.pc, &site.callee),"dex_entry":site.dex_entry,"method_index":site.method_index,"invoke_opcode":site.opcode,"invoke_words":site.words,"caller_code_offset_bytes":site.code_offset,"dispatch":site.dispatch})
 }
 
@@ -455,27 +596,32 @@ fn query_catalog_with_sites(
     root: &str,
     args: &Value,
     cancel: &AtomicBool,
-    provided: Option<Vec<native_xrefs::CallSite>>,
+    provided: Option<(Vec<native_xrefs::CallSite>, &ScanFailures)>,
 ) -> Result<Value> {
     let options = Options::parse(args)?;
     let normalized_root = crate::method_lookup::graph_selector(root, |name| catalog.class(name))?;
     let root = normalized_root.as_str();
     check_cancel(cancel)?;
     let root_key = catalog.canonical(root);
-    let aliases = interface_aliases(&catalog, root, &options, cancel)?;
+    let dispatch = dispatch_aliases(&catalog, root, &options, cancel)?;
+    let aliases = &dispatch.aliases;
     // Outgoing queries scan only reachable bodies. Reverse traversal needs the
     // project-wide call index, independently of graph projection limits.
-    let mut sites = if let Some(sites) = provided {
-        sites
+    let mut scan = ScanFailures::default();
+    let (mut sites, failures): (Vec<_>, &ScanFailures) = if let Some((sites, failures)) = provided {
+        (sites, failures)
     } else if options.direction == "callees" {
-        callee_sites(&catalog, &root_key, options.depth, cancel)?
+        let sites = callee_sites(&catalog, &root_key, options.depth, cancel, &mut scan)?;
+        (sites, &scan)
     } else {
         let mut sites = Vec::new();
         for class in catalog.classes.values() {
             check_cancel(cancel)?;
-            sites.extend(native_xrefs::call_sites(class, None, cancel)?);
+            for method in &class.methods {
+                sites.extend(scan_method(class, method, cancel, &mut scan)?);
+            }
         }
-        sites
+        (sites, &scan)
     };
     sites.sort_by(|a, b| (&a.caller, a.pc, &a.callee).cmp(&(&b.caller, b.pc, &b.callee)));
     let mut outgoing: HashMap<String, Vec<usize>> = HashMap::new();
@@ -546,17 +692,25 @@ fn query_catalog_with_sites(
     }
     check_cancel(cancel)?;
     let boundary = depths.values().any(|&depth| depth == options.depth);
-    let filters = json!({"package_prefix":options.package_prefix,"class_name":options.class_name,"annotation":options.annotation,
+    let filters = json!({"package_prefix":&options.package_prefix,"class_name":&options.class_name,"annotation":options.annotation,
         "component_type":options.component_type.map(|c| c.label().to_ascii_lowercase())});
     let metadata = json!({
-        "root_method_id":root,"direction":options.direction,"depth":options.depth,"direct_only":options.direct_only,
+        "root_method_id":root,"resolved_root_method_id":root_key,"root_body":catalog.body_state(&root_key),
+        "direction":options.direction,"depth":options.depth,"direct_only":options.direct_only,
         "projection":options.projection,"filters":filters,"depth_boundary_reached":boundary,
-        "filter_semantics":"Filters select canonical neighbor declarations after traversal; they do not prune traversal. Compact records match the neighbor in the requested traversal direction. Graph nodes retain matching declarations plus the root; edges connect retained nodes.",
+        "depth_boundary_semantics":"true when a traversed method lies at the requested depth; its own neighbors were not expanded, so deeper relationships may exist. false means every method reachable in the requested direction was expanded before the depth limit.",
+        "scan_complete":failures.count() == 0,"undecodable_methods":failures.json(),
+        "filter_semantics":"Filters select canonical neighbor declarations after traversal; they do not prune traversal. Compact records match the neighbor in the requested traversal direction. Graph nodes retain matching declarations plus the root; edges connect retained nodes. package_prefix and class_name accept dotted, slash or descriptor forms; a trailing dot is ignored.",
         "annotation_semantics":"Exact DEX descriptor or fully qualified type name on the class or method declaration; combined filters use AND.",
         "component_semantics":"Static superclass ancestry classification.",
-        "analysis":"static DEX declared calls; inherited aliases resolved through known superclasses; no runtime dispatch, reflection, or Intent target inference"
+        "analysis":"static DEX declared calls; inherited aliases resolved through known superclasses (not through interface default methods); no runtime dispatch, reflection, Intent target or invoke-custom (lambda) target inference"
     });
     let mut result = metadata;
+    if root_key != root {
+        result["root_resolution_note"] = json!(
+            "method_id names an inherited member that its class does not declare. Traversal uses the declaring ancestor resolved_root_method_id, so callers include invokes naming any class that resolves to that declaration."
+        );
+    }
     if options.projection == "call_sites" {
         let total = selected_sites.len();
         result["direct_matching_total"] =
@@ -565,7 +719,7 @@ fn query_catalog_with_sites(
             "Each record is one raw DEX invoke to callee_method_id. depth is traversal distance from the query root; only depth=1 records are direct root neighbors. call_sites defaults to depth=1; explicit depth includes transitive sites."
         );
         let record_for = |i: usize, depth: usize| {
-            let mut row = record(&sites[i], depth);
+            let mut row = record(&sites[i], depth, &canonical_cache[&sites[i].callee]);
             let inferred = aliases.contains(&sites[i].callee)
                 && matches!(sites[i].opcode, 0x6e | 0x74 | 0x72 | 0x78);
             row["relationship"] = json!(if inferred {
@@ -593,6 +747,10 @@ fn query_catalog_with_sites(
         result["possible_dispatch_total"] = json!(inferred);
         result["dispatch_through_interfaces"] = json!(options.interface_dispatch);
         result["dispatch_through_superclasses"] = json!(options.superclass_dispatch);
+        result["dispatch_expansion"] = json!(dispatch.status);
+        result["dispatch_expansion_semantics"] = json!(
+            "applied: invoke-virtual/invoke-interface sites whose raw target names the root member on any known or unknown supertype of the root class (declaring or not) are added as possible dispatch; invoke-super, direct and static calls and sibling or unrelated receiver types are never added. skipped_*: no inference because the root is not a concrete instance method declared by its own loaded class."
+        );
         let mut hash = Sha256::new();
         for (&i, &depth) in &selected_sites {
             check_cancel(cancel)?;
@@ -694,6 +852,9 @@ fn query_catalog_with_sites(
     result["dispatch_targets_truncated"] = json!(dispatch_targets_truncated);
     result["dispatch_note"] = json!(
         "Related ancestor declarations are possible dispatch entry points; query their callers separately."
+    );
+    result["node_id_semantics"] = json!(
+        "Non-root method_id values are declaring methods resolved through known superclasses; the root keeps the requested id and resolves to resolved_root_method_id. call_sites counts raw DEX invokes between the two declarations."
     );
     check_cancel(cancel)?;
     Ok(result)
@@ -1232,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn callee_queries_scan_only_reachable_bodies_within_requested_depth() {
+    fn undecodable_bodies_are_reported_instead_of_failing_or_vanishing() {
         let mut root = class(
             "app.Root",
             None,
@@ -1245,24 +1406,70 @@ mod tests {
         let mut middle = class("app.Middle", None, vec![("run", vec![], vec![])]);
         middle.methods[0].code.as_mut().unwrap().instructions = vec![0x0071, u16::MAX, 0];
         let classes = vec![root, middle];
-        let args = json!({"projection":"call_sites","direction":"callees","direct_only":true});
-        let result = run(&classes, "app.Root.run()V", args);
-        assert_eq!(result["matching_total"], 1);
-        for args in [
+        // Direct callee queries decode only the root body, which is valid.
+        let direct = run(
+            &classes,
+            "app.Root.run()V",
+            json!({"projection":"call_sites","direction":"callees","direct_only":true}),
+        );
+        assert_eq!(direct["matching_total"], 1);
+        assert_eq!(direct["scan_complete"], true);
+        assert_eq!(direct["undecodable_methods"]["count"], 0);
+        // Transitive callee queries reach the broken body and say so.
+        let deep = run(
+            &classes,
+            "app.Root.run()V",
             json!({"projection":"call_sites","direction":"callees","depth":2}),
-            json!({"projection":"call_sites","direction":"callers","direct_only":true}),
-        ] {
-            let cancel = AtomicBool::new(false);
-            assert!(
-                query_catalog(
-                    Catalog::new(&classes, &cancel).unwrap(),
-                    "app.Root.run()V",
-                    &args,
-                    &cancel
-                )
-                .is_err()
-            );
-        }
+        );
+        assert_eq!(deep["matching_total"], 1);
+        assert_eq!(deep["scan_complete"], false);
+        assert_eq!(deep["undecodable_methods"]["count"], 1);
+        assert_eq!(
+            deep["undecodable_methods"]["samples"][0]["method_id"],
+            "app.Middle.run()V"
+        );
+        assert_eq!(
+            deep["undecodable_methods"]["samples"][0]["error"],
+            "Invalid method index"
+        );
+        // Caller queries scan every body: both broken ones are counted, by scan
+        // and by the disk index alike.
+        let args = json!({"projection":"call_sites","direction":"callers","direct_only":true});
+        let scanned = run(&classes, "app.Root.run()V", args.clone());
+        assert_eq!(scanned["matching_total"], 0);
+        assert_eq!(scanned["scan_complete"], false);
+        assert_eq!(scanned["undecodable_methods"]["count"], 2);
+        let cancel = AtomicBool::new(false);
+        let cache = Cache::default();
+        let indexed = query_cached_catalog(
+            Catalog::new(&classes, &cancel).unwrap(),
+            "app.Root.run()V",
+            &args,
+            &cancel,
+            &cache,
+        )
+        .unwrap();
+        assert_eq!(indexed["scan_complete"], false);
+        assert_eq!(indexed["undecodable_methods"]["count"], 2);
+        assert_eq!(indexed["invoke_index"]["undecodable_methods"], 2);
+        let names: Vec<_> = indexed["undecodable_methods"]["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["method_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, ["app.Middle.run()V", "app.Root.unrelated()V"]);
+        // Cancellation still wins over tolerance.
+        let cancelled = AtomicBool::new(true);
+        assert!(
+            query_catalog(
+                Catalog::new(&classes, &AtomicBool::new(false)).unwrap(),
+                "app.Root.run()V",
+                &args,
+                &cancelled
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1411,5 +1618,332 @@ mod tests {
         ] {
             assert!(Options::parse(&args).is_err(), "{args}");
         }
+    }
+
+    #[test]
+    fn filters_normalize_trailing_dots_descriptors_and_slashes() {
+        let classes = vec![
+            class("app.work.Good", None, vec![("run", vec![], vec![])]),
+            class(
+                "app.Root",
+                None,
+                vec![("entry", vec![], vec!["app.work.Good.run()V"])],
+            ),
+            class(
+                "other.Bad",
+                None,
+                vec![("entry", vec![], vec!["app.work.Good.run()V"])],
+            ),
+        ];
+        let callers = |extra: Value| {
+            let mut args = json!({"projection":"call_sites","direction":"callers"});
+            for (k, v) in extra.as_object().unwrap() {
+                args[k] = v.clone();
+            }
+            run(&classes, "app.work.Good.run()V", args)
+        };
+        assert_eq!(callers(json!({}))["matching_total"], 2);
+        for prefix in ["app", "app.", "app/", ".app."] {
+            let result = callers(json!({"package_prefix":prefix}));
+            assert_eq!(result["matching_total"], 1, "{prefix}");
+            assert_eq!(result["filters"]["package_prefix"], "app", "{prefix}");
+            assert_eq!(
+                result["call_sites"][0]["caller_method_id"],
+                "app.Root.entry()V"
+            );
+        }
+        assert_eq!(callers(json!({"package_prefix":"ap"}))["matching_total"], 0);
+        assert_eq!(
+            callers(json!({"package_prefix":"other."}))["matching_total"],
+            1
+        );
+        for name in ["app.Root", "Lapp/Root;", "app/Root"] {
+            let result = callers(json!({"class_name":name}));
+            assert_eq!(result["matching_total"], 1, "{name}");
+            assert_eq!(result["filters"]["class_name"], "app.Root", "{name}");
+        }
+        assert_eq!(
+            callers(json!({"class_name":"app.Nope"}))["matching_total"],
+            0
+        );
+        let cancel = AtomicBool::new(false);
+        for prefix in [".", "/", ""] {
+            assert!(
+                query_catalog(
+                    Catalog::new(&classes, &cancel).unwrap(),
+                    "app.work.Good.run()V",
+                    &json!({"projection":"call_sites","direction":"callers","package_prefix":prefix}),
+                    &cancel
+                )
+                .is_err(),
+                "{prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_ids_expose_inherited_root_and_callee_declarations() {
+        let fixture = |abstract_parent: bool| {
+            let mut parent = class("app.Parent", None, vec![("run", vec![], vec![])]);
+            parent.methods[0].access_flags = 1;
+            if abstract_parent {
+                parent.access_flags = 0x401;
+                parent.methods[0].access_flags = 0x401;
+                parent.methods[0].code = None;
+            }
+            vec![
+                parent,
+                class("app.Child", Some("app.Parent"), vec![]),
+                class(
+                    "app.Caller",
+                    None,
+                    vec![("entry", vec![], vec!["app.Child.run()V"])],
+                ),
+            ]
+        };
+        let classes = fixture(false);
+        let callers = run(
+            &classes,
+            "app.Child.run()V",
+            json!({"projection":"call_sites","direction":"callers"}),
+        );
+        assert_eq!(callers["root_method_id"], "app.Child.run()V");
+        assert_eq!(callers["resolved_root_method_id"], "app.Parent.run()V");
+        assert_eq!(callers["root_body"], "code");
+        assert!(
+            callers["root_resolution_note"]
+                .as_str()
+                .unwrap()
+                .contains("declaring ancestor")
+        );
+        assert!(callers["depth_boundary_semantics"].is_string());
+        assert_eq!(callers["matching_total"], 1);
+        let site = &callers["call_sites"][0];
+        assert_eq!(site["raw_callee_method_id"], "app.Child.run()V");
+        assert_eq!(site["callee_method_id"], "app.Child.run()V");
+        assert_eq!(site["resolved_callee_method_id"], "app.Parent.run()V");
+        assert_eq!(site["relationship"], "exact_declared_call");
+        let declared = run(
+            &classes,
+            "app.Parent.run()V",
+            json!({"projection":"call_sites","direction":"callers"}),
+        );
+        assert_eq!(declared["resolved_root_method_id"], "app.Parent.run()V");
+        assert!(declared.get("root_resolution_note").is_none());
+        assert_eq!(declared["matching_total"], 1);
+        let callees = run(
+            &classes,
+            "app.Caller.entry()V",
+            json!({"projection":"call_sites","direction":"callees"}),
+        );
+        assert_eq!(
+            callees["call_sites"][0]["resolved_callee_method_id"],
+            "app.Parent.run()V"
+        );
+        let graph = run(
+            &classes,
+            "app.Caller.entry()V",
+            json!({"projection":"graph","direction":"callees"}),
+        );
+        assert_eq!(graph["nodes"][1]["method_id"], "app.Parent.run()V");
+        assert!(graph["node_id_semantics"].is_string());
+        // Abstract and external roots describe their body state honestly.
+        let no_code = run(
+            &fixture(true),
+            "app.Child.run()V",
+            json!({"projection":"call_sites","direction":"callers"}),
+        );
+        assert_eq!(no_code["root_body"], "no_code");
+        assert_eq!(no_code["matching_total"], 1);
+        let external = run(
+            &classes,
+            "ext.Lib.run()V",
+            json!({"projection":"call_sites","direction":"callers"}),
+        );
+        assert_eq!(external["root_body"], "not_loaded");
+        assert_eq!(external["resolved_root_method_id"], "ext.Lib.run()V");
+        assert_eq!(external["matching_total"], 0);
+    }
+
+    #[test]
+    fn dispatch_expansion_covers_non_declaring_ancestors_and_excludes_siblings() {
+        let cancel = AtomicBool::new(false);
+        let mut base = class(
+            "p.Base",
+            Some("ext.Framework"),
+            vec![("run", vec![], vec![])],
+        );
+        base.methods[0].access_flags = 1;
+        let intermediate = class("p.Intermediate", Some("p.Base"), vec![]);
+        let sibling = class("p.Sibling", Some("p.Base"), vec![]);
+        let mut iface = class("p.Iface", None, vec![("run", vec![], vec![])]);
+        iface.access_flags = 0x201;
+        iface.methods[0].access_flags = 0x401;
+        iface.methods[0].code = None;
+        let mut sub_iface = class("p.SubIface", None, vec![]);
+        sub_iface.access_flags = 0x201;
+        sub_iface.interfaces = vec!["Lp/Iface;".into()];
+        let mut impl_class = class(
+            "p.Impl",
+            Some("p.Intermediate"),
+            vec![("run", vec![], vec![])],
+        );
+        impl_class.interfaces = vec!["Lp/SubIface;".into()];
+        impl_class.methods[0].access_flags = 1;
+        let mut caller = class(
+            "p.Caller",
+            None,
+            vec![(
+                "call",
+                vec![],
+                vec![
+                    "p.Intermediate.run()V",
+                    "p.Sibling.run()V",
+                    "p.Base.run()V",
+                    "p.SubIface.run()V",
+                    "p.Iface.run()V",
+                    "p.Impl.run()V",
+                    "unknown.Ext.run()V",
+                    "ext.Framework.run()V",
+                    "p.Intermediate.run()V",
+                ],
+            )],
+        );
+        let body = caller.methods[0].code.as_mut().unwrap();
+        body.outs = 1;
+        for (call, opcode) in [
+            (0, 0x106e),
+            (1, 0x106e),
+            (2, 0x106e),
+            (3, 0x1072),
+            (4, 0x1072),
+            (5, 0x106e),
+            (6, 0x106e),
+            (7, 0x106e),
+            (8, 0x106f),
+        ] {
+            body.instructions[call * 4 + 1] = opcode;
+        }
+        let classes = vec![
+            base,
+            intermediate,
+            sibling,
+            iface,
+            sub_iface,
+            impl_class,
+            caller,
+        ];
+        let cache = Cache::default();
+        let both = |root: &str, args: Value| {
+            let scanned = run(&classes, root, args.clone());
+            let mut indexed = query_cached_catalog(
+                Catalog::new(&classes, &cancel).unwrap(),
+                root,
+                &args,
+                &cancel,
+                &cache,
+            )
+            .unwrap();
+            let object = indexed.as_object_mut().unwrap();
+            object.remove("invoke_index");
+            object.remove("invoke_index_cached");
+            assert_eq!(indexed, scanned, "{root} {args}");
+            scanned
+        };
+        let raw = |result: &Value| -> Vec<String> {
+            result["call_sites"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["raw_callee_method_id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let full = both(
+            "p.Impl.run()V",
+            json!({"projection":"call_sites","direction":"callers","dispatch_through_interfaces":true,"dispatch_through_superclasses":true}),
+        );
+        assert_eq!(full["dispatch_expansion"], "applied");
+        assert_eq!(full["matching_total"], 6);
+        assert_eq!(full["exact_matching_total"], 1);
+        assert_eq!(full["possible_dispatch_total"], 5);
+        let targets = raw(&full);
+        for expected in [
+            "p.Intermediate.run()V",
+            "p.Base.run()V",
+            "p.SubIface.run()V",
+            "p.Iface.run()V",
+            "p.Impl.run()V",
+            "ext.Framework.run()V",
+        ] {
+            assert!(
+                targets.contains(&expected.to_owned()),
+                "{expected} in {targets:?}"
+            );
+        }
+        for excluded in ["p.Sibling.run()V", "unknown.Ext.run()V"] {
+            assert!(!targets.contains(&excluded.to_owned()), "{excluded}");
+        }
+        assert_eq!(
+            targets
+                .iter()
+                .filter(|t| t.as_str() == "p.Intermediate.run()V")
+                .count(),
+            1,
+            "invoke-super must not be inferred as dispatch"
+        );
+        for site in full["call_sites"].as_array().unwrap() {
+            if site["relationship"] != "exact_declared_call" {
+                assert_eq!(site["possible_implementation_method_id"], "p.Impl.run()V");
+            }
+        }
+        let supers = both(
+            "p.Impl.run()V",
+            json!({"projection":"call_sites","direction":"callers","dispatch_through_superclasses":true}),
+        );
+        assert_eq!(supers["possible_dispatch_total"], 3);
+        assert!(!raw(&supers).contains(&"p.Iface.run()V".to_owned()));
+        let interfaces = both(
+            "p.Impl.run()V",
+            json!({"projection":"call_sites","direction":"callers","dispatch_through_interfaces":true}),
+        );
+        assert_eq!(interfaces["possible_dispatch_total"], 2);
+        assert!(!raw(&interfaces).contains(&"p.Base.run()V".to_owned()));
+        let plain = both(
+            "p.Impl.run()V",
+            json!({"projection":"call_sites","direction":"callers"}),
+        );
+        assert_eq!(plain["dispatch_expansion"], "not_requested");
+        assert_eq!(plain["matching_total"], 1);
+        // A root its class does not declare resolves to the declaring ancestor
+        // and performs no dispatch inference; every invoke resolving there is exact.
+        let inherited = both(
+            "p.Intermediate.run()V",
+            json!({"projection":"call_sites","direction":"callers","dispatch_through_interfaces":true,"dispatch_through_superclasses":true}),
+        );
+        assert_eq!(
+            inherited["dispatch_expansion"],
+            "skipped_root_not_declared_in_its_class"
+        );
+        assert_eq!(inherited["resolved_root_method_id"], "p.Base.run()V");
+        assert_eq!(inherited["exact_matching_total"], 4);
+        assert_eq!(inherited["possible_dispatch_total"], 0);
+        let external = both(
+            "unknown.Ext.run()V",
+            json!({"projection":"call_sites","direction":"callers","dispatch_through_superclasses":true}),
+        );
+        assert_eq!(
+            external["dispatch_expansion"],
+            "skipped_root_class_not_loaded"
+        );
+        assert_eq!(external["matching_total"], 1);
+        let abstract_root = both(
+            "p.Iface.run()V",
+            json!({"projection":"call_sites","direction":"callers","dispatch_through_interfaces":true}),
+        );
+        assert_eq!(
+            abstract_root["dispatch_expansion"],
+            "skipped_interface_or_abstract_root"
+        );
+        assert_eq!(abstract_root["matching_total"], 1);
     }
 }

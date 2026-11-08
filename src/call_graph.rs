@@ -112,25 +112,7 @@ fn body(engine: &NativeDexEngine, target: &str) -> Option<(String, String)> {
 /// Resolve inherited aliases using available superclass metadata. External bodies
 /// remain unavailable; this does not infer runtime virtual dispatch.
 fn canonical(engine: &NativeDexEngine, target: &str) -> String {
-    if let Some((_, id)) = body(engine, target) {
-        return id;
-    }
-    let Some(original) = owner(target) else {
-        return target.into();
-    };
-    let member = &target[original.len() + 1..];
-    if member.starts_with('<') {
-        return target.into();
-    }
-    let mut name = original.to_string();
-    let mut seen = HashSet::new();
-    while seen.insert(name.clone()) {
-        match parent(engine, &name) {
-            Some(next) => name = next,
-            None => break,
-        }
-    }
-    target.into()
+    body(engine, target).map_or_else(|| target.into(), |(_, id)| id)
 }
 
 /// Ancestor declarations are possible dispatch entry points, not proven callers.

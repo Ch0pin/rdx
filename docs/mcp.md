@@ -244,7 +244,24 @@ other entries proceed.
 The response includes numbered nodes, method IDs, distance from the root,
 component classifications, available declarations, call-site counts, and
 component-path highlights. `truncated` reports the 5,000-node/20,000-edge cap;
-`depth_boundary_reached` reports that nodes reached the requested depth.
+`depth_boundary_reached` is true when some traversed method lies at the
+requested depth, so its own neighbors were not expanded and deeper
+relationships may exist; false means every reachable method in the requested
+direction was expanded before the limit (`depth_boundary_semantics` repeats
+this). Every response also carries `resolved_root_method_id`: when `method_id`
+names a member its class inherits rather than declares, traversal uses the
+declaring ancestor, `root_resolution_note` says so, and callers include invokes
+naming any class that resolves to that declaration. `root_body` is `code`,
+`no_code` (abstract or native declaration) or `not_loaded` (class outside the
+DEX set). Graph node IDs for non-root methods are declaring methods resolved
+through known superclasses (`node_id_semantics`).
+
+Method bodies whose instructions cannot be decoded (reserved opcodes, truncated
+instructions or invalid symbol indexes) do not pass DEX verification and
+contribute no calls. They never fail a query silently: `scan_complete` is false
+and `undecodable_methods` lists `count` plus up to 25 `samples` with the method
+and the decode error. The scope is every loaded method for caller or
+bidirectional queries and only the reachable bodies for callee queries.
 The graph is returned as one response, without pagination. The first caller or
 bidirectional query builds a project-owned disk invoke index. Subsequent queries
 reuse its per-direction shards. Candidates are verified against the original
@@ -254,7 +271,7 @@ a fresh cache. Failed or cancelled builds can be retried. Callee-only queries
 walk reachable methods directly.
 
 `get_instance_info.invoke_index` reports `state`, `scanned_classes`,
-`total_classes`, `invoke_sites`, and `active_batches`. Poll it from the same MCP
+`total_classes`, `invoke_sites`, `undecodable_methods`, and `active_batches`. Poll it from the same MCP
 connection while a query runs. Cancellation is cooperative during construction,
 shard scans, traversal, and between method reconstructions. The gateway's 120-second
 request deadline still applies; a cancelled build publishes no partial index.
@@ -284,16 +301,23 @@ and `direct_matching_total` counts only depth-1 matches. Method selectors accept
 The compact projection returns one record per DEX call site, including
 `caller_method_id`, `caller_signature`, `callee_method_id`, and
 `call_site_offset` in DEX code units. Multiple calls in the same caller remain
-separate. Evidence fields include `raw_callee_method_id`, `dex_entry`,
+separate. Evidence fields include `raw_callee_method_id` (the operand exactly as
+encoded), `resolved_callee_method_id` (the declaring method reached through
+known superclasses, or the raw operand when nothing resolves), `dex_entry`,
 `method_index` (local to that DEX), `invoke_instruction` (readable raw invoke), `invoke_opcode`, `invoke_words` (numeric
-16-bit instruction words), and `caller_code_offset_bytes`. The raw operand is
+16-bit instruction words), and `caller_code_offset_bytes`, the `code_off` of the
+caller's `code_item` header inside `dex_entry`. The instruction array starts 16
+bytes after that header, so the invoke lives at
+`caller_code_offset_bytes + 16 + 2 * call_site_offset` within the DEX file. The raw operand is
 resolved using the caller's own DEX table. `matching_total` counts all matching records; follow `next_offset`
 until null. `source_hash` identifies the complete ordered matching record set
 and stays stable across pages. Compact enumeration is independent of the graph node/edge caps.
 `offset` and `limit` apply only to `projection: "call_sites"` (maximum 500).
 
-Optional filters combine with AND: `package_prefix` matches package boundaries,
-`class_name` is an exact FQCN, `annotation` matches a method or class annotation
+Optional filters combine with AND: `package_prefix` matches package boundaries
+(`app`, `app.` and `app/` are equivalent; a bare `.` is rejected rather than
+matching nothing), `class_name` is an exact class in FQCN, slash or descriptor
+form (`app.Root`, `app/Root`, `Lapp/Root;`), `annotation` matches a method or class annotation
 by descriptor or FQCN, and `component_type` is `activity`, `service`, `receiver`,
 or `provider`, based on known DEX ancestry. Filters select neighboring method
 declarations after depth-bounded traversal; intermediate methods remain
@@ -303,9 +327,15 @@ the callee operand declared at the DEX instruction even when hierarchy lookup
 resolves it to an inherited implementation.
 
 This is a static graph. It resolves inherited aliases through known superclass
-metadata, but does not infer runtime virtual targets, reflection or Intent
-routing. External method bodies cannot be expanded. The GUI graph continues
-to follow outgoing calls; direction selection is currently an MCP feature.
+metadata, but not through interface default methods: an invoke naming an
+interface member keeps that interface as its resolved callee. It does not infer
+runtime virtual targets, reflection or Intent routing. `invoke-polymorphic`
+sites appear with their declared `MethodHandle` target and no argument
+analysis; `invoke-custom` (lambda bootstrap) instructions are not call sites, so
+lambda bodies are reached only through their synthetic methods. External method
+bodies cannot be expanded. The GUI graph follows the same rules and a test keeps
+its nodes, edges and dispatch suggestions identical to the `graph` projection;
+direction selection is currently an MCP feature.
 
 `find_direct_subclasses` follows immediate superclass edges. Use `find_implementations` with `class_id` to list concrete direct and indirect implementations of an interface or class; it supports the same instance/project scope and offset/limit pagination.
 
@@ -1249,15 +1279,20 @@ When APK optimization replaces application attribute names with decimal resource
 
 ### Interface caller expansion
 
-Use `get_call_graph(method_id, direction="callers", projection="call_sites", depth=1, dispatch_through_interfaces=true)` to include invokes through known ancestor interface declarations. The original `callee_method_id`, `raw_callee_method_id`, opcode and offset remain unchanged. Rows have `relationship="exact_declared_call"` or `"possible_interface_dispatch"`; inferred rows add `possible_implementation_method_id`. `exact_matching_total` and `possible_dispatch_total` keep the counts separate. A runtime receiver may select another implementation. The opt-in is limited to direct caller call-site queries; batch queries can pass the same option.
+Use `get_call_graph(method_id, direction="callers", projection="call_sites", depth=1, dispatch_through_interfaces=true)` to include `invoke-interface` and `invoke-virtual` sites whose raw target names the root member on any interface the root class implements, directly or through superinterfaces and superclasses, whether or not that interface redeclares the member and whether or not it is loaded. The original `callee_method_id`, `raw_callee_method_id`, opcode and offset remain unchanged. Rows have `relationship="exact_declared_call"` or `"possible_interface_dispatch"`; inferred rows add `possible_implementation_method_id`. `exact_matching_total` and `possible_dispatch_total` keep the counts separate. A runtime receiver may select another implementation. The opt-in is limited to direct caller call-site queries; batch queries can pass the same option.
 
 Superclass dispatch uses `dispatch_through_superclasses=true` with the same
-direct caller projection. It includes `invoke-virtual` sites targeting known
-overridden superclass declarations, including abstract bases, and labels them
-`possible_virtual_dispatch`. `invoke-super`, static and direct calls are excluded
-from inferred dispatch. The raw declared target remains available; possible
-receiver dispatch is separate from exact calls. Both dispatch options can be
-combined.
+direct caller projection. It includes `invoke-virtual` sites whose raw target
+names the root member on any superclass of the root class (declaring or not,
+abstract or concrete, loaded or framework) and labels them
+`possible_virtual_dispatch`. `invoke-super`, static and direct calls, and sites
+on sibling or unrelated receiver types are never inferred. Both options can be
+combined. `dispatch_expansion` reports what happened: `applied`,
+`not_requested`, or a `skipped_*` reason when the root is not a concrete
+instance method declared by its own loaded class (constructors, static and
+private methods, abstract or interface declarations, inherited-only members and
+unloaded classes get no inference). Inherited-only roots instead resolve to the
+declaring ancestor, and every invoke that resolves there is reported as exact.
 
 ### Asset contents
 

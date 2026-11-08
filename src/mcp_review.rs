@@ -340,7 +340,7 @@ pub(super) fn call_arguments(
         })();
         for (index, pc) in positions {
             let mut value = match &run {
-                Ok(values) => values.get(&pc).cloned().unwrap_or_else(||json!({"status":"unresolved","reason":"Call site is unreachable or unsupported"})),
+                Ok(values) => values.get(&pc).cloned().unwrap_or_else(||json!({"status":"unresolved","reason":"Call site is in code unreachable from the method entry; no constant state exists for it"})),
                 Err(error) => json!({"status":"unresolved","reason":format!("{error:#}")}),
             };
             let size = serde_json::to_vec(&value)?.len();

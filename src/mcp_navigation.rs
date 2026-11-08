@@ -380,7 +380,7 @@ pub(super) fn call_site_table(
         .map(|site| {
             let arguments = match &constants {
                 Ok(found) => found.get(&site.pc).cloned().unwrap_or_else(
-                    || json!({"status":"unresolved","reason":"Call site is unreachable or unsupported"}),
+                    || json!({"status":"unresolved","reason":"Call site is in code unreachable from the method entry; no constant state exists for it"}),
                 ),
                 Err(reason) => json!({"status":"unresolved","reason":reason}),
             };

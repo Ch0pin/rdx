@@ -543,9 +543,150 @@ pub(super) fn call_arguments(
     Ok(())
 }
 
+/// Keeps only call sites whose constant proof binds `argument_index` to
+/// `argument_literal`. Excluded (different proven constant) and unresolved
+/// sites stay visible as compact records so negative coverage remains bounded.
+pub(super) fn argument_filter(result: &mut Value, args: &Value) -> Result<()> {
+    let index = args["argument_index"]
+        .as_u64()
+        .context("argument_index must be an integer")? as usize;
+    let literal = &args["argument_literal"];
+    ensure!(
+        literal.is_string() || literal.is_i64(),
+        "argument_literal must be a string or a signed 32-bit integer"
+    );
+    let sites = result["call_sites"]
+        .as_array_mut()
+        .context("argument_index/argument_literal require projection=call_sites")?;
+    let page_total = sites.len();
+    let (mut matched, mut excluded, mut unresolved) = (Vec::new(), Vec::new(), Vec::new());
+    for site in sites.drain(..) {
+        let compact = |reason: Value, proven: Option<&Value>| {
+            let mut record = json!({"caller_method_id":site["caller_method_id"],"call_site_offset":site["call_site_offset"],
+                "invoke_instruction":site["invoke_instruction"],"depth":site["depth"],"reason":reason});
+            if let Some(argument) = proven {
+                record["argument"] = argument.clone();
+            }
+            record
+        };
+        let proof = &site["constant_arguments"];
+        if proof["status"] != "analyzed" {
+            let reason = proof["reason"]
+                .as_str()
+                .unwrap_or("constant argument analysis unavailable for this call site");
+            unresolved.push(compact(json!(reason), None));
+            continue;
+        }
+        let arguments = proof["arguments"].as_array().cloned().unwrap_or_default();
+        let Some(argument) = arguments.get(index) else {
+            excluded.push(compact(
+                json!(format!(
+                    "argument_index {index} exceeds the invoke's parameter count ({})",
+                    arguments.len()
+                )),
+                None,
+            ));
+            continue;
+        };
+        if argument["status"] != "constant" {
+            let reason = argument["reason"].as_str().unwrap_or(
+                "value is not a single proven constant on every reachable CFG path (merged registers, exception entry, arithmetic, field, parameter or call result)",
+            );
+            unresolved.push(compact(json!(reason), Some(argument)));
+            continue;
+        }
+        let same = match (literal, argument["kind"].as_str()) {
+            (Value::String(wanted), Some("string")) => argument["value"] == *wanted,
+            (Value::Number(wanted), Some("bits32")) => {
+                argument["value"].as_i64() == wanted.as_i64()
+            }
+            _ => false,
+        };
+        if same {
+            matched.push(site);
+        } else {
+            excluded.push(compact(
+                json!("proven constant differs from argument_literal"),
+                Some(argument),
+            ));
+        }
+    }
+    result["argument_filter"] = json!({
+        "argument_index":index,"argument_literal":literal,"page_total":page_total,
+        "matched":matched.len(),"excluded":excluded.len(),"unresolved":unresolved.len(),
+        "semantics":"Applied to this page only; follow next_offset for remaining pages. matched sites prove the literal at argument_index via intraprocedural constant flow and keep constant_arguments. excluded sites prove a different constant, kind or parameter count. unresolved sites are neither proven nor refuted and need manual review. Receiver excluded from indexing. constant_arguments_hash covers the analyzed page before filtering."
+    });
+    result["call_sites"] = json!(matched);
+    result["excluded_call_sites"] = json!(excluded);
+    result["unresolved_call_sites"] = json!(unresolved);
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn site(offset: u64, proof: Value) -> Value {
+        json!({"caller_method_id":"app.Caller.run()V","call_site_offset":offset,"depth":1,
+            "invoke_instruction":format!("{offset:04x}: invoke-virtual"),"constant_arguments":proof})
+    }
+    fn constant(index: usize, kind: &str, value: Value) -> Value {
+        json!({"status":"analyzed","arguments":[{"argument_index":index,"register":1,"descriptor":"Ljava/lang/String;","status":"constant","kind":kind,"value":value}]})
+    }
+    #[test]
+    fn argument_filter_partitions_matched_excluded_and_unresolved() {
+        let mut result = json!({"call_sites":[
+            site(1, constant(0, "string", json!("token"))),
+            site(2, constant(0, "string", json!("other"))),
+            site(3, constant(0, "bits32", json!(0))),
+            site(4, json!({"status":"analyzed","arguments":[{"argument_index":0,"register":2,"descriptor":"Ljava/lang/String;","status":"unresolved"}]})),
+            site(5, json!({"status":"unresolved","reason":"Caller definition unavailable"})),
+            site(6, json!({"status":"analyzed","arguments":[]})),
+        ],"returned_count":6});
+        argument_filter(
+            &mut result,
+            &json!({"argument_index":0,"argument_literal":"token"}),
+        )
+        .unwrap();
+        let summary = &result["argument_filter"];
+        assert_eq!(summary["page_total"], 6);
+        assert_eq!(summary["matched"], 1);
+        assert_eq!(summary["excluded"], 3);
+        assert_eq!(summary["unresolved"], 2);
+        assert_eq!(result["call_sites"][0]["call_site_offset"], 1);
+        assert_eq!(
+            result["call_sites"][0]["constant_arguments"]["status"],
+            "analyzed"
+        );
+        let excluded = result["excluded_call_sites"].as_array().unwrap();
+        assert_eq!(excluded[0]["argument"]["value"], "other");
+        assert_eq!(excluded[1]["argument"]["kind"], "bits32");
+        assert!(
+            excluded[2]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("parameter count (0)")
+        );
+        let unresolved = result["unresolved_call_sites"].as_array().unwrap();
+        assert_eq!(unresolved[0]["call_site_offset"], 4);
+        assert_eq!(unresolved[0]["argument"]["register"], 2);
+        assert_eq!(unresolved[1]["reason"], "Caller definition unavailable");
+        assert_eq!(result["returned_count"], 6);
+        let mut by_int = json!({"call_sites":[site(7, constant(0, "bits32", json!(21)))]});
+        argument_filter(
+            &mut by_int,
+            &json!({"argument_index":0,"argument_literal":21}),
+        )
+        .unwrap();
+        assert_eq!(by_int["argument_filter"]["matched"], 1);
+        let mut missing = json!({"graph":[]});
+        assert!(
+            argument_filter(
+                &mut missing,
+                &json!({"argument_index":0,"argument_literal":"x"})
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn annotation_presence_distinguishes_absence_unused_types_and_filtered_matches() {
         use crate::native_dex::{self, DexAnnotation, DexAnnotationDirectory};

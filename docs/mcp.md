@@ -1007,6 +1007,22 @@ Arguments exclude the receiver and retain their parameter descriptor and source
 register. Literal size/work budgets are reported explicitly. A preceding nearby
 string is never assumed to be an argument without register-flow evidence.
 
+To exhaust the callers that pass one specific value, add `argument_index` (zero-based,
+receiver excluded) and `argument_literal` (exact string, or a signed 32-bit integer)
+to the same query. This implies the constant-argument analysis and partitions the
+returned page: `call_sites` keeps only invokes whose dataflow proves the literal at
+that position (each retains `constant_arguments` as the proof), `excluded_call_sites`
+lists invokes that provably carry a different constant, kind or parameter count,
+and `unresolved_call_sites` lists invokes the analysis could neither prove nor
+refute (merged registers, exception entries, arithmetic, fields, parameters, call
+results) with the reason and the source register. `argument_filter` reports the
+counts for the page so the negative coverage stays bounded: every site on the page
+is in exactly one of the three lists. The filter is applied per page; `matching_total`,
+`offset` and `next_offset` keep their unfiltered meaning, so follow `next_offset`
+until it is null before claiming the writer has been exhausted. The parameters are
+accepted only with `projection: "call_sites"` and are not available on
+`get_call_graph_batch`.
+
 ### Reviewer discovery and XML queries
 
 All queries below require `instance_id` and `project_id`. New scans support cancellation and stable occurrence pagination (`offset`, `limit <= 500`), bounded response pages, and explicit error coverage. `complete` describes the documented scan, never application security coverage.

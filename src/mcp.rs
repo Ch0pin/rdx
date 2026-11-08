@@ -1190,8 +1190,12 @@ fn dispatch(
         normalized["class_id"] = json!(resolved);
     }
     let mut result = dispatch_resolved(engine, project, name, &normalized, cancel)?;
-    if name == "get_call_graph" && args["include_const_args"] == true {
+    let argument_filter = name == "get_call_graph" && args.get("argument_literal").is_some();
+    if name == "get_call_graph" && (args["include_const_args"] == true || argument_filter) {
         review::call_arguments(engine, &mut result, cancel)?;
+    }
+    if argument_filter {
+        review::argument_filter(&mut result, args)?;
     }
     if name == "get_call_graph" {
         navigation::enrich(engine, &mut result, args, cancel)?;
@@ -1916,6 +1920,10 @@ fn tools_list() -> Value {
             properties.insert("dispatch_through_interfaces".into(),json!({"type":"boolean","default":false,"description":"Direct callers with call_sites only: include interface-typed invokes as possible dispatch, preserving raw target and separate counts"}));
             for key in ["include_source_locations","include_forwarders"] {properties.insert(key.into(),json!({"type":"boolean","default":false,"description":"call_sites only: optional bounded source mapping or verified static-forwarder metadata"}));}
             properties.insert("include_const_args".into(),json!({"type":"boolean","default":false,"description":"call_sites only: conservative CFG constant argument analysis for the returned page; unresolved values are explicit"}));
+            if name=="get_call_graph" {
+                properties.insert("argument_index".into(),json!({"type":"integer","minimum":0,"maximum":255,"description":"call_sites only, with argument_literal: zero-based parameter position (receiver excluded) that must be proven equal to argument_literal; implies include_const_args"}));
+                properties.insert("argument_literal".into(),json!({"type":["string","integer"],"description":"call_sites only, with argument_index: exact string literal or signed 32-bit integer the argument must be proven to carry; call_sites keeps proven matches, excluded_call_sites and unresolved_call_sites bound the negative coverage per page"}));
+            }
             properties.insert("direct_only".into(),json!({"type":"boolean","default":false}));
             properties.insert("projection".into(),json!({"type":"string","enum":["graph","call_sites"],"default":"graph"}));
             for key in ["package_prefix", "class_name", "annotation"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
@@ -2038,6 +2046,14 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
             );
         } else if name == "find_integer_references" && key == "values" {
             ensure!(value.is_array(), "values must be an array");
+        } else if name == "get_call_graph" && key == "argument_literal" {
+            ensure!(
+                value
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty() && s.len() <= 4096)
+                    || value.as_i64().is_some_and(|v| i32::try_from(v).is_ok()),
+                "argument_literal must be a nonempty string of at most 4096 bytes or a signed 32-bit integer"
+            );
         } else if name == "resolve_switch_case_callers" && key == "case" {
             ensure!(
                 value.as_i64().is_some_and(|v| i32::try_from(v).is_ok()),
@@ -2117,6 +2133,18 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
         ensure!(
             args["projection"] == "call_sites",
             "include_const_args requires projection=call_sites"
+        );
+    }
+    if name == "get_call_graph"
+        && (args.get("argument_index").is_some() || args.get("argument_literal").is_some())
+    {
+        ensure!(
+            args.get("argument_index").is_some() && args.get("argument_literal").is_some(),
+            "argument_index and argument_literal must be supplied together"
+        );
+        ensure!(
+            args["projection"] == "call_sites",
+            "argument_index/argument_literal require projection=call_sites"
         );
     }
     if name == "find_integer_references" {
@@ -3241,6 +3269,69 @@ mod tests {
         assert_eq!(
             result["data"]["call_sites"][0]["constant_arguments"]["status"],
             "analyzed"
+        );
+        for (literal, matched, excluded) in [(json!(21), 1, 0), (json!(22), 0, 1)] {
+            let mut args = scope.clone();
+            args.as_object_mut().unwrap().extend(json!({"method_id":"sample.Target.doubleValue(I)I","direction":"callers","projection":"call_sites","argument_index":0,"argument_literal":literal}).as_object().unwrap().clone());
+            validate("get_call_graph", &args).unwrap();
+            let data = &remote(&record, "get_call_graph", &args).unwrap()["data"];
+            assert_eq!(data["argument_filter"]["page_total"], 1);
+            assert_eq!(data["argument_filter"]["matched"], matched);
+            assert_eq!(data["argument_filter"]["excluded"], excluded);
+            assert_eq!(data["argument_filter"]["unresolved"], 0);
+            assert_eq!(data["call_sites"].as_array().unwrap().len(), matched);
+            assert_eq!(
+                data["excluded_call_sites"].as_array().unwrap().len(),
+                excluded
+            );
+            assert_eq!(data["matching_total"], 1);
+            if matched == 1 {
+                assert_eq!(
+                    data["call_sites"][0]["constant_arguments"]["arguments"][0]["value"],
+                    21
+                );
+            } else {
+                assert_eq!(data["excluded_call_sites"][0]["argument"]["value"], 21);
+                assert_eq!(
+                    data["excluded_call_sites"][0]["caller_method_id"],
+                    "sample.Caller.compute()I"
+                );
+            }
+        }
+        for (extra, message) in [
+            (json!({"argument_index":0}), "supplied together"),
+            (json!({"argument_literal":"token"}), "supplied together"),
+            (
+                json!({"argument_index":0,"argument_literal":"token","projection":"graph"}),
+                "require projection=call_sites",
+            ),
+            (
+                json!({"argument_index":0,"argument_literal":"","projection":"call_sites"}),
+                "nonempty string",
+            ),
+            (
+                json!({"argument_index":0,"argument_literal":true,"projection":"call_sites"}),
+                "signed 32-bit integer",
+            ),
+        ] {
+            let mut args = scope.clone();
+            args.as_object_mut().unwrap().extend(
+                json!({"method_id":"sample.Target.doubleValue(I)I","direction":"callers"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let error = format!("{:#}", validate("get_call_graph", &args).unwrap_err());
+            assert!(error.contains(message), "{error}");
+        }
+        let mut args = scope.clone();
+        args.as_object_mut().unwrap().extend(json!({"method_ids":["sample.Target.doubleValue(I)I"],"argument_index":0,"argument_literal":21}).as_object().unwrap().clone());
+        assert!(
+            format!("{:#}", validate("get_call_graph_batch", &args).unwrap_err())
+                .contains("Unknown argument: argument_index")
         );
         let out =
             std::env::temp_dir().join(format!("rdx-reviewer-service-{}", random_id().unwrap()));

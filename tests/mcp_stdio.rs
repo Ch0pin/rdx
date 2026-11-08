@@ -200,6 +200,15 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         schema("get_call_graph")["properties"]["include_const_args"]["type"],
         "boolean"
     );
+    assert_eq!(
+        schema("get_call_graph")["properties"]["argument_index"]["maximum"],
+        255
+    );
+    assert_eq!(
+        schema("get_call_graph")["properties"]["argument_literal"]["type"],
+        json!(["string", "integer"])
+    );
+    assert!(schema("get_call_graph_batch")["properties"]["argument_literal"].is_null());
     assert_eq!(method_source["properties"]["limit"]["maximum"], 128000);
     assert_eq!(method_source["properties"]["offset"]["minimum"], 0);
     assert_eq!(

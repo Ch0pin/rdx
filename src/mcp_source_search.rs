@@ -10,10 +10,28 @@ use std::{
 /// Empty pages with remaining work must never read as an APK-wide negative.
 pub(super) fn page_status(empty: bool, more: bool, errors: bool) -> Value {
     json!({"complete":!more && !errors,
-        "message":if more && empty {"No matches on this page; the scan is incomplete. Follow next_offset and next_source_offset, or use mode=identifiers for method/type/field names."}
+        "message":if more && empty {"No matches on this page; the scan is incomplete. Follow next_offset and next_source_offset with the same query, package_prefix and pagination. For class, method or field names, mode=identifiers searches the DEX symbol index without decompilation; find_string_references indexes DEX string literals."}
             else if more {"More source remains; follow both continuation offsets."}
             else if errors {"Scan finished with class errors; absence is inconclusive."}
             else {"Scan complete."}})
+}
+
+/// Generated-source text has no precomputed index. Point identifier-shaped
+/// queries at the indexed symbol search whenever this page was empty or the
+/// scan is still open, which is where decompilation round trips accumulate.
+pub(super) fn identifier_hint(query: &str, empty: bool, exhausted: bool) -> Value {
+    let mut chars = query.chars();
+    let identifier = chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, '_' | '$'))
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'));
+    if identifier && (empty || !exhausted) {
+        json!(
+            "The query is a plain identifier. mode=identifiers searches DEX class, method and field names from the symbol index without decompiling any class; find_string_references indexes DEX string literals. Source mode has no precomputed index and reconstructs each scanned class."
+        )
+    } else {
+        Value::Null
+    }
 }
 
 /// `offset` remains a filtered-class cursor; `limit` bounds returned occurrences.
@@ -40,19 +58,10 @@ fn search_with(
         !query.is_empty() && query.len() <= 4096,
         "Query must contain 1..4096 bytes"
     );
-    let package = args["package_prefix"]
-        .as_str()
-        .unwrap_or("")
-        .trim_end_matches('.');
+    let scope = crate::package_scope::PackageScope::from_args(args)?;
     let classes: Vec<_> = project_classes
         .iter()
-        .filter(|class| {
-            package.is_empty()
-                || class.as_str() == package
-                || class
-                    .strip_prefix(package)
-                    .is_some_and(|tail| tail.starts_with('.'))
-        })
+        .filter(|class| scope.matches(class))
         .collect();
     let offset = args["offset"].as_u64().unwrap_or(0) as usize;
     let limit = args["limit"].as_u64().unwrap_or(100) as usize;
@@ -132,7 +141,7 @@ fn search_with(
         }
     }
     Ok(
-        json!({"items":items,"pagination":"hits","scope":"generated Java and mixed DEX; case-sensitive literal plus exact numeric aliases for resolved resource links; resource files excluded","offset":offset,"limit":limit,"scanned_classes":scanned,"total_classes":classes.len(),"page_status":page_status(items.is_empty(),next.is_some(),error_count>0),"errors":errors,"next_offset":next,"next_source_offset":next.map(|_| next_source),"exhausted":next.is_none(),"scan_boundary":boundary,"page_error_count":error_count,"errors_truncated":error_count > errors.len(),"scan_budget_ms":20000,"elapsed_ms":started.elapsed().as_millis()}),
+        json!({"items":items,"pagination":"hits","scope":"generated Java and mixed DEX; case-sensitive literal plus exact numeric aliases for resolved resource links; resource files excluded","offset":offset,"limit":limit,"scanned_classes":scanned,"total_classes":classes.len(),"page_status":page_status(items.is_empty(),next.is_some(),error_count>0),"errors":errors,"next_offset":next,"next_source_offset":next.map(|_| next_source),"exhausted":next.is_none(),"scan_boundary":boundary,"page_error_count":error_count,"errors_truncated":error_count > errors.len(),"scan_budget_ms":20000,"elapsed_ms":started.elapsed().as_millis(),"package_scope":scope.describe(),"hint":identifier_hint(query,items.is_empty(),next.is_none())}),
     )
 }
 
@@ -213,6 +222,66 @@ mod tests {
         assert_eq!(page["items"], json!([]));
         assert_eq!(page["exhausted"], true);
         assert_eq!(page["next_offset"], Value::Null);
+        assert!(page["hint"].as_str().unwrap().contains("mode=identifiers"));
+        assert_eq!(page["package_scope"]["prefixes"], json!([]));
+    }
+
+    #[test]
+    fn package_scope_lists_and_obfuscated_root_filter_classes() {
+        let names = classes(&[
+            "app.A",
+            "app.sub.B",
+            "application.C",
+            "wr.b$a",
+            "tk.a",
+            "Top",
+            "com.vendor.D",
+        ]);
+        let page = search_with(
+            &names,
+            &json!({"query":"api","package_prefix":["app.","obfuscated-root"]}),
+            &AtomicBool::new(false),
+            |_| Ok(code("api();")),
+        )
+        .unwrap();
+        assert_eq!(page["total_classes"], 5);
+        let found: Vec<_> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["class_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(found, ["app.A", "app.sub.B", "wr.b$a", "tk.a", "Top"]);
+        assert_eq!(page["pagination"], "hits");
+        assert_eq!(page["package_scope"]["prefixes"], json!(["app"]));
+        assert_eq!(page["package_scope"]["obfuscated_root"], true);
+        assert_eq!(page["hint"], Value::Null);
+        let error = search_with(
+            &names,
+            &json!({"query":"api","package_prefix":["app", ""]}),
+            &AtomicBool::new(false),
+            |_| Ok(code("api();")),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("must not be empty"));
+    }
+
+    #[test]
+    fn identifier_hint_covers_empty_or_open_scans_only() {
+        assert!(
+            identifier_hint("GetGoogleIdOption", true, true)
+                .as_str()
+                .unwrap()
+                .contains("mode=identifiers")
+        );
+        assert!(identifier_hint("GetGoogleIdOption", false, false).is_string());
+        assert_eq!(
+            identifier_hint("GetGoogleIdOption", false, true),
+            Value::Null
+        );
+        assert_eq!(identifier_hint("api.key", true, true), Value::Null);
+        assert_eq!(identifier_hint("9lives", true, true), Value::Null);
+        assert_eq!(identifier_hint("", true, true), Value::Null);
     }
 
     #[test]

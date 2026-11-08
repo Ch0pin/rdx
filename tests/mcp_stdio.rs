@@ -113,6 +113,24 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         json!(["all", "class", "method", "field"])
     );
     assert_eq!(search["properties"]["case_sensitive"]["type"], "boolean");
+    assert_eq!(search["properties"]["pagination"]["default"], "hits");
+    for name in [
+        "search_code",
+        "get_all_classes",
+        "search_classes_by_keyword",
+    ] {
+        assert_eq!(
+            schema(name)["properties"]["package_prefix"]["type"],
+            json!(["string", "array"])
+        );
+    }
+    for name in [
+        "get_class_source",
+        "get_method_source",
+        "get_class_disassembly",
+    ] {
+        assert_eq!(schema(name)["properties"]["source_hash"]["type"], "string");
+    }
 
     let integers = schema("find_integer_references");
     for key in ["values", "instance_id", "project_id"] {

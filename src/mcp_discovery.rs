@@ -22,22 +22,29 @@ pub(super) fn classes(project: &Project, args: &Value) -> Result<Value> {
     let query = args["query"].as_str().unwrap_or("");
     let sensitive = args["case_sensitive"].as_bool().unwrap_or(true);
     let folded = query.to_lowercase();
+    let scope = crate::package_scope::PackageScope::from_args(args)?;
     let items: Vec<_> = project
         .classes
         .iter()
         .filter(|c| {
-            if sensitive {
-                c.contains(query)
-            } else {
-                c.to_lowercase().contains(&folded)
-            }
+            scope.matches(c)
+                && if sensitive {
+                    c.contains(query)
+                } else {
+                    c.to_lowercase().contains(&folded)
+                }
         })
         .map(|c| json!({"class_id":c,"name":c}))
         .collect();
     let absent = items.is_empty();
     let mut result = page(items, args)?;
     result["case_sensitive"] = json!(sensitive);
+    result["package_scope"] = scope.describe();
     if absent {
+        // Near matches stay project-wide so a class excluded by the scope is
+        // still discoverable.
+        result["suggestions_scope"] =
+            json!("all loaded classes, case-insensitive, ignoring package_prefix");
         result["suggestions"] = json!(
             project
                 .classes

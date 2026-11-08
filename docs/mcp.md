@@ -64,9 +64,11 @@ suggestions preserve exact FQCN and unique short-name selection rules.
 | DEX analysis | `find_field_references`, `get_lambda_branch`, `resolve_switch_case_callers`, `find_network_stacks`, `find_config_key_consumers`, `find_instantiations`, `find_integer_references`, `find_annotation_usages`, `find_type_references`, `find_webview_chooser_flows` |
 | DEX strings | `get_dex_strings` (strings from the DEX containing `class_id`), `find_string_references` |
 
-`search_classes_by_keyword` searches literal class-name substrings only.
+`search_classes_by_keyword` searches literal class-name substrings only; its
+`package_prefix` accepts one prefix, an array of prefixes, or `obfuscated-root`.
 `search_code` searches generated Java and mixed DEX source using a case-sensitive
-literal query by default; `mode: "identifiers"` searches the native symbol index.
+literal query by default, paging matching occurrences across classes;
+`mode: "identifiers"` searches the native symbol index.
 Use `search_resources` for decoded ARSC names and values across configurations.
 Class identifiers currently follow the native engine's class-name identity.
 Disassembly is `rdx-dex`, not assemblable Smali. Java source can contain explicit
@@ -298,8 +300,13 @@ classes retain their usual Java header.
 For paged text, `returned_chars`, `page_end`, `has_more`, and
 `full_text_in_response` describe the returned slice. `full_text_in_response: true`
 means this response contains the complete document. Follow `next_offset` until
-null and retain `source_hash`; a terminal page starting after zero is still a
-slice. Coverage remains class-wide even when only a small source slice is returned.
+null with the same selector; a terminal page starting after zero is still a
+slice. `source_hash` identifies the complete document, not a request cursor.
+Pass it back as the optional `source_hash` argument of `get_class_source`,
+`get_method_source`, `get_class_disassembly`, `get_android_manifest`,
+`get_resource_file` or `get_manifest_summary` to fail with `SOURCE_CHANGED`
+instead of paging a document that changed underneath. Coverage remains
+class-wide even when only a small source slice is returned.
 
 ### Method source
 
@@ -341,28 +348,42 @@ error rather than silently truncating source.
 
 ## Bounded code search
 
-Set `pagination: "hits"` to page by occurrences across the APK. `limit` then
-bounds matches (default 100, maximum 500), rather than classes. The server scans
-until that limit, the end of the filtered class list, or a 20-second budget
-checked between class renders. One expensive class may exceed that budget;
-cancellation remains cooperative. Resume with **both** `next_offset` and
-`next_source_offset`, using the same query, prefix and pagination mode.
-`scan_boundary` explains each page boundary; `scanned_classes` and `total_classes`
-show progress. `page_error_count` includes all failed renders even when the
-bounded `errors` detail list is truncated. This mode reduces round trips;
-uncached generated-source search still needs Java reconstruction. For DEX string
-literals use `find_string_references`, which indexes literal operands directly.
+Source-mode `search_code` pages by occurrences across the APK by default
+(`pagination: "hits"`). `limit` bounds matches (default 100, maximum 500), not
+classes, so a page is never empty while matches remain. The server scans until
+that limit, the end of the filtered class list, or a 20-second budget checked
+between class renders. One expensive class may exceed that budget; cancellation
+remains cooperative. Resume with **both** `next_offset` and `next_source_offset`,
+using the same query, `package_prefix` and pagination mode. `scan_boundary`
+explains each page boundary; `scanned_classes` and `total_classes` show
+progress. `page_error_count` includes all failed renders even when the bounded
+`errors` detail list is truncated. Generated-source text has no precomputed
+index: uncached search still reconstructs each scanned class. An
+identifier-shaped query on an empty or unfinished page carries a `hint` naming
+`mode: "identifiers"`, which searches DEX class, method and field names from the
+symbol index without decompiling. For DEX string literals use
+`find_string_references`, which indexes literal operands directly.
 
-The default `pagination: "classes"` preserves the previous contract:
+`package_prefix` accepts a single prefix, an array of prefixes, or the
+pseudo-prefix `obfuscated-root` on `search_code` (both modes), `get_all_classes`
+and `search_classes_by_keyword`. Each prefix matches the named class itself or
+classes below it at a `.` boundary; entries combine with OR and trailing dots are
+ignored. `obfuscated-root` selects default-package classes and classes whose
+every package segment has at most three characters, such as `wr.b$a`, `tk.a` or
+`a.b.C`: a superset heuristic for R8/ProGuard package renaming that also admits
+short conventional roots such as `com.a`. Pair it with the application prefix,
+for example `["com.example.app", "obfuscated-root"]`, to cover relocated classes
+that a single prefix misses. Responses echo the applied scope as
+`package_scope`. Other scoped tools still take one string prefix.
 
-`search_code` requires `instance_id`, `project_id` and `query`. Optionally set
-`package_prefix` (package boundary match), `offset` (class index), `limit`
-(classes to scan, default 25, maximum 500), and `source_offset` (Unicode character
-offset inside the first class). Each response contains at most 100 matches.
-Resume with both `next_offset` and `next_source_offset`, keeping the query and
-package prefix unchanged. Continue until `exhausted` is true, and check every
-page's `errors` before interpreting an empty result as absence. A failed class
-is reported and does not silently count as successfully searched.
+`pagination: "classes"` keeps the class-window contract: `offset` is a class
+index, `limit` counts classes to scan (default 25, maximum 500), and
+`source_offset` is the Unicode character offset inside the first class. Each
+response contains at most 100 matches. Resume with both `next_offset` and
+`next_source_offset`, keeping the query, scope and pagination unchanged. Continue
+until `exhausted` is true, and check every page's `errors` before interpreting an
+empty result as absence. A failed class is reported and does not silently count
+as successfully searched.
 
 Hits include `class_id`, `source_hash`, Unicode `start`/`end`, one-based `line`,
 and a bounded snippet. Source hashes identify generated text; the response
@@ -1017,8 +1038,9 @@ pagination:
 {"instance_id":"INSTANCE","project_id":"PROJECT","mode":"identifiers","query":"ServerDrivenActionService","symbol_kind":"class","occurrence":"reference","package_prefix":"com.mercadolibre.android.sc_feed","limit":500}
 ```
 
-Pass that object to `search_code`. Source-mode `limit` counts classes by default
-(25, maximum 500); `pagination: "hits"` instead pages source matches.
+Pass that object to `search_code`. Source-mode `limit` counts matching
+occurrences by default (`pagination: "hits"`, 100, maximum 500);
+`pagination: "classes"` instead counts classes to scan (25, maximum 500).
 
 `find_annotation_usages` accepts `annotation_type` as an FQCN or DEX descriptor,
 `element: "all"|"class"|"field"|"method"|"parameter"`, `package_prefix`, and
@@ -1113,7 +1135,7 @@ accepted only with `projection: "call_sites"` and are not available on
 
 All queries below require `instance_id` and `project_id`. New scans support cancellation and stable occurrence pagination (`offset`, `limit <= 500`), bounded response pages, and explicit error coverage. `complete` describes the documented scan, never application security coverage.
 
-- `get_all_classes` and `search_classes_by_keyword` accept `case_sensitive:false`. Returned IDs preserve case; an empty case-sensitive search includes up to 20 case-insensitive near matches. Resolution never silently substitutes a case variant. Missing-class errors describe absence from the loaded DEX set, without asserting runtime loading.
+- `get_all_classes` and `search_classes_by_keyword` accept `case_sensitive:false`. Returned IDs preserve case; an empty case-sensitive search includes up to 20 case-insensitive near matches. Resolution never silently substitutes a case variant. Missing-class errors describe absence from the loaded DEX set, without asserting runtime loading. `package_prefix` accepts one prefix, an array of prefixes, or `obfuscated-root`; near-match `suggestions` ignore it and say so in `suggestions_scope`.
 - Validation errors include `accepted_parameters` containing the tool input schema and selector alternatives. Singular IDs and plural batch IDs retain their separate meanings.
 - `find_type_references(class_name, package_prefix?)` pages exact original DEX type references. Use FQCN or a DEX descriptor. It includes class literals, casts, type checks, allocations, inheritance, field/parameter/return declaration types, and explicit class/field/method/parameter annotation types with decoded values. Annotation hits follow identifier hits; the combined source hash covers both. Array component matches preserve the actual array operand. Annotation defaults and nested value types are outside this projection.
 - `search_kotlin_metadata(query, case_sensitive?, package_prefix?)` searches `kotlin.Metadata.d2`, returning owning DEX class, table index and matched string. These are discovery evidence, **not verified original-name aliases**: a d2 entry may describe a referenced type or member. Canonical lookup continues to use DEX identities.
@@ -1326,8 +1348,9 @@ not interchangeable with instruction offsets.
 
 Source-mode `search_code` includes `page_status.complete` and an explanatory
 message when a zero-hit page still has unscanned classes or occurrences. Resume
-its cursors or choose `mode: "identifiers"` for DEX symbol searches. Identifier
-filters require that mode. `format: "dex"` returns RDX's labeled DEX listing;
+its cursors or choose `mode: "identifiers"` for DEX symbol searches; an
+identifier-shaped query on such a page also carries a `hint` naming that mode.
+Identifier filters require that mode. `format: "dex"` returns RDX's labeled DEX listing;
 it is not advertised as assemblable Smali.
 
 `list_nav_deeplinks` includes `hotwire_annotation` records for exact

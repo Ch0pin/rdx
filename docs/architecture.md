@@ -69,9 +69,8 @@ prepare trigram filters and compressed records; the coordinator owns cache
 admission and disk writes. Indexed classes resolve at admission, so only classes
 that need rendering occupy the window. Rendered results are consumed as workers
 finish them and reported in input order: a slow class delays only its own report
-while the other workers keep rendering the classes behind it. Admission pauses
-once buffered hits alone would fill the result limits. A 128 MiB byte budget
-covers queued results, including prepared records. The oldest render in flight
+while the other workers keep rendering the classes behind it. A 128 MiB byte
+budget covers queued results, including prepared records. The oldest render in flight
 may exceed that budget to ensure progress, and each worker may hold one
 additional rendered result while waiting. Rendering and compression have
 transient allocations, so this is not a process memory ceiling. Cancellation and
@@ -99,8 +98,10 @@ Adaptive negative filters survive source-storage admission limits; possible
 matches without cached source are rendered again. Records contain a small
 metadata frame and UTF-8 source, using fast DEFLATE compression when it saves
 space. Compressed and expanded records both retain the 32 MiB document bound.
-Results stop at 1,000 hits / 32 MiB retained
-matching content. Native searches cache navigation metadata with matched source.
+Results are not capped: every match is reported and the scan runs to the end.
+Each matching class keeps its generated source in memory while the results are
+open, so result memory grows with the number of matching classes rather than
+with a fixed bound. Native searches cache navigation metadata with matched source.
 Cancellation is checked between classes and resources. There are no source
 handoff files or Java code caches.
 

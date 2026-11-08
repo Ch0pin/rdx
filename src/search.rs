@@ -12,8 +12,6 @@ use std::{
     },
 };
 
-const MAX_HITS: usize = 1000;
-const MAX_RETAINED: usize = 32 * 1024 * 1024;
 mod candidates;
 #[cfg(test)]
 mod latency_tests;
@@ -206,9 +204,7 @@ pub struct SearchSummary {
     pub hits: usize,
     pub skipped: usize,
     pub cancelled: bool,
-    pub limited: bool,
     pub errors: Vec<String>,
-    retained_bytes: usize,
 }
 
 // Java lexical comments; strings, characters and text blocks shield comment markers.
@@ -754,7 +750,7 @@ pub fn run_search_interactive(
             },
             &mut interactive,
         );
-        if !q.resources || result.cancelled || result.limited {
+        if !q.resources || result.cancelled {
             result.total += resource_count;
             return result;
         }
@@ -800,7 +796,6 @@ pub fn run_search_interactive(
         .collect();
     let mut summary = class_summary.unwrap_or_default();
     summary.total = summary.scanned + selected.len() + entries.len();
-    let mut retained = summary.retained_bytes;
     let mut last_progress = std::time::Instant::now();
     let mut prefetched = HashMap::new();
     let mut batches_available = true;
@@ -1011,21 +1006,10 @@ pub fn run_search_interactive(
                     summary.skipped += 1;
                     record_error(&mut summary, format!("{}: {note}", document.name));
                 }
-                let cost = document.source.len()
-                    + document
-                        .links
-                        .iter()
-                        .map(|link| std::mem::size_of::<CodeLink>() + link.label.len())
-                        .sum::<usize>();
-                let batch = matches(document, &definitions, query, MAX_HITS - summary.hits);
+                let batch = matches(document, &definitions, query, usize::MAX);
                 if !batch.is_empty() {
-                    if retained + cost > MAX_RETAINED {
-                        summary.limited = true;
-                    } else {
-                        retained += cost;
-                        summary.hits += batch.len();
-                        emit(SearchUpdate::Batch(batch));
-                    }
+                    summary.hits += batch.len();
+                    emit(SearchUpdate::Batch(batch));
                 }
             }
             Ok(None) => {
@@ -1040,8 +1024,6 @@ pub fn run_search_interactive(
         }
         if last_progress.elapsed() >= std::time::Duration::from_millis(50)
             || summary.scanned == summary.total
-            || summary.hits >= MAX_HITS
-            || summary.limited
         {
             emit(SearchUpdate::Progress {
                 scanned: summary.scanned,
@@ -1050,10 +1032,6 @@ pub fn run_search_interactive(
                 skipped: summary.skipped,
             });
             last_progress = std::time::Instant::now();
-        }
-        if summary.hits >= MAX_HITS || summary.limited {
-            summary.limited = true;
-            break;
         }
     }
     summary

@@ -8,7 +8,7 @@ the current native renderer. It is not the same corpus as full JADX Java output.
 `cargo build --release --bins` builds the native application and sample plugin.
 `target/release/rdx --benchmark-search-current FILE QUERY 200000` measures project
 load separately from cold and repeat native representation searches. It verifies
-cold/warm result tuples and reports skipped/limited coverage. Package exclusions
+cold/warm result tuples and reports skipped coverage. Package exclusions
 are disabled in this benchmark.
 
 `scripts/benchmark_memory.py OUTPUT.json COMMAND ...` is development-only Python

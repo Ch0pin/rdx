@@ -70,7 +70,7 @@ fn ranked_search_preserves_complete_source_results_across_queries() {
         assert_eq!(actual, expected, "query {text}");
         assert_eq!(result.scanned, baseline.scanned);
         assert_eq!(result.skipped, 0);
-        assert!(!result.cancelled && !result.limited);
+        assert!(!result.cancelled);
         // A fully indexed repeat must not revisit the metadata planning pass.
         let fetched = cache.source_fetches;
         let warm = run_search_interactive(
@@ -262,7 +262,7 @@ fn apk_general_search_complete_sample() {
                 );
                 assert_eq!(summary.scanned, count);
                 assert_eq!(summary.skipped, 0);
-                assert!(!summary.cancelled && !summary.limited);
+                assert!(!summary.cancelled);
                 if let Some(expected) = &baseline {
                     assert_eq!(&hits, expected);
                 } else {
@@ -341,7 +341,7 @@ fn apk_code_search_profile() {
         prepare += t.elapsed();
         record_bytes += prepared.estimated_bytes();
         let t = Instant::now();
-        hits += matches(document, &definitions, &query, MAX_HITS).len();
+        hits += matches(document, &definitions, &query, usize::MAX).len();
         matching += t.elapsed();
     }
     slowest.sort_by(|a, b| b.0.total_cmp(&a.0));

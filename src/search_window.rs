@@ -251,8 +251,6 @@ impl SearchWindow {
         self.skipped = summary.skipped;
         let state = if summary.cancelled {
             "Cancelled — partial results"
-        } else if summary.limited {
-            "Search stopped early — partial results"
         } else if summary.skipped > 0 {
             "Search complete — partial coverage"
         } else {
@@ -830,10 +828,11 @@ mod tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             assert!(window.show_contents(ctx, false).start.is_none());
         });
-        let mut summary = SearchSummary::default();
-        summary.cancelled = true;
-        summary.hits = 9;
-        window.finish(summary);
+        window.finish(SearchSummary {
+            cancelled: true,
+            hits: 9,
+            ..Default::default()
+        });
         assert!(window.status.contains("updated query"));
         let mut started = None;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -867,10 +866,11 @@ mod tests {
             skipped: 0,
         });
         assert!(window.running);
-        let mut summary = SearchSummary::default();
-        summary.scanned = 100;
-        summary.total = 100;
-        window.finish(summary);
+        window.finish(SearchSummary {
+            scanned: 100,
+            total: 100,
+            ..Default::default()
+        });
         assert!(!window.running);
         assert!(window.status.starts_with("Search complete"));
     }

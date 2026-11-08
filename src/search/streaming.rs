@@ -14,20 +14,15 @@ enum Outcome {
     Resolved {
         hits: Vec<SearchHit>,
         note: Option<String>,
-        cost: usize,
     },
 }
 
 /// Outcomes resolve in completion order and report in class order, so hit
-/// order, counters and result limits match a serial scan while a slow class
-/// never idles the other workers. Documents leave memory at resolution; only
-/// hits retain theirs, bounded by the result limits before admission continues.
+/// order and counters match a serial scan while a slow class never idles the
+/// other workers. Documents leave memory at resolution unless they have hits.
 struct Reporter {
     completed: BTreeMap<usize, Outcome>,
     next: usize,
-    retained: usize,
-    buffered_hits: usize,
-    buffered_cost: usize,
     last_progress: Instant,
 }
 impl Reporter {
@@ -35,9 +30,6 @@ impl Reporter {
         Self {
             completed: BTreeMap::new(),
             next: 0,
-            retained: 0,
-            buffered_hits: 0,
-            buffered_cost: 0,
             last_progress: Instant::now(),
         }
     }
@@ -49,43 +41,26 @@ impl Reporter {
         match rendered {
             Err(error) => Outcome::Failed(format!("{name}: {error}")),
             Ok(None) => Outcome::Skipped,
-            Ok(Some((document, definitions, note))) => {
-                let hits = matches(document.clone(), &definitions, query, MAX_HITS);
-                let cost = if hits.is_empty() {
-                    0
-                } else {
-                    cached_cost(
-                        &document.target,
-                        &Some((document.clone(), definitions, None)),
-                    )
-                };
-                Outcome::Resolved { hits, note, cost }
-            }
+            Ok(Some((document, definitions, note))) => Outcome::Resolved {
+                hits: matches(document, &definitions, query, usize::MAX),
+                note,
+            },
         }
     }
     fn buffer(&mut self, index: usize, outcome: Outcome) {
-        if let Outcome::Resolved { hits, cost, .. } = &outcome {
-            self.buffered_hits += hits.len();
-            self.buffered_cost += cost;
-        }
         self.completed.insert(index, outcome);
     }
     /// Classes with a known outcome, reported or still waiting for an earlier class.
     fn resolved(&self) -> usize {
         self.next + self.completed.len()
     }
-    /// Admission pauses once buffered hits alone can fill the result limits.
-    fn wants_more(&self, summary: &SearchSummary) -> bool {
-        summary.hits + self.buffered_hits < MAX_HITS
-            && self.retained + self.buffered_cost <= MAX_RETAINED
-    }
-    /// Report contiguous outcomes in class order; false once a limit stops the scan.
+    /// Report contiguous outcomes in class order.
     fn drain(
         &mut self,
         summary: &mut SearchSummary,
         cache: &mut SearchCache,
         emit: &mut impl FnMut(SearchUpdate),
-    ) -> bool {
+    ) {
         while let Some(outcome) = self.completed.remove(&self.next) {
             self.next += 1;
             summary.scanned += 1;
@@ -96,36 +71,18 @@ impl Reporter {
                     record_error(summary, error);
                     summary.skipped += 1;
                 }
-                Outcome::Resolved {
-                    mut hits,
-                    note,
-                    cost,
-                } => {
-                    self.buffered_hits -= hits.len();
-                    self.buffered_cost -= cost;
+                Outcome::Resolved { hits, note } => {
                     if let Some(note) = note {
                         summary.skipped += 1;
                         record_error(summary, note);
                     }
-                    if hits.is_empty() {
-                        continue;
-                    }
-                    if self.retained + cost > MAX_RETAINED {
-                        summary.limited = true;
-                        return false;
-                    }
-                    self.retained += cost;
-                    hits.truncate(MAX_HITS - summary.hits);
-                    summary.hits += hits.len();
-                    emit(SearchUpdate::Batch(hits));
-                    if summary.hits >= MAX_HITS {
-                        summary.limited = true;
-                        return false;
+                    if !hits.is_empty() {
+                        summary.hits += hits.len();
+                        emit(SearchUpdate::Batch(hits));
                     }
                 }
             }
         }
-        true
     }
     fn progress(
         &mut self,
@@ -358,8 +315,7 @@ pub(super) fn run_with_workers(
             }
             // Admission resolves indexed classes inline and bounds only renders
             // in flight, so a slow render never starves the workers behind it.
-            while next < classes.len() && in_flight.len() < window && reporter.wants_more(&summary)
-            {
+            while next < classes.len() && in_flight.len() < window {
                 interactive(engine);
                 if cancel.load(Ordering::Relaxed) {
                     summary.cancelled = true;
@@ -392,16 +348,12 @@ pub(super) fn run_with_workers(
                     budget.head(*in_flight.first().unwrap());
                 }
                 next += 1;
-                if !reporter.drain(&mut summary, cache, emit) {
-                    break 'scan;
-                }
+                reporter.drain(&mut summary, cache, emit);
                 reporter.progress(&summary, emit, false);
             }
             if in_flight.is_empty() {
-                if next >= classes.len() || !reporter.wants_more(&summary) {
-                    break;
-                }
-                continue;
+                // Admission only stops with the window open once every class is in.
+                break;
             }
             match results_rx.recv_timeout(Duration::from_millis(20)) {
                 Ok((index, result, bytes)) => {
@@ -421,9 +373,7 @@ pub(super) fn run_with_workers(
                         Err(error) => Reporter::resolve(name, Err(error), query),
                     };
                     reporter.buffer(index, outcome);
-                    if !reporter.drain(&mut summary, cache, emit) {
-                        break;
-                    }
+                    reporter.drain(&mut summary, cache, emit);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -433,14 +383,13 @@ pub(super) fn run_with_workers(
                             Outcome::Failed(format!("{}: Source workers stopped", classes[index])),
                         );
                     }
-                    let _ = reporter.drain(&mut summary, cache, emit);
+                    reporter.drain(&mut summary, cache, emit);
                     break;
                 }
             }
             reporter.progress(&summary, emit, false);
         }
         summary.cancelled |= cancel.load(Ordering::Relaxed);
-        summary.retained_bytes = reporter.retained;
         reporter.progress(&summary, emit, true);
         stop.store(true, Ordering::Relaxed);
         budget.stop();
@@ -549,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn reporter_reports_in_class_order_and_pauses_admission_at_limits() {
+    fn reporter_reports_in_class_order() {
         let query = CompiledQuery::new(SearchQuery {
             text: "needle".into(),
             ..Default::default()
@@ -588,42 +537,18 @@ mod tests {
         };
         reporter.buffer(2, Reporter::resolve("C", Ok(value("C")), &query));
         reporter.buffer(1, Outcome::Rejected);
-        assert!(reporter.drain(&mut summary, &mut cache, &mut emit));
+        reporter.drain(&mut summary, &mut cache, &mut emit);
         assert_eq!(summary.scanned, 0);
         assert_eq!(reporter.resolved(), 2);
-        assert_eq!(reporter.buffered_hits, 2);
-        assert!(reporter.wants_more(&summary));
         reporter.buffer(0, Reporter::resolve("A", Err("boom".into()), &query));
-        assert!(reporter.drain(&mut summary, &mut cache, &mut emit));
+        reporter.drain(&mut summary, &mut cache, &mut emit);
         assert_eq!(summary.scanned, 3);
         assert_eq!(summary.skipped, 1);
         assert_eq!(cache.index_rejections, 1);
         assert_eq!(summary.hits, 2);
         assert_eq!(summary.errors, vec!["A: boom".to_string()]);
-        assert_eq!(reporter.buffered_hits, 0);
         assert_eq!(reporter.resolved(), 3);
-        assert!(reporter.retained > 0);
         assert_eq!(batches, vec![vec!["C".to_string(), "C".to_string()]]);
-
-        let mut reporter = Reporter::new();
-        let mut summary = SearchSummary::default();
-        for index in 1..MAX_HITS / 2 {
-            reporter.buffer(index, Reporter::resolve("C", Ok(value("C")), &query));
-        }
-        assert!(reporter.wants_more(&summary));
-        reporter.buffer(MAX_HITS / 2, Reporter::resolve("C", Ok(value("C")), &query));
-        assert!(!reporter.wants_more(&summary));
-        reporter.buffer(0, Outcome::Skipped);
-        let mut emitted = 0;
-        assert!(!reporter.drain(&mut summary, &mut cache, &mut |update| {
-            if let SearchUpdate::Batch(hits) = update {
-                emitted += hits.len();
-            }
-        }));
-        assert!(summary.limited);
-        assert_eq!(summary.hits, MAX_HITS);
-        assert_eq!(emitted, MAX_HITS);
-        assert_eq!(summary.scanned, MAX_HITS / 2 + 1);
     }
 
     #[test]
@@ -762,7 +687,6 @@ mod tests {
                 workers,
             );
             assert!(summary.cancelled);
-            assert!(!summary.limited);
             assert!(summary.scanned <= window);
             assert!(cache.source_fetches <= summary.scanned + window);
         }
@@ -797,7 +721,6 @@ mod tests {
                 workers,
             );
             assert!(summary.cancelled);
-            assert!(!summary.limited);
             assert_eq!(cache.source_fetches, 0);
             assert_eq!(summary.scanned, 0);
         }

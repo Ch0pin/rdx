@@ -72,7 +72,7 @@ fn run(
         json!({
             "seconds": started.elapsed().as_secs_f64(), "scanned": summary.scanned,
             "total": summary.total, "hits": summary.hits, "skipped": summary.skipped,
-            "limited": summary.limited, "errors": summary.errors,
+            "errors": summary.errors,
             "memory_hits": cache.hits - before.0, "disk_hits": cache.disk_hits - before.1,
             "index_rejections": cache.index_rejections - before.2,
             "source_fetches": cache.source_fetches - before.3,
@@ -115,10 +115,6 @@ fn variant(
     ensure!(
         cold["skipped"] == 0 && warm["skipped"] == 0,
         "Benchmark has skipped documents: cold={cold}, warm={warm}"
-    );
-    ensure!(
-        cold["limited"] == false && warm["limited"] == false,
-        "Choose a narrower query: result limits make this comparison incomplete"
     );
     Ok((
         json!({"load_seconds":load_seconds,"project_classes":project.classes.len(),"corpus":classes,"cold":cold,"warm":warm}),

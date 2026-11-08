@@ -670,12 +670,12 @@ fn project_request(
         check_project_file(project)?;
         result["format"] = json!("records");
         result["offset_unit"] = json!("matching component records");
-        result["coverage"] = crate::manifest_summary::component_coverage(
-            &crate::manifest_summary::resolved_xml(&xml, engine.resource_table())
-                .map_err(anyhow::Error::msg)?
-                .0,
-        )
-        .map_err(anyhow::Error::msg)?;
+        let resolved = crate::manifest_summary::resolved_xml(&xml, engine.resource_table())
+            .map_err(anyhow::Error::msg)?
+            .0;
+        result["coverage"] =
+            crate::manifest_summary::component_coverage(&resolved).map_err(anyhow::Error::msg)?;
+        feedback::route_hints(&mut result, &resolved, args, true, cancel)?;
         result["coverage"]["excludes_non_exported"] = json!(false);
         result["coverage"]["filters"] = component_filters(args);
         result["coverage"]["matching_components"] = result["total"].clone();
@@ -725,12 +725,12 @@ fn project_request(
         result["analysis"] = json!(
             "Manifest declarations only; exported does not establish runtime callback reachability or authorization."
         );
-        result["coverage"] = crate::manifest_summary::component_coverage(
-            &crate::manifest_summary::resolved_xml(&xml, engine.resource_table())
-                .map_err(anyhow::Error::msg)?
-                .0,
-        )
-        .map_err(anyhow::Error::msg)?;
+        let resolved = crate::manifest_summary::resolved_xml(&xml, engine.resource_table())
+            .map_err(anyhow::Error::msg)?
+            .0;
+        result["coverage"] =
+            crate::manifest_summary::component_coverage(&resolved).map_err(anyhow::Error::msg)?;
+        feedback::route_hints(&mut result, &resolved, args, false, cancel)?;
         result["coverage"]["excludes_non_exported"] = json!(false);
         result["coverage"]["filters"] = component_filters(args);
         Ok(result)
@@ -744,6 +744,7 @@ fn component_filters(args: &Value) -> Value {
         "class_name",
         "exported_state",
         "match_mode",
+        "route_match_mode",
         "component",
         "component_type",
         "permission",
@@ -756,6 +757,10 @@ fn component_filters(args: &Value) -> Value {
             filters.insert(key.into(), value.clone());
         }
     }
+    filters.insert(
+        "effective_matching".into(),
+        crate::manifest_summary::effective_matching(args),
+    );
     Value::Object(filters)
 }
 
@@ -1695,13 +1700,13 @@ fn tools_list() -> Value {
         ),
         (
             "get_manifest_summary",
-            "Read manifest Markdown (character offsets), or format=records for structured components and permissions (record offsets, limit <=500). Any filter selects records. component and permission are literal substrings; component_type is exact. host/scheme are exact declarations, path is a substring of declared path attributes. Route filters must match the same intent-filter. query is a case-insensitive substring. Declarations do not prove runtime reachability.",
+            "Read manifest Markdown (character offsets), or format=records for structured components and permissions (record offsets, limit <=500). Any filter selects records. component and permission are literal substrings; component_type is exact. route_match_mode selects exact/contains literal matching for host/scheme/path; omitted mode preserves exact host/scheme and substring path matching. Effective modes and bounded zero-result hints are returned. Route filters must match the same intent-filter. query is a case-insensitive substring. Declarations do not prove runtime reachability.",
             vec![],
             true,
         ),
         (
             "get_manifest_components",
-            "Look up components in the decoded manifest. class_name uses match_mode=contains (default) or exact (relative/simple names normalized against manifest package). Includes matching aliases, declared/effective exported state and permissions, and original intent filters. component_type is exact; permission is a substring; query is case-insensitive. host/scheme are exact declarations and path is a declared-attribute substring, within one intent-filter. Paginated matching records, limit <=500.",
+            "Look up components in the decoded manifest. class_name uses match_mode=contains (default) or exact (relative/simple names normalized against manifest package). Includes matching aliases, declared/effective exported state and permissions, and original intent filters. component_type is exact; permission is a substring; query is case-insensitive. route_match_mode controls host/scheme/path literal matching independently of class_name. Defaults remain exact host/scheme and substring path; filters stay within one intent-filter. coverage.filters echoes effective rules; bounded zero-result hints never widen the returned results. Paginated matching records, limit <=500.",
             vec![],
             true,
         ),
@@ -1882,6 +1887,7 @@ fn tools_list() -> Value {
             properties.insert("format".into(),json!({"type":"string","enum":["markdown","records","exposure"]}));
         }
         if ["get_manifest_summary", "get_manifest_components"].contains(&name) {
+            properties.insert("route_match_mode".into(),json!({"type":"string","enum":["exact","contains"],"description":"Case-sensitive literal matching for host, scheme and declared path attributes. If omitted, host/scheme are exact and path uses contains. This searches declarations, not Android runtime URI matching."}));
             properties.insert("projection".into(),json!({"type":"string","enum":["full","compact"],"default":"full"}));
             properties.insert("fields".into(),json!({"type":"string","minLength":1,"description":"Comma-separated record field names; overrides projection. Activity launch fields preserve declared/default/inherited/unresolved state; unknown fields return allowed_fields.","x-allowed-fields":crate::manifest_summary::RECORD_FIELDS}));
         }
@@ -1889,7 +1895,7 @@ fn tools_list() -> Value {
             properties.insert("exported_state".into(),json!({"type":"string","enum":["true","false","unresolved"]}));
             properties.insert("max_bytes".into(),json!({"type":"integer","minimum":1024,"maximum":1048576,"default":32768,"description":"Maximum serialized items bytes; pagination preserves complete records. Metadata is additional."}));
             for key in ["class_name", "host", "scheme", "path", "permission", "query"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
-            properties.insert("match_mode".into(),json!({"type":"string","enum":["exact","contains"],"default":"contains"}));
+            properties.insert("match_mode".into(),json!({"type":"string","enum":["exact","contains"],"default":"contains","description":"Applies to class_name only; use route_match_mode for host, scheme and path"}));
             properties.insert("component_type".into(),json!({"type":"string","enum":["activity","activity-alias","service","receiver","provider"]}));
         }
         if name=="find_string_references" {
@@ -3495,9 +3501,53 @@ mod tests {
             route["data"]["items"][0]["exported_state"]["effective"],
             true
         );
+        args["host"] = json!("example");
+        let miss = remote(&record, "get_manifest_components", &args).unwrap();
+        assert_eq!(miss["data"]["total"], 0);
+        assert_eq!(miss["data"]["warnings"][0]["field"], "host");
+        assert_eq!(miss["data"]["warnings"][0]["matching_components"], 1);
+        assert_eq!(
+            miss["data"]["coverage"]["filters"]["effective_matching"]["host"]["mode"],
+            "exact"
+        );
+        args["route_match_mode"] = json!("contains");
+        validate("get_manifest_components", &args).unwrap();
+        let matched = remote(&record, "get_manifest_components", &args).unwrap();
+        assert_eq!(matched["data"]["total"], 1);
+        assert_eq!(matched["data"]["warnings"], json!([]));
+        assert_eq!(
+            matched["data"]["coverage"]["filters"]["effective_matching"]["class_name"]["mode"],
+            "exact"
+        );
+        args["offset"] = json!(1);
+        let tail = remote(&record, "get_manifest_components", &args).unwrap();
+        assert_eq!(tail["data"]["items"], json!([]));
+        assert_eq!(tail["data"]["total"], 1);
+        assert_eq!(tail["data"]["warnings"], json!([]));
+        args["offset"] = json!(0);
+        let mut summary_args = args.clone();
+        summary_args.as_object_mut().unwrap().remove("class_name");
+        summary_args.as_object_mut().unwrap().remove("match_mode");
+        summary_args["format"] = json!("records");
+        validate("get_manifest_summary", &summary_args).unwrap();
+        let summary = remote(&record, "get_manifest_summary", &summary_args).unwrap();
+        assert_eq!(summary["data"]["total"], 1);
+        assert_eq!(
+            summary["data"]["coverage"]["filters"]["effective_matching"]["host"]["mode"],
+            "contains"
+        );
+        summary_args["route_match_mode"] = json!("exact");
+        let summary_miss = remote(&record, "get_manifest_summary", &summary_args).unwrap();
+        assert_eq!(summary_miss["data"]["total"], 0);
+        assert_eq!(
+            summary_miss["data"]["warnings"][0]["matching_components"],
+            1
+        );
         for (key, value) in [
             ("class_name", Value::Null),
             ("match_mode", json!("regex")),
+            ("route_match_mode", json!("regex")),
+            ("route_match_mode", Value::Null),
             ("limit", json!(501)),
             ("component_type", json!("application")),
         ] {

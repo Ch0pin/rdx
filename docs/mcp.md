@@ -404,8 +404,10 @@ component and permission records with matching-record offsets and a maximum
 `limit` of 500. Filters combine with AND: `component` and `permission` are
 literal substrings, `component_type` is exact (`activity`, `activity-alias`,
 `service`, `receiver`, or `provider`), and `query` is a case-insensitive substring
-of the serialized record. `host` and `scheme` match exact declarations; `path`
-matches substrings of declared path attributes. Route predicates must match
+of the serialized record. By default, `host` and `scheme` match exact declarations;
+`path` matches substrings of declared path attributes. `route_match_mode: "exact"`
+or `"contains"` explicitly applies that case-sensitive literal comparison to all
+three route fields. Route predicates must match
 within the same intent-filter. Records preserve separate data elements and
 relative-filter groups, including their declared allow/block attributes.
 `matching_filter_indexes` identifies matching filters. These are declaration
@@ -504,6 +506,42 @@ The declaration rules follow Android's [activity](https://developer.android.com/
 and [activity-alias](https://developer.android.com/guide/topics/manifest/activity-alias-element)
 documentation. These records do not establish `onNewIntent` delivery or a task
 hijacking vulnerability.
+
+### Route matching and zero-result diagnostics
+
+`get_manifest_components` and `get_manifest_summary` accept `route_match_mode`.
+Use `"contains"` for declaration substring searches such as:
+
+```json
+{"instance_id":"INSTANCE","project_id":"PROJECT","host":"madison","route_match_mode":"contains"}
+```
+
+`match_mode` continues to control `class_name` only. For example, an exact class
+selection can be combined with substring route matching. Omitting
+`route_match_mode` preserves the previous defaults: exact host/scheme and
+substring path. Explicit `"exact"` means equality with the declared path value,
+including `pathPrefix`/`pathPattern` text; it does not evaluate Android URI
+matching or wildcard patterns. Comparisons remain case-sensitive.
+
+`coverage.filters` retains the requested filter values and adds
+`effective_matching`, which lists the actual mode and case sensitivity for each
+active filter. Route comparisons still belong to the same intent-filter, and
+resource references are resolved before matching.
+
+When the full filtered record count is zero, `warnings` may contain
+`MANIFEST_ROUTE_NEAR_MATCH`. Each hint relaxes only one route field to substring
+matching, first case-sensitive and then ASCII-case-insensitive if necessary.
+All other selectors and filters remain fixed, including exported state. Hints
+report distinct component counts and up to five examples with bounded declared
+value previews. They never add records to `items` or establish runtime routing.
+An empty continuation page with a nonzero total does not trigger these hints.
+
+`near_match_diagnostics.status` describes whether hints completed, were
+unnecessary/not applicable, or were skipped. Diagnostics are limited to manifests
+up to 1 MiB and 1,000 component declarations. Cancellation is checked between
+comparisons. A skipped diagnostic makes no claim about relaxed matches. Use the
+shown declaration spelling for case differences; `route_match_mode=contains`
+itself remains case-sensitive and applies to all three route fields.
 
 ### Permission protection levels and component coverage
 

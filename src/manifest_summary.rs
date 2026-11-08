@@ -11,6 +11,9 @@ use std::{
 
 #[path = "manifest_launch.rs"]
 mod launch;
+#[path = "manifest_routes.rs"]
+mod routes;
+pub(crate) use routes::{effective_matching, exported_matches, near_matches};
 
 /// Shared by projection validation and its machine-readable error details.
 pub(crate) const RECORD_FIELDS: &[&str] = &[
@@ -621,6 +624,15 @@ pub fn query_components(
     xml: &str,
     args: &serde_json::Value,
 ) -> Result<Vec<serde_json::Value>, String> {
+    query_components_with_routes(xml, args, None)
+}
+
+fn query_components_with_routes(
+    xml: &str,
+    args: &serde_json::Value,
+    relaxed: Option<routes::Relaxation>,
+) -> Result<Vec<serde_json::Value>, String> {
+    routes::validate(args)?;
     use serde_json::json;
     let mode = args["match_mode"].as_str().unwrap_or("contains");
     if !matches!(mode, "exact" | "contains") {
@@ -781,19 +793,7 @@ pub fn query_components(
                 .map(|i| &nodes[i])
                 .filter(|n| n.tag == "data")
                 .collect();
-            let matches = ["host", "scheme", "path"].iter().all(|key| {
-                args[*key].as_str().is_none_or(|q| {
-                    data.iter().any(|data| {
-                        if *key == "path" {
-                            data.attrs
-                                .iter()
-                                .any(|(key, value)| key.starts_with("path") && value.contains(q))
-                        } else {
-                            data.get(key) == Some(q)
-                        }
-                    })
-                })
-            });
+            let matches = routes::matches(&data, args, relaxed);
             if matches {
                 matching_filter_indexes.push(filters.len());
             }
@@ -853,6 +853,15 @@ pub fn query_components(
 /// Filter manifest declarations before pagination. Route predicates are evaluated
 /// within one intent-filter, while each original data element stays separate.
 pub fn query(xml: &str, args: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    query_with_routes(xml, args, None)
+}
+
+fn query_with_routes(
+    xml: &str,
+    args: &serde_json::Value,
+    relaxed: Option<routes::Relaxation>,
+) -> Result<Vec<serde_json::Value>, String> {
+    routes::validate(args)?;
     use serde_json::json;
     let nodes = parse(xml)?;
     let components = components(xml)?;
@@ -924,19 +933,7 @@ pub fn query(xml: &str, args: &serde_json::Value) -> Result<Vec<serde_json::Valu
                     .map(|i| &nodes[i])
                     .filter(|n| n.tag == "data")
                     .collect();
-                let matches = ["host", "scheme", "path"].iter().all(|key| {
-                    args[*key].as_str().is_none_or(|q| {
-                        data.iter().any(|d| {
-                            if *key == "path" {
-                                d.attrs
-                                    .iter()
-                                    .any(|(k, v)| k.starts_with("path") && v.contains(q))
-                            } else {
-                                d.get(key) == Some(q)
-                            }
-                        })
-                    })
-                });
+                let matches = routes::matches(&data, args, relaxed);
                 if matches {
                     matching_filter_indexes.push(filters.len());
                 }

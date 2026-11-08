@@ -60,7 +60,8 @@ The service listens locally and authenticates requests. It uses additional memor
 while enabled because its project engine is independent of the GUI engine.
 
 RDX needs writable user-settings and temporary directories. Large APKs require
-more memory and temporary disk space; the search index can grow up to 1 GiB.
+more memory and temporary disk space; the search index can grow to 1 GiB, or
+16 KiB per class for projects beyond about 65,000 classes.
 Individual cache budgets are not a total application memory limit.
 
 ## Verify a download

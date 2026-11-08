@@ -13,13 +13,19 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-const DISK_LIMIT: usize = 1024 * 1024 * 1024;
+// Floors for small projects. A project-sized index grows them so that every
+// class of a large APK can hold a filter and a payload: measured generated Java
+// costs about 7 KiB of compressed payload and 1.2 KiB of filter metadata per
+// class, so 16 KiB and 2 KiB per class leave room for heavier code.
+const DEFAULT_DISK_LIMIT: usize = 1024 * 1024 * 1024;
+const DISK_PER_CLASS: usize = 16 * 1024;
 // Includes conservative hash-table slack, owned class-name capacity, and a free
-// extent per live entry. The separate 256 MiB bound gives a 116,005-class
+// extent per live entry. The separate metadata bound gives a 116,005-class
 // project room for adaptive filters even when its source payload quota is full.
 // Filter admission remains bounded and fails open when this budget is exhausted.
-const META_LIMIT: usize = 256 * 1024 * 1024;
-const ENTRY_LIMIT: usize = 150_000;
+const DEFAULT_META_LIMIT: usize = 256 * 1024 * 1024;
+const META_PER_CLASS: usize = 2 * 1024;
+const DEFAULT_ENTRY_LIMIT: usize = 150_000;
 const ENTRY_BASE_METADATA: usize = 384;
 const DOC_LIMIT: usize = 32 * 1024 * 1024;
 // Session-only format: magic, little-endian metadata length, source length.
@@ -181,6 +187,9 @@ pub struct DiskIndex {
     bytes: usize,
     metadata: usize,
     disabled: bool,
+    disk_limit: usize,
+    meta_limit: usize,
+    entry_limit: usize,
 }
 impl Default for DiskIndex {
     fn default() -> Self {
@@ -194,7 +203,23 @@ impl Default for DiskIndex {
             bytes: 0,
             metadata: 0,
             disabled: false,
+            disk_limit: DEFAULT_DISK_LIMIT,
+            meta_limit: DEFAULT_META_LIMIT,
+            entry_limit: DEFAULT_ENTRY_LIMIT,
         }
+    }
+}
+impl DiskIndex {
+    /// An index whose quotas cover every class of the project, so a complete
+    /// scan leaves no class to re-render on the next search. Quotas never
+    /// shrink below the defaults.
+    pub fn for_project(classes: usize) -> Self {
+        let mut index = Self::default();
+        index.disk_limit = DEFAULT_DISK_LIMIT.max(classes.saturating_mul(DISK_PER_CLASS));
+        index.meta_limit = DEFAULT_META_LIMIT.max(classes.saturating_mul(META_PER_CLASS));
+        // Headroom for resource documents and class-name capacity rounding.
+        index.entry_limit = DEFAULT_ENTRY_LIMIT.max(classes.saturating_add(classes / 8));
+        index
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -499,8 +524,8 @@ impl DiskIndex {
     }
     pub fn insert(&mut self, key: SearchTarget, value: &CachedValue) {
         if self.entries.contains_key(&key)
-            || self.entries.len() >= ENTRY_LIMIT
-            || self.metadata >= META_LIMIT
+            || self.entries.len() >= self.entry_limit
+            || self.metadata >= self.meta_limit
         {
             return;
         }
@@ -513,7 +538,7 @@ impl DiskIndex {
         if self.entries.contains_key(&key) {
             return;
         }
-        if self.entries.len() >= ENTRY_LIMIT || self.metadata >= META_LIMIT {
+        if self.entries.len() >= self.entry_limit || self.metadata >= self.meta_limit {
             return;
         }
         let PreparedEntry {
@@ -528,11 +553,11 @@ impl DiskIndex {
                 SearchTarget::Class(name) => name.capacity(),
                 _ => 0,
             };
-        if self.metadata + base_metadata + filter.bytes() > META_LIMIT {
+        if self.metadata + base_metadata + filter.bytes() > self.meta_limit {
             filter.bits = Vec::new();
         }
         let metadata = base_metadata + filter.bytes();
-        if self.metadata + metadata > META_LIMIT {
+        if self.metadata + metadata > self.meta_limit {
             return;
         }
         // Negative evidence is session metadata, independent of optional source
@@ -550,13 +575,13 @@ impl DiskIndex {
                 partial,
             },
         );
-        if self.bytes >= DISK_LIMIT {
+        if self.bytes >= self.disk_limit {
             return;
         }
         let Some(bytes) = bytes else {
             return;
         };
-        if bytes.len() > DOC_LIMIT || self.bytes + bytes.len() > DISK_LIMIT {
+        if bytes.len() > DOC_LIMIT || self.bytes + bytes.len() > self.disk_limit {
             return;
         }
         if self.store().is_none() {
@@ -574,7 +599,7 @@ impl DiskIndex {
             }
             offset
         } else {
-            if self.store_len + bytes.len() > DISK_LIMIT {
+            if self.store_len + bytes.len() > self.disk_limit {
                 return;
             }
             let offset = self.store_len as u64;
@@ -765,7 +790,7 @@ mod tests {
         let key = SearchTarget::Class("Budget".into());
         let value = value(&key);
         let mut disk = DiskIndex::default();
-        disk.bytes = DISK_LIMIT;
+        disk.bytes = disk.disk_limit;
         disk.insert_prepared(key.clone(), PreparedEntry::prepare(&value).unwrap());
         assert!(!disk.contains(&key));
         assert!(disk.rejects(&key, "absent-boundary", true, false, false));
@@ -777,9 +802,9 @@ mod tests {
                 SearchTarget::Class(name) => name.capacity(),
                 _ => 0,
             };
-        disk.metadata = META_LIMIT - base;
+        disk.metadata = disk.meta_limit - base;
         disk.insert_prepared(key.clone(), PreparedEntry::prepare(&value).unwrap());
-        assert_eq!(disk.metadata, META_LIMIT);
+        assert_eq!(disk.metadata, disk.meta_limit);
         assert!(disk.entries[&key].filter.bits.is_empty());
         assert!(!disk.rejects(&key, "absent-boundary", true, false, false));
         let other = SearchTarget::Class("Rejected".into());
@@ -825,6 +850,31 @@ mod tests {
         );
     }
     #[test]
+    fn project_sized_quotas_cover_every_class_and_never_shrink() {
+        let small = DiskIndex::for_project(1_000);
+        let default = DiskIndex::default();
+        assert_eq!(small.disk_limit, default.disk_limit);
+        assert_eq!(small.meta_limit, default.meta_limit);
+        assert_eq!(small.entry_limit, default.entry_limit);
+        let large = DiskIndex::for_project(222_039);
+        assert!(large.entry_limit >= 222_039 + 222_039 / 8);
+        assert_eq!(large.meta_limit, 222_039 * META_PER_CLASS);
+        assert_eq!(large.disk_limit, 222_039 * DISK_PER_CLASS);
+        // Filter metadata for a large project fits the scaled bound with the
+        // measured 1.2 KiB per class, payload with the measured 7 KiB per class.
+        assert!(large.meta_limit >= 222_039 * 1_300);
+        assert!(large.disk_limit >= 222_039 * 7 * 1024);
+        let mut disk = DiskIndex::for_project(200_000);
+        disk.bytes = disk.disk_limit;
+        for i in 0..160_000 {
+            let key = SearchTarget::Class(format!("com.example.application.Component{i:06}"));
+            disk.insert(key, &value(&SearchTarget::Class(String::new())));
+        }
+        assert_eq!(disk.entries.len(), 160_000);
+        assert!(disk.metadata < disk.meta_limit);
+    }
+
+    #[test]
     fn packed_index_admits_one_hundred_thousand_classes() {
         let mut disk = DiskIndex::default();
         for i in 0..100_000 {
@@ -833,7 +883,7 @@ mod tests {
             disk.insert(key.clone(), &value(&key));
         }
         assert_eq!(disk.entries.len(), 100_000);
-        assert!(disk.metadata < META_LIMIT);
+        assert!(disk.metadata < disk.meta_limit);
         assert!(disk.bytes < 32 * 1024 * 1024);
         let directory = disk.directory.as_ref().unwrap();
         assert_eq!(fs::read_dir(directory).unwrap().count(), 1);
@@ -855,13 +905,13 @@ mod tests {
     #[test]
     fn full_project_filters_survive_payload_quota() {
         let mut disk = DiskIndex::default();
-        disk.bytes = DISK_LIMIT;
+        disk.bytes = disk.disk_limit;
         for i in 0..116_005 {
             let key = SearchTarget::Class(format!("com.example.application.Component{i:06}"));
             disk.insert(key, &value(&SearchTarget::Class(String::new())));
         }
         assert_eq!(disk.entries.len(), 116_005);
-        assert!(disk.metadata < META_LIMIT);
+        assert!(disk.metadata < disk.meta_limit);
         assert!(disk.directory.is_none());
         let key = SearchTarget::Class("com.example.application.Component116004".into());
         assert!(disk.rejects(&key, "absent-boundary", true, false, false));
@@ -1003,16 +1053,16 @@ mod tests {
         assert_eq!(disk.metadata, entry.metadata);
         assert!(entry.metadata >= ENTRY_BASE_METADATA + entry.filter.bytes());
         assert!(entry.filter.bytes() <= FILTER_MAX_BYTES);
-        assert!(disk.metadata <= META_LIMIT);
+        assert!(disk.metadata <= disk.meta_limit);
         disk.remove(&key);
         assert_eq!(disk.metadata, 0);
         // Preserve source admission when only the optional filter cannot fit.
-        disk.metadata = META_LIMIT - 400;
+        disk.metadata = disk.meta_limit - 400;
         disk.insert(key.clone(), &value);
         assert!(disk.entries.contains_key(&key));
         assert!(disk.entries[&key].filter.bits.is_empty());
         assert!(disk.load(&key).is_some());
-        assert!(disk.metadata <= META_LIMIT);
+        assert!(disk.metadata <= disk.meta_limit);
     }
     #[test]
     fn disk_roundtrip_corruption_and_cleanup() {
@@ -1178,14 +1228,14 @@ mod tests {
             Some("Truncated".into()),
         ));
         let mut disk = DiskIndex::default();
-        disk.bytes = DISK_LIMIT;
+        disk.bytes = disk.disk_limit;
         disk.insert(key.clone(), &value);
         assert!(disk.directory.is_none());
         assert_eq!(disk.entries.len(), 1);
         assert!(!disk.contains(&key));
         disk.remove(&key);
         disk.bytes = 0;
-        disk.metadata = META_LIMIT;
+        disk.metadata = disk.meta_limit;
         disk.insert(key.clone(), &value);
         assert!(disk.entries.is_empty());
         disk.metadata = 0;

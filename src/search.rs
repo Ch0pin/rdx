@@ -445,10 +445,12 @@ impl SearchCache {
             ..Self::default()
         }
     }
-    pub fn reset(&mut self, project_id: u64) {
+    /// Start a fresh index whenever the project changes, sized so that every
+    /// class of the project can stay indexed for the rest of the session.
+    pub fn reset(&mut self, project_id: u64, classes: usize) {
         if self.project_id != Some(project_id) {
             self.entries.clear();
-            self.disk = crate::search_index::DiskIndex::default();
+            self.disk = crate::search_index::DiskIndex::for_project(classes);
             self.disk_hits = 0;
             self.index_rejections = 0;
             self.source_fetches = 0;
@@ -687,7 +689,7 @@ pub fn run_search_interactive(
     mut emit: impl FnMut(SearchUpdate),
     mut interactive: impl FnMut(&mut NativeEngine),
 ) -> SearchSummary {
-    cache.reset(project_id);
+    cache.reset(project_id, classes.len());
     let q = &query.query;
     let mut selected = if q.classes || q.methods || q.fields || q.code || q.comments {
         query.ordered_classes(classes)
@@ -1303,7 +1305,7 @@ mod tests {
     #[test]
     fn cache_reuses_no_hit_documents_and_invalidates_project() {
         let mut cache = SearchCache::default();
-        cache.reset(1);
+        cache.reset(1, 0);
         let key = SearchTarget::Class("example.Target".into());
         let doc = document("class Target {}");
         cache.insert(key.clone(), Some((doc.clone(), Arc::new(Vec::new()), None)));
@@ -1315,12 +1317,12 @@ mod tests {
         let cached = cache.get(&key).unwrap().unwrap();
         assert!(Arc::ptr_eq(&doc, &cached.0));
         assert!(matches(cached.0, &[], &query, 100).is_empty());
-        cache.reset(1);
+        cache.reset(1, 0);
         assert!(cache.get(&key).is_some());
         assert_eq!(cache.hits, 2);
         cache.remove(&key);
         assert_eq!(cache.bytes, 0);
-        cache.reset(2);
+        cache.reset(2, 0);
         assert!(cache.get(&key).is_none());
         assert_eq!(cache.bytes, 0);
         cache.budget = 1;

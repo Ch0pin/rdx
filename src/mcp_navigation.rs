@@ -411,6 +411,17 @@ pub(super) fn enrich(
         .context("Source locations and forwarders require projection=call_sites")?;
     let mut groups = BTreeMap::<String, Vec<usize>>::new();
     for (i, site) in sites.iter_mut().enumerate() {
+        // Allocation evidence has no invoke target to follow or map.
+        if site["kind"] == "lambda_creation" {
+            if forwards {
+                site["cross_namespace_calls"] = Value::Null;
+                site["forwarder"] = Value::Null;
+            }
+            if source {
+                site["source_mapping"] = json!({"status":"not_applicable","reason":"lambda_creation evidence is a new-instance allocation, not an invoke","reconstruction_status":"not_attempted"});
+            }
+            continue;
+        }
         if forwards {
             site["cross_namespace_calls"] = cross_namespace_calls(
                 engine,

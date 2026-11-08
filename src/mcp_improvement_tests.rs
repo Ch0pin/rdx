@@ -1185,3 +1185,79 @@ fn smali_field_alias_normalizes_without_changing_owner_or_type() {
         false
     );
 }
+
+#[test]
+fn semantic_edges_flag_validates_and_reports_metadata() {
+    let dir = Scratch::new();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+    let (_server, record, base) = manifest_server(fixture, &dir);
+    let mut args = base.clone();
+    args["method_id"] = json!("sample.Target.doubleValue(I)I");
+    args["direction"] = json!("callers");
+    args["semantic_edges"] = json!(true);
+    validate("get_call_graph", &args).unwrap();
+    let mut both = args.clone();
+    both["direction"] = json!("both");
+    let error = validate("get_call_graph", &both).unwrap_err().to_string();
+    assert!(error.contains("direction=callers"), "{error}");
+    let mut conflict = args.clone();
+    conflict["dispatch_through_interfaces"] = json!(true);
+    let error = validate("get_call_graph", &conflict)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("omit dispatch_through"), "{error}");
+    let mut text_flag = args.clone();
+    text_flag["semantic_edges"] = json!("true");
+    assert!(validate("get_call_graph", &text_flag).is_err());
+
+    let graph = remote(&record, "get_call_graph", &args).unwrap()["data"].clone();
+    assert_eq!(graph["semantic_edges"]["enabled"], true, "{graph}");
+    assert_eq!(graph["semantic_edges"]["complete"], true);
+    assert_eq!(graph["semantic_edges"]["method_budget"], 2048);
+    assert!(
+        graph["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["semantic_edges"].is_number())
+    );
+    let mut sites = args.clone();
+    sites["projection"] = json!("call_sites");
+    sites["depth"] = json!(3);
+    sites["include_const_args"] = json!(true);
+    sites["include_forwarders"] = json!(true);
+    sites["include_source_locations"] = json!(true);
+    let page = remote(&record, "get_call_graph", &sites).unwrap()["data"].clone();
+    let total = |key: &str| page[key].as_u64().unwrap();
+    assert_eq!(
+        total("semantic_edge_total")
+            + total("exact_matching_total")
+            + total("possible_dispatch_total"),
+        total("matching_total"),
+        "{page}"
+    );
+    assert!(page["semantic_edge_kinds"].is_object());
+    assert!(total("matching_total") > 0, "{page}");
+    for row in page["call_sites"].as_array().unwrap() {
+        assert!(row["constant_arguments"]["status"].is_string(), "{row}");
+        assert!(row["source_mapping"]["status"].is_string(), "{row}");
+        assert!(row["relationship"].is_string(), "{row}");
+    }
+    let mut plain = base.clone();
+    plain["method_id"] = json!("sample.Target.doubleValue(I)I");
+    plain["direction"] = json!("callers");
+    let plain = remote(&record, "get_call_graph", &plain).unwrap()["data"].clone();
+    assert_eq!(plain["semantic_edges"], json!({"enabled":false}));
+
+    let mut batch = base.clone();
+    batch["method_ids"] = json!(["sample.Target.doubleValue(I)I"]);
+    batch["semantic_edges"] = json!(true);
+    validate("get_call_graph_batch", &batch).unwrap();
+    let result = remote(&record, "get_call_graph_batch", &batch).unwrap();
+    assert_eq!(
+        result["data"]["results"][0]["data"]["semantic_edges"]["enabled"], true,
+        "{result}"
+    );
+    batch["direction"] = json!("callees");
+    assert!(validate("get_call_graph_batch", &batch).is_err());
+}

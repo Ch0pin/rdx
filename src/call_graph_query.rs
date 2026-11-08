@@ -20,6 +20,7 @@ struct Options<'a> {
     direction: &'a str,
     interface_dispatch: bool,
     superclass_dispatch: bool,
+    semantic_edges: bool,
     depth: usize,
     direct_only: bool,
     projection: &'a str,
@@ -131,9 +132,19 @@ impl<'a> Options<'a> {
                     && (direct_only || requested_depth == 1)),
             "Dispatch expansion requires direction=callers, projection=call_sites and depth=1"
         );
+        let semantic_edges = args["semantic_edges"].as_bool().unwrap_or(false);
+        ensure!(
+            !semantic_edges || direction == "callers",
+            "semantic_edges requires direction=callers"
+        );
+        ensure!(
+            !semantic_edges || !(interface_dispatch || superclass_dispatch),
+            "semantic_edges already includes transitive interface and virtual dispatch; omit dispatch_through_interfaces and dispatch_through_superclasses"
+        );
         Ok(Self {
             interface_dispatch,
             superclass_dispatch,
+            semantic_edges,
             direction,
             depth: if direct_only { 1 } else { requested_depth },
             direct_only,
@@ -353,15 +364,15 @@ impl ScanFailures {
     }
 }
 
-/// Scan one body, converting malformed bytecode into a reported gap. Cancellation
-/// still propagates as an error.
+/// Scan one body for invokes and `new-instance` allocations, converting malformed
+/// bytecode into a reported gap. Cancellation still propagates as an error.
 pub(super) fn scan_method(
     class: &DexClass,
     method: &crate::native_dex::DexMethod,
     cancel: &AtomicBool,
     failures: &mut ScanFailures,
-) -> Result<Vec<native_xrefs::CallSite>> {
-    match native_xrefs::method_call_sites(class, method, cancel) {
+) -> Result<(Vec<native_xrefs::CallSite>, Vec<native_xrefs::Allocation>)> {
+    match native_xrefs::method_sites(class, method, cancel) {
         Ok(sites) => Ok(sites),
         Err(error) => {
             check_cancel(cancel)?;
@@ -369,7 +380,7 @@ pub(super) fn scan_method(
                 &crate::native_engine::disassembly::method_id(method),
                 &error,
             );
-            Ok(Vec::new())
+            Ok((Vec::new(), Vec::new()))
         }
     }
 }
@@ -409,10 +420,6 @@ fn query_cached_catalog(
     let (index, cached) = cache.get(&catalog)?;
     let canonical = catalog.canonical(&normalized);
     let dispatch = dispatch_aliases(&catalog, &normalized, &options, cancel)?;
-    let mut queue = VecDeque::from([(canonical.clone(), 0)]);
-    let mut visited = HashSet::from([canonical]);
-    let mut seen_sites = HashSet::new();
-    let mut sites = vec![];
     // Reverse shards are keyed by the resolved declaration, so an alias naming a
     // non-declaring ancestor is found through its own resolution. Only sites whose
     // raw target names an ancestor type of the root class qualify.
@@ -421,46 +428,37 @@ fn query_cached_catalog(
         .iter()
         .map(|alias| catalog.canonical(alias))
         .collect();
+    let mut initial = vec![];
     for key in &alias_keys {
         for site in index.neighbors(&catalog, key, true)? {
             if dispatch.aliases.contains(&site.callee)
                 && matches!(site.opcode, 0x6e | 0x74 | 0x72 | 0x78)
-                && seen_sites.insert((site.caller.clone(), site.pc, site.callee.clone()))
             {
-                sites.push(site);
+                initial.push(site);
             }
         }
     }
-    while let Some((current, depth)) = queue.pop_front() {
-        check_cancel(cancel)?;
-        if depth >= options.depth {
-            continue;
-        }
-        for reverse in [true, false] {
-            if !reverse && options.direction == "callers" {
-                continue;
-            }
-            for site in index.neighbors(&catalog, &current, reverse)? {
-                let next = if reverse {
-                    site.caller.clone()
-                } else {
-                    catalog.canonical(&site.callee)
-                };
-                if visited.insert(next.clone()) {
-                    queue.push_back((next, depth + 1));
-                }
-                if seen_sites.insert((site.caller.clone(), site.pc, site.callee.clone())) {
-                    sites.push(site);
-                }
-            }
-        }
-    }
+    let mut report = SemanticReport::default();
+    let (sites, semantic) = collect(
+        &catalog,
+        &canonical,
+        &options,
+        &*index,
+        initial,
+        cancel,
+        &mut report,
+    )?;
     let mut result = query_catalog_with_sites(
         catalog,
         &normalized,
         args,
         cancel,
-        Some((sites, &index.failures)),
+        Some(Provided {
+            sites,
+            semantic,
+            report,
+            failures: &index.failures,
+        }),
     )?;
     result["invoke_index_cached"] = json!(cached);
     result["invoke_index"] = cache.status();
@@ -489,7 +487,7 @@ fn callee_sites(
             check_cancel(cancel)?;
             continue;
         };
-        for site in scan_method(class, &class.methods[position], cancel, failures)? {
+        for site in scan_method(class, &class.methods[position], cancel, failures)?.0 {
             check_cancel(cancel)?;
             let callee = catalog.canonical(&site.callee);
             if seen.insert(callee.clone()) {
@@ -518,15 +516,35 @@ fn dispatch_aliases(
     options: &Options<'_>,
     cancel: &AtomicBool,
 ) -> Result<Dispatch> {
+    if !(options.interface_dispatch || options.superclass_dispatch) {
+        return Ok(Dispatch {
+            aliases: HashSet::new(),
+            status: "not_requested",
+        });
+    }
+    dispatch_aliases_for(
+        catalog,
+        root,
+        options.interface_dispatch,
+        options.superclass_dispatch,
+        cancel,
+    )
+}
+
+/// Alias owners for `root` through interfaces and/or superclasses.
+fn dispatch_aliases_for(
+    catalog: &Catalog<'_>,
+    root: &str,
+    interfaces: bool,
+    superclasses: bool,
+    cancel: &AtomicBool,
+) -> Result<Dispatch> {
     let none = |status| {
         Ok(Dispatch {
             aliases: HashSet::new(),
             status,
         })
     };
-    if !(options.interface_dispatch || options.superclass_dispatch) {
-        return none("not_requested");
-    }
     let Some((owner_name, class)) = owner(root).and_then(|name| Some((name, catalog.class(name)?)))
     else {
         return none("skipped_root_class_not_loaded");
@@ -559,11 +577,7 @@ fn dispatch_aliases(
         let name = crate::native_engine::disassembly::type_name(&descriptor);
         let ancestor = catalog.class(&name);
         let interface = ancestor.map_or(via_interface, |c| c.access_flags & 0x200 != 0);
-        let wanted = if interface {
-            options.interface_dispatch
-        } else {
-            options.superclass_dispatch
-        };
+        let wanted = if interface { interfaces } else { superclasses };
         if wanted {
             aliases.insert(format!("{name}.{member}"));
         }
@@ -583,6 +597,354 @@ fn record(site: &native_xrefs::CallSite, depth: usize, resolved: &str) -> Value 
         "invoke_instruction":crate::native_engine::disassembly::invoke_text(&site.words, site.pc, &site.callee),"dex_entry":site.dex_entry,"method_index":site.method_index,"invoke_opcode":site.opcode,"invoke_words":site.words,"caller_code_offset_bytes":site.code_offset,"dispatch":site.dispatch})
 }
 
+/// Caller-side evidence source: the project disk index for MCP queries, or an
+/// in-memory full scan that serves as the oracle the index must agree with.
+trait Lookup {
+    /// Declared invokes into (`reverse`) or out of a canonical method id.
+    fn neighbors(
+        &self,
+        catalog: &Catalog<'_>,
+        method: &str,
+        reverse: bool,
+    ) -> Result<Vec<native_xrefs::CallSite>>;
+    /// Whether any invoke names `raw_callee` verbatim, before alias resolution.
+    fn references_raw(&self, raw_callee: &str) -> bool;
+    /// Every `new-instance` of `class`, with its allocating method.
+    fn allocators(
+        &self,
+        catalog: &Catalog<'_>,
+        class: &str,
+    ) -> Result<Vec<native_xrefs::Allocation>>;
+}
+
+struct ScanLookup {
+    sites: Vec<native_xrefs::CallSite>,
+    by_caller: HashMap<String, Vec<usize>>,
+    by_callee: HashMap<String, Vec<usize>>,
+    raw_callees: HashSet<String>,
+    allocations: HashMap<String, Vec<native_xrefs::Allocation>>,
+}
+impl ScanLookup {
+    fn new(
+        catalog: &Catalog<'_>,
+        sites: Vec<native_xrefs::CallSite>,
+        allocations: Vec<native_xrefs::Allocation>,
+    ) -> Result<Self> {
+        let mut by_caller: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_callee: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut raw_callees = HashSet::new();
+        let mut canonical = HashMap::new();
+        for (i, site) in sites.iter().enumerate() {
+            check_cancel(catalog.cancel)?;
+            by_caller.entry(site.caller.clone()).or_default().push(i);
+            let key = canonical
+                .entry(site.callee.clone())
+                .or_insert_with(|| catalog.canonical(&site.callee))
+                .clone();
+            by_callee.entry(key).or_default().push(i);
+            raw_callees.insert(site.callee.clone());
+        }
+        let mut grouped: HashMap<String, Vec<native_xrefs::Allocation>> = HashMap::new();
+        for allocation in allocations {
+            grouped
+                .entry(allocation.class.clone())
+                .or_default()
+                .push(allocation);
+        }
+        Ok(Self {
+            sites,
+            by_caller,
+            by_callee,
+            raw_callees,
+            allocations: grouped,
+        })
+    }
+}
+impl Lookup for ScanLookup {
+    fn neighbors(
+        &self,
+        _: &Catalog<'_>,
+        method: &str,
+        reverse: bool,
+    ) -> Result<Vec<native_xrefs::CallSite>> {
+        let map = if reverse {
+            &self.by_callee
+        } else {
+            &self.by_caller
+        };
+        Ok(map
+            .get(method)
+            .into_iter()
+            .flatten()
+            .map(|&i| self.sites[i].clone())
+            .collect())
+    }
+    fn references_raw(&self, raw_callee: &str) -> bool {
+        self.raw_callees.contains(raw_callee)
+    }
+    fn allocators(&self, _: &Catalog<'_>, class: &str) -> Result<Vec<native_xrefs::Allocation>> {
+        Ok(self.allocations.get(class).cloned().unwrap_or_default())
+    }
+}
+
+/// Bytecode backing a semantic edge: an ancestor-typed invoke, or the
+/// `new-instance` that creates a callback object.
+enum Evidence {
+    Invoke(native_xrefs::CallSite),
+    Allocation(native_xrefs::Allocation, &'static str),
+}
+
+/// A caller-side relationship that no DEX invoke states directly, labelled by
+/// the producer that inferred it. `from` runs before `to` at runtime.
+struct SemanticEdge {
+    from: String,
+    to: String,
+    kind: &'static str,
+    evidence: Evidence,
+}
+impl SemanticEdge {
+    fn pc(&self) -> usize {
+        match &self.evidence {
+            Evidence::Invoke(site) => site.pc,
+            Evidence::Allocation(allocation, _) => allocation.pc,
+        }
+    }
+    fn key(&self) -> (&'static str, String, usize, String) {
+        (self.kind, self.from.clone(), self.pc(), self.to.clone())
+    }
+}
+
+/// Coverage of the semantic producers for one query.
+#[derive(Default)]
+struct SemanticReport {
+    expanded: usize,
+    skipped: usize,
+    samples: Vec<Value>,
+}
+impl SemanticReport {
+    const METHOD_LIMIT: usize = 2048;
+    const KINDS: [&'static str; 3] = [
+        "lambda_creation",
+        "possible_interface_dispatch",
+        "possible_virtual_dispatch",
+    ];
+    fn skip(&mut self, method: &str, reason: &str) {
+        self.skipped += 1;
+        if self.samples.len() < ScanFailures::SAMPLE_LIMIT {
+            self.samples
+                .push(json!({"method_id":method,"reason":reason}));
+        }
+    }
+    fn json(&self, enabled: bool) -> Value {
+        if !enabled {
+            return json!({"enabled":false});
+        }
+        json!({"enabled":true,"kinds":Self::KINDS,"complete":self.skipped == 0,"methods_expanded":self.expanded,
+            "methods_skipped":self.skipped,"skipped_samples":self.samples,"sample_limit":ScanFailures::SAMPLE_LIMIT,"method_budget":Self::METHOD_LIMIT,
+            "semantics":"Opt-in labelled edges that no DEX invoke states directly, produced for every traversed method of a caller query and never replacing declared calls. lambda_creation: a new-instance of a callback class (synthetic, anonymous $N, Lambda-named, or extending a Kotlin lambda/continuation base) links the allocating method to each concrete instance method of that class; the allocation is exact, the callback relationship is inferred. possible_interface_dispatch and possible_virtual_dispatch: invoke-interface or invoke-virtual sites whose raw target names the traversed member on any known or unknown supertype of its class. Not covered: invoke-custom (indy) lambdas, named listener classes without those markers, reflection, LiveData/Flow/RxJava value delivery, dependency-injection factories, Intent, Handler or executor delivery. complete=false when the method budget or an ancestry budget skipped a method; skipped_samples lists them."})
+    }
+}
+
+const LAMBDA_BASES: [&str; 5] = [
+    "kotlin.jvm.internal.Lambda",
+    "kotlin.coroutines.jvm.internal.SuspendLambda",
+    "kotlin.coroutines.jvm.internal.RestrictedSuspendLambda",
+    "kotlin.coroutines.jvm.internal.ContinuationImpl",
+    "kotlin.coroutines.jvm.internal.BaseContinuationImpl",
+];
+
+/// Classes whose instance methods run as callbacks after construction rather
+/// than through a direct invoke from application code, with the marker matched.
+fn callback_class(class: &DexClass) -> Option<&'static str> {
+    if class.access_flags & 0x1000 != 0 {
+        return Some("synthetic_class");
+    }
+    let name = crate::native_engine::disassembly::type_name(&class.descriptor);
+    let simple = name.rsplit('.').next().unwrap_or(&name);
+    if let Some((_, tail)) = simple.rsplit_once('$')
+        && !tail.is_empty()
+        && tail.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Some("anonymous_class");
+    }
+    if simple.contains("Lambda") {
+        return Some("lambda_named_class");
+    }
+    let parent = class
+        .superclass
+        .as_deref()
+        .map(crate::native_engine::disassembly::type_name);
+    if parent.is_some_and(|parent| LAMBDA_BASES.contains(&parent.as_str())) {
+        return Some("kotlin_lambda_base");
+    }
+    None
+}
+
+/// Semantic producers for one traversed method: ancestor-typed invokes that may
+/// run it as an override, and allocations of its class when that class is a
+/// callback carrier.
+fn semantic_into(
+    catalog: &Catalog<'_>,
+    method: &str,
+    lookup: &dyn Lookup,
+    cancel: &AtomicBool,
+    report: &mut SemanticReport,
+) -> Result<Vec<SemanticEdge>> {
+    let mut edges = Vec::new();
+    if report.expanded >= SemanticReport::METHOD_LIMIT {
+        report.skip(method, "semantic method budget reached");
+        return Ok(edges);
+    }
+    report.expanded += 1;
+    match dispatch_aliases_for(catalog, method, true, true, cancel) {
+        Ok(dispatch) => {
+            let keys: BTreeSet<String> = dispatch
+                .aliases
+                .iter()
+                .filter(|alias| lookup.references_raw(alias))
+                .map(|alias| catalog.canonical(alias))
+                .collect();
+            for key in &keys {
+                for site in lookup.neighbors(catalog, key, true)? {
+                    if dispatch.aliases.contains(&site.callee)
+                        && matches!(site.opcode, 0x6e | 0x74 | 0x72 | 0x78)
+                    {
+                        let kind = if matches!(site.opcode, 0x72 | 0x78) {
+                            "possible_interface_dispatch"
+                        } else {
+                            "possible_virtual_dispatch"
+                        };
+                        edges.push(SemanticEdge {
+                            from: site.caller.clone(),
+                            to: method.into(),
+                            kind,
+                            evidence: Evidence::Invoke(site),
+                        });
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            check_cancel(cancel)?;
+            report.skip(method, &format!("{error:#}"));
+        }
+    }
+    if let Some((owner_name, class)) =
+        owner(method).and_then(|name| Some((name, catalog.class(name)?)))
+        && let Some(position) = catalog.method_position(method)
+        && let Some(marker) = callback_class(class)
+    {
+        let member = &method[owner_name.len() + 1..];
+        let declared = &class.methods[position];
+        if !member.starts_with('<') && declared.access_flags & 0x40a == 0 {
+            for allocation in lookup.allocators(catalog, owner_name)? {
+                edges.push(SemanticEdge {
+                    from: allocation.method.clone(),
+                    to: method.into(),
+                    kind: "lambda_creation",
+                    evidence: Evidence::Allocation(allocation, marker),
+                });
+            }
+        }
+    }
+    Ok(edges)
+}
+
+/// Caller-side traversal shared by the disk index and the in-memory oracle.
+/// Declared invokes reach callers; with `semantic_edges`, every traversed method
+/// also contributes the producers above, and their sources are traversed too.
+fn collect(
+    catalog: &Catalog<'_>,
+    root_key: &str,
+    options: &Options<'_>,
+    lookup: &dyn Lookup,
+    initial: Vec<native_xrefs::CallSite>,
+    cancel: &AtomicBool,
+    report: &mut SemanticReport,
+) -> Result<(Vec<native_xrefs::CallSite>, Vec<SemanticEdge>)> {
+    let mut queue = VecDeque::from([(root_key.to_string(), 0usize)]);
+    let mut visited = HashSet::from([root_key.to_string()]);
+    let mut seen_sites = HashSet::new();
+    let mut sites = Vec::new();
+    for site in initial {
+        if seen_sites.insert((site.caller.clone(), site.pc, site.callee.clone())) {
+            sites.push(site);
+        }
+    }
+    let mut seen_edges = HashSet::new();
+    let mut semantic = Vec::new();
+    while let Some((current, depth)) = queue.pop_front() {
+        check_cancel(cancel)?;
+        if depth >= options.depth {
+            continue;
+        }
+        for reverse in [true, false] {
+            if !reverse && options.direction == "callers" {
+                continue;
+            }
+            for site in lookup.neighbors(catalog, &current, reverse)? {
+                let next = if reverse {
+                    site.caller.clone()
+                } else {
+                    catalog.canonical(&site.callee)
+                };
+                if visited.insert(next.clone()) {
+                    queue.push_back((next, depth + 1));
+                }
+                if seen_sites.insert((site.caller.clone(), site.pc, site.callee.clone())) {
+                    sites.push(site);
+                }
+            }
+        }
+        if options.semantic_edges {
+            for edge in semantic_into(catalog, &current, lookup, cancel, report)? {
+                if visited.insert(edge.from.clone()) {
+                    queue.push_back((edge.from.clone(), depth + 1));
+                }
+                if seen_edges.insert(edge.key()) {
+                    semantic.push(edge);
+                }
+            }
+        }
+    }
+    Ok((sites, semantic))
+}
+
+/// Traversal output handed to the projection stage by a caller-side collector.
+struct Provided<'f> {
+    sites: Vec<native_xrefs::CallSite>,
+    semantic: Vec<SemanticEdge>,
+    report: SemanticReport,
+    failures: &'f ScanFailures,
+}
+
+fn semantic_record(edge: &SemanticEdge, depth: usize, catalog: &Catalog<'_>) -> Value {
+    let mut row = match &edge.evidence {
+        Evidence::Invoke(site) => {
+            let mut row = record(site, depth, &catalog.canonical(&site.callee));
+            row["confidence"] = json!("possible");
+            row["possible_implementation_method_id"] = json!(edge.to);
+            row
+        }
+        Evidence::Allocation(allocation, marker) => json!({
+            "caller_method_id":allocation.method,"caller_signature":allocation.method,
+            "callee_method_id":Value::Null,"raw_callee_method_id":Value::Null,"resolved_callee_method_id":Value::Null,
+            "call_site_offset":allocation.pc,"depth":depth,
+            "instruction":format!("new-instance v{}, {}", allocation.register, allocation.descriptor),
+            "opcode":"new-instance","opcode_value":0x22,"instruction_words":allocation.words,
+            "destination_register":allocation.register,"type_index":allocation.type_index,
+            "allocated_class_id":allocation.class,"allocated_descriptor":allocation.descriptor,
+            "callback_class_marker":marker,"dex_entry":allocation.dex_entry,
+            "caller_code_offset_bytes":allocation.code_offset,"dispatch":"allocation (no invoke)",
+            "confidence":"exact_allocation"
+        }),
+    };
+    row["relationship"] = json!("semantic_edge");
+    row["kind"] = json!(edge.kind);
+    row["semantic_target_method_id"] = json!(edge.to);
+    row
+}
+
 fn query_catalog(
     catalog: Catalog<'_>,
     root: &str,
@@ -596,7 +958,7 @@ fn query_catalog_with_sites(
     root: &str,
     args: &Value,
     cancel: &AtomicBool,
-    provided: Option<(Vec<native_xrefs::CallSite>, &ScanFailures)>,
+    provided: Option<Provided<'_>>,
 ) -> Result<Value> {
     let options = Options::parse(args)?;
     let normalized_root = crate::method_lookup::graph_selector(root, |name| catalog.class(name))?;
@@ -608,22 +970,50 @@ fn query_catalog_with_sites(
     // Outgoing queries scan only reachable bodies. Reverse traversal needs the
     // project-wide call index, independently of graph projection limits.
     let mut scan = ScanFailures::default();
-    let (mut sites, failures): (Vec<_>, &ScanFailures) = if let Some((sites, failures)) = provided {
-        (sites, failures)
+    let mut report = SemanticReport::default();
+    let mut semantic = Vec::new();
+    let (mut sites, failures): (Vec<_>, &ScanFailures) = if let Some(provided) = provided {
+        semantic = provided.semantic;
+        report = provided.report;
+        (provided.sites, provided.failures)
     } else if options.direction == "callees" {
         let sites = callee_sites(&catalog, &root_key, options.depth, cancel, &mut scan)?;
         (sites, &scan)
     } else {
         let mut sites = Vec::new();
+        let mut allocations = Vec::new();
         for class in catalog.classes.values() {
             check_cancel(cancel)?;
             for method in &class.methods {
-                sites.extend(scan_method(class, method, cancel, &mut scan)?);
+                let (calls, allocated) = scan_method(class, method, cancel, &mut scan)?;
+                sites.extend(calls);
+                if options.semantic_edges {
+                    allocations.extend(allocated);
+                }
             }
+        }
+        if options.semantic_edges {
+            // The oracle path runs the same collector as the disk index so both
+            // agree on which methods were expanded.
+            let lookup = ScanLookup::new(&catalog, sites, allocations)?;
+            let (collected, edges) = collect(
+                &catalog,
+                &root_key,
+                &options,
+                &lookup,
+                Vec::new(),
+                cancel,
+                &mut report,
+            )?;
+            semantic = edges;
+            sites = collected;
         }
         (sites, &scan)
     };
     sites.sort_by(|a, b| (&a.caller, a.pc, &a.callee).cmp(&(&b.caller, b.pc, &b.callee)));
+    semantic
+        .sort_by(|a, b| (a.kind, &a.from, a.pc(), &a.to).cmp(&(b.kind, &b.from, b.pc(), &b.to)));
+    let declared = sites.len();
     let mut outgoing: HashMap<String, Vec<usize>> = HashMap::new();
     let mut incoming: HashMap<String, Vec<usize>> = HashMap::new();
     let mut keys = Vec::with_capacity(sites.len());
@@ -647,6 +1037,20 @@ fn query_catalog_with_sites(
         outgoing.entry(caller.clone()).or_default().push(i);
         incoming.entry(callee.clone()).or_default().push(i);
         keys.push((caller, callee));
+    }
+    // Semantic edges only ever point towards the traversed method, so they join
+    // the reverse adjacency and never the forward one.
+    for (j, edge) in semantic.iter().enumerate() {
+        check_cancel(cancel)?;
+        let from = canonical_cache
+            .entry(edge.from.clone())
+            .or_insert_with(|| catalog.canonical(&edge.from))
+            .clone();
+        incoming
+            .entry(edge.to.clone())
+            .or_default()
+            .push(declared + j);
+        keys.push((from, edge.to.clone()));
     }
     let mut depths = HashMap::from([(root_key.clone(), 0usize)]);
     let mut queue = VecDeque::from([root_key.clone()]);
@@ -703,7 +1107,12 @@ fn query_catalog_with_sites(
         "filter_semantics":"Filters select canonical neighbor declarations after traversal; they do not prune traversal. Compact records match the neighbor in the requested traversal direction. Graph nodes retain matching declarations plus the root; edges connect retained nodes. package_prefix and class_name accept dotted, slash or descriptor forms; a trailing dot is ignored.",
         "annotation_semantics":"Exact DEX descriptor or fully qualified type name on the class or method declaration; combined filters use AND.",
         "component_semantics":"Static superclass ancestry classification.",
-        "analysis":"static DEX declared calls; inherited aliases resolved through known superclasses (not through interface default methods); no runtime dispatch, reflection, Intent target or invoke-custom (lambda) target inference"
+        "semantic_edges":report.json(options.semantic_edges),
+        "analysis":if options.semantic_edges {
+            "static DEX declared calls plus labelled semantic edges (lambda_creation from new-instance allocations of callback classes; possible_interface_dispatch and possible_virtual_dispatch from supertype-typed invokes) for every traversed method; inherited aliases resolved through known superclasses; no reflection, Intent target, invoke-custom (lambda) target or data-flow inference"
+        } else {
+            "static DEX declared calls; inherited aliases resolved through known superclasses (not through interface default methods); no runtime dispatch, reflection, Intent target or invoke-custom (lambda) target inference"
+        }
     });
     let mut result = metadata;
     if root_key != root {
@@ -719,6 +1128,9 @@ fn query_catalog_with_sites(
             "Each record is one raw DEX invoke to callee_method_id. depth is traversal distance from the query root; only depth=1 records are direct root neighbors. call_sites defaults to depth=1; explicit depth includes transitive sites."
         );
         let record_for = |i: usize, depth: usize| {
+            if i >= declared {
+                return semantic_record(&semantic[i - declared], depth, &catalog);
+            }
             let mut row = record(&sites[i], depth, &canonical_cache[&sites[i].callee]);
             let inferred = aliases.contains(&sites[i].callee)
                 && matches!(sites[i].opcode, 0x6e | 0x74 | 0x72 | 0x78);
@@ -739,12 +1151,22 @@ fn query_catalog_with_sites(
         let inferred = selected_sites
             .keys()
             .filter(|&&i| {
-                aliases.contains(&sites[i].callee)
+                i < declared
+                    && aliases.contains(&sites[i].callee)
                     && matches!(sites[i].opcode, 0x6e | 0x74 | 0x72 | 0x78)
             })
             .count();
-        result["exact_matching_total"] = json!(total - inferred);
+        let mut semantic_kinds: BTreeMap<&str, usize> = BTreeMap::new();
+        for &i in selected_sites.keys().filter(|&&i| i >= declared) {
+            *semantic_kinds
+                .entry(semantic[i - declared].kind)
+                .or_default() += 1;
+        }
+        let semantic_selected: usize = semantic_kinds.values().sum();
+        result["exact_matching_total"] = json!(total - inferred - semantic_selected);
         result["possible_dispatch_total"] = json!(inferred);
+        result["semantic_edge_total"] = json!(semantic_selected);
+        result["semantic_edge_kinds"] = json!(semantic_kinds);
         result["dispatch_through_interfaces"] = json!(options.interface_dispatch);
         result["dispatch_through_superclasses"] = json!(options.superclass_dispatch);
         result["dispatch_expansion"] = json!(dispatch.status);
@@ -794,12 +1216,21 @@ fn query_catalog_with_sites(
     methods.insert(0, (root_key.clone(), 0));
     let matching_nodes = methods.len();
     let matching_keys: HashSet<_> = methods.iter().map(|(method, _)| method.as_str()).collect();
-    let mut counts = BTreeMap::new();
+    // Declared invokes and semantic edges between the same declarations are
+    // counted apart so a graph edge never hides which evidence supports it.
+    let mut counts: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
     for i in traversed_sites {
         check_cancel(cancel)?;
         let (from, to) = &keys[i];
         if matching_keys.contains(from.as_str()) && matching_keys.contains(to.as_str()) {
-            *counts.entry((from.clone(), to.clone())).or_insert(0usize) += 1;
+            let entry = counts
+                .entry((from.clone(), to.clone()))
+                .or_insert((0usize, 0usize));
+            if i < declared {
+                entry.0 += 1;
+            } else {
+                entry.1 += 1;
+            }
         }
     }
     let matching_edges = counts.len();
@@ -819,7 +1250,8 @@ fn query_catalog_with_sites(
             depth,
         });
     }
-    for ((from, to), count) in counts {
+    let mut semantic_counts = Vec::new();
+    for ((from, to), (count, inferred)) in counts {
         if let (Some(&from), Some(&to)) = (indices.get(&from), indices.get(&to)) {
             if graph.edges.len() == EDGE_LIMIT {
                 break;
@@ -829,6 +1261,7 @@ fn query_catalog_with_sites(
                 to,
                 sites: count,
             });
+            semantic_counts.push(inferred);
         }
     }
     graph.truncated = matching_nodes > graph.nodes.len() || matching_edges > graph.edges.len();
@@ -841,7 +1274,13 @@ fn query_catalog_with_sites(
             .collect::<Vec<_>>()
     };
     result["nodes"] = json!(graph.nodes.iter().enumerate().map(|(i,n)| json!({"id":i,"method_id":n.method,"depth":n.depth,"component":n.component.map(|c| c.label()),"available":n.available,"reachable_components":kinds(masks[i])})).collect::<Vec<_>>());
-    result["edges"] = json!(graph.edges.iter().map(|e| json!({"from":e.from,"to":e.to,"call_sites":e.sites,"highlighted":masks[e.to] != 0,"reachable_components":kinds(masks[e.to])})).collect::<Vec<_>>());
+    result["edges"] = json!(graph.edges.iter().zip(&semantic_counts).map(|(e, &inferred)| {
+        let mut edge = json!({"from":e.from,"to":e.to,"call_sites":e.sites,"highlighted":masks[e.to] != 0,"reachable_components":kinds(masks[e.to])});
+        if options.semantic_edges {
+            edge["semantic_edges"] = json!(inferred);
+        }
+        edge
+    }).collect::<Vec<_>>());
     result["root"] = json!(0);
     result["truncated"] = json!(graph.truncated);
     result["node_limit"] = json!(NODE_LIMIT);
@@ -1945,5 +2384,257 @@ mod tests {
             "skipped_interface_or_abstract_root"
         );
         assert_eq!(abstract_root["matching_total"], 1);
+    }
+
+    /// Splice a `new-instance` of `target` before the final return of a fixture method.
+    pub(super) fn allocate(class: &mut DexClass, method: usize, target: &str) {
+        let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+        let index = symbols.types.len() as u16;
+        symbols
+            .types
+            .push(format!("L{};", target.replace('.', "/")).into());
+        let code = class.methods[method].code.as_mut().unwrap();
+        let end = code.instructions.len() - 1;
+        code.instructions.splice(end..end, [0x0022, index]);
+    }
+
+    #[test]
+    fn semantic_edges_follow_lambda_creation_and_transitive_dispatch_in_both_paths() {
+        let mut outer = class(
+            "app.Outer",
+            None,
+            vec![
+                ("start", vec![], vec![]),
+                ("other", vec![], vec!["app.Outer.start()V"]),
+            ],
+        );
+        allocate(&mut outer, 0, "app.Outer$1");
+        let mut callback = class(
+            "app.Outer$1",
+            None,
+            vec![("onEvent", vec![], vec!["app.Sink.handle()V"])],
+        );
+        callback.interfaces = vec!["Lapi/Listener;".into()];
+        callback.methods[0].access_flags = 1;
+        let mut listener = class("api.Listener", None, vec![("onEvent", vec![], vec![])]);
+        listener.access_flags = 0x201;
+        listener.methods[0].access_flags = 0x401;
+        listener.methods[0].code = None;
+        let sink = class("app.Sink", None, vec![("handle", vec![], vec![])]);
+        let mut bus = class(
+            "app.Bus",
+            None,
+            vec![("fire", vec![], vec!["api.Listener.onEvent()V"])],
+        );
+        bus.methods[0].code.as_mut().unwrap().instructions[1] = 0x1072;
+        let scheduler = class(
+            "app.Scheduler",
+            None,
+            vec![("go", vec![], vec!["app.Bus.fire()V"])],
+        );
+        let classes = vec![outer, callback, listener, sink, bus, scheduler];
+        let cancel = AtomicBool::new(false);
+        let cache = Cache::default();
+        let cached = |root: &str, args: &Value| {
+            let mut actual = query_cached_catalog(
+                Catalog::new(&classes, &cancel).unwrap(),
+                root,
+                args,
+                &cancel,
+                &cache,
+            )
+            .unwrap();
+            let object = actual.as_object_mut().unwrap();
+            object.remove("invoke_index");
+            object.remove("invoke_index_cached");
+            actual
+        };
+        let root = "app.Sink.handle()V";
+        let deep = json!({"direction":"callers","projection":"call_sites","depth":5,"semantic_edges":true});
+        let result = run(&classes, root, deep.clone());
+        assert_eq!(result, cached(root, &deep), "{result}");
+        assert_eq!(result["matching_total"], 5, "{result}");
+        assert_eq!(result["exact_matching_total"], 3);
+        assert_eq!(result["semantic_edge_total"], 2);
+        assert_eq!(result["possible_dispatch_total"], 0);
+        assert_eq!(
+            result["semantic_edge_kinds"],
+            json!({"lambda_creation":1,"possible_interface_dispatch":1})
+        );
+        assert_eq!(result["semantic_edges"]["enabled"], true);
+        assert_eq!(result["semantic_edges"]["complete"], true);
+        assert_eq!(result["semantic_edges"]["methods_expanded"], 6);
+        assert!(
+            result["analysis"]
+                .as_str()
+                .unwrap()
+                .contains("lambda_creation")
+        );
+        let rows = result["call_sites"].as_array().unwrap();
+        let exact: Vec<_> = rows
+            .iter()
+            .filter(|r| r["relationship"] == "exact_declared_call")
+            .map(|r| (r["caller_method_id"].clone(), r["depth"].clone()))
+            .collect();
+        assert_eq!(
+            exact,
+            vec![
+                (json!("app.Outer$1.onEvent()V"), json!(1)),
+                (json!("app.Outer.other()V"), json!(3)),
+                (json!("app.Scheduler.go()V"), json!(3)),
+            ]
+        );
+        assert!(
+            rows.iter()
+                .filter(|r| r["relationship"] == "exact_declared_call")
+                .all(|r| r.get("kind").is_none())
+        );
+        let lambda = rows
+            .iter()
+            .find(|r| r["kind"] == "lambda_creation")
+            .unwrap();
+        assert_eq!(lambda["relationship"], "semantic_edge");
+        assert_eq!(lambda["caller_method_id"], "app.Outer.start()V");
+        assert_eq!(
+            lambda["semantic_target_method_id"],
+            "app.Outer$1.onEvent()V"
+        );
+        assert_eq!(lambda["allocated_class_id"], "app.Outer$1");
+        assert_eq!(lambda["callback_class_marker"], "anonymous_class");
+        assert_eq!(lambda["call_site_offset"], 0);
+        assert_eq!(lambda["depth"], 2);
+        assert_eq!(lambda["confidence"], "exact_allocation");
+        assert!(lambda["callee_method_id"].is_null());
+        assert_eq!(lambda["instruction"], "new-instance v0, Lapp/Outer$1;");
+        assert_eq!(lambda["opcode_value"], 0x22);
+        assert!(lambda.get("invoke_opcode").is_none());
+        let dispatch = rows
+            .iter()
+            .find(|r| r["kind"] == "possible_interface_dispatch")
+            .unwrap();
+        assert_eq!(dispatch["relationship"], "semantic_edge");
+        assert_eq!(dispatch["caller_method_id"], "app.Bus.fire()V");
+        assert_eq!(dispatch["raw_callee_method_id"], "api.Listener.onEvent()V");
+        assert_eq!(dispatch["invoke_opcode"], 0x72);
+        assert_eq!(dispatch["call_site_offset"], 1);
+        assert_eq!(
+            dispatch["possible_implementation_method_id"],
+            "app.Outer$1.onEvent()V"
+        );
+        assert_eq!(dispatch["confidence"], "possible");
+        assert_eq!(dispatch["depth"], 2);
+
+        let plain = run(
+            &classes,
+            root,
+            json!({"direction":"callers","projection":"call_sites","depth":5}),
+        );
+        assert_eq!(plain["matching_total"], 1);
+        assert_eq!(plain["semantic_edge_total"], 0);
+        assert_eq!(plain["semantic_edges"], json!({"enabled":false}));
+
+        let shallow = json!({"direction":"callers","projection":"call_sites","depth":2,"semantic_edges":true});
+        let result = run(&classes, root, shallow.clone());
+        assert_eq!(result, cached(root, &shallow));
+        assert_eq!(result["matching_total"], 3);
+        assert_eq!(result["depth_boundary_reached"], true);
+
+        let graph_args = json!({"direction":"callers","depth":5,"semantic_edges":true});
+        let graph = run(&classes, root, graph_args.clone());
+        assert_eq!(graph, cached(root, &graph_args));
+        let nodes = graph["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 6);
+        let depth_of =
+            |id: &str| nodes.iter().find(|n| n["method_id"] == id).unwrap()["depth"].clone();
+        assert_eq!(depth_of("app.Outer$1.onEvent()V"), 1);
+        assert_eq!(depth_of("app.Bus.fire()V"), 2);
+        assert_eq!(depth_of("app.Outer.start()V"), 2);
+        assert_eq!(depth_of("app.Scheduler.go()V"), 3);
+        let edges = graph["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 5);
+        let inferred: Vec<_> = edges.iter().filter(|e| e["semantic_edges"] == 1).collect();
+        assert_eq!(inferred.len(), 2);
+        assert!(inferred.iter().all(|e| e["call_sites"] == 0));
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|e| e["call_sites"] == 1 && e["semantic_edges"] == 0)
+                .count(),
+            3
+        );
+        let plain_graph = run(&classes, root, json!({"direction":"callers","depth":5}));
+        assert_eq!(plain_graph["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(plain_graph["edges"].as_array().unwrap().len(), 1);
+        assert!(plain_graph["edges"][0].get("semantic_edges").is_none());
+
+        let direct = json!({"direction":"callers","projection":"call_sites","semantic_edges":true});
+        let result = run(&classes, "app.Outer$1.onEvent()V", direct.clone());
+        assert_eq!(result, cached("app.Outer$1.onEvent()V", &direct));
+        assert_eq!(result["matching_total"], 2);
+        assert_eq!(result["exact_matching_total"], 0);
+        assert_eq!(result["direct_matching_total"], 2);
+
+        let filtered = json!({"direction":"callers","projection":"call_sites","depth":5,"semantic_edges":true,"class_name":"app.Bus"});
+        let result = run(&classes, root, filtered.clone());
+        assert_eq!(result, cached(root, &filtered));
+        assert_eq!(result["matching_total"], 1);
+        assert_eq!(
+            result["call_sites"][0]["kind"],
+            "possible_interface_dispatch"
+        );
+
+        for args in [
+            json!({"semantic_edges":true}),
+            json!({"semantic_edges":true,"direction":"both"}),
+            json!({"semantic_edges":true,"direction":"callers","dispatch_through_interfaces":true}),
+            json!({"semantic_edges":true,"direction":"callers","projection":"call_sites","dispatch_through_superclasses":true}),
+        ] {
+            assert!(Options::parse(&args).is_err(), "{args}");
+        }
+    }
+
+    #[test]
+    fn semantic_method_budget_is_reported_as_incomplete_coverage() {
+        let mut wide = vec![class("c.Root", None, vec![("m", vec![], vec![])])];
+        for i in 0..SemanticReport::METHOD_LIMIT + 2 {
+            wide.push(class(
+                &format!("c.C{i}"),
+                None,
+                vec![("m", vec![], vec!["c.Root.m()V"])],
+            ));
+        }
+        let result = run(
+            &wide,
+            "c.Root.m()V",
+            json!({"direction":"callers","depth":2,"semantic_edges":true}),
+        );
+        assert_eq!(result["semantic_edges"]["complete"], false);
+        assert_eq!(
+            result["semantic_edges"]["methods_expanded"],
+            SemanticReport::METHOD_LIMIT
+        );
+        assert_eq!(result["semantic_edges"]["methods_skipped"], 3);
+        assert_eq!(
+            result["semantic_edges"]["skipped_samples"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            result["semantic_edges"]["skipped_samples"][0]["reason"],
+            "semantic method budget reached"
+        );
+        assert_eq!(
+            result["matching_node_count"],
+            SemanticReport::METHOD_LIMIT + 3
+        );
+        let unlimited = run(
+            &wide,
+            "c.Root.m()V",
+            json!({"direction":"callers","depth":1,"semantic_edges":true}),
+        );
+        assert_eq!(unlimited["semantic_edges"]["complete"], true);
+        assert_eq!(unlimited["semantic_edges"]["methods_expanded"], 1);
     }
 }

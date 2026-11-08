@@ -2038,6 +2038,7 @@ fn tools_list() -> Value {
         if ["get_call_graph","get_call_graph_batch"].contains(&name) {
             properties.insert("dispatch_through_superclasses".into(),json!({"type":"boolean","default":false,"description":"Direct callers with call_sites only: include virtual invokes to overridden superclass declarations as possible dispatch; preserve raw target and separate counts"}));
             properties.insert("dispatch_through_interfaces".into(),json!({"type":"boolean","default":false,"description":"Direct callers with call_sites only: include interface-typed invokes as possible dispatch, preserving raw target and separate counts"}));
+            properties.insert("semantic_edges".into(),json!({"type":"boolean","default":false,"description":"Caller queries only, any depth or projection: add labelled inferred edges for every traversed method (lambda_creation from new-instance of callback classes; possible_interface_dispatch and possible_virtual_dispatch from supertype-typed invokes) with separate counts, a 2048-method budget and a completeness report; subsumes and conflicts with dispatch_through_* options"}));
             for key in ["include_source_locations","include_forwarders"] {properties.insert(key.into(),json!({"type":"boolean","default":false,"description":"call_sites only: optional bounded source mapping or verified static-forwarder metadata"}));}
             properties.insert("include_const_args".into(),json!({"type":"boolean","default":false,"description":"call_sites only: conservative CFG constant argument analysis for the returned page; unresolved values are explicit"}));
             if name=="get_call_graph" {
@@ -2376,6 +2377,17 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
             args["direct_only"] != true || args["depth"].as_u64().unwrap_or(1) == 1,
             "direct_only requires depth=1 when depth is supplied"
         );
+        if args["semantic_edges"] == true {
+            ensure!(
+                args["direction"] == "callers",
+                "semantic_edges requires direction=callers"
+            );
+            ensure!(
+                args["dispatch_through_interfaces"] != true
+                    && args["dispatch_through_superclasses"] != true,
+                "semantic_edges already includes transitive interface and virtual dispatch; omit dispatch_through_interfaces and dispatch_through_superclasses"
+            );
+        }
         ensure!(
             args["projection"] == "call_sites"
                 || (args.get("offset").is_none() && args.get("limit").is_none()),

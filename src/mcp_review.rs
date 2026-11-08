@@ -314,7 +314,12 @@ pub(super) fn call_arguments(
         .as_array_mut()
         .context("include_const_args requires projection=call_sites")?;
     let mut groups = std::collections::BTreeMap::<String, Vec<(usize, usize)>>::new();
+    let mut allocations = Vec::new();
     for (index, site) in sites.iter().enumerate() {
+        if site["kind"] == "lambda_creation" {
+            allocations.push(index);
+            continue;
+        }
         let id = site["caller_method_id"]
             .as_str()
             .context("Missing caller ID")?;
@@ -322,6 +327,9 @@ pub(super) fn call_arguments(
             .as_u64()
             .context("Missing call offset")? as usize;
         groups.entry(id.to_owned()).or_default().push((index, pc));
+    }
+    for index in allocations {
+        sites[index]["constant_arguments"] = json!({"status":"not_applicable","reason":"lambda_creation evidence is a new-instance allocation; constant arguments apply to invoke sites only"});
     }
     let mut work = 0;
     let mut bytes = 0;

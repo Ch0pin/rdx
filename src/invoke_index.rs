@@ -1,11 +1,14 @@
 //! Project-owned disk postings. Fingerprints select candidates; raw DEX verifies each hit.
-use super::{Catalog, ScanFailures, check_cancel, scan_method};
-use crate::native_xrefs::{self, CallSite};
+use super::{Catalog, Lookup, ScanFailures, check_cancel, scan_method};
+use crate::{
+    native_dex::{DexClass, DexMethod},
+    native_xrefs::{self, Allocation, CallSite},
+};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Write},
     path::PathBuf,
@@ -16,6 +19,8 @@ use std::{
     time::Duration,
 };
 
+/// Forward shards (by caller), reverse shards (by resolved callee) and allocation
+/// shards (by allocated class), each `SHARDS` wide.
 const SHARDS: usize = 32;
 const RECORD: usize = 20;
 fn fingerprint(s: &str) -> u64 {
@@ -56,6 +61,7 @@ pub(crate) struct Cache {
     scanned: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
     sites: Arc<AtomicUsize>,
+    allocations: Arc<AtomicUsize>,
     undecodable: Arc<AtomicUsize>,
     pub(crate) batches: Arc<Mutex<BTreeMap<String, Value>>>,
 }
@@ -63,7 +69,7 @@ impl Cache {
     pub(crate) fn status(&self) -> Value {
         json!({"state":match self.state.load(Ordering::Relaxed) {1=>"building",2=>"ready",_=>"not_built"},
             "scanned_classes":self.scanned.load(Ordering::Relaxed),"total_classes":self.total.load(Ordering::Relaxed),
-            "invoke_sites":self.sites.load(Ordering::Relaxed),"undecodable_methods":self.undecodable.load(Ordering::Relaxed),"storage":"project_owned_disk_shards",
+            "invoke_sites":self.sites.load(Ordering::Relaxed),"allocation_sites":self.allocations.load(Ordering::Relaxed),"undecodable_methods":self.undecodable.load(Ordering::Relaxed),"storage":"project_owned_disk_shards",
             "active_batches":*self.batches.lock().unwrap()})
     }
     pub(super) fn get(&self, catalog: &Catalog<'_>) -> Result<(Arc<Index>, bool)> {
@@ -81,6 +87,7 @@ impl Cache {
         self.state.store(1, Ordering::Relaxed);
         self.scanned.store(0, Ordering::Relaxed);
         self.sites.store(0, Ordering::Relaxed);
+        self.allocations.store(0, Ordering::Relaxed);
         self.undecodable.store(0, Ordering::Relaxed);
         self.total.store(catalog.classes.len(), Ordering::Relaxed);
         let result =
@@ -108,12 +115,31 @@ pub(super) struct Index {
     directory: Directory,
     names: Vec<String>,
     lengths: Vec<u64>,
+    /// Fingerprints of every raw invoke target, so alias probes skip shard scans
+    /// for members nothing names.
+    raw: HashSet<u64>,
     pub(super) failures: ScanFailures,
+}
+fn write_record(
+    writers: &mut [BufWriter<File>],
+    shard: usize,
+    hash: u64,
+    ci: usize,
+    mi: usize,
+    pc: usize,
+) -> Result<()> {
+    let mut record = [0u8; RECORD];
+    record[..8].copy_from_slice(&hash.to_le_bytes());
+    record[8..12].copy_from_slice(&u32::try_from(ci)?.to_le_bytes());
+    record[12..16].copy_from_slice(&u32::try_from(mi)?.to_le_bytes());
+    record[16..20].copy_from_slice(&u32::try_from(pc)?.to_le_bytes());
+    writers[shard].write_all(&record)?;
+    Ok(())
 }
 impl Index {
     fn build(catalog: &Catalog<'_>, progress: &Cache) -> Result<Self> {
         let directory = Directory::new()?;
-        let mut writers = (0..SHARDS * 2)
+        let mut writers = (0..SHARDS * 3)
             .map(|i| {
                 File::create(directory.0.join(i.to_string()))
                     .map(|f| BufWriter::with_capacity(65536, f))
@@ -121,12 +147,15 @@ impl Index {
             .collect::<std::io::Result<Vec<_>>>()?;
         let mut names = Vec::new();
         let mut targets = HashMap::new();
+        let mut raw = HashSet::new();
         let mut failures = ScanFailures::default();
         for (ci, (name, class)) in catalog.classes.iter().enumerate() {
             check_cancel(catalog.cancel)?;
             names.push(name.clone());
             for (mi, method) in class.methods.iter().enumerate() {
-                for site in scan_method(class, method, catalog.cancel, &mut failures)? {
+                let (sites, allocations) =
+                    scan_method(class, method, catalog.cancel, &mut failures)?;
+                for site in sites {
                     let key = (Arc::as_ptr(&class.symbols) as usize, site.method_index);
                     if targets.len() >= 262144 {
                         targets.clear();
@@ -134,17 +163,19 @@ impl Index {
                     let callee = *targets
                         .entry(key)
                         .or_insert_with(|| fingerprint(&catalog.canonical(&site.callee)));
+                    raw.insert(fingerprint(&site.callee));
                     let caller = fingerprint(&site.caller);
-                    for (reverse, hash) in [(false, caller), (true, callee)] {
-                        let shard = (hash as usize % SHARDS) + if reverse { SHARDS } else { 0 };
-                        let mut record = [0u8; RECORD];
-                        record[..8].copy_from_slice(&hash.to_le_bytes());
-                        record[8..12].copy_from_slice(&u32::try_from(ci)?.to_le_bytes());
-                        record[12..16].copy_from_slice(&u32::try_from(mi)?.to_le_bytes());
-                        record[16..20].copy_from_slice(&u32::try_from(site.pc)?.to_le_bytes());
-                        writers[shard].write_all(&record)?;
+                    for (base, hash) in [(0, caller), (SHARDS, callee)] {
+                        let shard = base + hash as usize % SHARDS;
+                        write_record(&mut writers, shard, hash, ci, mi, site.pc)?;
                     }
                     progress.sites.fetch_add(1, Ordering::Relaxed);
+                }
+                for allocation in allocations {
+                    let hash = fingerprint(&allocation.class);
+                    let shard = 2 * SHARDS + hash as usize % SHARDS;
+                    write_record(&mut writers, shard, hash, ci, mi, allocation.pc)?;
+                    progress.allocations.fetch_add(1, Ordering::Relaxed);
                 }
             }
             progress.scanned.store(ci + 1, Ordering::Relaxed);
@@ -162,24 +193,25 @@ impl Index {
             directory,
             names,
             lengths,
+            raw,
             failures,
         })
     }
-    pub(super) fn neighbors(
+    /// Visit every posting in `shard` whose fingerprint matches, handing the raw
+    /// DEX position to `visit`, which must verify the exact target itself.
+    fn candidates(
         &self,
         catalog: &Catalog<'_>,
-        target: &str,
-        reverse: bool,
-    ) -> Result<Vec<CallSite>> {
-        let hash = fingerprint(target);
-        let shard = (hash as usize % SHARDS) + if reverse { SHARDS } else { 0 };
+        shard: usize,
+        hash: u64,
+        mut visit: impl FnMut(&DexClass, &DexMethod, usize) -> Result<()>,
+    ) -> Result<()> {
         let file = File::open(self.directory.0.join(shard.to_string()))?;
         ensure!(
             file.metadata()?.len() == self.lengths[shard],
             "Invoke index shard changed; reopen project"
         );
         let mut reader = BufReader::with_capacity(65536, file);
-        let mut result = vec![];
         for n in 0..self.lengths[shard] / RECORD as u64 {
             if n % 1024 == 0 {
                 check_cancel(catalog.cancel)?;
@@ -201,6 +233,20 @@ impl Index {
                 .methods
                 .get(mi)
                 .context("Invalid invoke index method")?;
+            visit(class, method, pc)?;
+        }
+        check_cancel(catalog.cancel)
+    }
+    pub(super) fn neighbors(
+        &self,
+        catalog: &Catalog<'_>,
+        target: &str,
+        reverse: bool,
+    ) -> Result<Vec<CallSite>> {
+        let hash = fingerprint(target);
+        let shard = (hash as usize % SHARDS) + if reverse { SHARDS } else { 0 };
+        let mut result = vec![];
+        self.candidates(catalog, shard, hash, |class, method, pc| {
             let site =
                 native_xrefs::call_site_at(class, method, pc)?.context("Invalid indexed invoke")?;
             let actual = if reverse {
@@ -211,15 +257,45 @@ impl Index {
             if actual == target {
                 result.push(site);
             }
-        }
-        check_cancel(catalog.cancel)?;
+            Ok(())
+        })?;
         Ok(result)
+    }
+    pub(super) fn allocators(&self, catalog: &Catalog<'_>, class: &str) -> Result<Vec<Allocation>> {
+        let hash = fingerprint(class);
+        let shard = 2 * SHARDS + hash as usize % SHARDS;
+        let mut result = vec![];
+        self.candidates(catalog, shard, hash, |owner, method, pc| {
+            let allocation = native_xrefs::allocation_at(owner, method, pc)?
+                .context("Invalid indexed allocation")?;
+            if allocation.class == class {
+                result.push(allocation);
+            }
+            Ok(())
+        })?;
+        Ok(result)
+    }
+}
+impl Lookup for Index {
+    fn neighbors(
+        &self,
+        catalog: &Catalog<'_>,
+        method: &str,
+        reverse: bool,
+    ) -> Result<Vec<CallSite>> {
+        Index::neighbors(self, catalog, method, reverse)
+    }
+    fn references_raw(&self, raw_callee: &str) -> bool {
+        self.raw.contains(&fingerprint(raw_callee))
+    }
+    fn allocators(&self, catalog: &Catalog<'_>, class: &str) -> Result<Vec<Allocation>> {
+        Index::allocators(self, catalog, class)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::class;
+    use super::super::tests::{allocate, class};
     use super::*;
     use std::sync::atomic::AtomicBool;
     fn fixtures() -> Vec<crate::native_dex::DexClass> {
@@ -346,5 +422,43 @@ mod tests {
         drop(index);
         drop(cache);
         assert!(!path.exists());
+    }
+    #[test]
+    fn allocation_shards_and_raw_targets_are_verified_like_invokes() {
+        let mut classes = fixtures();
+        let mut maker = class("app.Maker", None, vec![("make", vec![], vec![])]);
+        allocate(&mut maker, 0, "app.One");
+        classes.push(maker);
+        let cancel = AtomicBool::new(false);
+        let catalog = Catalog::new(&classes, &cancel).unwrap();
+        let cache = Cache::default();
+        let (index, _) = cache.get(&catalog).unwrap();
+        let hits = index.allocators(&catalog, "app.One").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].method, "app.Maker.make()V");
+        assert_eq!(hits[0].class, "app.One");
+        assert_eq!(hits[0].pc, 0);
+        assert_eq!(hits[0].words, vec![0x0022, 0]);
+        assert!(index.allocators(&catalog, "app.Two").unwrap().is_empty());
+        assert!(Lookup::references_raw(&*index, "api.Child.call()V"));
+        assert!(!Lookup::references_raw(&*index, "api.Parent.run()V"));
+        assert_eq!(cache.status()["allocation_sites"], 1);
+        assert_eq!(cache.status()["invoke_sites"], 3);
+        // A colliding posting that points at another class fails verification.
+        let mut forged = Index::build(&catalog, &cache).unwrap();
+        let target = "app.Two";
+        let hash = fingerprint(target);
+        let shard = 2 * SHARDS + hash as usize % SHARDS;
+        let ci = forged.names.iter().position(|s| s == "app.Maker").unwrap() as u32;
+        let mut bytes = Vec::new();
+        bytes.extend(hash.to_le_bytes());
+        bytes.extend(ci.to_le_bytes());
+        bytes.extend(0u32.to_le_bytes());
+        bytes.extend(0u32.to_le_bytes());
+        fs::write(forged.directory.0.join(shard.to_string()), bytes).unwrap();
+        forged.lengths[shard] = 20;
+        assert!(forged.allocators(&catalog, target).unwrap().is_empty());
+        cancel.store(true, Ordering::Relaxed);
+        assert!(index.allocators(&catalog, "app.One").is_err());
     }
 }

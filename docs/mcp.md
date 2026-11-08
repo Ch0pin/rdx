@@ -1292,7 +1292,7 @@ When APK optimization replaces application attribute names with decimal resource
 
 ### Interface caller expansion
 
-Use `get_call_graph(method_id, direction="callers", projection="call_sites", depth=1, dispatch_through_interfaces=true)` to include `invoke-interface` and `invoke-virtual` sites whose raw target names the root member on any interface the root class implements, directly or through superinterfaces and superclasses, whether or not that interface redeclares the member and whether or not it is loaded. The original `callee_method_id`, `raw_callee_method_id`, opcode and offset remain unchanged. Rows have `relationship="exact_declared_call"` or `"possible_interface_dispatch"`; inferred rows add `possible_implementation_method_id`. `exact_matching_total` and `possible_dispatch_total` keep the counts separate. A runtime receiver may select another implementation. The opt-in is limited to direct caller call-site queries; batch queries can pass the same option.
+Use `get_call_graph(method_id, direction="callers", projection="call_sites", depth=1, dispatch_through_interfaces=true)` to include `invoke-interface` and `invoke-virtual` sites whose raw target names the root member on any interface the root class implements, directly or through superinterfaces and superclasses, whether or not that interface redeclares the member and whether or not it is loaded. The original `callee_method_id`, `raw_callee_method_id`, opcode and offset remain unchanged. Rows have `relationship="exact_declared_call"` or `"possible_interface_dispatch"`; inferred rows add `possible_implementation_method_id`. `exact_matching_total` and `possible_dispatch_total` keep the counts separate. A runtime receiver may select another implementation. The opt-in is limited to direct caller call-site queries; batch queries can pass the same option. Transitive expansion of the same inference, for every traversed method, is the `semantic_edges` option below.
 
 Superclass dispatch uses `dispatch_through_superclasses=true` with the same
 direct caller projection. It includes `invoke-virtual` sites whose raw target
@@ -1306,6 +1306,39 @@ instance method declared by its own loaded class (constructors, static and
 private methods, abstract or interface declarations, inherited-only members and
 unloaded classes get no inference). Inherited-only roots instead resolve to the
 declaring ancestor, and every invoke that resolves there is reported as exact.
+
+### Semantic edges
+
+Caller graphs stop where the application hands control to a framework: a
+listener is registered and later invoked through an interface, or a lambda
+object is created and later run. `get_call_graph(method_id, direction="callers",
+semantic_edges=true)`, and the same option on `get_call_graph_batch`, adds
+labelled inferred edges for every traversed method, in both projections and at
+any depth, and traverses their sources too. Three producers exist.
+`lambda_creation` links a `new-instance` of a callback class to each concrete
+instance method of that class; a class qualifies when it is synthetic,
+anonymous (`Outer$1`), named with `Lambda`, or extends a Kotlin lambda or
+continuation base, and `callback_class_marker` names the rule that matched.
+`possible_interface_dispatch` and `possible_virtual_dispatch` are the dispatch
+expansion above applied to each traversed method. Declared calls keep
+`relationship="exact_declared_call"`; inferred rows have
+`relationship="semantic_edge"`, a `kind`, `semantic_target_method_id` (the
+traversed method the edge leads to) and `confidence` (`exact_allocation` for an
+allocation whose callback relationship is inferred, `possible` for dispatch).
+Allocation rows carry `instruction`, `opcode_value`, `instruction_words`,
+`allocated_class_id` and a null `callee_method_id`; their `call_site_offset` is
+the `new-instance` offset. `semantic_edge_total` and `semantic_edge_kinds` are
+counted apart from `exact_matching_total`; graph edges add `semantic_edges`
+beside `call_sites`, so an edge supported only by inference shows
+`call_sites=0`. The `semantic_edges` object in every response states `enabled`,
+`complete`, `methods_expanded`, the per-query `method_budget` (2048 traversed
+methods) and `skipped_samples`. Not covered, and left absent rather than
+guessed: invoke-custom lambdas, named listener classes without those markers,
+reflection, LiveData, Flow or RxJava value delivery, dependency-injection
+factories, and Intent, Handler or executor delivery. `semantic_edges` requires
+`direction="callers"` and conflicts with `dispatch_through_*`, which it
+subsumes. Source locations, forwarders and constant arguments mark allocation
+rows `not_applicable`.
 
 ### Asset contents
 

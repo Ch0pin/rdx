@@ -1,7 +1,7 @@
 //! Method call edges from DEX instructions, independent of Java reconstruction.
 use crate::{
     native_cfg::instruction_width,
-    native_dex::{DexClass, DexMethod},
+    native_dex::{DexClass, DexCode, DexMethod},
 };
 use anyhow::{Context, Result, ensure};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,17 +38,26 @@ pub fn call_sites(
     Ok(sites)
 }
 
-/// Scan one already-resolved method without walking unrelated method bodies.
-pub fn method_call_sites(
-    class: &DexClass,
-    m: &DexMethod,
+/// One `new-instance` operand, resolved within its owning DEX.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Allocation {
+    pub method: String,
+    pub class: String,
+    pub descriptor: String,
+    pub pc: usize,
+    pub register: u16,
+    pub type_index: usize,
+    pub dex_entry: Option<String>,
+    pub words: Vec<u16>,
+    pub code_offset: u32,
+}
+
+/// Visit every instruction boundary of a body, skipping payload tables.
+fn walk(
+    code: &DexCode,
     cancel: &AtomicBool,
-) -> Result<Vec<CallSite>> {
-    ensure!(!cancel.load(Ordering::Relaxed), "Call search cancelled");
-    let mut sites = Vec::new();
-    let Some(code) = &m.code else {
-        return Ok(sites);
-    };
+    mut visit: impl FnMut(usize) -> Result<()>,
+) -> Result<()> {
     let mut pc = 0;
     let mut next_cancel_pc = 0;
     while pc < code.instructions.len() {
@@ -61,12 +70,95 @@ pub fn method_call_sites(
             pc + width <= code.instructions.len(),
             "Truncated instruction"
         );
-        if !payload && let Some(site) = call_site_at(class, m, pc)? {
-            sites.push(site);
+        if !payload {
+            visit(pc)?;
         }
         pc += width;
     }
+    Ok(())
+}
+
+/// Scan one already-resolved method without walking unrelated method bodies.
+pub fn method_call_sites(
+    class: &DexClass,
+    m: &DexMethod,
+    cancel: &AtomicBool,
+) -> Result<Vec<CallSite>> {
+    ensure!(!cancel.load(Ordering::Relaxed), "Call search cancelled");
+    let mut sites = Vec::new();
+    let Some(code) = &m.code else {
+        return Ok(sites);
+    };
+    walk(code, cancel, |pc| {
+        if let Some(site) = call_site_at(class, m, pc)? {
+            sites.push(site);
+        }
+        Ok(())
+    })?;
     Ok(sites)
+}
+
+/// Scan one body once for both invokes and `new-instance` allocations.
+pub fn method_sites(
+    class: &DexClass,
+    m: &DexMethod,
+    cancel: &AtomicBool,
+) -> Result<(Vec<CallSite>, Vec<Allocation>)> {
+    ensure!(!cancel.load(Ordering::Relaxed), "Call search cancelled");
+    let mut calls = Vec::new();
+    let mut allocations = Vec::new();
+    let Some(code) = &m.code else {
+        return Ok((calls, allocations));
+    };
+    walk(code, cancel, |pc| {
+        if let Some(site) = call_site_at(class, m, pc)? {
+            calls.push(site);
+        } else if let Some(allocation) = allocation_at(class, m, pc)? {
+            allocations.push(allocation);
+        }
+        Ok(())
+    })?;
+    Ok((calls, allocations))
+}
+
+/// Decode a `new-instance` at an instruction boundary established by the DEX scanner.
+pub fn allocation_at(class: &DexClass, m: &DexMethod, pc: usize) -> Result<Option<Allocation>> {
+    let code = m.code.as_ref().context("Method has no code")?;
+    let word = *code
+        .instructions
+        .get(pc)
+        .context("Invalid allocation offset")?;
+    if word as u8 != 0x22 {
+        return Ok(None);
+    }
+    let (width, payload) = instruction_width(&code.instructions, pc)?;
+    ensure!(
+        !payload && pc + width <= code.instructions.len(),
+        "Truncated new-instance"
+    );
+    let type_index = code.instructions[pc + 1] as usize;
+    let descriptor = class
+        .symbols
+        .types
+        .get(type_index)
+        .context("Invalid allocation type")?;
+    ensure!(
+        descriptor.starts_with('L') && descriptor.ends_with(';'),
+        "Invalid new-instance class descriptor"
+    );
+    let register = word >> 8;
+    ensure!(register < code.registers, "Invalid allocation register");
+    Ok(Some(Allocation {
+        method: crate::native_engine::disassembly::method_id(m),
+        class: crate::native_engine::disassembly::type_name(descriptor),
+        descriptor: descriptor.to_string(),
+        pc,
+        register,
+        type_index,
+        dex_entry: class.symbols.origin.get().cloned(),
+        words: code.instructions[pc..pc + width].to_vec(),
+        code_offset: code.offset,
+    }))
 }
 
 /// Decode an invoke at an instruction boundary established by the DEX scanner.

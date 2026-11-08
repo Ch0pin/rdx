@@ -79,10 +79,11 @@ fn initial(m: &DexMethod) -> Option<Vec<Origin>> {
     Some(state)
 }
 fn instruction_text(
+    class: &DexClass,
     m: &DexMethod,
-    symbols: &DexSymbols,
     cancelled: &impl Fn() -> bool,
 ) -> Result<HashMap<usize, String>, String> {
+    let symbols = &class.symbols;
     let code = m.code.as_ref().ok_or("dispatcher code missing")?;
     if code.instructions.len() > 65_536 {
         return Err("dispatcher readable disassembly exceeds code budget".into());
@@ -107,7 +108,7 @@ fn instruction_text(
             }
         }
     }
-    let rendered = crate::native_engine::disassembly::render_method(m, symbols);
+    let rendered = crate::native_engine::disassembly::render_method(class, m);
     let mut text = HashMap::new();
     for line in rendered.source.lines() {
         if cancelled() {
@@ -620,7 +621,7 @@ fn dispatch(
             {
                 return Ok(None);
             }
-            let readable = instruction_text(m, &class.symbols, cancelled)?;
+            let readable = instruction_text(class, m, cancelled)?;
             let entry = *cfg
                 .block_at
                 .get(&selected)

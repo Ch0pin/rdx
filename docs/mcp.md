@@ -72,6 +72,36 @@ Class identifiers currently follow the native engine's class-name identity.
 Disassembly is `rdx-dex`, not assemblable Smali. Java source can contain explicit
 DEX fallbacks. Method IDs retain full DEX signatures.
 
+`rdx-dex` output emits DEX annotations as directives next to their owners, so
+annotation values are readable even when class, interface, or annotation names
+are obfuscated. Class annotations follow `.implements`; field annotations follow
+the `.field` line; method annotations open the method body; parameter annotations
+sit under `.param <index>` (zero-based, receiver excluded) and close with
+`.end param`. Each block is `.annotation <build|runtime|system> <Type>`, one
+`name = value` line per element, and `.end annotation`. Values render strings
+quoted and escaped, numbers with `t`/`s`/`L`/`f` suffixes for byte/short/long/
+float, types as dotted names, enum constants as field IDs, arrays in braces, and
+nested annotations as `@Type(name = value)`. Strings beyond 2048 characters,
+arrays beyond 64 items and nesting beyond 8 levels are cut with an explicit
+`/* +N ... */` or `@<nesting limit>` marker; invalid DEX indices print as
+`<invalid s index N>`. A Retrofit service therefore shows its `@GET`/`@Url`/
+`@Path` values in `get_class_disassembly` and in `get_method_source` with
+`format: "dex"`, and `dalvik.annotation.Signature` exposes generic signatures.
+
+```text
+.method ff.g.a(Ljava/lang/String;)Lretrofit2/Call; // access=0x401
+    .annotation runtime retrofit2.http.GET
+        value = "v1/profile/{id}"
+    .end annotation
+    .param 0 // zero-based, receiver excluded; type Ljava/lang/String;
+        .annotation runtime retrofit2.http.Path
+            value = "id"
+        .end annotation
+    .end param
+    // No DEX code item (abstract/native declaration).
+.end method
+```
+
 List responses contain `next_offset`; text responses use Unicode character
 `offset` and `next_offset`. Continue until `next_offset` is null. Text paging
 only limits tool responses: it does not truncate the GUI viewer. Lists default
@@ -953,23 +983,39 @@ Pass that object to `search_code`. Source-mode `limit` counts classes by default
 (25, maximum 500); `pagination: "hits"` instead pages source matches.
 
 `find_annotation_usages` accepts `annotation_type` as an FQCN or DEX descriptor,
-`element: "all"|"class"|"field"|"method"|"parameter"`, and `package_prefix`.
-Results include owner IDs, zero-based parameter indices excluding the receiver,
-DEX entry, visibility (0 build / 1 runtime / 2 system), and typed decoded values.
-It searches explicit declarations, including obfuscated annotation names. It does
-not infer inherited annotations or fill in annotation defaults. Pages count
-matching annotations; follow `next_offset`. Oversized individual annotation
-values fail explicitly instead of being silently truncated.
+`element: "all"|"class"|"field"|"method"|"parameter"`, `package_prefix`, and
+`match_mode`:
 
-The response includes the canonical `annotation_type`, `match_mode:
-"exact_descriptor"`, and `requested_type_present`. Type presence checks DEX type
-tables of all loaded classes before applying package or element filters; it does
-not require an annotation class definition. An absent type returns a structured
-`warnings` entry with code `ANNOTATION_TYPE_ABSENT`. Obfuscation, removal, or an
-incorrect name can explain absence. A present type with zero filtered usages
-returns an empty warnings array. `complete: true` describes the exact-descriptor
-scan within the supplied filters, not coverage of semantic equivalents under
-obfuscation. Use the actual DEX annotation name; semantic aliases are not inferred.
+- `exact_descriptor` (default) matches the complete descriptor, for example
+  `retrofit2.http.GET` or `Lretrofit2/http/GET;`.
+- `simple_name` matches the class name after the last package separator, so
+  `GET` finds `retrofit2.http.GET` and a relocated `ff.a.GET` alike. Qualified
+  spellings reduce to their simple name. Nested names keep their `$` segment.
+- `prefix` matches a literal FQCN or package prefix on the internal name, so
+  `retrofit2.http` finds every Retrofit HTTP annotation and `retrofit2.http.`
+  stops at the package boundary.
+
+Results include owner IDs, zero-based parameter indices excluding the receiver,
+DEX entry, visibility (0 build / 1 runtime / 2 system), the item's actual
+`annotation_type` descriptor, and typed decoded values. It searches explicit
+declarations, including obfuscated annotation names. It does not infer inherited
+annotations or fill in annotation defaults. Pages count matching annotations;
+follow `next_offset`. Oversized individual annotation values fail explicitly
+instead of being silently truncated.
+
+The response includes the normalized `annotation_type` pattern, the effective
+`match_mode`, `matched_types` (distinct matched descriptors, bounded at 200 with
+`matched_types_complete`), and `requested_type_present`. Type presence applies
+the same match mode to DEX type tables of all loaded classes before package or
+element filters; it does not require an annotation class definition. An absent
+type returns a structured `warnings` entry with code `ANNOTATION_TYPE_ABSENT`.
+Obfuscation, removal, or an incorrect name can explain absence. A present type
+with zero filtered usages returns an empty warnings array. `complete: true`
+describes the scan for the selected match mode within the supplied filters, not
+coverage of semantic equivalents under obfuscation. Semantic aliases are not
+inferred: an obfuscated annotation class renamed to `a.b` is found only by its
+actual name, by a prefix covering its package, or through `get_class_disassembly`
+annotation directives on a known service.
 
 `get_method_source` also accepts `class_name` plus `method_name` and optional
 `descriptor` (for example `(Ljava/lang/String;)V`). `find_field_references`
@@ -1134,7 +1180,19 @@ The rule emits candidates and unresolved flows, never a vulnerability verdict. F
 ```
 
 The package prefix selects evidence owners at package boundaries; dependencies
-may be anywhere in the loaded DEX set. Named API evidence is ordered before
+may be anywhere in the loaded DEX set. Obfuscated builds commonly declare Retrofit
+service interfaces, and SDK endpoints such as upload or fallback services, in
+renamed top-level packages (`ff.g`, `a.b.c`) rather than under the application
+ID, so a prefix matching the application ID can exclude every service. When
+`package_prefix` is set, the scan counts Retrofit-annotated classes outside the
+prefix and, if any exist, adds a `warnings` entry with code
+`RETROFIT_SERVICES_OUTSIDE_PREFIX` carrying `classes`, `methods`, up to ten
+`examples` and `count_complete`; the raw count is also in
+`coverage.detector_coverage[0].retrofit_annotations_outside_prefix`. Repeat the
+query without `package_prefix`, or with the example packages, to include them.
+Retrofit detection itself keys on the `retrofit2.http.*` annotation descriptors,
+not on interface names, so renamed interfaces are found as long as the annotation
+classes keep their names. Named API evidence is ordered before
 structural maps. `offset`/`next_offset` page the combined evidence list (default
 25, maximum 100). Counts represent evidence records, not unique runtime clients
 or stacks. The same class may have multiple distinct records.

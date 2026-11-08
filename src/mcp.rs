@@ -1579,7 +1579,7 @@ fn tools_list() -> Value {
         ),
         (
             "find_annotation_usages",
-            "Find explicit exact-descriptor DEX annotation usages on classes, fields, methods and parameters, with decoded values and original IDs. annotation_type accepts FQCN or descriptor. Returns requested_type_present and an ANNOTATION_TYPE_ABSENT warning when the type is absent from loaded DEX tables; zero matches do not exclude obfuscated equivalents. Pagination counts matching annotations; parameter_index excludes receiver.",
+            "Find explicit DEX annotation usages on classes, fields, methods and parameters, with decoded values and original IDs. annotation_type accepts FQCN or descriptor; match_mode selects exact_descriptor (default), simple_name (GET matches retrofit2.http.GET and a relocated ff.a.GET) or prefix (retrofit2.http matches every Retrofit HTTP annotation). Items report their actual annotation_type and the response lists matched_types. Returns requested_type_present and an ANNOTATION_TYPE_ABSENT warning when the type is absent from loaded DEX tables; zero matches do not exclude obfuscated equivalents. Pagination counts matching annotations; parameter_index excludes receiver.",
             vec!["annotation_type"],
             true,
         ),
@@ -1627,7 +1627,7 @@ fn tools_list() -> Value {
         ),
         (
             "find_network_stacks",
-            "Find networking evidence owned by package_prefix (dependencies may be outside it): exact OkHttp contract relationships, selected client/TLS/interceptor configuration invokes and exact typed builder-field writes, Retrofit method/parameter annotations, plus relocated OkHttp-compatible structural maps. kind distinguishes api_usage from structural_stack; only structural maps contain hook_map. Records retain exact declarations or DEX-local invoke offsets. @Url/@HeaderMap identify argument-supplied values, not external control. Detector coverage and empty-result limitations are explicit: scan completion does not establish absence of networking. Runtime activity, effective pinning and interceptor order are not inferred. Named evidence precedes structural maps; offset/limit page evidence records, max 100.",
+            "Find networking evidence owned by package_prefix (dependencies may be outside it). Obfuscated builds often declare Retrofit service interfaces and SDK endpoints in renamed top-level packages, so omit package_prefix for an app-wide inventory; a RETROFIT_SERVICES_OUTSIDE_PREFIX warning counts Retrofit-annotated classes the prefix excluded. Evidence: exact OkHttp contract relationships, selected client/TLS/interceptor configuration invokes and exact typed builder-field writes, Retrofit method/parameter annotations, plus relocated OkHttp-compatible structural maps. kind distinguishes api_usage from structural_stack; only structural maps contain hook_map. Records retain exact declarations or DEX-local invoke offsets. @Url/@HeaderMap identify argument-supplied values, not external control. Detector coverage and empty-result limitations are explicit: scan completion does not establish absence of networking. Runtime activity, effective pinning and interceptor order are not inferred. Named evidence precedes structural maps; offset/limit page evidence records, max 100.",
             vec![],
             true,
         ),
@@ -1723,7 +1723,7 @@ fn tools_list() -> Value {
         ),
         (
             "get_class_disassembly",
-            "Read native RDX DEX disassembly, not assemblable Smali.",
+            "Read native RDX DEX disassembly, not assemblable Smali. Class, field, method and parameter annotations are emitted as .annotation <build|runtime|system> <Type> blocks with name = value lines (.end annotation); parameter annotations sit under .param <zero-based index> inside the method. Retrofit @GET/@Url/@Path values, Kotlin metadata and dalvik system annotations are therefore visible at DEX level regardless of obfuscated interface names.",
             vec!["class_id"],
             true,
         ),
@@ -1835,6 +1835,8 @@ fn tools_list() -> Value {
         if name=="find_annotation_usages" {
             properties.insert("element".into(),json!({"type":"string","enum":["all","class","field","method","parameter"],"default":"all"}));
             properties.insert("package_prefix".into(),json!({"type":"string"}));
+            properties.insert("match_mode".into(),json!({"type":"string","enum":["exact_descriptor","simple_name","prefix"],"default":"exact_descriptor",
+                "description":"exact_descriptor compares the complete descriptor; simple_name compares the class name after the last package separator, so GET matches retrofit2.http.GET and relocated copies; prefix matches a literal FQCN or package prefix such as retrofit2.http on the internal name"}));
         }
         if name=="search_resources" {
             properties.insert("scope".into(),json!({"type":"string","enum":["resource_table","assets"],"default":"resource_table","description":"assets searches UTF-8 asset contents and paths, one paginated record per matching file; skipped binary/oversized files are explicit"}));
@@ -3263,6 +3265,54 @@ mod tests {
             let response = remote(&record, tool, &args).unwrap();
             assert_eq!(response["identity"]["project_id"], scope["project_id"]);
         }
+        // Simple-name and prefix annotation queries reach the DEX annotation
+        // directories without knowing the (possibly renamed) package.
+        let mut args = scope.clone();
+        args.as_object_mut().unwrap().extend(
+            json!({"annotation_type":"Signature","match_mode":"simple_name"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        validate("find_annotation_usages", &args).unwrap();
+        let simple = remote(&record, "find_annotation_usages", &args).unwrap();
+        assert_eq!(simple["data"]["match_mode"], "simple_name");
+        assert_eq!(
+            simple["data"]["matched_types"],
+            json!(["Ldalvik/annotation/Signature;"])
+        );
+        assert!(simple["data"]["total"].as_u64().unwrap() >= 1, "{simple}");
+        let mut args = scope.clone();
+        args.as_object_mut().unwrap().extend(
+            json!({"annotation_type":"dalvik.annotation","match_mode":"prefix","element":"class"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let prefix = remote(&record, "find_annotation_usages", &args).unwrap();
+        assert_eq!(prefix["data"]["annotation_type"], "dalvik/annotation");
+        assert!(
+            prefix["data"]["matched_types"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("Ldalvik/annotation/InnerClass;")),
+            "{prefix}"
+        );
+        assert!(
+            prefix["data"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["element"] == "class"),
+            "{prefix}"
+        );
+        assert!(
+            validate(
+                "find_annotation_usages",
+                &json!({"instance_id":"i","project_id":"p","annotation_type":"GET","match_mode":"fuzzy"})
+            )
+            .is_err()
+        );
         let mut args = scope.clone();
         args.as_object_mut().unwrap().extend(json!({"method_id":"sample.Target.doubleValue(I)I","direction":"callers","projection":"call_sites","include_const_args":true}).as_object().unwrap().clone());
         let result = remote(&record, "get_call_graph", &args).unwrap();

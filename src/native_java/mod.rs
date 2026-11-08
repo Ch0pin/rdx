@@ -1599,9 +1599,17 @@ fn upgrade_methods_controlled(
             .unwrap_or_else(|_| render_mixed_field_fallback(name, class, field));
         let byte = boundaries[definition.start];
         let begin = raw.source[..byte].rfind('\n').map_or(0, |n| n + 1);
-        let Some(end) = raw.source[byte..].find('\n').map(|n| byte + n + 1) else {
+        let Some(mut end) = raw.source[byte..].find('\n').map(|n| byte + n + 1) else {
             continue;
         };
+        // Field annotation directives follow the declaration line; the Java
+        // field renders the same annotations itself.
+        while raw.source[end..].starts_with("    .annotation ") {
+            match raw.source[end..].find("\n    .end annotation\n") {
+                Some(n) => end += n + "\n    .end annotation\n".len(),
+                None => break,
+            }
+        }
         let (Ok(start), Ok(end)) = (
             boundaries.binary_search(&begin),
             boundaries.binary_search(&end),
@@ -1951,6 +1959,62 @@ mod initializer_tests {
                 .find(|link| link.label == "sample.Hello.CONFIG:Ljava/lang/String;")
                 .map(|link| (link.start, link.end)),
             Some((definition.start, definition.end))
+        );
+    }
+
+    #[test]
+    fn upgraded_fields_absorb_their_dex_annotation_directives() {
+        use crate::native_dex::{DexAnnotation, DexAnnotationDirectory};
+        use std::sync::Arc;
+
+        let mut class = crate::native_dex::parse(include_bytes!("../../tests/fixtures/hello.dex"))
+            .unwrap()
+            .classes
+            .remove(0);
+        class.fields = vec![DexField {
+            declaring_type: class.descriptor.clone(),
+            name: "token".into(),
+            field_type: "Ljava/lang/String;".into(),
+            access_flags: 0x2,
+            is_static: false,
+        }];
+        class.annotations_offset = 77;
+        let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+        let type_idx = symbols.types.len() as u32;
+        symbols.types.push("Lsample/Marker;".into());
+        symbols.annotations.insert(
+            77,
+            Arc::new(DexAnnotationDirectory {
+                fields: vec![Some(Arc::from([Arc::new(DexAnnotation {
+                    visibility: 1,
+                    type_idx,
+                    elements: vec![],
+                })]))],
+                ..Default::default()
+            }),
+        );
+        let raw = crate::native_engine::disassembly::render("sample.Hello", &class);
+        assert!(
+            raw.source.contains(
+                "\n.field sample.Hello.token:Ljava/lang/String; // access=0x2\n    .annotation runtime sample.Marker\n    .end annotation\n"
+            ),
+            "{}",
+            raw.source
+        );
+        let upgraded = upgrade_methods("sample.Hello", &class, raw);
+        assert!(
+            !upgraded
+                .source
+                .contains(".annotation runtime sample.Marker"),
+            "{}",
+            upgraded.source
+        );
+        assert!(
+            upgraded
+                .source
+                .contains("\n    @Marker\n    private String token;\n"),
+            "{}",
+            upgraded.source
         );
     }
 

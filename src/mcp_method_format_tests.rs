@@ -105,7 +105,7 @@ fn method_source_forced_dex_is_one_raw_method_with_stable_paging_and_lookup() {
     assert_eq!(forced["source_hash"], crate::engine::source_identity(text));
     let class = engine.dex_class("sample.Target").unwrap();
     let method = crate::method_lookup::resolve(class, id).unwrap();
-    let expected = crate::native_engine::disassembly::render_method(method, &class.symbols);
+    let expected = crate::native_engine::disassembly::render_method(class, method);
     assert_eq!(text, expected.source);
     let mut assembled = String::new();
     let mut offset = 0;
@@ -283,7 +283,7 @@ fn method_source_requested_disassembly_is_distinct_from_failed_reconstruction() 
     let owner = crate::method_lookup::owner(&id).unwrap();
     let class = engine.dex_class(owner).unwrap();
     let method = crate::method_lookup::resolve(class, &id).unwrap();
-    let expected = crate::native_engine::disassembly::render_method(method, &class.symbols);
+    let expected = crate::native_engine::disassembly::render_method(class, method);
     assert_eq!(raw, expected.source);
     assert!(raw.contains("monitor-enter"));
     assert!(!raw.contains("reconstruction failed"));

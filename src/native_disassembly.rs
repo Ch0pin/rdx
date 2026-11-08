@@ -1,7 +1,9 @@
 //! Native DEX instruction rendering. This is disassembly, not reconstructed Java.
 use crate::{
     engine::{CodeDefinition, CodeLink, DecompiledCode},
-    native_dex::{DexClass, DexMethod, DexSymbols},
+    native_dex::{
+        DexAnnotationDirectory, DexAnnotationSet, DexClass, DexMethod, DexSymbols, DexValue,
+    },
 };
 pub fn type_name(value: &str) -> String {
     value
@@ -151,8 +153,12 @@ fn render_with_header(name: &str, class: &DexClass, header: &str) -> DecompiledC
         out.reference(&type_name(interface));
         out.push("\n");
     }
+    let directory = annotation_directory(class);
+    if let Some(set) = directory.and_then(|d| d.class.as_ref()) {
+        append_annotations(&mut out, &class.symbols, set, "");
+    }
     let mut static_index = 0;
-    for field in &class.fields {
+    for (index, field) in class.fields.iter().enumerate() {
         out.push(".field ");
         out.definition(
             "field",
@@ -167,9 +173,20 @@ fn render_with_header(name: &str, class: &DexClass, header: &str) -> DecompiledC
             static_index += 1;
         }
         out.push("\n");
+        if let Some(set) = directory
+            .and_then(|d| d.fields.get(index))
+            .and_then(Option::as_ref)
+        {
+            append_annotations(&mut out, &class.symbols, set, "    ");
+        }
     }
-    for method in &class.methods {
-        append_method(&mut out, method, &class.symbols);
+    for (index, method) in class.methods.iter().enumerate() {
+        append_method(
+            &mut out,
+            method,
+            &class.symbols,
+            method_annotations(directory, index),
+        );
     }
     let source_hash = crate::engine::source_identity(&out.text);
     DecompiledCode {
@@ -177,6 +194,178 @@ fn render_with_header(name: &str, class: &DexClass, header: &str) -> DecompiledC
         source_hash,
         links: out.links,
         definitions: out.definitions,
+    }
+}
+fn annotation_directory(class: &DexClass) -> Option<&DexAnnotationDirectory> {
+    class
+        .symbols
+        .annotations
+        .get(&class.annotations_offset)
+        .map(AsRef::as_ref)
+}
+/// Annotation sets attached to one method: the method itself and its parameters.
+#[derive(Clone, Copy, Default)]
+struct MethodAnnotations<'a> {
+    method: Option<&'a DexAnnotationSet>,
+    parameters: &'a [Option<DexAnnotationSet>],
+}
+fn method_annotations(
+    directory: Option<&DexAnnotationDirectory>,
+    index: usize,
+) -> MethodAnnotations<'_> {
+    let Some(directory) = directory else {
+        return MethodAnnotations::default();
+    };
+    MethodAnnotations {
+        method: directory.methods.get(index).and_then(Option::as_ref),
+        parameters: directory.parameters.get(index).map_or(&[], Vec::as_slice),
+    }
+}
+fn visibility_name(visibility: u8) -> &'static str {
+    match visibility {
+        0 => "build",
+        1 => "runtime",
+        2 => "system",
+        _ => "unknown",
+    }
+}
+const ANNOTATION_STRING_CHARS: usize = 2048;
+const ANNOTATION_ARRAY_ITEMS: usize = 64;
+const ANNOTATION_NESTING: usize = 8;
+/// Element names are DEX strings; quote anything that is not a plain identifier.
+fn push_element_name(out: &mut Output, symbols: &DexSymbols, index: u32) {
+    match symbols.strings.get(index as usize) {
+        Some(name)
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '_' | '$')) =>
+        {
+            out.push(name)
+        }
+        Some(name) => out.push(&format!("{name:?}")),
+        None => out.push(&format!("<invalid s index {index}>")),
+    }
+}
+/// Textual encoded value for annotation directives, bounded in length and depth.
+fn append_value(out: &mut Output, symbols: &DexSymbols, value: &DexValue, depth: usize) {
+    match value {
+        DexValue::Byte(v) => out.push(&format!("{v}t")),
+        DexValue::Short(v) => out.push(&format!("{v}s")),
+        DexValue::Char(v) => match char::from_u32(u32::from(*v)) {
+            Some(c) => out.push(&format!("{c:?}")),
+            None => out.push(&format!("'\\u{v:04x}'")),
+        },
+        DexValue::Int(v) => out.push(&v.to_string()),
+        DexValue::Long(v) => out.push(&format!("{v}L")),
+        DexValue::Float(bits) => out.push(&format!("{:?}f", f32::from_bits(*bits))),
+        DexValue::Double(bits) => out.push(&format!("{:?}", f64::from_bits(*bits))),
+        DexValue::Boolean(v) => out.push(if *v { "true" } else { "false" }),
+        DexValue::Null => out.push("null"),
+        DexValue::String(index) => match symbols.strings.get(*index as usize) {
+            Some(s) => {
+                let total = s.chars().count();
+                if total <= ANNOTATION_STRING_CHARS {
+                    out.push(&format!("{s:?}"));
+                } else {
+                    let end = s
+                        .char_indices()
+                        .nth(ANNOTATION_STRING_CHARS)
+                        .map_or(s.len(), |(byte, _)| byte);
+                    out.push(&format!(
+                        "{:?} /* +{} chars */",
+                        &s[..end],
+                        total - ANNOTATION_STRING_CHARS
+                    ));
+                }
+            }
+            None => out.push(&format!("<invalid s index {index}>")),
+        },
+        DexValue::Type(index) => match symbol(symbols, 't', *index as usize) {
+            Some(ty) => out.reference(&ty),
+            None => out.push(&format!("<invalid t index {index}>")),
+        },
+        DexValue::Enum(index) | DexValue::Field(index) => {
+            match symbol(symbols, 'f', *index as usize) {
+                Some(field) => out.reference(&field),
+                None => out.push(&format!("<invalid f index {index}>")),
+            }
+        }
+        DexValue::Method(index) => match symbol(symbols, 'm', *index as usize) {
+            Some(method) => out.reference(&method),
+            None => out.push(&format!("<invalid m index {index}>")),
+        },
+        DexValue::MethodType(index) => match symbol(symbols, 'p', *index as usize) {
+            Some(proto) => out.push(&proto),
+            None => out.push(&format!("<invalid p index {index}>")),
+        },
+        DexValue::MethodHandle(index) => out.push(&format!("method_handle@{index}")),
+        DexValue::Array(values) => {
+            out.push("{");
+            for (i, item) in values.iter().take(ANNOTATION_ARRAY_ITEMS).enumerate() {
+                if i != 0 {
+                    out.push(", ");
+                }
+                append_value(out, symbols, item, depth);
+            }
+            if values.len() > ANNOTATION_ARRAY_ITEMS {
+                out.push(&format!(
+                    ", /* +{} items */",
+                    values.len() - ANNOTATION_ARRAY_ITEMS
+                ));
+            }
+            out.push("}");
+        }
+        DexValue::Annotation { type_idx, elements } => {
+            if depth >= ANNOTATION_NESTING {
+                out.push("@<nesting limit>");
+                return;
+            }
+            out.push("@");
+            match symbol(symbols, 't', *type_idx as usize) {
+                Some(ty) => out.reference(&ty),
+                None => out.push(&format!("<invalid t index {type_idx}>")),
+            }
+            out.push("(");
+            for (i, (name, item)) in elements.iter().enumerate() {
+                if i != 0 {
+                    out.push(", ");
+                }
+                push_element_name(out, symbols, *name);
+                out.push(" = ");
+                append_value(out, symbols, item, depth + 1);
+            }
+            out.push(")");
+        }
+    }
+}
+/// Emit one `.annotation <visibility> <Type>` block per annotation in the set.
+fn append_annotations(
+    out: &mut Output,
+    symbols: &DexSymbols,
+    set: &DexAnnotationSet,
+    indent: &str,
+) {
+    for annotation in set.iter() {
+        out.push(indent);
+        out.push(".annotation ");
+        out.push(visibility_name(annotation.visibility));
+        out.push(" ");
+        match symbol(symbols, 't', annotation.type_idx as usize) {
+            Some(ty) => out.reference(&ty),
+            None => out.push(&format!("<invalid t index {}>", annotation.type_idx)),
+        }
+        out.push("\n");
+        for (name, value) in &annotation.elements {
+            out.push(indent);
+            out.push("    ");
+            push_element_name(out, symbols, *name);
+            out.push(" = ");
+            append_value(out, symbols, value, 0);
+            out.push("\n");
+        }
+        out.push(indent);
+        out.push(".end annotation\n");
     }
 }
 /// Stop Debug formatting at a bounded prefix, including nested encoded values.
@@ -601,10 +790,30 @@ const BINARY_TWO: [&str; 32] = [
     "rem-double/2addr",
 ];
 
-fn append_method(out: &mut Output, method: &DexMethod, symbols: &DexSymbols) {
+fn append_method(
+    out: &mut Output,
+    method: &DexMethod,
+    symbols: &DexSymbols,
+    annotations: MethodAnnotations<'_>,
+) {
     out.push("\n.method ");
     out.definition("method", &method.name, &method_id(method));
     out.push(&format!(" // access=0x{:x}\n", method.access_flags));
+    if let Some(set) = annotations.method {
+        append_annotations(out, symbols, set, "    ");
+    }
+    for (index, set) in annotations.parameters.iter().enumerate() {
+        let Some(set) = set else { continue };
+        out.push(&format!(
+            "    .param {index} // zero-based, receiver excluded"
+        ));
+        match method.parameters.get(index) {
+            Some(ty) => out.push(&format!("; type {ty}\n")),
+            None => out.push("; no declared parameter at this index\n"),
+        }
+        append_annotations(out, symbols, set, "        ");
+        out.push("    .end param\n");
+    }
     for ty in &method.thrown_types {
         out.push("    .throws ");
         out.reference(&type_name(ty));
@@ -695,9 +904,17 @@ fn append_method(out: &mut Output, method: &DexMethod, symbols: &DexSymbols) {
     out.push(".end method\n");
 }
 
-pub(crate) fn render_method(method: &DexMethod, symbols: &DexSymbols) -> DecompiledCode {
+/// Render one declared method of `class`, including its annotation directives.
+pub(crate) fn render_method(class: &DexClass, method: &DexMethod) -> DecompiledCode {
+    let annotations = class
+        .methods
+        .iter()
+        .position(|candidate| std::ptr::eq(candidate, method))
+        .map_or_else(MethodAnnotations::default, |index| {
+            method_annotations(annotation_directory(class), index)
+        });
     let mut out = Output::default();
-    append_method(&mut out, method, symbols);
+    append_method(&mut out, method, &class.symbols, annotations);
     DecompiledCode {
         source_hash: crate::engine::source_identity(&out.text),
         source: out.text,
@@ -720,7 +937,7 @@ mod tests {
             .unwrap();
         let full = render("sample.Caller", class);
         for method in &class.methods {
-            let single = render_method(method, &class.symbols);
+            let single = render_method(class, method);
             assert_eq!(single.source.matches("\n.method ").count(), 1);
             assert_eq!(single.source.matches(".end method\n").count(), 1);
             assert!(full.source.contains(&single.source));
@@ -740,6 +957,151 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn annotation_directives_cover_every_owner_with_bounded_linked_values() {
+        use crate::native_dex::{
+            self, DexAnnotation, DexAnnotationDirectory, DexField, DexSymbols,
+        };
+        use std::sync::Arc;
+        let mut c = native_dex::parse(include_bytes!("../tests/fixtures/hello.dex"))
+            .unwrap()
+            .classes
+            .remove(0);
+        c.methods.retain(|m| m.name.as_ref() == "answer");
+        c.fields = vec![DexField {
+            declaring_type: c.descriptor.clone(),
+            name: "token".into(),
+            field_type: "Ljava/lang/String;".into(),
+            access_flags: 0x2,
+            is_static: false,
+        }];
+        c.annotations_offset = 1;
+        let long = "x".repeat(ANNOTATION_STRING_CHARS + 7);
+        let set = |visibility, type_idx, elements| -> DexAnnotationSet {
+            Arc::from([Arc::new(DexAnnotation {
+                visibility,
+                type_idx,
+                elements,
+            })])
+        };
+        let mut symbols = DexSymbols {
+            strings: vec![
+                "value".into(),
+                "https://api.example.com/{id}".into(),
+                "weird name".into(),
+                long.clone(),
+                "id".into(),
+                "INNER".into(),
+            ],
+            types: vec![
+                "Lretrofit2/http/GET;".into(),
+                "Lretrofit2/http/Path;".into(),
+                "Lsample/Marker;".into(),
+                "Ljava/lang/String;".into(),
+                "Lsample/Kind;".into(),
+                "Ldalvik/annotation/InnerClass;".into(),
+                "Lsample/Nested;".into(),
+            ],
+            fields: vec![(4, 4, 5)],
+            ..Default::default()
+        };
+        symbols.annotations.insert(
+            1,
+            Arc::new(DexAnnotationDirectory {
+                class: Some(set(
+                    2,
+                    5,
+                    vec![(0, DexValue::Int(9)), (2, DexValue::Boolean(true))],
+                )),
+                fields: vec![Some(set(
+                    1,
+                    2,
+                    vec![(
+                        0,
+                        DexValue::Array(vec![
+                            DexValue::Type(3),
+                            DexValue::Enum(0),
+                            DexValue::Annotation {
+                                type_idx: 6,
+                                elements: vec![(0, DexValue::Long(5))],
+                            },
+                        ]),
+                    )],
+                ))],
+                methods: vec![Some(set(1, 0, vec![(0, DexValue::String(1))]))],
+                parameters: vec![vec![
+                    Some(set(1, 1, vec![(0, DexValue::String(4))])),
+                    Some(set(
+                        0,
+                        2,
+                        vec![(4, DexValue::String(3)), (0, DexValue::String(99))],
+                    )),
+                ]],
+            }),
+        );
+        c.symbols = Arc::new(symbols);
+        let full = render("sample.Hello", &c);
+        let text = &full.source;
+        assert!(
+            text.contains(
+                "\n.annotation system dalvik.annotation.InnerClass\n    value = 9\n    \"weird name\" = true\n.end annotation\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\n.field sample.Hello.token:Ljava/lang/String; // access=0x2\n    .annotation runtime sample.Marker\n        value = {java.lang.String, sample.Kind.INNER:Lsample/Kind;, @sample.Nested(value = 5L)}\n    .end annotation\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                " // access=0x1\n    .annotation runtime retrofit2.http.GET\n        value = \"https://api.example.com/{id}\"\n    .end annotation\n    .param 0 // zero-based, receiver excluded;"
+            ) || text.contains(
+                "\n    .annotation runtime retrofit2.http.GET\n        value = \"https://api.example.com/{id}\"\n    .end annotation\n    .param 0 // zero-based, receiver excluded;"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\n        .annotation runtime retrofit2.http.Path\n            value = \"id\"\n        .end annotation\n    .end param\n    .param 1 // zero-based, receiver excluded;"
+            ),
+            "{text}"
+        );
+        let truncated = format!(
+            "\n        .annotation build sample.Marker\n            id = \"{}\" /* +7 chars */\n            value = <invalid s index 99>\n        .end annotation\n    .end param\n    .registers ",
+            "x".repeat(ANNOTATION_STRING_CHARS)
+        );
+        assert!(text.contains(&truncated), "{text}");
+        for label in [
+            "dalvik.annotation.InnerClass",
+            "sample.Marker",
+            "java.lang.String",
+            "sample.Kind.INNER:Lsample/Kind;",
+            "sample.Nested",
+            "retrofit2.http.GET",
+            "retrofit2.http.Path",
+        ] {
+            assert!(full.links.iter().any(|l| l.label == label), "{label}");
+        }
+        for link in &full.links {
+            assert_eq!(
+                text.chars()
+                    .skip(link.start)
+                    .take(link.end - link.start)
+                    .collect::<String>(),
+                link.label
+            );
+        }
+        let single = render_method(&c, &c.methods[0]);
+        assert!(single.source.contains(".param 1 "));
+        assert!(text.contains(&single.source));
+        assert!(
+            crate::native_engine::disassembly::render("sample.Hello", &c)
+                .source
+                .contains(".annotation runtime retrofit2.http.GET")
+        );
     }
     #[test]
     fn payload_boundaries_and_signed_branches() {

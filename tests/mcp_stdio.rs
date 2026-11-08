@@ -181,6 +181,10 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         json!(["all", "class", "field", "method", "parameter"])
     );
     assert_eq!(
+        schema("find_annotation_usages")["properties"]["match_mode"]["enum"],
+        json!(["exact_descriptor", "simple_name", "prefix"])
+    );
+    assert_eq!(
         schema("get_resource_value")["anyOf"],
         json!([{"required":["resource_id"]},{"required":["resource_name"]}])
     );

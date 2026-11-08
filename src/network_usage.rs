@@ -315,18 +315,15 @@ pub(super) fn scan(
         .iter()
         .map(|c| (c.descriptor.as_ref(), *c))
         .collect();
-    let scoped: Vec<_> = classes
-        .iter()
-        .copied()
-        .filter(|c| {
-            let name = type_name(&c.descriptor);
-            prefix.is_empty()
-                || name == prefix
-                || name
-                    .strip_prefix(prefix)
-                    .is_some_and(|s| s.starts_with('.'))
-        })
-        .collect();
+    let in_scope = |c: &DexClass| {
+        let name = type_name(&c.descriptor);
+        prefix.is_empty()
+            || name == prefix
+            || name
+                .strip_prefix(prefix)
+                .is_some_and(|s| s.starts_with('.'))
+    };
+    let scoped: Vec<_> = classes.iter().copied().filter(|c| in_scope(c)).collect();
     let mut scan = Scan {
         work: Work {
             remaining: budget,
@@ -512,10 +509,74 @@ pub(super) fn scan(
         }
     }
     complete &= scan.error_count == 0;
+    let work_budget_exhausted = scan.work.remaining == 0;
+    let outside_prefix = if prefix.is_empty() {
+        Value::Null
+    } else {
+        retrofit_outside_prefix(
+            classes.iter().copied().filter(|c| !in_scope(c)),
+            &mut scan.work,
+        )?
+    };
     Ok(
         json!({"items":scan.page.items,"matching_candidates_so_far":scan.page.total,
         "coverage":{"detector":"known_network_usage","complete":complete,"selected_classes":scoped.len(),"visited_classes":scan.classes,
-            "detectors_run":["okhttp_contracts","named_network_calls","named_network_fields","retrofit_annotations"],"work_budget_exhausted":scan.work.remaining==0,
+            "detectors_run":["okhttp_contracts","named_network_calls","named_network_fields","retrofit_annotations"],"work_budget_exhausted":work_budget_exhausted,
+            "retrofit_annotations_outside_prefix":outside_prefix,
             "errors":scan.errors,"error_count":scan.error_count,"scope":"Exact named OkHttp/Retrofit descriptors in selected classes, including loaded hierarchy edges. Renamed APIs, reflection and missing external hierarchy definitions are not resolved."}}),
+    )
+}
+
+/// Count Retrofit-annotated declarations that `package_prefix` excluded, so a
+/// zero result on an obfuscated build names the renamed top-level packages.
+fn retrofit_outside_prefix<'a>(
+    classes: impl Iterator<Item = &'a DexClass>,
+    work: &mut Work<'_>,
+) -> Result<Value> {
+    let mut owners = 0usize;
+    let mut methods = 0usize;
+    let mut examples = Vec::new();
+    let mut complete = true;
+    for c in classes {
+        if !work.take(1)? {
+            complete = false;
+            break;
+        }
+        let Some(directory) = c.symbols.annotations.get(&c.annotations_offset) else {
+            continue;
+        };
+        let role = |set: &Option<DexAnnotationSet>, parameter: bool| {
+            set.as_ref().is_some_and(|set| {
+                set.iter().any(|a| {
+                    c.symbols
+                        .types
+                        .get(a.type_idx as usize)
+                        .is_some_and(|ty| annotation_role(ty, parameter).is_some())
+                })
+            })
+        };
+        let annotated = (0..c.methods.len())
+            .filter(|&mi| {
+                directory
+                    .methods
+                    .get(mi)
+                    .is_some_and(|set| role(set, false))
+                    || directory
+                        .parameters
+                        .get(mi)
+                        .is_some_and(|sets| sets.iter().any(|set| role(set, true)))
+            })
+            .count();
+        if annotated > 0 {
+            owners += 1;
+            methods += annotated;
+            if examples.len() < 10 {
+                examples.push(type_name(&c.descriptor));
+            }
+        }
+    }
+    Ok(
+        json!({"classes":owners,"methods":methods,"examples":examples,"examples_limit":10,"complete":complete,
+        "scope":"Classes outside package_prefix declaring retrofit2.http method or parameter annotations; counted, not scanned for other evidence"}),
     )
 }

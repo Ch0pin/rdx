@@ -248,6 +248,15 @@ fn detect(
     result["coverage"]["scope"] = json!(
         "Completion means the configured detector scans finished within their budgets; it does not establish absence of networking. Exact API usage and structural maps are separate evidence records, not unique runtime stacks."
     );
+    let outside = &known["coverage"]["retrofit_annotations_outside_prefix"];
+    let mut warnings = result["warnings"].as_array().cloned().unwrap_or_default();
+    if let Some(classes) = outside["classes"].as_u64().filter(|n| *n > 0) {
+        warnings.push(json!({"code":"RETROFIT_SERVICES_OUTSIDE_PREFIX",
+            "message":format!("{classes} class(es) with {} Retrofit-annotated method(s) are declared outside package_prefix {:?} and were excluded from this scan. Obfuscated builds commonly place Retrofit service interfaces and SDK endpoints in renamed top-level packages; repeat the query without package_prefix, or with the listed example packages, to include them.",
+                outside["methods"], result["coverage"]["package_prefix"].as_str().unwrap_or("")),
+            "classes":classes,"methods":outside["methods"],"examples":outside["examples"],"examples_limit":outside["examples_limit"],"count_complete":outside["complete"]}));
+    }
+    result["warnings"] = json!(warnings);
     result["empty_result_note"] = if total == 0 {
         json!(
             "No evidence matched the named-API and structural detectors in this scope. Unsupported/renamed libraries, reflection, unavailable hierarchy definitions or unmodeled layouts may still provide networking."
@@ -819,12 +828,41 @@ mod tests {
             )]),
             ..Default::default()
         });
-        let result = run(&[c], json!({"package_prefix":"app"}));
+        let classes = [c];
+        let result = run(&classes, json!({"package_prefix":"app"}));
         assert_eq!(result["total"], 3);
         assert_eq!(result["items"][1]["parameter_index"], 0);
         assert_eq!(result["items"][1]["role"], "url_parameter");
         assert_eq!(result["items"][2]["role"], "header_map_parameter");
         assert_eq!(result["items"][2]["external_control"], "not_analyzed");
+        assert_eq!(result["warnings"], json!([]));
+        assert_eq!(
+            result["coverage"]["detector_coverage"][0]["retrofit_annotations_outside_prefix"]["classes"],
+            0
+        );
+        // A prefix that misses the renamed service package reports what it excluded.
+        let excluded = run(&classes, json!({"package_prefix":"com.example"}));
+        assert_eq!(excluded["total"], 0, "{excluded}");
+        assert_eq!(excluded["coverage"]["complete"], true);
+        let warning = &excluded["warnings"][0];
+        assert_eq!(warning["code"], "RETROFIT_SERVICES_OUTSIDE_PREFIX");
+        assert_eq!(warning["classes"], 1);
+        assert_eq!(warning["methods"], 1);
+        assert_eq!(warning["examples"], json!(["app.Api"]));
+        assert_eq!(warning["count_complete"], true);
+        assert!(
+            warning["message"]
+                .as_str()
+                .unwrap()
+                .contains("without package_prefix")
+        );
+        let unscoped = run(&classes, json!({}));
+        assert_eq!(unscoped["total"], 3);
+        assert_eq!(unscoped["warnings"], json!([]));
+        assert!(
+            unscoped["coverage"]["detector_coverage"][0]["retrofit_annotations_outside_prefix"]
+                .is_null()
+        );
     }
     #[test]
     fn merged_detector_paging_is_lossless_and_payloads_are_not_invokes() {

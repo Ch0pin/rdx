@@ -232,28 +232,101 @@ pub(super) fn annotations(
     )
 }
 
+/// How `annotation_type` selects DEX annotation types.
+enum AnnotationQuery {
+    /// The complete descriptor, `Lretrofit2/http/GET;`.
+    Exact(String),
+    /// The simple class name after the last package separator, `GET`.
+    SimpleName(String),
+    /// A literal prefix of the internal name, `retrofit2/http`.
+    Prefix(String),
+}
+impl AnnotationQuery {
+    fn parse(args: &Value) -> Result<Self> {
+        let requested = required(args, "annotation_type")?;
+        let internal = requested
+            .strip_prefix('L')
+            .and_then(|s| s.strip_suffix(';'))
+            .unwrap_or(requested)
+            .replace('.', "/");
+        ensure!(!internal.is_empty(), "annotation_type must not be empty");
+        Ok(
+            match args["match_mode"].as_str().unwrap_or("exact_descriptor") {
+                "exact_descriptor" => Self::Exact(format!("L{internal};")),
+                "simple_name" => Self::SimpleName(
+                    internal
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned(),
+                ),
+                "prefix" => Self::Prefix(internal),
+                other => bail!("Invalid match_mode {other:?}"),
+            },
+        )
+    }
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::Exact(_) => "exact_descriptor",
+            Self::SimpleName(_) => "simple_name",
+            Self::Prefix(_) => "prefix",
+        }
+    }
+    fn pattern(&self) -> &str {
+        match self {
+            Self::Exact(s) | Self::SimpleName(s) | Self::Prefix(s) => s,
+        }
+    }
+    fn matches(&self, descriptor: &str) -> bool {
+        match self {
+            Self::Exact(d) => descriptor == d,
+            Self::SimpleName(name) => {
+                descriptor
+                    .strip_prefix('L')
+                    .and_then(|s| s.strip_suffix(';'))
+                    .and_then(|s| s.rsplit('/').next())
+                    == Some(name)
+            }
+            Self::Prefix(prefix) => descriptor
+                .strip_prefix('L')
+                .and_then(|s| s.strip_suffix(';'))
+                .is_some_and(|s| s.starts_with(prefix)),
+        }
+    }
+    fn absence_message(&self) -> String {
+        let selector = match self {
+            Self::Exact(d) => format!("The annotation descriptor {d} is absent from"),
+            Self::SimpleName(n) => format!("No annotation type with simple name {n:?} exists in"),
+            Self::Prefix(p) => format!("No class type with internal-name prefix {p:?} exists in"),
+        };
+        format!(
+            "{selector} the loaded DEX type tables. Obfuscation, removal, or an incorrect name may explain this. Zero matches do not establish that equivalent annotations or API endpoints are absent. Query the actual DEX annotation name; no semantic alias was inferred."
+        )
+    }
+}
+/// Bounded distinct annotation types matched in the current scan.
+const MATCHED_TYPE_LIMIT: usize = 200;
+
 fn annotation_classes<'a>(
     classes: impl IntoIterator<Item = Result<(&'a str, &'a crate::native_dex::DexClass)>>,
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
-    let requested = required(args, "annotation_type")?;
-    let descriptor = if requested.starts_with('L') && requested.ends_with(';') {
-        requested.to_owned()
-    } else {
-        format!("L{};", requested.replace('.', "/"))
-    };
+    let query = AnnotationQuery::parse(args)?;
     let element = args["element"].as_str().unwrap_or("all");
     let mut page = scan::Page::new(args)?;
     let mut seen_tables = std::collections::HashSet::new();
     let mut type_present = false;
+    let mut matched_types = std::collections::BTreeSet::new();
+    let mut matched_types_complete = true;
     for class in classes {
         ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
         let (name, c) = class?;
         // Presence is project-wide, independent of result filters. Each shared
         // DEX type table is checked once; no Java reconstruction or index build.
         if !type_present && seen_tables.insert(Arc::as_ptr(&c.symbols)) {
-            type_present = c.symbols.types.iter().any(|ty| ty.as_ref() == descriptor);
+            type_present = c.symbols.types.iter().any(|ty| query.matches(ty));
         }
         if !scan::package_matches(name, args) {
             continue;
@@ -264,15 +337,23 @@ fn annotation_classes<'a>(
             }
             for annotation in set.iter() {
                 ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-                if c.symbols
+                let Some(descriptor) = c
+                    .symbols
                     .types
                     .get(annotation.type_idx as usize)
-                    .is_none_or(|t| t.as_ref() != descriptor)
-                {
+                    .filter(|t| query.matches(t))
+                else {
                     continue;
+                };
+                if matched_types.len() < MATCHED_TYPE_LIMIT
+                    || matched_types.contains(descriptor.as_ref())
+                {
+                    matched_types.insert(descriptor.to_string());
+                } else {
+                    matched_types_complete = false;
                 }
                 let mut item = owner.clone();
-                item["annotation_type"] = json!(descriptor);
+                item["annotation_type"] = json!(descriptor.as_ref());
                 item["visibility"] = json!(annotation.visibility);
                 item["values"] =
                     elements_value(&annotation.elements, &c.symbols, &mut (256 * 1024))?;
@@ -284,8 +365,10 @@ fn annotation_classes<'a>(
     }
     ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
     let mut result = page.finish()?;
-    result["annotation_type"] = json!(descriptor);
-    result["match_mode"] = json!("exact_descriptor");
+    result["annotation_type"] = json!(query.pattern());
+    result["match_mode"] = json!(query.mode());
+    result["matched_types"] = json!(matched_types);
+    result["matched_types_complete"] = json!(matched_types_complete);
     result["requested_type_present"] = json!(type_present);
     result["type_presence_scope"] =
         json!("DEX type tables of all loaded classes, before result filters");
@@ -294,11 +377,11 @@ fn annotation_classes<'a>(
     } else {
         json!([{
             "code": "ANNOTATION_TYPE_ABSENT",
-            "message": "The requested annotation descriptor is absent from the loaded DEX type tables. Obfuscation, removal, or an incorrect name may explain this. Zero exact-descriptor usages do not establish that equivalent annotations or API endpoints are absent. Query the actual DEX annotation name; no semantic alias was inferred."
+            "message": query.absence_message()
         }])
     };
     result["scope"] = json!(
-        "Complete covers explicit exact-descriptor DEX annotation usages within the supplied filters, not semantic equivalents under obfuscation. Parameter_index excludes the receiver. No inherited annotations or annotation defaults inferred."
+        "Complete covers explicit DEX annotation usages whose type matches match_mode (exact descriptor, simple name after the last package separator, or literal internal-name prefix) within the supplied filters, not semantic equivalents under obfuscation. Each item reports its actual annotation_type. Parameter_index excludes the receiver. No inherited annotations or annotation defaults inferred."
     );
     Ok(result)
 }
@@ -751,6 +834,8 @@ mod tests {
         assert_eq!(first["next_offset"], 1);
         assert_eq!(first["requested_type_present"], true);
         assert_eq!(first["items"][0]["annotation_type"], "Lqj/o;");
+        assert_eq!(first["matched_types"], json!(["Lqj/o;"]));
+        assert_eq!(first["matched_types_complete"], true);
         assert_eq!(first, query(json!({"annotation_type":"Lqj/o;", "limit":1})));
         let second = query(json!({"annotation_type":"qj.o", "offset":1, "limit":1}));
         assert_eq!(second["total"], 2);
@@ -761,6 +846,111 @@ mod tests {
                 [Ok(("sample.One", &classes[0]))],
                 &json!({"annotation_type":"qj.o"}),
                 &AtomicBool::new(true)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn annotation_simple_name_and_prefix_modes_match_relocated_types() {
+        use crate::native_dex::{self, DexAnnotation, DexAnnotationDirectory};
+        let mut c = native_dex::parse(include_bytes!("../tests/fixtures/hello.dex"))
+            .unwrap()
+            .classes
+            .remove(0);
+        c.methods.retain(|m| m.name.as_ref() == "answer");
+        c.annotations_offset = 1;
+        let annotation = |type_idx| {
+            Arc::from(vec![Arc::new(DexAnnotation {
+                visibility: 1,
+                type_idx,
+                elements: vec![],
+            })])
+        };
+        let mut symbols = DexSymbols {
+            types: vec![
+                "Lretrofit2/http/GET;".into(),
+                "Lff/a/GET;".into(),
+                "Lretrofit2/http/Url;".into(),
+                "Lretrofit2/Call;".into(),
+            ],
+            ..Default::default()
+        };
+        symbols.annotations.insert(
+            1,
+            Arc::new(DexAnnotationDirectory {
+                class: Some(annotation(0)),
+                methods: vec![Some(annotation(1))],
+                parameters: vec![vec![Some(annotation(2))]],
+                ..Default::default()
+            }),
+        );
+        c.symbols = Arc::new(symbols);
+        let cancel = AtomicBool::new(false);
+        let query = |args: Value| annotation_classes([Ok(("ff.g", &c))], &args, &cancel).unwrap();
+        let simple = query(json!({"annotation_type":"GET","match_mode":"simple_name"}));
+        assert_eq!(simple["total"], 2, "{simple}");
+        assert_eq!(simple["match_mode"], "simple_name");
+        assert_eq!(simple["annotation_type"], "GET");
+        assert_eq!(simple["requested_type_present"], true);
+        assert_eq!(simple["warnings"], json!([]));
+        assert_eq!(
+            simple["matched_types"],
+            json!(["Lff/a/GET;", "Lretrofit2/http/GET;"])
+        );
+        assert_eq!(simple["items"][0]["element"], "class");
+        assert_eq!(
+            simple["items"][0]["annotation_type"],
+            "Lretrofit2/http/GET;"
+        );
+        assert_eq!(simple["items"][1]["element"], "method");
+        assert_eq!(simple["items"][1]["annotation_type"], "Lff/a/GET;");
+        // Qualified spellings reduce to the same simple name.
+        for spelling in ["retrofit2.http.GET", "Lretrofit2/http/GET;", "ff/a/GET"] {
+            assert_eq!(
+                query(json!({"annotation_type":spelling,"match_mode":"simple_name"}))["total"],
+                2
+            );
+        }
+        let prefix = query(json!({"annotation_type":"retrofit2.http","match_mode":"prefix"}));
+        assert_eq!(prefix["total"], 2, "{prefix}");
+        assert_eq!(prefix["annotation_type"], "retrofit2/http");
+        assert_eq!(
+            prefix["matched_types"],
+            json!(["Lretrofit2/http/GET;", "Lretrofit2/http/Url;"])
+        );
+        assert_eq!(prefix["items"][1]["element"], "parameter");
+        assert_eq!(prefix["items"][1]["parameter_index"], 0);
+        assert_eq!(
+            query(json!({"annotation_type":"retrofit2.http.U","match_mode":"prefix"}))["total"],
+            1
+        );
+        // Presence follows the mode: retrofit2.Call exists but is not used as
+        // an annotation, while nothing in the tables starts with okhttp3.
+        let unused = query(json!({"annotation_type":"retrofit2.Call","match_mode":"prefix"}));
+        assert_eq!(unused["total"], 0);
+        assert_eq!(unused["requested_type_present"], true);
+        let absent = query(json!({"annotation_type":"okhttp3","match_mode":"prefix"}));
+        assert_eq!(absent["total"], 0);
+        assert_eq!(absent["requested_type_present"], false);
+        assert_eq!(absent["warnings"][0]["code"], "ANNOTATION_TYPE_ABSENT");
+        assert!(
+            absent["warnings"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("internal-name prefix \"okhttp3\"")
+        );
+        let missing = query(json!({"annotation_type":"Nope","match_mode":"simple_name"}));
+        assert_eq!(missing["requested_type_present"], false);
+        assert_eq!(missing["warnings"][0]["code"], "ANNOTATION_TYPE_ABSENT");
+        let exact = query(json!({"annotation_type":"retrofit2.http.GET"}));
+        assert_eq!(exact["total"], 1);
+        assert_eq!(exact["match_mode"], "exact_descriptor");
+        assert!(
+            annotation_classes(
+                [Ok(("ff.g", &c))],
+                &json!({"annotation_type":"GET","match_mode":"fuzzy"}),
+                &cancel
             )
             .is_err()
         );

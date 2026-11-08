@@ -959,6 +959,38 @@ fn basecamp_relocated_network_stacks() {
 }
 
 #[test]
+fn class_disassembly_emits_annotation_directives_with_values() {
+    let (mut engine, project) = fixture();
+    let read = |engine: &mut NativeEngine, class_id: &str| {
+        dispatch(
+            engine,
+            &project,
+            "get_class_disassembly",
+            &json!({"class_id":class_id}),
+            &false.into(),
+        )
+        .unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let inner = read(&mut engine, "sample.Target$Inner");
+    assert!(
+        inner.contains(
+            "\n.annotation system dalvik.annotation.EnclosingClass\n    value = sample.Target\n.end annotation\n.annotation system dalvik.annotation.InnerClass\n    accessFlags = 9\n    name = \"Inner\"\n.end annotation\n"
+        ),
+        "{inner}"
+    );
+    let caller = read(&mut engine, "sample.Caller");
+    assert!(
+        caller.contains(
+            ".method sample.Caller.targetType()Ljava/lang/Class; // access=0x9\n    .annotation system dalvik.annotation.Signature\n        value = {\"()\", \"Ljava/lang/Class<\", \"*>;\"}\n    .end annotation\n    .registers "
+        ),
+        "{caller}"
+    );
+}
+
+#[test]
 fn network_detector_schema_dispatch_and_limits() {
     let (mut engine, project) = fixture();
     validate(

@@ -585,7 +585,7 @@ impl NativeEngine {
         let method = crate::method_lookup::resolve(class, id)?;
         let (mut code, fallback) = if format == MethodSourceFormat::Dex {
             (
-                crate::native_engine::disassembly::render_method(method, &class.symbols),
+                crate::native_engine::disassembly::render_method(class, method),
                 None,
             )
         } else {
@@ -595,7 +595,7 @@ impl NativeEngine {
                     None,
                 ),
                 Err(error) => (
-                    crate::native_engine::disassembly::render_method(method, &class.symbols),
+                    crate::native_engine::disassembly::render_method(class, method),
                     Some(error.to_string()),
                 ),
             }

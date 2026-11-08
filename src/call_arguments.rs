@@ -36,6 +36,79 @@ fn transfer(i: &Instruction, state: &mut [Constant]) {
         }
     }
 }
+pub(crate) fn constant_bits_at(
+    m: &DexMethod,
+    pc: usize,
+    register: u16,
+    cancel: &AtomicBool,
+    work: &mut usize,
+) -> Result<Option<i64>> {
+    let code = m.code.as_ref().context("Method has no code")?;
+    ensure!(
+        code.instructions.len() <= 32768 && code.registers <= 512 && register < code.registers,
+        "Constant proof exceeds method budget"
+    );
+    let ir = DecodedMethod::decode(code)?;
+    let cfg = ControlFlowGraph::build(code)?;
+    ensure!(
+        cfg.blocks.len().saturating_mul(code.registers as usize) <= 100000,
+        "Constant proof exceeds state budget"
+    );
+    let instructions: HashMap<_, _> = ir.instructions.iter().map(|i| (i.pc, i)).collect();
+    let mut states = vec![None; cfg.blocks.len()];
+    let entry = *cfg.block_at.get(&0).context("No entry block")?;
+    states[entry] = Some(vec![Constant::Unknown; code.registers as usize]);
+    let mut queue = VecDeque::from([entry]);
+    let mut queued = vec![false; cfg.blocks.len()];
+    queued[entry] = true;
+    while let Some(b) = queue.pop_front() {
+        queued[b] = false;
+        ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+        let mut state = states[b].clone().unwrap();
+        for at in &cfg.blocks[b].instructions {
+            *work += 1;
+            ensure!(*work <= 2_000_000, "Constant proof exceeds work budget");
+            transfer(instructions[at], &mut state);
+        }
+        for edge in &cfg.blocks[b].successors {
+            let incoming = if edge.kind == EdgeKind::Exceptional {
+                vec![Constant::Unknown; state.len()]
+            } else {
+                state.clone()
+            };
+            let changed = if let Some(old) = &mut states[edge.target] {
+                let mut changed = false;
+                for (a, b) in old.iter_mut().zip(incoming) {
+                    if *a != b && *a != Constant::Unknown {
+                        *a = Constant::Unknown;
+                        changed = true;
+                    }
+                }
+                changed
+            } else {
+                states[edge.target] = Some(incoming);
+                true
+            };
+            if changed && !queued[edge.target] {
+                queued[edge.target] = true;
+                queue.push_back(edge.target);
+            }
+        }
+    }
+    for (block, input) in cfg.blocks.iter().zip(states) {
+        let Some(mut state) = input else { continue };
+        for at in &block.instructions {
+            if *at == pc {
+                return Ok(match state[register as usize] {
+                    Constant::Bits(v) => Some(v),
+                    _ => None,
+                });
+            }
+            transfer(instructions[at], &mut state);
+        }
+    }
+    Ok(None)
+}
 pub(crate) fn analyze(
     c: &DexClass,
     m: &DexMethod,

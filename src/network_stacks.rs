@@ -192,6 +192,13 @@ fn detect(
     cancel: &AtomicBool,
     budget: usize,
 ) -> Result<Value> {
+    if args["projection"] == "services" {
+        return usage::services(classes, args, cancel, budget);
+    }
+    ensure!(
+        args["projection"].is_null() || args["projection"] == "all",
+        "projection must be all or services"
+    );
     let offset = args["offset"].as_u64().unwrap_or(0) as usize;
     let limit = args["limit"].as_u64().unwrap_or(25) as usize;
     ensure!((1..=100).contains(&limit), "limit must be 1..100");
@@ -243,6 +250,7 @@ fn detect(
     result["coverage"]["supported_families"] = json!([
         "okhttp3-named-usage",
         "retrofit2-named-usage",
+        "retrofit-conservatively-recovered-annotations-and-services",
         "okhttp-compatible-structural"
     ]);
     result["coverage"]["scope"] = json!(
@@ -250,7 +258,7 @@ fn detect(
     );
     result["empty_result_note"] = if total == 0 {
         json!(
-            "No evidence matched the named-API and structural detectors in this scope. Unsupported/renamed libraries, reflection, unavailable hierarchy definitions or unmodeled layouts may still provide networking."
+            "No evidence matched the named-API, recovered-annotation and structural detectors in this scope. Unsupported libraries, reflection, unavailable hierarchy definitions or unmodeled layouts may still provide networking."
         )
     } else {
         Value::Null
@@ -820,11 +828,19 @@ mod tests {
             ..Default::default()
         });
         let result = run(&[c], json!({"package_prefix":"app"}));
-        assert_eq!(result["total"], 3);
+        assert_eq!(result["total"], 4);
+        assert!(
+            result["items"].as_array().unwrap()[..3]
+                .iter()
+                .all(|item| item["kind"] == "api_usage")
+        );
         assert_eq!(result["items"][1]["parameter_index"], 0);
         assert_eq!(result["items"][1]["role"], "url_parameter");
         assert_eq!(result["items"][2]["role"], "header_map_parameter");
         assert_eq!(result["items"][2]["external_control"], "not_analyzed");
+        assert_eq!(result["items"][3]["kind"], "retrofit_service_method");
+        assert_eq!(result["items"][3]["http_verb"], "GET");
+        assert_eq!(result["items"][3]["dynamic_url_parameter"], true);
     }
     #[test]
     fn merged_detector_paging_is_lossless_and_payloads_are_not_invokes() {

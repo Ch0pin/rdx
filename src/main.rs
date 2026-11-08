@@ -1,3 +1,4 @@
+mod analysis_window;
 mod call_graph_window;
 mod cli_export;
 mod code_fonts;

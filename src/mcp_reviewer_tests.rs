@@ -623,6 +623,121 @@ fn discovery_real_apk_probe() {
                 .any(|s| s["external_uri_may_flow"] == true))
     );
 }
+#[test]
+#[ignore = "Set RDX_RETROFIT_ACCEPTANCE_APK to the pinned ServiceNow APK"]
+fn retrofit_annotations_and_services_production_mcp_acceptance() {
+    let path = PathBuf::from(std::env::var("RDX_RETROFIT_ACCEPTANCE_APK").unwrap());
+    assert_eq!(
+        digest(&path).unwrap(),
+        "7ee97a910577b5c60db29cabaf226c3640ed7599f0e29564f4b8f3b92b6dc454"
+    );
+    let mut engine = NativeEngine::default();
+    let opened = Instant::now();
+    let project = engine.open(&path).unwrap();
+    eprintln!(
+        "retrofit_acceptance open_ms={}",
+        opened.elapsed().as_millis()
+    );
+    let cancel = AtomicBool::new(false);
+    let mut annotation_rows = Vec::new();
+    for (prefix, expected) in [("wv", 3), ("yv", 1), ("com.servicenow.nowchat.network", 1)] {
+        let phase = Instant::now();
+        let result = dispatch(
+            &mut engine,
+            &project,
+            "find_type_references",
+            &json!({"class_name":"kd0.y","package_prefix":prefix,"limit":500}),
+            &cancel,
+        )
+        .unwrap();
+        eprintln!(
+            "retrofit_acceptance type_prefix={prefix} elapsed_ms={}",
+            phase.elapsed().as_millis()
+        );
+        let found: Vec<_> = result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["reference_kind"] == "annotation_type")
+            .cloned()
+            .collect();
+        assert_eq!(found.len(), expected, "{prefix}");
+        assert!(found.iter().all(|v| v["element"] == "parameter"
+            && v["parameter_index"] == 0
+            && v["values"].is_object()));
+        annotation_rows.extend(found);
+    }
+    assert_eq!(annotation_rows.len(), 5);
+    let args = json!({"projection":"services","package_prefix":"wv.j1","offset":0,"limit":100});
+    let phase = Instant::now();
+    let inventory = dispatch(&mut engine, &project, "find_network_stacks", &args, &cancel).unwrap();
+    eprintln!(
+        "retrofit_acceptance services_full_ms={}",
+        phase.elapsed().as_millis()
+    );
+    assert_eq!(inventory["projection"], "services");
+    let rows = inventory["items"].as_array().unwrap();
+    let a = rows
+        .iter()
+        .find(|v| {
+            v["method_id"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("wv.j1.a("))
+        })
+        .unwrap();
+    let b = rows
+        .iter()
+        .find(|v| {
+            v["method_id"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("wv.j1.b("))
+        })
+        .unwrap();
+    assert_eq!(a["dynamic_url_parameter"], true);
+    assert_eq!(b["dynamic_url_parameter"], true);
+    assert!(
+        a["header_parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["index"] == 1 && p["name"] == "glide_tdn_tkn")
+    );
+    assert!(
+        a["query_parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["index"] == 2 && p["name"] == "sn_mobile_properties")
+    );
+    assert!(
+        b["query_parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["index"] == 1 && p["name"] == "url")
+    );
+    let mut one = args;
+    one["limit"] = json!(1);
+    let phase = Instant::now();
+    let first = dispatch(&mut engine, &project, "find_network_stacks", &one, &cancel).unwrap();
+    eprintln!(
+        "retrofit_acceptance services_first_ms={}",
+        phase.elapsed().as_millis()
+    );
+    assert_eq!(first["items"].as_array().unwrap().len(), 1);
+    assert_eq!(first["next_offset"], 1);
+    one["offset"] = first["next_offset"].clone();
+    let phase = Instant::now();
+    let second = dispatch(&mut engine, &project, "find_network_stacks", &one, &cancel).unwrap();
+    eprintln!(
+        "retrofit_acceptance services_second_ms={}",
+        phase.elapsed().as_millis()
+    );
+    assert_ne!(
+        first["items"][0]["method_id"],
+        second["items"][0]["method_id"]
+    );
+}
 
 #[test]
 fn xml_resource_paging_and_failed_file_coverage() {

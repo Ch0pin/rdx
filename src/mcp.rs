@@ -1296,7 +1296,7 @@ fn dispatch_resolved(
             args["offset"].as_u64().unwrap_or(0) as usize,
             args["limit"].as_u64().unwrap_or(100) as usize, cancel),
         "resolve_switch_case_callers" => crate::lambda_case_callers::search(engine, project, args, cancel),
-        "find_network_stacks" => crate::network_stacks::search(engine, project, args, cancel),
+        "find_network_stacks" => engine.network_stacks(project, args, cancel),
         "get_lambda_branch" => {
             let classes: Vec<_> = project.classes.iter().filter_map(|name| engine.dex_class(name)).collect();
             ensure!(classes.len() == project.classes.len(), "INCOMPLETE_PROJECT: missing DEX classes");
@@ -1526,7 +1526,7 @@ fn tools_list() -> Value {
     let definitions = [
         (
             "find_type_references",
-            "Paged original DEX type operands and declaration types. Includes const-class, check-cast, instance-of, new-instance and array creation. Reuses identifier scanning; XML references use find_layout_references.",
+            "Paged original DEX type operands, declaration types, and explicit class/field/method/parameter annotation type usages with decoded values. Annotation references follow identifier references in hit pagination. XML references use find_layout_references.",
             vec!["class_name"],
             true,
         ),
@@ -1628,7 +1628,7 @@ fn tools_list() -> Value {
         ),
         (
             "find_network_stacks",
-            "Find networking evidence owned by package_prefix (dependencies may be outside it): exact OkHttp contract relationships, selected client/TLS/interceptor configuration invokes and exact typed builder-field writes, Retrofit method/parameter annotations, plus relocated OkHttp-compatible structural maps. kind distinguishes api_usage from structural_stack; only structural maps contain hook_map. Records retain exact declarations or DEX-local invoke offsets. @Url/@HeaderMap identify argument-supplied values, not external control. Detector coverage and empty-result limitations are explicit: scan completion does not establish absence of networking. Runtime activity, effective pinning and interceptor order are not inferred. Named evidence precedes structural maps; offset/limit page evidence records, max 100.",
+            "Find networking evidence owned by package_prefix (dependencies may be outside it): exact OkHttp calls/contracts, structural maps, and Retrofit service methods including conservatively recovered renamed annotations. Service records retain original annotation descriptors, decoded explicit values, HTTP verb/path or dynamic URL, and header/query parameter indices when proven. Same-method builder/baseUrl/build/create links require one tracked object and a literal URL. Unsupported flows remain unresolved. kind distinguishes api_usage, retrofit_service_method and structural_stack. Runtime activity and external control are not inferred. Offset/limit page records, max 100.",
             vec![],
             true,
         ),
@@ -1871,7 +1871,7 @@ fn tools_list() -> Value {
             for key in ["apk_path", "apk_sha256", "package_name"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
         }
         if name=="resolve_switch_case_callers" { properties["limit"]["maximum"] = json!(100); properties.remove("offset"); }
-        if name=="find_network_stacks" { properties["limit"]["maximum"] = json!(100); }
+        if name=="find_network_stacks" { properties["limit"]["maximum"] = json!(100); properties.insert("projection".into(),json!({"type":"string","enum":["all","services"],"default":"all","description":"services pages Retrofit service-method rows only"})); }
         if name=="find_instantiations" { for key in ["allocating_class","allocating_method_id"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); } }
         if name=="find_integer_references" {
             properties.insert("values".into(),json!({"type":"array","minItems":1,"maxItems":64,"items":{"anyOf":[{"type":"integer"},{"type":"string","minLength":1,"maxLength":32}]},"description":"Signed decimals or decimal/0x hex strings. Hex patterns are interpreted at bit_width; duplicate normalized values are merged. Prefer strings for 64-bit precision."}));

@@ -1051,7 +1051,7 @@ All queries below require `instance_id` and `project_id`. New scans support canc
 
 - `get_all_classes` and `search_classes_by_keyword` accept `case_sensitive:false`. Returned IDs preserve case; an empty case-sensitive search includes up to 20 case-insensitive near matches. Resolution never silently substitutes a case variant. Missing-class errors describe absence from the loaded DEX set, without asserting runtime loading.
 - Validation errors include `accepted_parameters` containing the tool input schema and selector alternatives. Singular IDs and plural batch IDs retain their separate meanings.
-- `find_type_references(class_name, package_prefix?)` wraps the native identifier scanner with exact type-reference matching. Use FQCN or a DEX descriptor. Array component matches preserve the actual array operand in results. Includes class literals, casts, type checks, allocations, inheritance and field/parameter/return declaration types. Scope exclusions from the identifier scanner remain explicit.
+- `find_type_references(class_name, package_prefix?)` pages exact original DEX type references. Use FQCN or a DEX descriptor. It includes class literals, casts, type checks, allocations, inheritance, field/parameter/return declaration types, and explicit class/field/method/parameter annotation types with decoded values. Annotation hits follow identifier hits; the combined source hash covers both. Array component matches preserve the actual array operand. Annotation defaults and nested value types are outside this projection.
 - `search_kotlin_metadata(query, case_sensitive?, package_prefix?)` searches `kotlin.Metadata.d2`, returning owning DEX class, table index and matched string. These are discovery evidence, **not verified original-name aliases**: a d2 entry may describe a referenced type or member. Canonical lookup continues to use DEX identities.
 
 `export_source` reports the full missing parent path before rendering. Create the
@@ -1139,7 +1139,13 @@ The rule emits candidates and unresolved flows, never a vulnerability verdict. F
 
 ## Networking usage and relocated member maps
 
-`find_network_stacks` returns two distinct kinds of static evidence:
+The desktop GUI opens **Search → Annotation usages (DEX)…** for exact original
+annotation descriptors and **Tools → Retrofit services…** for the service-method
+table. Both run against the loaded project snapshot in background work and page
+results without opening another APK. Service rows show recovered semantic roles
+alongside original annotation descriptors and the parser evidence for each mapping.
+
+`find_network_stacks` returns three kinds of static evidence:
 
 - `kind:"api_usage"`: exact named OkHttp/Retrofit declarations and invoke sites.
   Detectors cover loaded hierarchy paths to `okhttp3.Interceptor` or
@@ -1150,10 +1156,21 @@ The rule emits candidates and unresolved flows, never a vulnerability verdict. F
 - `kind:"structural_stack"`: the existing OkHttp-compatible request/response/URL/
   headers/chain/interceptor profile, independent of package/member renaming.
   These records carry `hook_map` and unresolved-role information.
+- `kind:"retrofit_service_method"`: a service-method row with HTTP verb,
+  explicit path or dynamic URL flag, header/query parameter names and indices,
+  original annotation descriptors and decoded explicit values. Renamed roles
+  carry parser branch and state-field evidence. Unknown roles remain explicit.
 
 ```json
 {"instance_id":"INSTANCE","project_id":"PROJECT","package_prefix":"com.example","limit":25}
 ```
+
+Use `"projection":"services"` to page only Retrofit service-method rows. This
+projection skips the OkHttp structural pass; `offset`, `next_offset`, and `total`
+count service rows. Creation sites include a base URL candidate only when a
+literal is tracked through the same local builder and build result. The library
+setter/build semantics are labelled conditional on their recovered fingerprint.
+Dynamic values, branched callers, fields, and unsupported flows stay unresolved.
 
 The package prefix selects evidence owners at package boundaries; dependencies
 may be anywhere in the loaded DEX set. Named API evidence is ordered before
@@ -1175,7 +1192,8 @@ Retrofit evidence includes the annotated method and, where applicable, the
 zero-based parameter index excluding the receiver. `@Url` and `@HeaderMap`
 identify argument-supplied URL/header-map values. `external_control` remains
 `not_analyzed`: the argument may be constant, validated or externally influenced.
-Annotation literal values and runtime credentials are not returned.
+The service projection returns explicit annotation values; parameter names are
+metadata, not runtime credential values.
 
 `coverage.scan_complete`/`complete` describe whether the configured detector
 scans finished within their budgets. `detector_coverage` describes the known-API

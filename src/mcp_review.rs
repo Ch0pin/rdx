@@ -1,9 +1,10 @@
 //! Source export, convenient declaration selectors, and decoded metadata queries.
 use super::*;
-use crate::{
-    native_dex::{DexSymbols, DexValue},
-    native_engine::disassembly,
-};
+#[cfg(test)]
+use crate::annotation_values::elements_value;
+#[cfg(test)]
+use crate::native_dex::{DexSymbols, DexValue};
+use crate::native_engine::disassembly;
 
 pub(super) fn member_selector(
     engine: &NativeEngine,
@@ -102,205 +103,21 @@ pub(super) fn member_selector(
         id_key
     )
 }
-fn value(v: &DexValue, s: &DexSymbols, remaining: &mut usize) -> Result<Value> {
-    ensure!(
-        *remaining > 0,
-        "ANNOTATION_VALUE_LIMIT: nested value exceeds response budget"
-    );
-    *remaining -= 1;
-    if let DexValue::String(index) = v {
-        let bytes = s
-            .strings
-            .get(*index as usize)
-            .context("Invalid annotation string")?
-            .len();
-        ensure!(
-            bytes <= *remaining,
-            "ANNOTATION_VALUE_LIMIT: string exceeds response budget"
-        );
-        *remaining -= bytes;
-    }
-    let (kind, data) = match v {
-        DexValue::Byte(v) => ("byte", json!(v)),
-        DexValue::Short(v) => ("short", json!(v)),
-        DexValue::Char(v) => ("char", json!(v)),
-        DexValue::Int(v) => ("int", json!(v)),
-        DexValue::Long(v) => ("long", json!(v.to_string())),
-        DexValue::Float(v) => ("float_bits", json!(format!("0x{v:08x}"))),
-        DexValue::Double(v) => ("double_bits", json!(format!("0x{v:016x}"))),
-        DexValue::Boolean(v) => ("boolean", json!(v)),
-        DexValue::Null => ("null", Value::Null),
-        DexValue::String(i) => (
-            "string",
-            json!(
-                s.strings
-                    .get(*i as usize)
-                    .context("Invalid annotation string")?
-            ),
-        ),
-        DexValue::Type(i) => (
-            "type",
-            json!(
-                s.types
-                    .get(*i as usize)
-                    .context("Invalid annotation type")?
-                    .as_ref()
-            ),
-        ),
-        DexValue::Field(i) | DexValue::Enum(i) => (
-            if matches!(v, DexValue::Enum(_)) {
-                "enum"
-            } else {
-                "field"
-            },
-            json!(disassembly::symbol(s, 'f', *i as usize).context("Invalid annotation field")?),
-        ),
-        DexValue::Method(i) => (
-            "method",
-            json!(disassembly::symbol(s, 'm', *i as usize).context("Invalid annotation method")?),
-        ),
-        DexValue::MethodType(i) => (
-            "method_type",
-            json!(
-                s.protos
-                    .get(*i as usize)
-                    .map(|(r, p)| format!("({}){}", p.join(""), r))
-                    .context("Invalid annotation prototype")?
-            ),
-        ),
-        DexValue::MethodHandle(i) => ("method_handle_index", json!(i)),
-        DexValue::Array(v) => (
-            "array",
-            Value::Array(
-                v.iter()
-                    .map(|v| value(v, s, remaining))
-                    .collect::<Result<_>>()?,
-            ),
-        ),
-        DexValue::Annotation { type_idx, elements } => (
-            "annotation",
-            json!({"type":s.types.get(*type_idx as usize).context("Invalid nested annotation type")?.as_ref(),"values":elements_value(elements,s,remaining)?}),
-        ),
-    };
-    // Charge composite values too: this conservatively bounds symbol text,
-    // escaped strings and array/object overhead before building the next value.
-    let bytes = serde_json::to_vec(&data)?.len();
-    ensure!(
-        bytes <= *remaining,
-        "ANNOTATION_VALUE_LIMIT: decoded value exceeds response budget"
-    );
-    *remaining -= bytes;
-    Ok(json!({"kind":kind,"value":data}))
-}
-fn elements_value(
-    elements: &[(u32, DexValue)],
-    s: &DexSymbols,
-    remaining: &mut usize,
-) -> Result<Value> {
-    let mut out = serde_json::Map::new();
-    for (i, v) in elements {
-        let name = s
-            .strings
-            .get(*i as usize)
-            .context("Invalid annotation name")?;
-        ensure!(
-            name.len() <= *remaining,
-            "ANNOTATION_VALUE_LIMIT: names exceed response budget"
-        );
-        *remaining -= name.len();
-        out.insert(name.clone(), value(v, s, remaining)?);
-    }
-    Ok(Value::Object(out))
-}
 pub(super) fn annotations(
     engine: &NativeEngine,
     project: &Project,
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
-    annotation_classes(
-        project.classes.iter().map(|name| {
-            Ok((
-                name.as_str(),
-                engine
-                    .dex_class(name)
-                    .context("Missing class during annotation scan")?,
-            ))
-        }),
-        args,
-        cancel,
-    )
+    engine.annotation_usages(project, args, cancel)
 }
-
+#[cfg(test)]
 fn annotation_classes<'a>(
     classes: impl IntoIterator<Item = Result<(&'a str, &'a crate::native_dex::DexClass)>>,
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
-    let requested = required(args, "annotation_type")?;
-    let descriptor = if requested.starts_with('L') && requested.ends_with(';') {
-        requested.to_owned()
-    } else {
-        format!("L{};", requested.replace('.', "/"))
-    };
-    let element = args["element"].as_str().unwrap_or("all");
-    let mut page = scan::Page::new(args)?;
-    let mut seen_tables = std::collections::HashSet::new();
-    let mut type_present = false;
-    for class in classes {
-        ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-        let (name, c) = class?;
-        // Presence is project-wide, independent of result filters. Each shared
-        // DEX type table is checked once; no Java reconstruction or index build.
-        if !type_present && seen_tables.insert(Arc::as_ptr(&c.symbols)) {
-            type_present = c.symbols.types.iter().any(|ty| ty.as_ref() == descriptor);
-        }
-        if !scan::package_matches(name, args) {
-            continue;
-        }
-        scan::annotation_sets(c, name, |owner, set| {
-            if element != "all" && owner["element"] != element {
-                return Ok(());
-            }
-            for annotation in set.iter() {
-                ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-                if c.symbols
-                    .types
-                    .get(annotation.type_idx as usize)
-                    .is_none_or(|t| t.as_ref() != descriptor)
-                {
-                    continue;
-                }
-                let mut item = owner.clone();
-                item["annotation_type"] = json!(descriptor);
-                item["visibility"] = json!(annotation.visibility);
-                item["values"] =
-                    elements_value(&annotation.elements, &c.symbols, &mut (256 * 1024))?;
-                item["dex_entry"] = json!(c.symbols.origin.get());
-                page.add(item)?;
-            }
-            Ok(())
-        })?;
-    }
-    ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-    let mut result = page.finish()?;
-    result["annotation_type"] = json!(descriptor);
-    result["match_mode"] = json!("exact_descriptor");
-    result["requested_type_present"] = json!(type_present);
-    result["type_presence_scope"] =
-        json!("DEX type tables of all loaded classes, before result filters");
-    result["warnings"] = if type_present {
-        json!([])
-    } else {
-        json!([{
-            "code": "ANNOTATION_TYPE_ABSENT",
-            "message": "The requested annotation descriptor is absent from the loaded DEX type tables. Obfuscation, removal, or an incorrect name may explain this. Zero exact-descriptor usages do not establish that equivalent annotations or API endpoints are absent. Query the actual DEX annotation name; no semantic alias was inferred."
-        }])
-    };
-    result["scope"] = json!(
-        "Complete covers explicit exact-descriptor DEX annotation usages within the supplied filters, not semantic equivalents under obfuscation. Parameter_index excludes the receiver. No inherited annotations or annotation defaults inferred."
-    );
-    Ok(result)
+    crate::annotation_usage::scan_classes(classes, args, cancel)
 }
 pub(super) fn resources(
     engine: &NativeEngine,

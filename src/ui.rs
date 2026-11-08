@@ -1,5 +1,6 @@
 use crate::code_fonts::CodeFont;
 use crate::{
+    analysis_window::{AnalysisKind, AnalysisWindow, Query as AnalysisQuery},
     code_view::{CodeDocument, CodeTheme},
     icons::{self, Icon},
     navigation::{self, AssetGrouping, Node, Target},
@@ -87,6 +88,7 @@ enum Event {
     InteractiveReady(u64, NativeEngine),
     UsagesUpdate(u64, u64, UsageUpdate),
     UsagesDone(u64, u64, NativeEngine, UsageSummary),
+    AnalysisDone(u64, u64, Result<serde_json::Value, String>),
 }
 
 enum DialogResult {
@@ -469,6 +471,9 @@ pub struct App {
     mcp_error: String,
     mcp_auto_start: bool,
     search: SearchWindow,
+    analysis: AnalysisWindow,
+    analysis_cancel: Option<Arc<AtomicBool>>,
+    analysis_id: u64,
     usages: UsagesWindow,
     call_graph: crate::call_graph_window::CallGraphWindow,
     usages_cancel: Option<Arc<AtomicBool>>,
@@ -598,6 +603,9 @@ impl App {
             mcp_error: String::new(),
             mcp_auto_start: std::env::var_os("RDX_MCP_AUTO_START").is_some(),
             search,
+            analysis: AnalysisWindow::default(),
+            analysis_cancel: None,
+            analysis_id: 0,
             usages,
             call_graph: crate::call_graph_window::CallGraphWindow::default(),
             usages_cancel: None,
@@ -752,6 +760,11 @@ impl App {
     }
     fn stop(&mut self) {
         self.mcp_server = None;
+        if let Some(cancel) = self.analysis_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.analysis.stop_project();
+        self.analysis_id = self.analysis_id.wrapping_add(1);
         if let Some(index) = self.usage_index.take() {
             index.cancel_project();
         }
@@ -987,6 +1000,32 @@ impl App {
                 .navigate_graph_method_shared(&method)
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Event::Navigated(generation, origin, Some(engine), result));
+            ctx.request_repaint();
+        });
+    }
+    fn navigate_analysis_owner(&mut self, owner: String, method: bool, ctx: &egui::Context) {
+        let Some(snapshot) = self.shared_project.clone() else {
+            return;
+        };
+        let origin = self.current_location().unwrap_or(JumpLocation {
+            target: Target::Class(if method {
+                rdx::call_graph::owner(&owner).unwrap_or_default().into()
+            } else {
+                owner.clone()
+            }),
+            position: 0,
+            source_hash: None,
+        });
+        let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
+        thread::spawn(move || {
+            let mut engine = snapshot.engine().clone();
+            let result = if method {
+                engine.navigate_graph_method_shared(&owner)
+            } else {
+                engine.navigate_class_shared(&owner)
+            }
+            .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(Event::Navigated(generation, origin, None, result));
             ctx.request_repaint();
         });
     }
@@ -1539,6 +1578,55 @@ impl App {
             .map_err(|error| format!("{error:#}"));
             let _ = tx.send(Event::Exported(generation, engine, result));
             ctx.request_repaint();
+        });
+    }
+    fn open_analysis(&mut self, kind: AnalysisKind) {
+        if self.analysis.open(kind) {
+            if let Some(cancel) = self.analysis_cancel.take() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            self.analysis_id = self.analysis_id.wrapping_add(1);
+        }
+    }
+    fn start_analysis(&mut self, query: AnalysisQuery, ctx: &egui::Context) {
+        let Some(snapshot) = self.shared_project.clone() else {
+            self.analysis.status = "Open an APK, XAPK, APKS, or DEX first.".into();
+            return;
+        };
+        if let Some(cancel) = self.analysis_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.analysis_cancel = Some(cancel.clone());
+        self.analysis_id = self.analysis_id.wrapping_add(1);
+        self.analysis.begin(query.clone());
+        let (tx, generation, id, ctx) = (
+            self.tx.clone(),
+            self.generation,
+            self.analysis_id,
+            ctx.clone(),
+        );
+        thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let args = query.arguments();
+                let output = match query.kind {
+                    AnalysisKind::Annotations => {
+                        snapshot
+                            .engine()
+                            .annotation_usages(snapshot.project(), &args, &cancel)
+                    }
+                    AnalysisKind::Services => {
+                        snapshot
+                            .engine()
+                            .network_stacks(snapshot.project(), &args, &cancel)
+                    }
+                };
+                output.map_err(|error| format!("{error:#}"))
+            }))
+            .unwrap_or_else(|_| Err("Analysis worker failed unexpectedly.".into()));
+            let _ = tx.send(Event::AnalysisDone(generation, id, result));
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+            ctx.request_repaint_of(AnalysisWindow::viewport_id());
         });
     }
     fn start_search(&mut self, query: SearchQuery, ctx: &egui::Context) {
@@ -2542,6 +2630,12 @@ impl App {
                     self.usages.finish(summary.status, summary.errors);
                     self.status = self.usages.status.clone();
                 }
+                Event::AnalysisDone(generation, id, result)
+                    if generation == self.generation && id == self.analysis_id =>
+                {
+                    self.analysis_cancel = None;
+                    self.analysis.finish(result);
+                }
                 Event::SearchUpdate(generation, id, update)
                     if generation == self.generation && id == self.search_id =>
                 {
@@ -3156,8 +3250,17 @@ impl eframe::App for App {
                                     ui.close_menu();
                                 }
                             }
+                            ui.separator();
+                            if ui.button("Annotation usages (DEX)…").clicked() {
+                                self.open_analysis(AnalysisKind::Annotations);
+                                ui.close_menu();
+                            }
                         });
                         ui.menu_button("Tools", |ui| {
+                            if ui.button("Retrofit services…").clicked() {
+                                self.open_analysis(AnalysisKind::Services);
+                                ui.close_menu();
+                            }
                             if ui.button("MCP Server…").clicked() {
                                 self.show_mcp = true;
                                 ui.close_menu();
@@ -3685,6 +3788,27 @@ impl eframe::App for App {
             self.open_search_hit(hit);
             self.status = location;
         }
+        let actions = self
+            .analysis
+            .show(ctx, self.shared_project.is_some() && !self.loading_project);
+        if actions.cancel
+            && let Some(cancel) = &self.analysis_cancel
+        {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        if actions.invalidate {
+            self.analysis_id = self.analysis_id.wrapping_add(1);
+            self.analysis_cancel = None;
+        }
+        if let Some(query) = actions.start {
+            self.start_analysis(query, ctx);
+        }
+        if let Some(method) = actions.open_method {
+            self.navigate_analysis_owner(method, true, ctx);
+        }
+        if let Some(class) = actions.open_class {
+            self.navigate_analysis_owner(class, false, ctx);
+        }
         let (method, rebuild) = self.call_graph.show(ctx);
         if let Some(method) = method {
             self.navigate_graph_method(method, ctx);
@@ -4055,6 +4179,9 @@ mod settings_tests {
             mcp_error: String::new(),
             mcp_auto_start: false,
             search: SearchWindow::default(),
+            analysis: AnalysisWindow::default(),
+            analysis_cancel: None,
+            analysis_id: 0,
             usages: UsagesWindow::default(),
             call_graph: crate::call_graph_window::CallGraphWindow::default(),
             usages_cancel: None,
@@ -4113,6 +4240,33 @@ mod settings_tests {
             screenshot: crate::screenshot::RegionCapture::Idle,
             screenshot_remapped_primary: false,
         }
+    }
+    #[test]
+    fn analysis_results_reject_stale_generation_and_query_id() {
+        let mut app = navigation_test_app();
+        app.analysis.open(AnalysisKind::Services);
+        app.analysis.begin(app.analysis.query(0).unwrap());
+        app.analysis_id = 4;
+        let old_generation = app.generation;
+        app.tx
+            .send(Event::AnalysisDone(
+                old_generation,
+                3,
+                Ok(serde_json::json!({"items":[{"class_id":"stale.Id"}],"offset":0,"total":1})),
+            ))
+            .unwrap();
+        app.events(&egui::Context::default());
+        assert!(app.analysis.page.is_none());
+        app.stop();
+        app.tx
+            .send(Event::AnalysisDone(
+                old_generation,
+                4,
+                Ok(serde_json::json!({"items":[{"class_id":"old.Project"}],"offset":0,"total":1})),
+            ))
+            .unwrap();
+        app.events(&egui::Context::default());
+        assert!(app.analysis.page.is_none());
     }
     #[test]
     fn dialog_cancel_releases_guard_and_rejects_overlap() {

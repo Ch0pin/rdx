@@ -322,7 +322,11 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     let manifest = schema("get_manifest_summary");
     assert_eq!(
         manifest["properties"]["format"]["enum"],
-        json!(["markdown", "records", "exposure"])
+        json!(["markdown", "records", "exposure", "counts"])
+    );
+    assert_eq!(
+        manifest["properties"]["exported_state"]["enum"],
+        json!(["true", "false", "unresolved"])
     );
     assert_eq!(
         manifest["properties"]["component_type"]["enum"],

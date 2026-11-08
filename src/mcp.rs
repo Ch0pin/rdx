@@ -692,12 +692,23 @@ fn project_request(
             let mut records =
                 crate::manifest_summary::query_resolved(&xml, args, engine.resource_table(), false)
                     .map_err(anyhow::Error::msg)?;
+            if args.get("exported_state").is_some() {
+                records.retain(|record| {
+                    record["record_type"] == "component"
+                        && crate::manifest_summary::exported_matches(record, args)
+                });
+            }
             crate::manifest_summary::project_records(&mut records, args);
             let hash = crate::engine::source_identity(&serde_json::to_string(&records)?);
-            let mut result = page(records, args)?;
-            result["format"] = json!("records");
+            let mut result = if args["format"] == "counts" {
+                crate::manifest_summary::record_counts(&records)
+            } else {
+                let mut result = page(records, args)?;
+                result["format"] = json!("records");
+                result["offset_unit"] = json!("matching records");
+                result
+            };
             result["source_hash"] = json!(hash);
-            result["offset_unit"] = json!("matching records");
             result
         } else {
             let mut summary = crate::manifest_summary::render(
@@ -892,8 +903,10 @@ fn build_identity() -> Value {
 
 fn manifest_filtered(args: &Value) -> bool {
     args["format"] == "records"
+        || args["format"] == "counts"
         || [
             "component_type",
+            "exported_state",
             "component",
             "host",
             "scheme",
@@ -1984,15 +1997,15 @@ fn tools_list() -> Value {
         if name=="get_manifest_summary" {
             for key in ["component", "host", "scheme", "path", "permission", "query"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
             properties.insert("component_type".into(),json!({"type":"string","enum":["activity","activity-alias","service","receiver","provider"]}));
-            properties.insert("format".into(),json!({"type":"string","enum":["markdown","records","exposure"]}));
+            properties.insert("format".into(),json!({"type":"string","enum":["markdown","records","exposure","counts"],"description":"markdown (default) pages the GUI summary; records, or any filter, returns structured component and permission records; exposure summarizes an unfiltered manifest; counts returns one unpaged object of matching component totals per type and effective exported state"}));
         }
         if ["get_manifest_summary", "get_manifest_components"].contains(&name) {
+            properties.insert("exported_state".into(),json!({"type":"string","enum":["true","false","unresolved"],"description":"Effective resolved android:exported state; selects component records only, so permission records are excluded"}));
             properties.insert("route_match_mode".into(),json!({"type":"string","enum":["exact","contains"],"description":"Case-sensitive literal matching for host, scheme and declared path attributes. If omitted, host/scheme are exact and path uses contains. This searches declarations, not Android runtime URI matching."}));
             properties.insert("projection".into(),json!({"type":"string","enum":["full","compact"],"default":"full"}));
             properties.insert("fields".into(),json!({"type":"string","minLength":1,"description":"Comma-separated record field names; overrides projection. Activity launch fields preserve declared/default/inherited/unresolved state; unknown fields return allowed_fields.","x-allowed-fields":crate::manifest_summary::RECORD_FIELDS}));
         }
         if name=="get_manifest_components" {
-            properties.insert("exported_state".into(),json!({"type":"string","enum":["true","false","unresolved"]}));
             properties.insert("max_bytes".into(),json!({"type":"integer","minimum":1024,"maximum":1048576,"default":32768,"description":"Maximum serialized items bytes; pagination preserves complete records. Metadata is additional."}));
             for key in ["class_name", "host", "scheme", "path", "permission", "query"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
             properties.insert("match_mode".into(),json!({"type":"string","enum":["exact","contains"],"default":"contains","description":"Applies to class_name only; use route_match_mode for host, scheme and path"}));
@@ -2342,6 +2355,13 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
                 (args.get("projection").is_none() && args.get("fields").is_none())
                     || manifest_filtered(args),
                 "projection and fields require records format or a manifest filter"
+            );
+            ensure!(
+                args["format"] != "counts"
+                    || ["projection", "fields", "offset", "limit"]
+                        .iter()
+                        .all(|key| args.get(*key).is_none()),
+                "counts format returns one unpaged object; projection, fields, offset and limit do not apply"
             );
         }
     }
@@ -3819,7 +3839,7 @@ mod tests {
     }
 
     // A compiled XML fixture verifies the endpoint decodes the archive itself.
-    fn component_manifest_binary() -> Vec<u8> {
+    pub(super) fn component_manifest_binary() -> Vec<u8> {
         fn words(values: &[u32]) -> Vec<u8> {
             values.iter().flat_map(|v| v.to_le_bytes()).collect()
         }

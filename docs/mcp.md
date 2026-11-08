@@ -546,6 +546,19 @@ relative-filter groups, including their declared allow/block attributes.
 `matching_filter_indexes` identifies matching filters. These are declaration
 queries; runtime route delivery and callback reachability require separate proof.
 
+`exported_state: "true"`, `"false"` or `"unresolved"` selects component records by
+their effective resolved `android:exported` state and excludes permission records.
+`format: "counts"` returns one unpaged object instead of records: `components`
+carries overall and per-`component_type` totals split into `exported`,
+`non_exported` and `unresolved_exported` buckets, `permissions` counts matching
+permission records by declaration tag, and `source_hash` identifies the same
+filtered record set, so a later `format: "records"` query with identical filters
+and default projection pages exactly the counted records. `projection`, `fields`,
+`offset` and `limit` do not apply to counts. Whole-manifest `coverage` accompanies
+every structured response for comparison with filtered counts. On manifests with
+hundreds of components, start with counts, then page `exported_state: "true"` or
+one `component_type` with `projection: "compact"` or an explicit `fields` list.
+
 Both tools resolve `@string`, `@integer`, and `@bool` references (including
 package-qualified names and numeric IDs) before filtering, using the default
 configuration. `resource_resolution.attributes` preserves raw references,

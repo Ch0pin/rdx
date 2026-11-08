@@ -434,8 +434,10 @@ component and permission records with matching-record offsets and a maximum
 `limit` of 500. Filters combine with AND: `component` and `permission` are
 literal substrings, `component_type` is exact (`activity`, `activity-alias`,
 `service`, `receiver`, or `provider`), and `query` is a case-insensitive substring
-of the serialized record. `host` and `scheme` match exact declarations; `path`
-matches substrings of declared path attributes. Route predicates must match
+of the serialized record. By default, `host` and `scheme` match exact declarations;
+`path` matches substrings of declared path attributes. `route_match_mode: "exact"`
+or `"contains"` explicitly applies that case-sensitive literal comparison to all
+three route fields. Route predicates must match
 within the same intent-filter. Records preserve separate data elements and
 relative-filter groups, including their declared allow/block attributes.
 `matching_filter_indexes` identifies matching filters. These are declaration
@@ -534,6 +536,42 @@ The declaration rules follow Android's [activity](https://developer.android.com/
 and [activity-alias](https://developer.android.com/guide/topics/manifest/activity-alias-element)
 documentation. These records do not establish `onNewIntent` delivery or a task
 hijacking vulnerability.
+
+### Route matching and zero-result diagnostics
+
+`get_manifest_components` and `get_manifest_summary` accept `route_match_mode`.
+Use `"contains"` for declaration substring searches such as:
+
+```json
+{"instance_id":"INSTANCE","project_id":"PROJECT","host":"madison","route_match_mode":"contains"}
+```
+
+`match_mode` continues to control `class_name` only. For example, an exact class
+selection can be combined with substring route matching. Omitting
+`route_match_mode` preserves the previous defaults: exact host/scheme and
+substring path. Explicit `"exact"` means equality with the declared path value,
+including `pathPrefix`/`pathPattern` text; it does not evaluate Android URI
+matching or wildcard patterns. Comparisons remain case-sensitive.
+
+`coverage.filters` retains the requested filter values and adds
+`effective_matching`, which lists the actual mode and case sensitivity for each
+active filter. Route comparisons still belong to the same intent-filter, and
+resource references are resolved before matching.
+
+When the full filtered record count is zero, `warnings` may contain
+`MANIFEST_ROUTE_NEAR_MATCH`. Each hint relaxes only one route field to substring
+matching, first case-sensitive and then ASCII-case-insensitive if necessary.
+All other selectors and filters remain fixed, including exported state. Hints
+report distinct component counts and up to five examples with bounded declared
+value previews. They never add records to `items` or establish runtime routing.
+An empty continuation page with a nonzero total does not trigger these hints.
+
+`near_match_diagnostics.status` describes whether hints completed, were
+unnecessary/not applicable, or were skipped. Diagnostics are limited to manifests
+up to 1 MiB and 1,000 component declarations. Cancellation is checked between
+comparisons. A skipped diagnostic makes no claim about relaxed matches. Use the
+shown declaration spelling for case differences; `route_match_mode=contains`
+itself remains case-sensitive and applies to all three route fields.
 
 ### Permission protection levels and component coverage
 
@@ -1013,9 +1051,11 @@ Obfuscation, removal, or an incorrect name can explain absence. A present type
 with zero filtered usages returns an empty warnings array. `complete: true`
 describes the scan for the selected match mode within the supplied filters, not
 coverage of semantic equivalents under obfuscation. Semantic aliases are not
-inferred: an obfuscated annotation class renamed to `a.b` is found only by its
+inferred here: an obfuscated annotation class renamed to `a.b` is found by its
 actual name, by a prefix covering its package, or through `get_class_disassembly`
-annotation directives on a known service.
+annotation directives on a known service. For Retrofit specifically,
+`find_network_stacks` recovers renamed annotation roles from the bundled parser's
+control flow and reports them under `retrofit_recovered_roles`.
 
 `get_method_source` also accepts `class_name` plus `method_name` and optional
 `descriptor` (for example `(Ljava/lang/String;)V`). `find_field_references`
@@ -1075,7 +1115,7 @@ All queries below require `instance_id` and `project_id`. New scans support canc
 
 - `get_all_classes` and `search_classes_by_keyword` accept `case_sensitive:false`. Returned IDs preserve case; an empty case-sensitive search includes up to 20 case-insensitive near matches. Resolution never silently substitutes a case variant. Missing-class errors describe absence from the loaded DEX set, without asserting runtime loading.
 - Validation errors include `accepted_parameters` containing the tool input schema and selector alternatives. Singular IDs and plural batch IDs retain their separate meanings.
-- `find_type_references(class_name, package_prefix?)` wraps the native identifier scanner with exact type-reference matching. Use FQCN or a DEX descriptor. Array component matches preserve the actual array operand in results. Includes class literals, casts, type checks, allocations, inheritance and field/parameter/return declaration types. Scope exclusions from the identifier scanner remain explicit.
+- `find_type_references(class_name, package_prefix?)` pages exact original DEX type references. Use FQCN or a DEX descriptor. It includes class literals, casts, type checks, allocations, inheritance, field/parameter/return declaration types, and explicit class/field/method/parameter annotation types with decoded values. Annotation hits follow identifier hits; the combined source hash covers both. Array component matches preserve the actual array operand. Annotation defaults and nested value types are outside this projection.
 - `search_kotlin_metadata(query, case_sensitive?, package_prefix?)` searches `kotlin.Metadata.d2`, returning owning DEX class, table index and matched string. These are discovery evidence, **not verified original-name aliases**: a d2 entry may describe a referenced type or member. Canonical lookup continues to use DEX identities.
 
 `export_source` reports the full missing parent path before rendering. Create the
@@ -1163,7 +1203,13 @@ The rule emits candidates and unresolved flows, never a vulnerability verdict. F
 
 ## Networking usage and relocated member maps
 
-`find_network_stacks` returns two distinct kinds of static evidence:
+The desktop GUI opens **Search → Annotation usages (DEX)…** for exact original
+annotation descriptors and **Tools → Retrofit services…** for the service-method
+table. Both run against the loaded project snapshot in background work and page
+results without opening another APK. Service rows show recovered semantic roles
+alongside original annotation descriptors and the parser evidence for each mapping.
+
+`find_network_stacks` returns three kinds of static evidence:
 
 - `kind:"api_usage"`: exact named OkHttp/Retrofit declarations and invoke sites.
   Detectors cover loaded hierarchy paths to `okhttp3.Interceptor` or
@@ -1174,25 +1220,38 @@ The rule emits candidates and unresolved flows, never a vulnerability verdict. F
 - `kind:"structural_stack"`: the existing OkHttp-compatible request/response/URL/
   headers/chain/interceptor profile, independent of package/member renaming.
   These records carry `hook_map` and unresolved-role information.
+- `kind:"retrofit_service_method"`: a service-method row with HTTP verb,
+  explicit path or dynamic URL flag, header/query parameter names and indices,
+  original annotation descriptors and decoded explicit values. Renamed roles
+  carry parser branch and state-field evidence. Unknown roles remain explicit.
 
 ```json
 {"instance_id":"INSTANCE","project_id":"PROJECT","package_prefix":"com.example","limit":25}
 ```
+
+Use `"projection":"services"` to page only Retrofit service-method rows. This
+projection skips the OkHttp structural pass; `offset`, `next_offset`, and `total`
+count service rows. Creation sites include a base URL candidate only when a
+literal is tracked through the same local builder and build result. The library
+setter/build semantics are labelled conditional on their recovered fingerprint.
+Dynamic values, branched callers, fields, and unsupported flows stay unresolved.
 
 The package prefix selects evidence owners at package boundaries; dependencies
 may be anywhere in the loaded DEX set. Obfuscated builds commonly declare Retrofit
 service interfaces, and SDK endpoints such as upload or fallback services, in
 renamed top-level packages (`ff.g`, `a.b.c`) rather than under the application
 ID, so a prefix matching the application ID can exclude every service. When
-`package_prefix` is set, the scan counts Retrofit-annotated classes outside the
-prefix and, if any exist, adds a `warnings` entry with code
+`package_prefix` is set, both projections count Retrofit-annotated classes
+outside the prefix (exact `retrofit2.http` descriptors and recovered renamed
+annotation classes alike) and, if any exist, add a `warnings` entry with code
 `RETROFIT_SERVICES_OUTSIDE_PREFIX` carrying `classes`, `methods`, up to ten
-`examples` and `count_complete`; the raw count is also in
-`coverage.detector_coverage[0].retrofit_annotations_outside_prefix`. Repeat the
-query without `package_prefix`, or with the example packages, to include them.
-Retrofit detection itself keys on the `retrofit2.http.*` annotation descriptors,
-not on interface names, so renamed interfaces are found as long as the annotation
-classes keep their names. Named API evidence is ordered before
+`examples` and `count_complete`. The raw count is in
+`coverage.detector_coverage[0].retrofit_annotations_outside_prefix` for the
+combined inventory and in `coverage.retrofit_annotations_outside_prefix` for
+`projection: "services"`. Repeat the query without `package_prefix`, or with the
+example packages, to include them. Retrofit detection keys on annotation
+descriptors and recovered roles, never on interface names, so renamed service
+interfaces are found either way. Named API evidence is ordered before
 structural maps. `offset`/`next_offset` page the combined evidence list (default
 25, maximum 100). Counts represent evidence records, not unique runtime clients
 or stacks. The same class may have multiple distinct records.
@@ -1211,7 +1270,8 @@ Retrofit evidence includes the annotated method and, where applicable, the
 zero-based parameter index excluding the receiver. `@Url` and `@HeaderMap`
 identify argument-supplied URL/header-map values. `external_control` remains
 `not_analyzed`: the argument may be constant, validated or externally influenced.
-Annotation literal values and runtime credentials are not returned.
+The service projection returns explicit annotation values; parameter names are
+metadata, not runtime credential values.
 
 `coverage.scan_complete`/`complete` describe whether the configured detector
 scans finished within their budgets. `detector_coverage` describes the known-API

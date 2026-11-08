@@ -59,14 +59,7 @@ pub(super) fn selection(items: &[Value], args: &Value, all_registrations: bool) 
 }
 
 pub(super) fn component_page(mut records: Vec<Value>, args: &Value) -> Result<Value> {
-    if let Some(filter) = args["exported_state"].as_str() {
-        records.retain(|r| match filter {
-            "true" => r["exported_state"]["effective"] == true,
-            "false" => r["exported_state"]["effective"] == false,
-            "unresolved" => r["exported_state"]["effective"].is_null(),
-            _ => false,
-        });
-    }
+    records.retain(|record| crate::manifest_summary::exported_matches(record, args));
     crate::manifest_summary::project_records(&mut records, args);
     let hash = crate::engine::source_identity(&serde_json::to_string(&records)?);
     let total = records.len();
@@ -115,6 +108,30 @@ pub(super) fn caller_status(result: &mut Value) {
             "DEX call sites establish invokes, not absence of caller guards. not_attempted means this query did not reconstruct the caller; include_source_locations=true requests bounded reconstruction with reasons and locations."
         );
     }
+}
+
+pub(super) fn route_hints(
+    result: &mut Value,
+    resolved_xml: &str,
+    args: &Value,
+    component_mode: bool,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let mut diagnostics = if result["total"] == 0 {
+        crate::manifest_summary::near_matches(resolved_xml, args, component_mode, || {
+            cancel.load(Ordering::Relaxed)
+        })
+        .map_err(anyhow::Error::msg)?
+    } else {
+        json!({"status":"not_needed","warnings":[]})
+    };
+    result["warnings"] = diagnostics
+        .as_object_mut()
+        .unwrap()
+        .remove("warnings")
+        .unwrap();
+    result["near_match_diagnostics"] = diagnostics;
+    Ok(())
 }
 
 #[cfg(test)]

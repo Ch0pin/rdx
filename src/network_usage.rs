@@ -8,6 +8,9 @@ use crate::{
 use anyhow::Context;
 use std::{collections::HashMap, sync::Arc};
 
+#[path = "retrofit_semantics.rs"]
+mod retrofit;
+
 fn call_role(owner: &str, name: &str, params: &[Arc<str>], ret: &str) -> Option<&'static str> {
     let p: Vec<_> = params.iter().map(AsRef::as_ref).collect();
     match owner {
@@ -260,6 +263,18 @@ fn annotation_role(ty: &str, parameter: bool) -> Option<&'static str> {
         None
     }
 }
+fn recovered_annotation_role(semantic: &str, parameter: bool) -> Option<&'static str> {
+    annotation_role(&format!("Lretrofit2/http/{semantic};"), parameter)
+}
+fn dynamic_url_value(found: bool, unknown: bool, recovery_complete: bool) -> Value {
+    if found {
+        json!(true)
+    } else if unknown || !recovery_complete {
+        Value::Null
+    } else {
+        json!(false)
+    }
+}
 struct Scan<'a> {
     work: Work<'a>,
     page: Page,
@@ -281,23 +296,226 @@ impl Scan<'_> {
         m: &DexMethod,
         set: &DexAnnotationSet,
         parameter: Option<usize>,
+        mappings: &retrofit::Mappings,
     ) -> Result<bool> {
         for a in set.iter() {
             if !self.work.take(1)? {
                 return Ok(false);
             }
+            if a.visibility != 1 {
+                continue;
+            }
             let Some(ty) = c.symbols.types.get(a.type_idx as usize) else {
                 self.error(&type_name(&c.descriptor), "Invalid annotation type");
                 continue;
             };
-            if let Some(role) = annotation_role(ty, parameter.is_some()) {
+            let mapped = mappings.get(ty);
+            let mapped_role =
+                mapped.and_then(|m| recovered_annotation_role(m.name, parameter.is_some()));
+            if let Some(role) = annotation_role(ty, parameter.is_some()).or(mapped_role) {
                 self.page.add(json!({"kind":"api_usage","identification":"exact_descriptor_evidence","detector":"retrofit_annotations","family":"retrofit2",
                     "class_id":type_name(&c.descriptor),"method_id":method_id(m),"class_is_interface":c.access_flags&0x200!=0,
                     "parameter_index":parameter,"parameter_index_base":"zero-based; receiver excluded","annotation_type":type_name(ty),"role":role,
+                    "semantic_annotation":mapped.map(|m|m.name).or_else(||ty.strip_prefix("Lretrofit2/http/").and_then(|s|s.strip_suffix(';'))),
+                    "mapping_evidence":mapped.map(|m|&m.evidence),
                     "dynamic_input":match role {"url_parameter"=>Some("URL supplied as a method argument"),"header_map_parameter"=>Some("Header map supplied as a method argument"),_=>None},
                     "external_control":"not_analyzed","dex_entry":c.symbols.origin.get(),"runtime_verified":false}))?;
             }
         }
+        Ok(true)
+    }
+    fn service(
+        &mut self,
+        c: &DexClass,
+        m: &DexMethod,
+        method_index: usize,
+        mappings: &retrofit::Mappings,
+        links: &retrofit::CreationScan,
+    ) -> Result<bool> {
+        if c.access_flags & 0x200 == 0 {
+            return Ok(true);
+        }
+        let Some(directory) = c.symbols.annotations.get(&c.annotations_offset) else {
+            return Ok(true);
+        };
+        let Some(Some(method_set)) = directory.methods.get(method_index) else {
+            return Ok(true);
+        };
+        let known_http = method_set.iter().any(|a| {
+            if a.visibility != 1 {
+                return false;
+            }
+            c.symbols.types.get(a.type_idx as usize).is_some_and(|ty| {
+                let role = mappings.get(ty).map(|r| r.name).or_else(|| {
+                    ty.strip_prefix("Lretrofit2/http/")
+                        .and_then(|s| s.strip_suffix(';'))
+                });
+                role.is_some_and(|r| {
+                    [
+                        "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "HTTP",
+                    ]
+                    .contains(&r)
+                })
+            })
+        });
+        if !known_http {
+            return Ok(true);
+        }
+        let annotation_count = method_set.len()
+            + directory.parameters.get(method_index).map_or(0, |params| {
+                params
+                    .iter()
+                    .filter_map(Option::as_ref)
+                    .map(|set| set.len())
+                    .sum::<usize>()
+            });
+        if !self.work.take(annotation_count)? {
+            return Ok(false);
+        }
+        let mut value_budget = 120_000usize;
+        let mut method_annotations = Vec::new();
+        let mut parameter_annotations = Vec::new();
+        let mut verbs = Vec::new();
+        let mut dynamic_url = false;
+        let mut header_parameters = Vec::new();
+        let mut query_parameters = Vec::new();
+        let mut unknown_parameters = Vec::new();
+        let mut unresolved_parameter_values = false;
+        let mut unknown_runtime_method_annotations = 0usize;
+        let mut collect = |a: &crate::native_dex::DexAnnotation,
+                           parameter: Option<usize>|
+         -> Result<()> {
+            let ty = c
+                .symbols
+                .types
+                .get(a.type_idx as usize)
+                .context("Invalid annotation type")?;
+            let semantic = mappings
+                .get(ty)
+                .filter(|r| recovered_annotation_role(r.name, parameter.is_some()).is_some())
+                .map(|r| r.name)
+                .or_else(|| {
+                    ty.strip_prefix("Lretrofit2/http/")
+                        .and_then(|s| s.strip_suffix(';'))
+                        .filter(|role| {
+                            recovered_annotation_role(role, parameter.is_some()).is_some()
+                        })
+                });
+            let decoded = crate::annotation_values::elements_value(
+                &a.elements,
+                &c.symbols,
+                &mut value_budget,
+            );
+            let (values, value_status) = match decoded {
+                Ok(v) => (v, "explicit_decoded"),
+                Err(_) => (Value::Null, "unresolved_value_budget_or_invalid_symbol"),
+            };
+            let item = json!({"original_descriptor":ty.as_ref(),"semantic_role":semantic,"runtime_visible":a.visibility==1,
+                "values":values,"value_status":value_status,"mapping_evidence":mappings.get(ty).map(|r|&r.evidence),
+                "visibility":a.visibility,"parameter_index":parameter});
+            if let Some(index) = parameter {
+                if a.visibility == 1 {
+                    if value_status != "explicit_decoded" {
+                        unresolved_parameter_values = true;
+                    }
+                    match semantic {
+                        Some("Url") => dynamic_url = true,
+                        Some("Header") | Some("HeaderMap") => {
+                            if semantic == Some("Header") && !values["value"]["value"].is_string() {
+                                unresolved_parameter_values = true;
+                            }
+                            header_parameters.push(json!({"index":index,"name":values["value"]["value"],"role":semantic}));
+                        }
+                        Some("Query") | Some("QueryMap") | Some("QueryName") => {
+                            if semantic == Some("Query") && !values["value"]["value"].is_string() {
+                                unresolved_parameter_values = true;
+                            }
+                            query_parameters.push(json!({"index":index,"name":values["value"]["value"],"role":semantic}));
+                        }
+                        None => unknown_parameters.push(index),
+                        _ => {}
+                    }
+                }
+                parameter_annotations.push(item);
+            } else {
+                if a.visibility == 1 && semantic.is_none() {
+                    unknown_runtime_method_annotations += 1;
+                }
+                if let Some(role) = semantic.filter(|r| {
+                    a.visibility == 1 && {
+                        [
+                            "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "HTTP",
+                        ]
+                        .contains(r)
+                    }
+                }) {
+                    let verb = if role == "HTTP" {
+                        values["method"]["value"].as_str().map(str::to_owned)
+                    } else {
+                        Some(role.to_owned())
+                    };
+                    let path_key = if role == "HTTP" { "path" } else { "value" };
+                    verbs.push((
+                        verb,
+                        values[path_key]["value"].as_str().map(str::to_owned),
+                        ty.to_string(),
+                    ));
+                }
+                method_annotations.push(item);
+            }
+            Ok(())
+        };
+        if let Some(Some(set)) = directory.methods.get(method_index) {
+            for a in set.iter() {
+                collect(a, None)?;
+            }
+        }
+        if let Some(params) = directory.parameters.get(method_index) {
+            for (pi, set) in params.iter().enumerate() {
+                if let Some(set) = set {
+                    for a in set.iter() {
+                        collect(a, Some(pi))?;
+                    }
+                }
+            }
+        }
+        let unique = verbs.len() == 1;
+        let verb = if unique { verbs[0].0.clone() } else { None };
+        let path = if unique { verbs[0].1.clone() } else { None };
+        let sites = links
+            .items
+            .get(c.descriptor.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let link_status = if sites
+            .iter()
+            .any(|site| site["base_url_candidate"].is_string())
+        {
+            "callsite_same_object_library_model_conditional"
+        } else if sites.is_empty() {
+            if !links.model_resolved {
+                "creation_model_unresolved"
+            } else if links.budget_exhausted || links.sites_truncated > 0 {
+                "creation_search_incomplete"
+            } else {
+                "no_supported_creation_site_observed"
+            }
+        } else {
+            "creation_site_base_url_unresolved"
+        };
+        self.page.add(json!({"kind":"retrofit_service_method","detector":"retrofit_service_inventory",
+            "family":"retrofit2","class_id":type_name(&c.descriptor),"method_id":method_id(m),
+            "http_verb":verb,"declared_path":path,"dynamic_url_parameter":dynamic_url_value(dynamic_url,!unknown_parameters.is_empty(),mappings.recovery_complete),
+            "path_status":if !unique {"ambiguous_multiple_http_annotations"} else if path.is_some() {"explicit_annotation_value"} else {"unresolved_annotation_value_or_default"},
+            "header_parameters":header_parameters,"query_parameters":query_parameters,
+            "header_parameter_status":if unknown_parameters.is_empty() && !unresolved_parameter_values && mappings.recovery_complete {"explicit_annotations_resolved"}else{"partial_unresolved_annotations_or_values"},
+            "query_parameter_status":if unknown_parameters.is_empty() && !unresolved_parameter_values && mappings.recovery_complete {"explicit_annotations_resolved"}else{"partial_unresolved_annotations_or_values"},
+            "http_method_annotation_status":if unknown_runtime_method_annotations==0 {"recognized_http_annotation"}else{"known_http_annotation_with_unresolved_runtime_annotations"},
+            "unknown_parameter_indices":unknown_parameters,"method_annotations":method_annotations,
+            "parameter_annotations":parameter_annotations,"original_http_annotations":verbs.iter().map(|v|&v.2).collect::<Vec<_>>(),
+            "service_creation_sites":sites,"base_url_link_status":link_status,
+            "creation_sites_truncated_globally":links.sites_truncated>0,
+            "dex_entry":c.symbols.origin.get(),"runtime_verified":false,"external_control":"not_analyzed"}))?;
         Ok(true)
     }
 }
@@ -341,6 +559,8 @@ pub(super) fn scan(
         error_count: 0,
         classes: 0,
     };
+    let mappings = retrofit::discover(classes, cancel)?;
+    let links = retrofit::creation_links(classes, &mappings, cancel)?;
     let mut tables = HashMap::new();
     let mut complete = true;
     'classes: for c in &scoped {
@@ -435,7 +655,7 @@ pub(super) fn scan(
             }
             if let Some(directory) = annotations {
                 if let Some(Some(set)) = directory.methods.get(mi)
-                    && !scan.annotations(c, m, set, None)?
+                    && !scan.annotations(c, m, set, None, &mappings)?
                 {
                     complete = false;
                     break 'classes;
@@ -443,13 +663,17 @@ pub(super) fn scan(
                 if let Some(parameters) = directory.parameters.get(mi) {
                     for (parameter, set) in parameters.iter().enumerate() {
                         if let Some(set) = set
-                            && !scan.annotations(c, m, set, Some(parameter))?
+                            && !scan.annotations(c, m, set, Some(parameter), &mappings)?
                         {
                             complete = false;
                             break 'classes;
                         }
                     }
                 }
+            }
+            if !scan.service(c, m, mi, &mappings, &links)? {
+                complete = false;
+                break 'classes;
             }
             if roles.methods.is_empty() && roles.fields.is_empty() {
                 continue;
@@ -508,36 +732,134 @@ pub(super) fn scan(
             }
         }
     }
-    complete &= scan.error_count == 0;
-    let work_budget_exhausted = scan.work.remaining == 0;
-    let outside_prefix = if prefix.is_empty() {
-        Value::Null
-    } else {
-        retrofit_outside_prefix(
-            classes.iter().copied().filter(|c| !in_scope(c)),
-            &mut scan.work,
-        )?
-    };
+    complete &= scan.error_count == 0
+        && mappings.recovery_complete
+        && !links.budget_exhausted
+        && links.sites_truncated == 0;
+    let work_budget_exhausted = scan.work.remaining == 0 || links.budget_exhausted;
+    let outside_prefix = retrofit_outside_prefix(classes, prefix, &mappings, &mut scan.work)?;
     Ok(
         json!({"items":scan.page.items,"matching_candidates_so_far":scan.page.total,
         "coverage":{"detector":"known_network_usage","complete":complete,"selected_classes":scoped.len(),"visited_classes":scan.classes,
-            "detectors_run":["okhttp_contracts","named_network_calls","named_network_fields","retrofit_annotations"],"work_budget_exhausted":work_budget_exhausted,
-            "retrofit_annotations_outside_prefix":outside_prefix,
-            "errors":scan.errors,"error_count":scan.error_count,"scope":"Exact named OkHttp/Retrofit descriptors in selected classes, including loaded hierarchy edges. Renamed APIs, reflection and missing external hierarchy definitions are not resolved."}}),
+            "detectors_run":["okhttp_contracts","named_network_calls","named_network_fields","retrofit_annotations","retrofit_service_inventory"],"retrofit_parser_candidates":mappings.parser_candidates,"retrofit_parser_ambiguous":mappings.ambiguous,"retrofit_recovery_complete":mappings.recovery_complete,"retrofit_recovery_status":mappings.status(),"retrofit_recovered_roles":mappings.recovered_roles(),"retrofit_creation":{"model_resolved":links.model_resolved,"candidate_methods":links.candidate_methods,"scanned_methods":links.scanned_methods,"unsupported_methods":links.unsupported_methods,"budget_exhausted":links.budget_exhausted,"sites_seen":links.sites_seen,"sites_retained":links.sites_seen-links.sites_truncated,"sites_truncated":links.sites_truncated,"supported_scope":"branch-free local methods up to 2048 code units, no try regions; exact create(Class) reference, class constant, tracked builder receiver and literal base URL when available"},"work_budget_exhausted":work_budget_exhausted,"retrofit_annotations_outside_prefix":outside_prefix,
+            "errors":scan.errors,"error_count":scan.error_count,"scope":"Exact named OkHttp/Retrofit descriptors and conservatively mapped Retrofit annotations in selected classes. Service methods are static declarations; creation and base URL links require separate object dataflow evidence. Reflection and unsupported flows remain unresolved."}}),
     )
 }
-
-/// Count Retrofit-annotated declarations that `package_prefix` excluded, so a
-/// zero result on an obfuscated build names the renamed top-level packages.
-fn retrofit_outside_prefix<'a>(
-    classes: impl Iterator<Item = &'a DexClass>,
+pub(super) fn services(
+    classes: &[&DexClass],
+    args: &Value,
+    cancel: &AtomicBool,
+    budget: usize,
+) -> Result<Value> {
+    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+    let limit = args["limit"].as_u64().unwrap_or(25) as usize;
+    ensure!((1..=100).contains(&limit), "limit must be 1..100");
+    let prefix = args["package_prefix"]
+        .as_str()
+        .unwrap_or("")
+        .trim_end_matches('.');
+    let scoped: Vec<_> = classes
+        .iter()
+        .copied()
+        .filter(|c| {
+            let name = type_name(&c.descriptor);
+            prefix.is_empty()
+                || name == prefix
+                || name
+                    .strip_prefix(prefix)
+                    .is_some_and(|s| s.starts_with('.'))
+        })
+        .collect();
+    let mappings = retrofit::discover(classes, cancel)?;
+    let links = retrofit::creation_links(classes, &mappings, cancel)?;
+    let mut scan = Scan {
+        work: Work {
+            remaining: budget,
+            cancel,
+        },
+        page: Page {
+            offset,
+            limit,
+            total: 0,
+            items: vec![],
+            bytes: 0,
+            full: false,
+        },
+        errors: vec![],
+        error_count: 0,
+        classes: 0,
+    };
+    let mut complete = true;
+    'classes: for c in &scoped {
+        if !scan.work.take(1)? {
+            complete = false;
+            break;
+        }
+        scan.classes += 1;
+        if c.access_flags & 0x200 == 0 {
+            continue;
+        }
+        for (mi, m) in c.methods.iter().enumerate() {
+            if !scan.work.take(1)? {
+                complete = false;
+                break 'classes;
+            }
+            if !scan.service(c, m, mi, &mappings, &links)? {
+                complete = false;
+                break 'classes;
+            }
+        }
+    }
+    complete &= scan.error_count == 0
+        && mappings.recovery_complete
+        && !links.budget_exhausted
+        && links.sites_truncated == 0;
+    let work_budget_exhausted = scan.work.remaining == 0;
+    let outside_prefix = retrofit_outside_prefix(classes, prefix, &mappings, &mut scan.work)?;
+    if complete {
+        ensure!(offset <= scan.page.total, "Invalid service row offset");
+    }
+    let end = offset + scan.page.items.len();
+    Ok(
+        json!({"projection":"services","items":scan.page.items,"offset":offset,"limit":limit,
+        "total":complete.then_some(scan.page.total),"matching_candidates_so_far":scan.page.total,
+        "next_offset":(end<scan.page.total).then_some(end),"coverage":{"detector":"retrofit_service_inventory","complete":complete,
+            "selected_classes":scoped.len(),"visited_classes":scan.classes,"retrofit_parser_candidates":mappings.parser_candidates,
+            "retrofit_parser_ambiguous":mappings.ambiguous,"retrofit_recovery_complete":mappings.recovery_complete,"retrofit_recovery_status":mappings.status(),"retrofit_recovered_roles":mappings.recovered_roles(),
+            "creation_model_resolved":links.model_resolved,"creation_candidate_methods":links.candidate_methods,
+            "creation_scanned_methods":links.scanned_methods,"creation_unsupported_methods":links.unsupported_methods,
+            "creation_budget_exhausted":links.budget_exhausted,"creation_sites_seen":links.sites_seen,
+            "creation_sites_truncated":links.sites_truncated,"work_budget_exhausted":work_budget_exhausted,"retrofit_annotations_outside_prefix":outside_prefix,
+            "scope":"Runtime-visible interface method annotations with exact or conservatively recovered Retrofit roles. Rows are static declarations. Creation links cover branch-free local methods only; model assumptions, dynamic values and external control remain explicit."},
+        "empty_result_note":if scan.page.total==0 {Some("No recognized Retrofit service-method annotations in this scope; renamed or unsupported parser variants remain possible.")} else {None::<&str>}}),
+    )
+}
+/// Count runtime-visible Retrofit declarations that `package_prefix` excluded,
+/// so a zero result on an obfuscated build names the renamed top-level packages.
+/// Exact `retrofit2.http` descriptors and conservatively recovered renamed
+/// annotation classes both count. Null when no prefix was supplied.
+fn retrofit_outside_prefix(
+    classes: &[&DexClass],
+    prefix: &str,
+    mappings: &retrofit::Mappings,
     work: &mut Work<'_>,
 ) -> Result<Value> {
+    if prefix.is_empty() {
+        return Ok(Value::Null);
+    }
     let mut owners = 0usize;
     let mut methods = 0usize;
     let mut examples = Vec::new();
     let mut complete = true;
-    for c in classes {
+    for c in classes.iter().copied() {
+        let name = type_name(&c.descriptor);
+        if name == prefix
+            || name
+                .strip_prefix(prefix)
+                .is_some_and(|s| s.starts_with('.'))
+        {
+            continue;
+        }
         if !work.take(1)? {
             complete = false;
             break;
@@ -548,10 +870,13 @@ fn retrofit_outside_prefix<'a>(
         let role = |set: &Option<DexAnnotationSet>, parameter: bool| {
             set.as_ref().is_some_and(|set| {
                 set.iter().any(|a| {
-                    c.symbols
-                        .types
-                        .get(a.type_idx as usize)
-                        .is_some_and(|ty| annotation_role(ty, parameter).is_some())
+                    a.visibility == 1
+                        && c.symbols.types.get(a.type_idx as usize).is_some_and(|ty| {
+                            annotation_role(ty, parameter).is_some()
+                                || mappings.get(ty).is_some_and(|m| {
+                                    recovered_annotation_role(m.name, parameter).is_some()
+                                })
+                        })
                 })
             })
         };
@@ -571,12 +896,32 @@ fn retrofit_outside_prefix<'a>(
             owners += 1;
             methods += annotated;
             if examples.len() < 10 {
-                examples.push(type_name(&c.descriptor));
+                examples.push(name);
             }
         }
     }
     Ok(
         json!({"classes":owners,"methods":methods,"examples":examples,"examples_limit":10,"complete":complete,
-        "scope":"Classes outside package_prefix declaring retrofit2.http method or parameter annotations; counted, not scanned for other evidence"}),
+        "scope":"Classes outside package_prefix declaring runtime-visible retrofit2.http or recovered Retrofit method/parameter annotations; counted, not scanned for other evidence"}),
     )
+}
+#[cfg(test)]
+mod focused_tests {
+    use super::*;
+    #[test]
+    fn recovered_roles_obey_location_and_url_unknown_precedence() {
+        assert_eq!(recovered_annotation_role("Url", false), None);
+        assert_eq!(recovered_annotation_role("GET", true), None);
+        assert_eq!(
+            recovered_annotation_role("Url", true),
+            Some("url_parameter")
+        );
+        assert_eq!(
+            recovered_annotation_role("GET", false),
+            Some("service_method_annotation")
+        );
+        assert_eq!(dynamic_url_value(true, true, true), json!(true));
+        assert_eq!(dynamic_url_value(false, true, true), Value::Null);
+        assert_eq!(dynamic_url_value(false, false, true), json!(false));
+    }
 }

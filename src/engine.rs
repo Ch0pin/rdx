@@ -233,6 +233,24 @@ pub fn source_identity(source: &str) -> String {
 }
 
 impl NativeEngine {
+    /// Query exact original DEX annotation usages in the loaded project.
+    pub fn annotation_usages(
+        &self,
+        project: &Project,
+        args: &serde_json::Value,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<serde_json::Value> {
+        crate::annotation_usage::search(self, project, args, cancel)
+    }
+    /// Query static networking evidence, including `projection:"services"`.
+    pub fn network_stacks(
+        &self,
+        project: &Project,
+        args: &serde_json::Value,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<serde_json::Value> {
+        crate::network_stacks::search(self, project, args, cancel)
+    }
     pub(crate) fn opened_path(&self) -> Option<&Path> {
         self.input.as_deref()
     }

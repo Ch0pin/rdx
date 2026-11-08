@@ -266,6 +266,23 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     }
     assert_eq!(manifest["additionalProperties"], false);
     let components = schema("get_manifest_components");
+    for tool in ["get_manifest_components", "get_manifest_summary"] {
+        assert_eq!(
+            schema(tool)["properties"]["route_match_mode"]["enum"],
+            json!(["exact", "contains"])
+        );
+        assert!(
+            schema(tool)["properties"]["route_match_mode"]
+                .get("default")
+                .is_none()
+        );
+    }
+    assert!(
+        components["properties"]["match_mode"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("class_name only")
+    );
     for field in [
         "launchMode",
         "taskAffinity",

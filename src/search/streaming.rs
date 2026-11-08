@@ -226,7 +226,7 @@ pub(super) fn run(
     query: &CompiledQuery,
     cancel: &AtomicBool,
     emit: &mut impl FnMut(SearchUpdate),
-    interactive: &mut impl FnMut(&mut NativeEngine),
+    interactive: &mut impl FnMut(&mut NativeEngine, &mut SearchCache),
 ) -> SearchSummary {
     let workers =
         std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).clamp(1, 12));
@@ -250,7 +250,7 @@ pub(super) fn run_with_workers(
     query: &CompiledQuery,
     cancel: &AtomicBool,
     emit: &mut impl FnMut(SearchUpdate),
-    interactive: &mut impl FnMut(&mut NativeEngine),
+    interactive: &mut impl FnMut(&mut NativeEngine, &mut SearchCache),
     workers: usize,
 ) -> SearchSummary {
     let workers = workers.clamp(1, 16);
@@ -308,7 +308,7 @@ pub(super) fn run_with_workers(
         let mut in_flight = BTreeSet::new();
         let mut next = 0;
         'scan: loop {
-            interactive(engine);
+            interactive(engine, cache);
             if cancel.load(Ordering::Relaxed) {
                 summary.cancelled = true;
                 break;
@@ -316,7 +316,7 @@ pub(super) fn run_with_workers(
             // Admission resolves indexed classes inline and bounds only renders
             // in flight, so a slow render never starves the workers behind it.
             while next < classes.len() && in_flight.len() < window {
-                interactive(engine);
+                interactive(engine, cache);
                 if cancel.load(Ordering::Relaxed) {
                     summary.cancelled = true;
                     break 'scan;
@@ -400,7 +400,7 @@ pub(super) fn run_with_workers(
         // A worker may be finishing resource decoration when cancellation lands.
         // Keep serving navigation during shutdown as well as during rendering.
         while handles.iter().any(|handle| !handle.is_finished()) {
-            interactive(engine);
+            interactive(engine, cache);
             std::thread::sleep(Duration::from_millis(5));
         }
         summary
@@ -530,7 +530,7 @@ mod tests {
             if let SearchUpdate::Batch(hits) = update {
                 batches.push(
                     hits.iter()
-                        .map(|hit| hit.document.name.clone())
+                        .map(|hit| hit.origin.name.clone())
                         .collect::<Vec<_>>(),
                 );
             }
@@ -582,11 +582,11 @@ mod tests {
                     expected.extend(
                         batch
                             .into_iter()
-                            .map(|hit| (hit.document.name.clone(), hit.start, hit.end, hit.kind)),
+                            .map(|hit| (hit.origin.name.clone(), hit.start, hit.end, hit.kind)),
                     );
                 }
             },
-            &mut |_| {},
+            &mut |_, _| {},
             4,
         );
         assert!(first.errors.is_empty(), "{:?}", first.errors);
@@ -607,11 +607,11 @@ mod tests {
                     actual.extend(
                         batch
                             .into_iter()
-                            .map(|hit| (hit.document.name.clone(), hit.start, hit.end, hit.kind)),
+                            .map(|hit| (hit.origin.name.clone(), hit.start, hit.end, hit.kind)),
                     );
                 }
             },
-            &mut |_| {
+            &mut |_, _| {
                 callbacks += 1;
             },
             12,
@@ -642,7 +642,7 @@ mod tests {
                 &query,
                 &AtomicBool::new(false),
                 &mut |_| {},
-                &mut |_| {},
+                &mut |_, _| {},
                 workers,
             );
             assert_eq!(summary.scanned, names.len());
@@ -678,7 +678,7 @@ mod tests {
                 &query,
                 &cancel,
                 &mut |_| {},
-                &mut |_| {
+                &mut |_, _| {
                     callbacks += 1;
                     if callbacks == window + 2 {
                         cancel.store(true, Ordering::Relaxed);
@@ -712,7 +712,7 @@ mod tests {
                 &query,
                 &cancel,
                 &mut |_| {},
-                &mut |_| {
+                &mut |_, _| {
                     callbacks += 1;
                     if callbacks == 2 {
                         cancel.store(true, Ordering::Relaxed);

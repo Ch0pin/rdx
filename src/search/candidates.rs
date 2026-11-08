@@ -185,16 +185,17 @@ fn stable_prioritize<T>(classes: &mut Vec<T>, hints: Vec<bool>) {
 
 pub(super) fn prioritize(
     engine: &mut NativeEngine,
+    cache: &mut super::SearchCache,
     classes: &mut Vec<&String>,
     matcher: &Regex,
     cancel: &AtomicBool,
-    interactive: &mut impl FnMut(&mut NativeEngine),
+    interactive: &mut impl FnMut(&mut NativeEngine, &mut super::SearchCache),
 ) {
     let mut plans = HashMap::new();
     let mut hints = Vec::with_capacity(classes.len());
     for (index, name) in classes.iter().enumerate() {
         if index % 128 == 0 {
-            interactive(engine);
+            interactive(engine, cache);
         }
         if cancel.load(Ordering::Relaxed) {
             return;

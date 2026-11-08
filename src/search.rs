@@ -177,9 +177,40 @@ impl rdx::source_text::TextOwner for SearchDocument {
         self.source.capacity()
     }
 }
+/// Where a hit was found, shared by every hit of one document. Hits do not
+/// retain source: opening one reloads it from the session index, or renders
+/// the class again when the index holds no record. `retained` keeps the source
+/// only for results whose documents never reach the index, such as usage scans.
+#[derive(Debug)]
+pub struct HitOrigin {
+    pub target: SearchTarget,
+    pub name: String,
+    pub syntax: String,
+    pub source_hash: Option<String>,
+    pub retained: Option<Arc<SearchDocument>>,
+}
+impl HitOrigin {
+    fn describe(document: &SearchDocument, retained: Option<Arc<SearchDocument>>) -> Arc<Self> {
+        Arc::new(Self {
+            target: document.target.clone(),
+            name: document.name.clone(),
+            syntax: document.syntax.clone(),
+            source_hash: document.source_hash.clone(),
+            retained,
+        })
+    }
+    /// An indexed document: the hit reloads its source when opened.
+    pub fn indexed(document: &SearchDocument) -> Arc<Self> {
+        Self::describe(document, None)
+    }
+    /// A document outside the session index: the hit keeps its source.
+    pub fn retaining(document: Arc<SearchDocument>) -> Arc<Self> {
+        Self::describe(&document, Some(document.clone()))
+    }
+}
 #[derive(Clone)]
 pub struct SearchHit {
-    pub document: Arc<SearchDocument>,
+    pub origin: Arc<HitOrigin>,
     pub start: usize,
     pub end: usize,
     pub line: usize,
@@ -351,6 +382,7 @@ fn matches(
             }
         }
     }
+    let origin = HitOrigin::indexed(&document);
     let (mut byte_cursor, mut char_cursor, mut line, mut row_start) = (0, 0, 1, 0);
     found
         .into_iter()
@@ -386,7 +418,7 @@ fn matches(
                     .map_or(tail.len(), |(i, _)| i);
             preview.push_str(&tail);
             SearchHit {
-                document: document.clone(),
+                origin: origin.clone(),
                 start,
                 end,
                 line,
@@ -461,6 +493,16 @@ impl SearchCache {
             self.hits += 1;
         }
         entry
+    }
+    /// Memory tier first, then the disk index; counts a disk hit when a record loads.
+    fn lookup(&mut self, key: &SearchTarget) -> Option<CachedValue> {
+        self.get(key).or_else(|| {
+            let value = self.disk.load(key);
+            if value.is_some() {
+                self.disk_hits += 1;
+            }
+            value
+        })
     }
     fn remove(&mut self, key: &SearchTarget) {
         if let Some(value) = self.entries.remove(key) {
@@ -647,6 +689,107 @@ fn definition_candidates(
     Ok(candidates)
 }
 
+/// Text preview of one archive entry as a search document; `None` for binary entries.
+fn resource_document(
+    engine: &mut NativeEngine,
+    archive: &Archive,
+    entry: &rdx::apk::Entry,
+) -> LoadedDocument {
+    let decoded_xml = entry.path == "AndroidManifest.xml"
+        || (entry.path.starts_with("res/") && entry.path.ends_with(".xml"));
+    let preview = if decoded_xml {
+        engine
+            .read_resource(&entry.path)
+            .map(|text| Preview::Text {
+                text,
+                syntax: "xml".into(),
+                note: None,
+            })
+            .or_else(|error| match archive.preview(entry.index) {
+                Ok(preview @ Preview::Text { .. }) => Ok(preview),
+                _ => Err(error),
+            })
+    } else if is_binary_path(&entry.path) {
+        Ok(Preview::Binary {
+            text: String::new(),
+            note: String::new(),
+        })
+    } else {
+        archive.preview(entry.index)
+    };
+    preview
+        .map(|preview| match preview {
+            Preview::Text { text, syntax, note } => Some((
+                SearchDocument {
+                    target: SearchTarget::Resource(entry.index),
+                    name: entry.path.clone(),
+                    source: text,
+                    syntax,
+                    links: Vec::new(),
+                    source_hash: None,
+                    metadata_complete: true,
+                },
+                Vec::new(),
+                note,
+            )),
+            _ => None,
+        })
+        .map_err(|e| format!("{}: {e}", entry.path))
+}
+
+/// Source for opening a hit: the session index first, then a fresh render.
+/// A rendered fallback joins the index so the next open is a lookup.
+pub fn hit_source(
+    engine: &mut NativeEngine,
+    cache: &mut SearchCache,
+    archive: Option<&Archive>,
+    origin: &HitOrigin,
+) -> Result<Arc<SearchDocument>, String> {
+    if let Some(document) = &origin.retained {
+        return Ok(document.clone());
+    }
+    if let Some(Some((document, _, _))) = cache.lookup(&origin.target) {
+        return Ok(document);
+    }
+    let loaded = match &origin.target {
+        SearchTarget::Class(name) => engine
+            .decompile_for_search(name)
+            .map(|code| {
+                Some((
+                    SearchDocument {
+                        target: SearchTarget::Class(name.clone()),
+                        name: name.clone(),
+                        source: code.source,
+                        syntax: "java".into(),
+                        links: code.links,
+                        source_hash: Some(code.source_hash),
+                        metadata_complete: true,
+                    },
+                    code.definitions,
+                    None,
+                ))
+            })
+            .map_err(|e| format!("{name}: {e}")),
+        SearchTarget::Resource(index) => {
+            let archive =
+                archive.ok_or_else(|| format!("{}: archive is unavailable", origin.name))?;
+            let entry = archive
+                .entries
+                .iter()
+                .find(|entry| entry.index == *index)
+                .ok_or_else(|| format!("{}: archive entry is unavailable", origin.name))?;
+            resource_document(engine, archive, entry)
+        }
+    }?;
+    let value = loaded
+        .map(|(document, definitions, note)| (Arc::new(document), Arc::new(definitions), note));
+    cache.insert(origin.target.clone(), value.clone());
+    match value {
+        Some((document, _, _)) => Ok(document),
+        None => Err(format!("{}: source is not text", origin.name)),
+    }
+}
+
 // Keep the engine, cache identity, input scope and cancellation explicit at this boundary.
 #[allow(clippy::too_many_arguments)]
 pub fn run_search(
@@ -668,7 +811,7 @@ pub fn run_search(
         query,
         cancel,
         emit,
-        |_| {},
+        |_, _| {},
     )
 }
 
@@ -683,7 +826,7 @@ pub fn run_search_interactive(
     query: &CompiledQuery,
     cancel: &AtomicBool,
     mut emit: impl FnMut(SearchUpdate),
-    mut interactive: impl FnMut(&mut NativeEngine),
+    mut interactive: impl FnMut(&mut NativeEngine, &mut SearchCache),
 ) -> SearchSummary {
     cache.reset(project_id, classes.len());
     let q = &query.query;
@@ -710,6 +853,7 @@ pub fn run_search_interactive(
     {
         candidates::prioritize(
             engine,
+            cache,
             &mut selected,
             &query.matcher,
             cancel,
@@ -761,7 +905,7 @@ pub fn run_search_interactive(
     if !q.code && !q.comments && !selected.is_empty() {
         let mut candidates = HashSet::new();
         for page in selected.chunks(128) {
-            interactive(engine);
+            interactive(engine, cache);
             if cancel.load(Ordering::Relaxed) {
                 return SearchSummary {
                     cancelled: true,
@@ -801,7 +945,7 @@ pub fn run_search_interactive(
     let mut batches_available = true;
     let definitions_requested = q.classes || q.methods || q.fields;
     for index in 0..selected.len() + entries.len() {
-        interactive(engine);
+        interactive(engine, cache);
         if cancel.load(Ordering::Relaxed) {
             summary.cancelled = true;
             break;
@@ -919,48 +1063,7 @@ pub fn run_search_interactive(
                 }
             } else {
                 let entry = entries[index - selected.len()];
-                let decoded_xml = entry.path == "AndroidManifest.xml"
-                    || (entry.path.starts_with("res/") && entry.path.ends_with(".xml"));
-                let preview = if decoded_xml {
-                    engine
-                        .read_resource(&entry.path)
-                        .map(|text| Preview::Text {
-                            text,
-                            syntax: "xml".into(),
-                            note: None,
-                        })
-                        .or_else(|error| {
-                            match archive.expect("entry archive").preview(entry.index) {
-                                Ok(preview @ Preview::Text { .. }) => Ok(preview),
-                                _ => Err(error),
-                            }
-                        })
-                } else if is_binary_path(&entry.path) {
-                    Ok(Preview::Binary {
-                        text: String::new(),
-                        note: String::new(),
-                    })
-                } else {
-                    archive.expect("entry archive").preview(entry.index)
-                };
-                preview
-                    .map(|preview| match preview {
-                        Preview::Text { text, syntax, note } => Some((
-                            SearchDocument {
-                                target: SearchTarget::Resource(entry.index),
-                                name: entry.path.clone(),
-                                source: text,
-                                syntax,
-                                links: Vec::new(),
-                                source_hash: None,
-                                metadata_complete: true,
-                            },
-                            Vec::new(),
-                            note,
-                        )),
-                        _ => None,
-                    })
-                    .map_err(|e| format!("{}: {e}", entry.path))
+                resource_document(engine, archive.expect("entry archive"), entry)
             };
             let loaded = loaded
                 .map(|entry| entry.map(|(doc, defs, note)| (Arc::new(doc), Arc::new(defs), note)));
@@ -1448,7 +1551,7 @@ mod tests {
                 if let SearchUpdate::Batch(hits) = update {
                     assert!(
                         hits.iter()
-                            .any(|hit| hit.document.name.ends_with(".VendingBackupAgent"))
+                            .any(|hit| hit.origin.name.ends_with(".VendingBackupAgent"))
                     );
                     first = Some(started.elapsed());
                     cancel.store(true, Ordering::Relaxed);
@@ -1492,13 +1595,13 @@ mod tests {
                 if let SearchUpdate::Batch(hits) = update {
                     found |= hits
                         .iter()
-                        .any(|hit| hit.document.name.ends_with(".ScreenshotsActivityV2"));
+                        .any(|hit| hit.origin.name.ends_with(".ScreenshotsActivityV2"));
                     if found {
                         cancel.store(true, Ordering::Relaxed);
                     }
                 }
             },
-            |_| {
+            |_, _| {
                 if started.elapsed().as_secs() >= 90 {
                     cancel.store(true, Ordering::Relaxed);
                 }
@@ -1529,7 +1632,7 @@ mod tests {
                 if let SearchUpdate::Batch(hits) = update {
                     warm_found |= hits
                         .iter()
-                        .any(|hit| hit.document.name.ends_with(".ScreenshotsActivityV2"));
+                        .any(|hit| hit.origin.name.ends_with(".ScreenshotsActivityV2"));
                     if warm_found {
                         cancel.store(true, Ordering::Relaxed);
                     }
@@ -1579,20 +1682,23 @@ mod tests {
             assert!(result.errors.is_empty(), "{:?}", result.errors);
             assert_eq!(result.scanned, project.classes.len());
             assert!(hits.len() >= 4);
-            assert!(hits.iter().all(|h| h.document.metadata_complete));
             let hit = hits
                 .iter()
-                .find(|h| h.document.name == "sample.Caller")
+                .find(|h| h.origin.name == "sample.Caller")
                 .unwrap();
             assert!(
                 engine
                     .navigate(
-                        &hit.document.name,
+                        &hit.origin.name,
                         hit.start,
-                        hit.document.source_hash.as_deref().unwrap()
+                        hit.origin.source_hash.as_deref().unwrap()
                     )
                     .is_ok()
             );
+            // Metadata is complete on the indexed documents the hits reload.
+            let document =
+                hit_source(&mut engine, &mut cache, Some(&archive), &hit.origin).unwrap();
+            assert!(document.metadata_complete);
             if round == 1 {
                 assert_eq!(cache.source_fetches, before);
             }
@@ -1630,5 +1736,117 @@ mod tests {
         );
         assert_eq!(result.hits, 2);
         assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn hits_reload_source_from_the_index_and_render_misses() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let mut engine = NativeEngine::start().unwrap();
+        let project = engine.open(&path).unwrap();
+        let archive = Archive::open(&path).unwrap();
+        let mut cache = SearchCache::default();
+        let cancel = AtomicBool::new(false);
+        let query = CompiledQuery::new(SearchQuery {
+            text: "sample".into(),
+            resources: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut hits = Vec::new();
+        let summary = run_search(
+            &mut engine,
+            &mut cache,
+            1,
+            &project.classes,
+            Some(&archive),
+            &query,
+            &cancel,
+            |update| {
+                if let SearchUpdate::Batch(batch) = update {
+                    hits.extend(batch);
+                }
+            },
+        );
+        assert!(
+            !summary.cancelled && summary.errors.is_empty(),
+            "{:?}",
+            summary.errors
+        );
+        let class_hit = hits
+            .iter()
+            .find(|hit| matches!(hit.origin.target, SearchTarget::Class(_)))
+            .expect("class hit");
+        let resource_hit = hits
+            .iter()
+            .find(|hit| matches!(hit.origin.target, SearchTarget::Resource(_)))
+            .expect("manifest hit");
+        // Hits carry no source; every hit of one document shares one origin.
+        assert!(class_hit.origin.retained.is_none());
+        assert!(class_hit.origin.source_hash.is_some());
+        let siblings = hits
+            .iter()
+            .filter(|hit| Arc::ptr_eq(&hit.origin, &class_hit.origin))
+            .count();
+        assert_eq!(
+            siblings,
+            hits.iter()
+                .filter(|hit| hit.origin.name == class_hit.origin.name)
+                .count()
+        );
+        let matched = |document: &SearchDocument, hit: &SearchHit| -> String {
+            document
+                .source
+                .chars()
+                .skip(hit.start)
+                .take(hit.end - hit.start)
+                .collect()
+        };
+        // Indexed documents come back from the session index with the searched bytes.
+        let before = cache.hits + cache.disk_hits;
+        let document =
+            hit_source(&mut engine, &mut cache, Some(&archive), &class_hit.origin).unwrap();
+        assert_eq!(cache.hits + cache.disk_hits, before + 1);
+        assert_eq!(document.source_hash, class_hit.origin.source_hash);
+        assert_eq!(document.name, class_hit.origin.name);
+        assert!(matched(&document, class_hit).eq_ignore_ascii_case("sample"));
+        let manifest = hit_source(
+            &mut engine,
+            &mut cache,
+            Some(&archive),
+            &resource_hit.origin,
+        )
+        .unwrap();
+        assert_eq!(manifest.name, resource_hit.origin.name);
+        assert!(matched(&manifest, resource_hit).eq_ignore_ascii_case("sample"));
+        // Without an index record the source is rendered again, then indexed.
+        let mut fresh = SearchCache::default();
+        fresh.reset(1, project.classes.len());
+        let rendered =
+            hit_source(&mut engine, &mut fresh, Some(&archive), &class_hit.origin).unwrap();
+        assert_eq!(rendered.source_hash, class_hit.origin.source_hash);
+        assert_eq!(rendered.source, document.source);
+        assert!(fresh.contains(&class_hit.origin.target));
+        let rendered = hit_source(
+            &mut engine,
+            &mut fresh,
+            Some(&archive),
+            &resource_hit.origin,
+        )
+        .unwrap();
+        assert_eq!(rendered.source, manifest.source);
+        assert!(fresh.contains(&resource_hit.origin.target));
+        let before = fresh.hits;
+        hit_source(&mut engine, &mut fresh, Some(&archive), &class_hit.origin).unwrap();
+        assert_eq!(fresh.hits, before + 1);
+        // An indexed resource no longer needs the archive.
+        let indexed = hit_source(&mut engine, &mut fresh, None, &resource_hit.origin).unwrap();
+        assert_eq!(indexed.source, manifest.source);
+        // Retained origins answer from the hit itself.
+        let retained = HitOrigin::retaining(document.clone());
+        let mut empty = SearchCache::default();
+        let answered = hit_source(&mut engine, &mut empty, None, &retained).unwrap();
+        assert!(Arc::ptr_eq(&answered, &document));
+        assert_eq!(empty.hits + empty.disk_hits, 0);
     }
 }

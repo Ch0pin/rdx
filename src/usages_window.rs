@@ -199,7 +199,7 @@ impl UsagesWindow {
                             let title = format!(
                                 "{}:{}",
                                 if hit.kind.is_empty() {
-                                    &hit.document.name
+                                    &hit.origin.name
                                 } else {
                                     &hit.kind
                                 },
@@ -225,7 +225,7 @@ impl UsagesWindow {
                                     ui.visuals().widgets.hovered.bg_fill,
                                 );
                             }
-                            let icon = match hit.document.target {
+                            let icon = match hit.origin.target {
                                 crate::search::SearchTarget::Class(_) => {
                                     crate::icons::Icon::Classes
                                 }
@@ -268,7 +268,7 @@ impl UsagesWindow {
                             } else {
                                 let preview = crate::code_view::search_preview(
                                     &hit.preview,
-                                    &hit.document.syntax,
+                                    &hit.origin.syntax,
                                     hit.preview_match.clone(),
                                     key.1,
                                 );
@@ -295,7 +295,7 @@ impl UsagesWindow {
                             if response
                                 .on_hover_text(format!(
                                     "{} · {}:{}\n{}",
-                                    hit.kind, hit.document.name, hit.line, hit.preview
+                                    hit.kind, hit.origin.name, hit.line, hit.preview
                                 ))
                                 .clicked()
                             {
@@ -358,7 +358,7 @@ impl UsagesWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::{SearchDocument, SearchTarget};
+    use crate::search::{HitOrigin, SearchTarget};
     use std::sync::Arc;
     #[test]
     fn result_click_focuses_code_and_respects_keep_open() {
@@ -401,14 +401,12 @@ mod tests {
             mode,
             keep_open,
             results: vec![SearchHit {
-                document: Arc::new(SearchDocument {
+                origin: Arc::new(HitOrigin {
                     target: SearchTarget::Class("sample.Example".into()),
                     name: "sample.Example".into(),
-                    source: "return target;".into(),
                     syntax: "java".into(),
-                    links: Vec::new(),
                     source_hash: None,
-                    metadata_complete: true,
+                    retained: None,
                 }),
                 start: 7,
                 end: 13,

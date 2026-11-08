@@ -103,7 +103,7 @@ impl SearchWindow {
         ui.fonts(|fonts| {
             for hit in &self.results[count..] {
                 let font = egui::FontId::monospace(13.0);
-                let title = format!("{}:{}", hit.document.name, hit.line);
+                let title = format!("{}:{}", hit.origin.name, hit.line);
                 widths.x = widths.x.max(
                     fonts
                         .layout_no_wrap(title, font.clone(), egui::Color32::WHITE)
@@ -513,7 +513,7 @@ impl SearchWindow {
                     for index in rows {
                         let hit = &self.results[index];
                         ui.push_id(index, |ui| {
-                            let title = format!("{}:{}", hit.document.name, hit.line);
+                            let title = format!("{}:{}", hit.origin.name, hit.line);
                             let (rect, response) = ui.allocate_exact_size(
                                 egui::vec2(table_width, row_height - ui.spacing().item_spacing.y),
                                 egui::Sense::click(),
@@ -531,7 +531,7 @@ impl SearchWindow {
                                     ui.visuals().widgets.hovered.bg_fill,
                                 );
                             }
-                            let icon = match hit.document.target {
+                            let icon = match hit.origin.target {
                                 crate::search::SearchTarget::Class(_) => {
                                     crate::icons::Icon::Classes
                                 }
@@ -574,7 +574,7 @@ impl SearchWindow {
                             } else {
                                 let preview = crate::code_view::search_preview(
                                     &hit.preview,
-                                    &hit.document.syntax,
+                                    &hit.origin.syntax,
                                     hit.preview_match.clone(),
                                     key.1,
                                 );
@@ -601,7 +601,7 @@ impl SearchWindow {
                             if response
                                 .on_hover_text(format!(
                                     "{} · {}:{}\n{}",
-                                    hit.kind, hit.document.name, hit.line, hit.preview
+                                    hit.kind, hit.origin.name, hit.line, hit.preview
                                 ))
                                 .clicked()
                             {
@@ -735,7 +735,7 @@ impl SearchWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::{SearchDocument, SearchTarget};
+    use crate::search::{HitOrigin, SearchTarget};
     use std::sync::Arc;
 
     #[test]
@@ -1093,14 +1093,12 @@ mod tests {
             visible: true,
             keep_open: true,
             results: vec![SearchHit {
-                document: Arc::new(SearchDocument {
+                origin: Arc::new(HitOrigin {
                     target: SearchTarget::Class("sample.Example".into()),
                     name: "sample.Example".into(),
-                    source: preview.clone(),
                     syntax: "java".into(),
-                    links: Vec::new(),
                     source_hash: None,
-                    metadata_complete: true,
+                    retained: None,
                 }),
                 start: 7,
                 end: 13,
@@ -1200,14 +1198,12 @@ mod tests {
             visible: true,
             keep_open,
             results: vec![SearchHit {
-                document: Arc::new(SearchDocument {
+                origin: Arc::new(HitOrigin {
                     target: SearchTarget::Class("sample.Example".into()),
                     name: "sample.Example".into(),
-                    source: "return target;".into(),
                     syntax: "java".into(),
-                    links: Vec::new(),
                     source_hash: None,
-                    metadata_complete: true,
+                    retained: None,
                 }),
                 start: 7,
                 end: 13,

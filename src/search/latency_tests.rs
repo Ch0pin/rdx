@@ -37,11 +37,11 @@ fn ranked_search_preserves_complete_source_results_across_queries() {
             if let SearchUpdate::Batch(batch) = update {
                 set.extend(batch.into_iter().map(|hit| {
                     (
-                        hit.document.name.clone(),
+                        hit.origin.name.clone(),
                         hit.start,
                         hit.end,
                         hit.kind,
-                        hit.document.source_hash.clone(),
+                        hit.origin.source_hash.clone(),
                     )
                 }));
             }
@@ -53,7 +53,7 @@ fn ranked_search_preserves_complete_source_results_across_queries() {
             &query,
             &cancel,
             &mut |u| collect(&mut expected, u),
-            &mut |_| {},
+            &mut |_, _| {},
             1,
         );
         let mut cache = SearchCache::default();
@@ -82,7 +82,7 @@ fn ranked_search_preserves_complete_source_results_across_queries() {
             &query,
             &cancel,
             |_| {},
-            |_| {},
+            |_, _| {},
         );
         assert_eq!(warm.hits, result.hits);
         assert_eq!(cache.source_fetches, fetched);
@@ -111,7 +111,7 @@ fn candidate_planning_is_interactive_and_cancellable() {
         &query,
         &cancel,
         |_| {},
-        |_| cancel.store(true, Ordering::Relaxed),
+        |_, _| cancel.store(true, Ordering::Relaxed),
     );
     assert!(summary.cancelled);
     assert_eq!(cache.source_fetches, 0);
@@ -144,7 +144,7 @@ fn apk_general_search_first_results() {
             let mut emit = |update| {
                 if let SearchUpdate::Batch(hits) = update {
                     first = Some(started.elapsed().as_secs_f64());
-                    owner = Some(hits[0].document.name.clone());
+                    owner = Some(hits[0].origin.name.clone());
                     cancel.store(true, Ordering::Relaxed);
                 }
             };
@@ -169,7 +169,7 @@ fn apk_general_search_first_results() {
                         &query,
                         &cancel,
                         &mut emit,
-                        &mut |_| {},
+                        &mut |_, _| {},
                         1,
                     );
                     baseline_fetches = baseline_cache.source_fetches;
@@ -245,11 +245,11 @@ fn apk_general_search_complete_sample() {
                     &mut |update| {
                         if let SearchUpdate::Batch(batch) = update {
                             hits.extend(batch.into_iter().map(|hit| {
-                                (hit.document.name.clone(), hit.start, hit.end, hit.kind)
+                                (hit.origin.name.clone(), hit.start, hit.end, hit.kind)
                             }));
                         }
                     },
-                    &mut |_| {},
+                    &mut |_, _| {},
                     workers,
                 );
                 eprintln!(
@@ -290,12 +290,14 @@ fn apk_code_search_profile() {
     let mut selected = query.ordered_classes(&project.classes);
     let ordered = started.elapsed().as_secs_f64();
     let started = Instant::now();
+    let mut cache = SearchCache::default();
     candidates::prioritize(
         &mut engine,
+        &mut cache,
         &mut selected,
         &query.matcher,
         &cancel,
-        &mut |_| {},
+        &mut |_, _| {},
     );
     eprintln!(
         "SEARCH_PROFILE {}",
@@ -391,7 +393,7 @@ fn apk_code_search_profile() {
             &query,
             &cancel,
             &mut |_| {},
-            &mut |_| {},
+            &mut |_, _| {},
         );
         let seconds = started.elapsed().as_secs_f64();
         let (entries, payloads, metadata, payload_bytes) = cache.index_stats();
@@ -483,7 +485,7 @@ fn apk_code_search_scaling() {
             &query,
             &cancel,
             &mut |_| {},
-            &mut |_| {},
+            &mut |_, _| {},
             workers,
         );
         let seconds = started.elapsed().as_secs_f64();

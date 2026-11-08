@@ -99,9 +99,14 @@ matches without cached source are rendered again. Records contain a small
 metadata frame and UTF-8 source, using fast DEFLATE compression when it saves
 space. Compressed and expanded records both retain the 32 MiB document bound.
 Results are not capped: every match is reported and the scan runs to the end.
-Each matching class keeps its generated source in memory while the results are
-open, so result memory grows with the number of matching classes rather than
-with a fixed bound. Native searches cache navigation metadata with matched source.
+Hits do not retain source: each carries its target, offsets and the source hash
+the scan recorded, so result memory stays small however broad the query. Opening
+a hit reloads the source from the session index on the engine thread (the search
+thread services the request between classes while a scan runs) and renders the
+class again only when the index holds no record. A render whose hash differs
+from the recorded one opens on the match line rather than trusting stale
+offsets. Find-usages hits keep their source because their documents never enter
+the index. Native searches cache navigation metadata with matched source.
 Cancellation is checked between classes and resources. There are no source
 handoff files or Java code caches.
 

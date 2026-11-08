@@ -1,5 +1,5 @@
 //! Semantic reference collection, cancellable between source owners.
-use crate::search::{SearchDocument, SearchHit, SearchTarget};
+use crate::search::{HitOrigin, SearchDocument, SearchHit, SearchTarget};
 use rdx::engine::{ClassUsages, NativeEngine};
 use std::sync::{
     Arc,
@@ -350,6 +350,8 @@ fn hits(mut result: ClassUsages) -> Result<Vec<SearchHit>, String> {
         source_hash: Some(code.source_hash),
         metadata_complete: true,
     });
+    // Usage sources never reach the session index, so the hits keep them.
+    let origin = HitOrigin::retaining(doc.clone());
     result.occurrences.sort_by_key(|reference| reference.start);
     let source = &doc.source;
     let total_chars = source.chars().count();
@@ -391,7 +393,7 @@ fn hits(mut result: ClassUsages) -> Result<Vec<SearchHit>, String> {
                 .map_or(tail.len(), |(i, _)| i);
         preview.push_str(&tail);
         output.push(SearchHit {
-            document: doc.clone(),
+            origin: origin.clone(),
             start: reference.start,
             end: reference.end,
             line,
@@ -476,7 +478,7 @@ mod tests {
             &cancel,
             |update| {
                 if let UsageUpdate::Batch(hits) = update {
-                    first.extend(hits.into_iter().map(|hit| hit.document.name.clone()));
+                    first.extend(hits.into_iter().map(|hit| hit.origin.name.clone()));
                 }
             },
         );
@@ -497,7 +499,7 @@ mod tests {
             &cancel,
             |update| {
                 if let UsageUpdate::Batch(hits) = update {
-                    second.extend(hits.into_iter().map(|hit| hit.document.name.clone()));
+                    second.extend(hits.into_iter().map(|hit| hit.origin.name.clone()));
                 }
             },
         );
@@ -582,7 +584,7 @@ mod tests {
         );
         assert!(summary.errors.is_empty());
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].document.name, "40");
+        assert_eq!(hits[0].origin.name, "40");
     }
 
     #[test]
@@ -666,7 +668,11 @@ mod tests {
         })
         .unwrap();
         assert_eq!(batch.len(), 2);
-        assert!(Arc::ptr_eq(&batch[0].document, &batch[1].document));
+        assert!(Arc::ptr_eq(&batch[0].origin, &batch[1].origin));
+        assert!(
+            batch[0].origin.retained.is_some(),
+            "usage hits keep their source"
+        );
         for hit in batch {
             assert_eq!(hit.line, 2);
             assert_eq!(&hit.preview[hit.preview_match], "café");

@@ -23,7 +23,7 @@ fn run(
     let started = Instant::now();
     let mut first_result_seconds = None;
     let mut last_progress = Instant::now();
-    let mut matched_texts = BTreeSet::new();
+    let mut pending_texts = Vec::new();
     let summary = search::run_search(
         engine,
         cache,
@@ -49,33 +49,48 @@ fn run(
             }
             if let SearchUpdate::Batch(batch) = update {
                 first_result_seconds.get_or_insert_with(|| started.elapsed().as_secs_f64());
-                for hit in &batch {
-                    let text: String = hit
-                        .document
-                        .source
-                        .chars()
-                        .skip(hit.start)
-                        .take(hit.end - hit.start)
-                        .collect();
-                    matched_texts.insert((hit.document.name.clone(), hit.kind.clone(), text));
-                }
-                hits.extend(
-                    batch
-                        .into_iter()
-                        .map(|hit| (hit.document.name.clone(), hit.start, hit.end, hit.kind)),
-                );
+                hits.extend(batch.iter().map(|hit| {
+                    (
+                        hit.origin.name.clone(),
+                        hit.start,
+                        hit.end,
+                        hit.kind.clone(),
+                    )
+                }));
+                pending_texts.extend(batch);
             }
         },
     );
+    let seconds = started.elapsed().as_secs_f64();
+    let counters = (
+        cache.hits - before.0,
+        cache.disk_hits - before.1,
+        cache.index_rejections - before.2,
+        cache.source_fetches - before.3,
+    );
     let (filter_entries, source_entries, metadata_bytes, disk_bytes) = cache.index_stats();
+    // Hits carry no source: read the matched text back through the index.
+    let mut matched_texts = BTreeSet::new();
+    for hit in pending_texts {
+        let text: String = match search::hit_source(engine, cache, None, &hit.origin) {
+            Ok(document) => document
+                .source
+                .chars()
+                .skip(hit.start)
+                .take(hit.end - hit.start)
+                .collect(),
+            Err(error) => format!("<unavailable: {error}>"),
+        };
+        matched_texts.insert((hit.origin.name.clone(), hit.kind.clone(), text));
+    }
     (
         json!({
-            "seconds": started.elapsed().as_secs_f64(), "scanned": summary.scanned,
+            "seconds": seconds, "scanned": summary.scanned,
             "total": summary.total, "hits": summary.hits, "skipped": summary.skipped,
             "errors": summary.errors,
-            "memory_hits": cache.hits - before.0, "disk_hits": cache.disk_hits - before.1,
-            "index_rejections": cache.index_rejections - before.2,
-            "source_fetches": cache.source_fetches - before.3,
+            "memory_hits": counters.0, "disk_hits": counters.1,
+            "index_rejections": counters.2,
+            "source_fetches": counters.3,
             "first_result_seconds": first_result_seconds,
             "matched_texts": matched_texts,
             "index": {"filter_entries": filter_entries, "source_entries": source_entries,

@@ -5,7 +5,8 @@ use crate::{
     icons::{self, Icon},
     navigation::{self, AssetGrouping, Node, Target},
     search::{
-        self, CompiledQuery, SearchHit, SearchQuery, SearchSummary, SearchTarget, SearchUpdate,
+        self, CompiledQuery, SearchDocument, SearchHit, SearchQuery, SearchSummary, SearchTarget,
+        SearchUpdate,
     },
     search_window::{SearchMode, SearchWindow},
     settings::{SearchPreferences, Settings, SettingsStore},
@@ -86,6 +87,8 @@ enum Event {
         Result<Arc<SharedCode>, String>,
     ),
     InteractiveReady(u64, NativeEngine),
+    /// Source reloaded for a search hit the user opened.
+    HitSource(u64, SearchHit, Result<Arc<SearchDocument>, String>),
     UsagesUpdate(u64, u64, UsageUpdate),
     UsagesDone(u64, u64, NativeEngine, UsageSummary),
     AnalysisDone(u64, u64, Result<serde_json::Value, String>),
@@ -105,13 +108,19 @@ enum InteractiveRequest {
     Metadata(String, String),
     Navigate(String, usize, String),
     NavigateClass(String, JumpLocation),
+    /// Reload the source behind a search hit from the session index.
+    OpenHit(SearchHit),
 }
 
+/// Only the latest jump matters: a newer navigation or hit open replaces any
+/// pending one, while metadata requests stay queued.
 fn replace_pending_navigation(requests: &mut Vec<InteractiveRequest>, request: InteractiveRequest) {
     requests.retain(|pending| {
         !matches!(
             pending,
-            InteractiveRequest::Navigate(..) | InteractiveRequest::NavigateClass(..)
+            InteractiveRequest::Navigate(..)
+                | InteractiveRequest::NavigateClass(..)
+                | InteractiveRequest::OpenHit(..)
         )
     });
     requests.push(request);
@@ -121,11 +130,17 @@ impl InteractiveRequest {
     fn execute(
         self,
         engine: &mut NativeEngine,
+        cache: &mut search::SearchCache,
+        archive: Option<&Archive>,
         tx: &mpsc::Sender<Event>,
         generation: u64,
         ctx: &egui::Context,
     ) {
         let event = match self {
+            Self::OpenHit(hit) => {
+                let result = search::hit_source(engine, cache, archive, &hit.origin);
+                Event::HitSource(generation, hit, result)
+            }
             Self::Metadata(name, hash) => {
                 let result = engine.decompile_shared(&name).map_err(|e| format!("{e:#}"));
                 Event::SearchMetadata(generation, name, hash, None, result)
@@ -156,6 +171,25 @@ impl InteractiveRequest {
         ctx.request_repaint();
     }
 }
+fn hit_target(target: &SearchTarget) -> Target {
+    match target {
+        SearchTarget::Class(name) => Target::Class(name.clone()),
+        SearchTarget::Resource(index) => Target::File(*index),
+    }
+}
+
+/// Unicode scalar offset where 1-based `line` starts, clamped to the source.
+fn line_start(source: &str, line: usize) -> usize {
+    let mut offset = 0;
+    for (index, text) in source.split('\n').enumerate() {
+        if index + 1 >= line {
+            break;
+        }
+        offset += text.chars().count() + 1;
+    }
+    offset.min(source.chars().count().saturating_sub(1))
+}
+
 enum Content {
     Text(Box<CodeDocument>),
     Summary(Box<SummaryDocument>),
@@ -365,24 +399,19 @@ struct Tab {
     note: Option<String>,
 }
 impl Tab {
+    /// Jump within an open view when it shows the exact source the hit was
+    /// found in: same target and the same source hash, which identifies the text.
     fn reuse_search_hit(&mut self, hit: &SearchHit) -> Result<bool, String> {
-        let snapshot = &hit.document;
-        let target = match &snapshot.target {
-            SearchTarget::Class(name) => Target::Class(name.clone()),
-            SearchTarget::Resource(index) => Target::File(*index),
-        };
-        if self.target != target
-            || snapshot.source_hash.is_none()
-            || self.source_hash != snapshot.source_hash
+        let origin = &hit.origin;
+        if self.target != hit_target(&origin.target)
+            || origin.source_hash.is_none()
+            || self.source_hash != origin.source_hash
         {
             return Ok(false);
         }
         let Content::Text(document) = &mut self.content else {
             return Ok(false);
         };
-        if document.text() != snapshot.source {
-            return Ok(false);
-        }
         document.jump_to_range(hit.start, hit.end)?;
         if let Some(view) = &mut self.manifest_view {
             view.select_xml();
@@ -1680,13 +1709,20 @@ impl App {
                         let _ = tx.send(Event::SearchUpdate(generation, search_id, update));
                         SearchWindow::wake(&ctx);
                     },
-                    |engine| {
+                    |engine, cache| {
                         let request = interactive_requests
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .pop();
                         if let Some(request) = request {
-                            request.execute(engine, &tx, generation, &ctx);
+                            request.execute(
+                                engine,
+                                cache,
+                                archive.as_deref(),
+                                &tx,
+                                generation,
+                                &ctx,
+                            );
                         }
                     },
                 )
@@ -1701,62 +1737,106 @@ impl App {
             SearchWindow::wake(&ctx);
         });
     }
-    fn open_search_hit(&mut self, hit: SearchHit) {
+    fn open_search_hit(&mut self, hit: SearchHit, ctx: &egui::Context) {
         if let Some(pending) = self.pending_history.take() {
             self.cancelled_history = Some(pending.destination.target);
         }
         self.deferred_target = None;
-        let mut reused = false;
+        if self.select_hit_in_open_view(&hit) {
+            return;
+        }
+        if let Some(document) = hit.origin.retained.clone() {
+            self.open_hit_document(hit, document);
+            return;
+        }
+        // Hits carry no source. The engine thread reloads it from the session
+        // index: between classes while a scan runs, otherwise on the next frame.
+        self.status = if self.search_cancel.is_some() {
+            format!(
+                "Opening result after the current search batch · {}",
+                hit.origin.name
+            )
+        } else {
+            format!("Opening result · {}", hit.origin.name)
+        };
+        let mut requests = self
+            .interactive_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        replace_pending_navigation(&mut requests, InteractiveRequest::OpenHit(hit));
+        drop(requests);
+        ctx.request_repaint();
+    }
+    /// Jump to the hit inside a view that already shows its exact source.
+    /// Reports whether such a view exists, including when the jump itself fails.
+    fn select_hit_in_open_view(&mut self, hit: &SearchHit) -> bool {
+        let mut reused = None;
         for (index, tab) in self.tabs.iter_mut().enumerate() {
-            match tab.reuse_search_hit(&hit) {
+            match tab.reuse_search_hit(hit) {
                 Ok(true) => {
-                    self.selected = index;
-                    self.future.clear();
-                    self.status = format!("Search match · {}:{}", hit.document.name, hit.line);
-                    if tab.note.is_none() {
-                        return;
-                    }
-                    reused = true;
+                    reused = Some((index, tab.note.is_some()));
                     break;
                 }
                 Ok(false) => {}
                 Err(error) => {
                     self.error(error);
-                    return;
+                    return true;
                 }
             }
         }
-        let snapshot = &hit.document;
+        let Some((index, retry_metadata)) = reused else {
+            return false;
+        };
+        self.selected = index;
+        self.future.clear();
+        self.status = format!("Search match · {}:{}", hit.origin.name, hit.line);
+        if retry_metadata
+            && let (SearchTarget::Class(name), Some(hash)) =
+                (&hit.origin.target, &hit.origin.source_hash)
+        {
+            self.queue_search_metadata(name, hash);
+        }
+        true
+    }
+    fn queue_search_metadata(&mut self, name: &str, hash: &str) {
+        self.pending_search_metadata
+            .retain(|(pending, _)| pending != name);
+        self.pending_search_metadata
+            .push((name.to_owned(), hash.to_owned()));
+        if self.pending_search_metadata.len() > 8 {
+            self.pending_search_metadata.remove(0);
+        }
+    }
+    /// Show the source behind a hit. Offsets are trusted only while the source
+    /// carries the hash recorded by the scan; a changed render opens on the line.
+    fn open_hit_document(&mut self, hit: SearchHit, snapshot: Arc<SearchDocument>) {
+        if self.select_hit_in_open_view(&hit) {
+            return;
+        }
         let needs_metadata = (!snapshot.metadata_complete || snapshot.links.is_empty())
             && matches!(snapshot.target, SearchTarget::Class(_));
         if needs_metadata && let Some(hash) = &snapshot.source_hash {
-            self.pending_search_metadata
-                .retain(|(name, _)| name != &snapshot.name);
-            self.pending_search_metadata
-                .push((snapshot.name.clone(), hash.clone()));
-            if self.pending_search_metadata.len() > 8 {
-                self.pending_search_metadata.remove(0);
-            }
+            self.queue_search_metadata(&snapshot.name, hash);
         }
-        if reused {
-            return;
-        }
+        let changed =
+            hit.origin.source_hash.is_some() && snapshot.source_hash != hit.origin.source_hash;
         let mut document = CodeDocument::from_search(snapshot.clone());
-        if let Err(error) = document.jump_to_range(hit.start, hit.end) {
+        let jump = if changed {
+            document.jump_to(line_start(&snapshot.source, hit.line))
+        } else {
+            document.jump_to_range(hit.start, hit.end)
+        };
+        if let Err(error) = jump {
             self.error(error);
             return;
         }
-        let target = match &snapshot.target {
-            SearchTarget::Class(name) => Target::Class(name.clone()),
-            SearchTarget::Resource(index) => Target::File(*index),
-        };
         if let Err(error) = self.push_tab(Tab {
             manifest_view: None,
             pinned: false,
             bookmarked: false,
             loading_navigation: needs_metadata,
             source_hash: snapshot.source_hash.clone(),
-            target,
+            target: hit_target(&snapshot.target),
             name: snapshot.name.clone(),
             content: Content::Text(Box::new(document)),
             note: None,
@@ -1765,7 +1845,12 @@ impl App {
             return;
         }
         self.future.clear();
-        self.status = if needs_metadata {
+        self.status = if changed {
+            format!(
+                "Search match · {}:{} · source changed since the search",
+                snapshot.name, hit.line
+            )
+        } else if needs_metadata {
             format!("Opening result · {}", snapshot.name)
         } else {
             format!("Search match · {}:{}", snapshot.name, hit.line)
@@ -1804,8 +1889,21 @@ impl App {
         let mut engine = self.engine.take().expect("checked above");
         self.busy = true;
         let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
+        let (search_cache, archive) = (self.search_cache.clone(), self.archive.clone());
         thread::spawn(move || {
-            request.execute(&mut engine, &tx, generation, &ctx);
+            {
+                let mut cache = search_cache
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                request.execute(
+                    &mut engine,
+                    &mut cache,
+                    archive.as_deref(),
+                    &tx,
+                    generation,
+                    &ctx,
+                );
+            }
             let _ = tx.send(Event::InteractiveReady(generation, engine));
             ctx.request_repaint();
         });
@@ -2680,6 +2778,12 @@ impl App {
                 Event::InteractiveReady(generation, engine) if generation == self.generation => {
                     self.busy = false;
                     self.engine = Some(engine);
+                }
+                Event::HitSource(generation, hit, result) if generation == self.generation => {
+                    match result {
+                        Ok(document) => self.open_hit_document(hit, document),
+                        Err(error) => self.error(error),
+                    }
                 }
                 Event::Plugin(generation, result) => {
                     self.plugin_busy = false;
@@ -3775,7 +3879,7 @@ impl eframe::App for App {
             self.start_search(query, ctx);
         }
         if let Some(hit) = actions.open {
-            self.open_search_hit(hit);
+            self.open_search_hit(hit, ctx);
         }
         let actions = self.usages.show(ctx);
         if actions.cancel
@@ -3785,7 +3889,7 @@ impl eframe::App for App {
         }
         if let Some(hit) = actions.open {
             let location = format!("{} · {}:{}", self.usages.mode.title(), hit.kind, hit.line);
-            self.open_search_hit(hit);
+            self.open_search_hit(hit, ctx);
             self.status = location;
         }
         let actions = self
@@ -5360,6 +5464,7 @@ mod settings_tests {
         };
         let mut requests = vec![
             InteractiveRequest::Metadata("sample.Hello".into(), "hash".into()),
+            InteractiveRequest::OpenHit(sample_hit("sample.Hello", Some("old"), 3)),
             InteractiveRequest::Navigate("sample.Hello".into(), 3, "old".into()),
         ];
         replace_pending_navigation(
@@ -5375,7 +5480,14 @@ mod settings_tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.dex");
         engine.open(&fixture).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        request.execute(&mut engine, &tx, 11, &egui::Context::default());
+        request.execute(
+            &mut engine,
+            &mut search::SearchCache::default(),
+            None,
+            &tx,
+            11,
+            &egui::Context::default(),
+        );
         let event = rx.recv().unwrap();
         let Event::Navigated(generation, returned_origin, None, result) = event else {
             panic!("deferred class jump emitted the wrong event");
@@ -5407,23 +5519,7 @@ mod settings_tests {
             content: Content::Text(Box::new(document)),
             note: None,
         };
-        let mut hit = SearchHit {
-            document: Arc::new(search::SearchDocument {
-                target: SearchTarget::Class("sample.Hello".into()),
-                name: "sample.Hello".into(),
-                source: source.into(),
-                syntax: "java".into(),
-                links: Vec::new(),
-                source_hash: Some("original".into()),
-                metadata_complete: false,
-            }),
-            start: 7,
-            end: 13,
-            line: 1,
-            kind: "Code".into(),
-            preview: source.into(),
-            preview_match: 7..13,
-        };
+        let mut hit = sample_hit("sample.Hello", Some("original"), 7);
         let Content::Text(document) = &tab.content else {
             unreachable!()
         };
@@ -5439,16 +5535,207 @@ mod settings_tests {
         // metadata proves opening it has not replaced the navigable document.
         assert!(original_bytes > CodeDocument::new(source.into(), "java").retained_bytes());
         assert!(tab.note.is_none());
-        Arc::get_mut(&mut hit.document).unwrap().source_hash = Some("changed".into());
+        Arc::get_mut(&mut hit.origin).unwrap().source_hash = Some("changed".into());
         assert!(!tab.reuse_search_hit(&hit).unwrap());
-        Arc::get_mut(&mut hit.document).unwrap().source_hash = Some("original".into());
-        Arc::get_mut(&mut hit.document).unwrap().source = "return other;".into();
+        Arc::get_mut(&mut hit.origin).unwrap().source_hash = Some("original".into());
+        Arc::get_mut(&mut hit.origin).unwrap().target = SearchTarget::Class("sample.Other".into());
         assert!(!tab.reuse_search_hit(&hit).unwrap());
-        Arc::get_mut(&mut hit.document).unwrap().source = source.into();
-        Arc::get_mut(&mut hit.document).unwrap().target =
-            SearchTarget::Class("sample.Other".into());
-        assert!(!tab.reuse_search_hit(&hit).unwrap());
+        Arc::get_mut(&mut hit.origin).unwrap().target = SearchTarget::Class("sample.Hello".into());
+        Arc::get_mut(&mut hit.origin).unwrap().source_hash = None;
+        assert!(
+            !tab.reuse_search_hit(&hit).unwrap(),
+            "unhashed sources are reloaded"
+        );
         assert_eq!(tab.text(), Some(source));
+    }
+
+    /// A six-character match at `start` in a class whose hit carries no source.
+    fn sample_hit(class: &str, hash: Option<&str>, start: usize) -> SearchHit {
+        SearchHit {
+            origin: Arc::new(search::HitOrigin {
+                target: SearchTarget::Class(class.into()),
+                name: class.into(),
+                syntax: "java".into(),
+                source_hash: hash.map(str::to_owned),
+                retained: None,
+            }),
+            start,
+            end: start + 6,
+            line: 1,
+            kind: "Code".into(),
+            preview: "target".into(),
+            preview_match: 0..6,
+        }
+    }
+
+    #[test]
+    fn opened_hits_reload_source_through_the_request_queue() {
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let mut engine = NativeEngine::start().unwrap();
+        let project = engine.open(&fixture).unwrap();
+        let mut app = navigation_test_app();
+        let ctx = egui::Context::default();
+        let query = CompiledQuery::new(SearchQuery {
+            text: "doubleValue".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut hits = Vec::new();
+        {
+            let mut cache = app.search_cache.lock().unwrap();
+            search::run_search(
+                &mut engine,
+                &mut cache,
+                app.generation,
+                &project.classes,
+                None,
+                &query,
+                &AtomicBool::new(false),
+                |update| {
+                    if let SearchUpdate::Batch(batch) = update {
+                        hits.extend(batch);
+                    }
+                },
+            );
+        }
+        let hit = hits
+            .iter()
+            .find(|hit| hit.origin.name == "sample.Caller")
+            .expect("fixture hit")
+            .clone();
+        assert!(hit.origin.retained.is_none(), "scan hits carry no source");
+        let target = Target::Class(hit.origin.name.clone());
+        let wait_for_open = |app: &mut App, hash: Option<&str>| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                app.events(&ctx);
+                if app.engine.is_some()
+                    && app.tabs.get(app.selected).is_some_and(|tab| {
+                        tab.target == target && tab.source_hash.as_deref() == hash
+                    })
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "hit did not open: {}",
+                    app.status
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+
+        // Idle engine: the next frame dispatches the reload, then the view opens on the match.
+        app.engine = Some(engine);
+        app.open_search_hit(hit.clone(), &ctx);
+        assert_eq!(app.status, format!("Opening result · {}", hit.origin.name));
+        assert!(
+            app.tabs.is_empty(),
+            "nothing opens before the source is back"
+        );
+        app.load_pending_search_metadata(&ctx);
+        assert!(
+            app.engine.is_none() && app.busy,
+            "the reload owns the engine"
+        );
+        wait_for_open(&mut app, hit.origin.source_hash.as_deref());
+        assert!(
+            app.status.ends_with(&format!(":{}", hit.line)),
+            "{}",
+            app.status
+        );
+        let Content::Text(document) = &app.tabs[app.selected].content else {
+            panic!("hit did not open a source document");
+        };
+        assert_eq!(document.navigation_position(), hit.start);
+        let text = document.text().to_owned();
+        assert_eq!(
+            text.chars()
+                .skip(hit.start)
+                .take(hit.end - hit.start)
+                .collect::<String>(),
+            "doubleValue"
+        );
+
+        // Running scan: the request waits for the search thread, which services it
+        // between classes; here the scan ends first and the UI drains the queue.
+        app.busy = true;
+        app.search_cancel = Some(Arc::new(AtomicBool::new(false)));
+        let held = app.engine.take().unwrap();
+        app.tabs.clear();
+        app.open_search_hit(hit.clone(), &ctx);
+        assert!(
+            app.status
+                .starts_with("Opening result after the current search batch")
+        );
+        assert_eq!(app.interactive_requests.lock().unwrap().len(), 1);
+        app.tx
+            .send(Event::SearchDone(
+                0,
+                0,
+                held,
+                Ok(search::SearchSummary::default()),
+            ))
+            .unwrap();
+        app.events(&ctx);
+        app.load_pending_search_metadata(&ctx);
+        wait_for_open(&mut app, hit.origin.source_hash.as_deref());
+        let Content::Text(document) = &app.tabs[app.selected].content else {
+            panic!("deferred hit did not open a source document");
+        };
+        assert_eq!(document.navigation_position(), hit.start);
+
+        // A hit whose recorded hash no longer matches the render opens on its line
+        // instead of trusting stale offsets.
+        let mut stale = hit.clone();
+        stale.origin = Arc::new(search::HitOrigin {
+            target: hit.origin.target.clone(),
+            name: hit.origin.name.clone(),
+            syntax: hit.origin.syntax.clone(),
+            source_hash: Some("stale".into()),
+            retained: None,
+        });
+        app.open_search_hit(stale.clone(), &ctx);
+        app.load_pending_search_metadata(&ctx);
+        wait_for_open(&mut app, hit.origin.source_hash.as_deref());
+        assert!(
+            app.status.ends_with("source changed since the search"),
+            "{}",
+            app.status
+        );
+        let Content::Text(document) = &app.tabs[app.selected].content else {
+            panic!("stale hit did not open a source document");
+        };
+        assert_eq!(document.navigation_position(), line_start(&text, hit.line));
+        assert_eq!(
+            app.tabs.len(),
+            1,
+            "the stale open replaced the view for the same class"
+        );
+
+        // Reopening a hit of an open view jumps in place without a reload.
+        app.open_search_hit(hit.clone(), &ctx);
+        assert!(app.interactive_requests.lock().unwrap().is_empty());
+        assert!(
+            app.status.ends_with(&format!(":{}", hit.line)),
+            "{}",
+            app.status
+        );
+        let Content::Text(document) = &app.tabs[app.selected].content else {
+            panic!("reused view lost its document");
+        };
+        assert_eq!(document.navigation_position(), hit.start);
+    }
+
+    #[test]
+    fn line_start_clamps_to_the_source() {
+        assert_eq!(line_start("ab\ncd\nef", 1), 0);
+        assert_eq!(line_start("ab\ncd\nef", 2), 3);
+        assert_eq!(line_start("ab\ncd\nef", 3), 6);
+        assert_eq!(line_start("ab\ncd\nef", 9), 7);
+        assert_eq!(line_start("é\nx", 2), 2);
+        assert_eq!(line_start("", 3), 0);
     }
 
     #[test]
@@ -5518,15 +5805,18 @@ mod settings_tests {
         ] {
             let start = document.source.find(needle).unwrap();
             let end = start + needle.len();
-            app.open_search_hit(SearchHit {
-                document,
-                start,
-                end,
-                line,
-                kind: kind.into(),
-                preview: needle.into(),
-                preview_match: 0..needle.len(),
-            });
+            app.open_search_hit(
+                SearchHit {
+                    origin: search::HitOrigin::retaining(document),
+                    start,
+                    end,
+                    line,
+                    kind: kind.into(),
+                    preview: needle.into(),
+                    preview_match: 0..needle.len(),
+                },
+                &context,
+            );
             assert!(
                 app.status.ends_with(&format!(":{line}")),
                 "{kind} line status"

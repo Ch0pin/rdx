@@ -1,4 +1,5 @@
-//! Source-only private instance forwarding for static DEX invoke-super bridges.
+//! Source-only private instance forwarding for DEX invoke-super sites whose
+//! receiver is an exact-typed parameter or cast rather than `this`.
 use super::{java_type, names};
 use crate::{
     native_calls::BoundCalls,
@@ -157,19 +158,10 @@ fn discover(class: &DexClass) -> Option<Vec<Bridge>> {
     let hierarchy = class.symbols.hierarchy.get()?;
     let mut bridges: BTreeMap<u32, Bridge> = BTreeMap::new();
     let mut words = 0usize;
-    for (method_index, method) in class
-        .methods
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.access_flags & 8 != 0)
-    {
+    for (method_index, method) in class.methods.iter().enumerate() {
         let Some(code) = &method.code else {
             continue;
         };
-        words = words.checked_add(code.instructions.len())?;
-        if words > 65_536 {
-            return None;
-        }
         if !code
             .instructions
             .iter()
@@ -177,11 +169,29 @@ fn discover(class: &DexClass) -> Option<Vec<Bridge>> {
         {
             continue;
         }
+        words = words.checked_add(code.instructions.len())?;
+        if words > 65_536 {
+            return None;
+        }
         let ir = DecodedMethod::decode(code).ok()?;
         let calls = BoundCalls::bind(code, &ir, &class.symbols).ok()?;
         let cfg = crate::native_cfg::ControlFlowGraph::build(code).ok()?;
         let analysis = std::cell::OnceCell::new();
+        let written = |register: u16| {
+            ir.instructions.iter().any(|i| {
+                i.writes.iter().any(|w| {
+                    register >= w.register
+                        && usize::from(register - w.register) < w.kind.word_count()
+                })
+            })
+        };
         let mut parameter_register = code.registers.checked_sub(code.ins)?;
+        // An instance method receives `this` first. A never-written `this`
+        // register is plain Java `super` dispatch and needs no bridge.
+        let this_register = (method.access_flags & 8 == 0).then_some(parameter_register);
+        if this_register.is_some() {
+            parameter_register = parameter_register.checked_add(1)?;
+        }
         let mut receivers = Vec::new();
         for ty in &method.parameters {
             if ty == &class.descriptor {
@@ -204,6 +214,9 @@ fn discover(class: &DexClass) -> Option<Vec<Bridge>> {
         {
             let call = calls.calls.iter().find(|c| c.pc == instruction.pc)?;
             let receiver = call.receiver.as_ref()?.register;
+            if this_register == Some(receiver) && !written(receiver) {
+                continue;
+            }
             let block = &cfg.blocks[*cfg.block_at.get(&instruction.pc)?];
             let last_write = ir.instructions.iter().rev().find(|i| {
                 i.pc >= block.start
@@ -220,15 +233,33 @@ fn discover(class: &DexClass) -> Option<Vec<Bridge>> {
                         == Some(&class.descriptor)
             });
             // A successful cast in this basic block establishes the exact
-            // bridge receiver type, including array-extracted arguments.
-            if !cast_receiver
-                && !receivers.contains(&receiver)
-                && !analysis
+            // bridge receiver type, including array-extracted arguments. A
+            // never-written parameter of the class type is exact as well.
+            let parameter_receiver =
+                receivers.contains(&receiver) && (this_register.is_none() || !written(receiver));
+            if !cast_receiver && !parameter_receiver {
+                let Some(analysis) = analysis
                     .get_or_init(|| crate::native_method::MethodAnalysis::build(class, method).ok())
                     .as_ref()
-                    .is_some_and(|analysis| cast_origin(class, analysis, instruction.pc))
-            {
-                continue;
+                else {
+                    continue;
+                };
+                // The emitter prints `super` for a proven `this` read, so the
+                // bridge covers the remaining exact-cast receivers only.
+                if this_register.is_some()
+                    && crate::native_hierarchy::this_receiver_identity::proves_read(
+                        method,
+                        analysis.instructions(),
+                        analysis.ssa(),
+                        instruction.pc,
+                        usize::from(receiver),
+                    )
+                {
+                    continue;
+                }
+                if !cast_origin(class, analysis, instruction.pc) {
+                    continue;
+                }
             }
             let crate::native_calls::CallTarget::Method {
                 method_index: target_index,

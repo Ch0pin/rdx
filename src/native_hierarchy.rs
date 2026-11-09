@@ -892,6 +892,11 @@ pub struct TypeHierarchy {
     writable_fields: Arc<WritableFieldIndex>,
     sneaky_readable_fields: Arc<SneakyReadableFieldIndex>,
     loaded_call_families: Arc<HashMap<Arc<str>, LoadedCallOwner>>,
+    /// Exact loaded declarations named by an `invoke-super` anywhere in the
+    /// project, keyed `owner->name(params)ret`. `Some(flags)` marks a unique,
+    /// legally printable declaration of a non-interface owner. The index is
+    /// demand-driven, so it survives the readability-family budget.
+    super_declarations: Arc<HashMap<String, Option<u32>>>,
     static_sneaky_source_headers: Arc<HashSet<String>>,
     enum_array_retainers: Arc<HashSet<Arc<str>>>,
     checked_call_certificates: Arc<checked_call_certificates::Certificates>,
@@ -1501,6 +1506,114 @@ fn method_may_infer_checked(class: &DexClass, method: &crate::native_dex::DexMet
         })
 }
 
+/// The declaration shape the Java renderer prints verbatim: known flags, one
+/// visibility, varargs on an array parameter, a body exactly when the method
+/// is neither abstract nor native, and no modifier Java forbids on `abstract`.
+fn legal_source_declaration(method: &crate::native_dex::DexMethod) -> bool {
+    method.access_flags & !0x31dff == 0
+        && matches!(method.access_flags & 7, 0 | 1 | 2 | 4)
+        && (method.access_flags & 0x80 == 0
+            || method
+                .parameters
+                .last()
+                .is_some_and(|ty| ty.starts_with('[')))
+        && (method.access_flags & (0x400 | 0x100) != 0) == method.code.is_none()
+        && (method.access_flags & 0x400 == 0
+            || method.access_flags & (2 | 8 | 0x10 | 0x20 | 0x100 | 0x800 | 0x20000) == 0)
+}
+
+/// Exact declaration key shared by the invoke-super index and its lookup.
+fn declaration_key(owner: &str, name: &str, parameters: &[Arc<str>], ret: &str) -> String {
+    format!(
+        "{owner}->{name}({}){ret}",
+        parameters.iter().map(AsRef::as_ref).collect::<String>()
+    )
+}
+
+/// Index the loaded declarations that some `invoke-super` names. The raw word
+/// scan is overinclusive: any word pair whose low byte is an invoke-super
+/// opcode is read as a method reference. That only indexes extra exact
+/// declarations; every lookup still matches owner, name, arguments and return
+/// type, and `Some(flags)` requires a unique legal declaration.
+fn super_declarations(
+    classes: &[&DexClass],
+    duplicate_owners: &HashSet<&Arc<str>>,
+) -> HashMap<String, Option<u32>> {
+    let mut targets = HashSet::new();
+    let mut target_names = HashSet::new();
+    for class in classes {
+        for method in &class.methods {
+            let Some(code) = method.code.as_ref() else {
+                continue;
+            };
+            for words in code.instructions.windows(2) {
+                if !matches!(words[0] as u8, 0x6f | 0x75) {
+                    continue;
+                }
+                let Some(&(owner, proto, name)) = class.symbols.methods.get(usize::from(words[1]))
+                else {
+                    continue;
+                };
+                let (Some(owner), Some((ret, parameters)), Some(name)) = (
+                    class.symbols.types.get(usize::from(owner)),
+                    class.symbols.protos.get(usize::from(proto)),
+                    class.symbols.strings.get(name as usize),
+                ) else {
+                    continue;
+                };
+                if targets.insert(declaration_key(owner, name, parameters, ret)) {
+                    if targets.len() > MAX_EDGES {
+                        return HashMap::new();
+                    }
+                    target_names.insert(name.as_str());
+                }
+            }
+        }
+    }
+    let mut declarations = HashMap::new();
+    for class in classes {
+        if class.access_flags & 0x200 != 0
+            || duplicate_owners.contains(&class.descriptor)
+            || (class.annotations_offset != 0
+                && !class
+                    .symbols
+                    .annotations
+                    .contains_key(&class.annotations_offset))
+            || class
+                .methods
+                .iter()
+                .any(|m| m.declaring_type != class.descriptor)
+        {
+            continue;
+        }
+        for method in &class.methods {
+            if !target_names.contains(method.name.as_ref()) {
+                continue;
+            }
+            let key = declaration_key(
+                &class.descriptor,
+                &method.name,
+                &method.parameters,
+                &method.return_type,
+            );
+            if !targets.contains(&key) {
+                continue;
+            }
+            let unique = class
+                .methods
+                .iter()
+                .filter(|m| m.name == method.name && m.parameters.len() == method.parameters.len())
+                .count()
+                == 1;
+            declarations.insert(
+                key,
+                (unique && legal_source_declaration(method)).then_some(method.access_flags),
+            );
+        }
+    }
+    declarations
+}
+
 fn summarize_loaded_call_owner(
     class: &DexClass,
     future_words_left: &mut usize,
@@ -1581,16 +1694,7 @@ fn summarize_loaded_call_owner(
             static_no_return: static_no_return::prove(method),
             declared_throws_empty: class.methods[index].thrown_types.is_empty(),
             generic_method,
-            legal_source_declaration: method.access_flags & !0x31dff == 0
-                && matches!(method.access_flags & 7, 0 | 1 | 2 | 4)
-                && (method.access_flags & 0x80 == 0
-                    || method
-                        .parameters
-                        .last()
-                        .is_some_and(|ty| ty.starts_with('[')))
-                && (method.access_flags & (0x400 | 0x100) != 0) == method.code.is_none()
-                && (method.access_flags & 0x400 == 0
-                    || method.access_flags & (2 | 8 | 0x10 | 0x20 | 0x100 | 0x800 | 0x20000) == 0),
+            legal_source_declaration: legal_source_declaration(method),
             no_new_checked_header: false,
             future_checked_effects_closed,
             may_infer_checked,
@@ -1885,25 +1989,14 @@ impl TypeHierarchy {
             return false;
         }
         let flags = if self.loaded_owners.contains(owner) {
-            let Some(summary) = self.loaded_call_families.get(owner) else {
-                return false;
-            };
-            let Some(method) = summary
-                .methods
-                .get(name)
-                .and_then(|f| f.get(&args.len()))
-                .and_then(Option::as_ref)
-            else {
-                return false;
-            };
-            if summary.access_flags & 0x200 != 0
-                || method.parameters != args
-                || method.return_type.as_ref() != ret
-                || !method.legal_source_declaration
+            // The demand-driven index survives the readability-family budget.
+            match self
+                .super_declarations
+                .get(&declaration_key(owner, name, args, ret))
             {
-                return false;
+                Some(Some(flags)) => *flags,
+                _ => return false,
             }
-            method.access_flags
         } else {
             let facts = platform_source_declarations();
             if !facts.complete
@@ -3599,6 +3692,7 @@ impl TypeHierarchy {
 
         let loaded_owners: HashSet<Arc<str>> =
             classes.iter().map(|c| c.descriptor.clone()).collect();
+        let super_declarations = super_declarations(&classes, &duplicate_owners);
         let mut loaded_call_families = HashMap::new();
         let mut readability_families = 0usize;
         let mut future_words_left = 1_000_000usize;
@@ -3933,6 +4027,7 @@ impl TypeHierarchy {
             writable_fields: Arc::new(writable_fields),
             sneaky_readable_fields: Arc::new(sneaky_readable_fields),
             loaded_call_families: Arc::new(loaded_call_families),
+            super_declarations: Arc::new(super_declarations),
             static_sneaky_source_headers: Arc::new(HashSet::new()),
             enum_array_retainers: Arc::new(enum_array_retainer::collect(&classes)),
             checked_call_certificates: Arc::new(Default::default()),

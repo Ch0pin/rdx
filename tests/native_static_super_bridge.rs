@@ -59,7 +59,17 @@ fn fixture(bad: usize, range: bool) -> DexClass {
         methods,
         symbols: symbols.clone(),
     };
-    let parent = class("Lsample/Parent;", "Ljava/lang/Object;", vec![parent_method]);
+    let mut parent = class("Lsample/Parent;", "Ljava/lang/Object;", vec![parent_method]);
+    if bad == 10 {
+        // A same-arity overload makes the super declaration ambiguous.
+        parent.methods.push(method(
+            "Lsample/Parent;",
+            "ping",
+            1,
+            vec!["J".into()],
+            vec![0x010f],
+        ));
+    }
     let mut child = class(
         "Lsample/Child;",
         "Lsample/Parent;",
@@ -96,7 +106,7 @@ fn fixture(bad: usize, range: bool) -> DexClass {
         child.methods[0].access_flags = 1;
         child.methods[0].parameters.remove(0);
     }
-    if bad >= 5 {
+    if (5..=7).contains(&bad) {
         let m = &mut child.methods[0];
         m.parameters = vec!["[Ljava/lang/Object;".into(), "I".into()];
         let c = m.code.as_mut().unwrap();
@@ -123,6 +133,22 @@ fn fixture(bad: usize, range: bool) -> DexClass {
         if bad == 7 {
             c.instructions[9] = 0x3207;
         }
+    }
+    if bad == 8 || bad == 9 {
+        // Instance method: this=v1, object=v2, value=v3.
+        let m = &mut child.methods[0];
+        m.access_flags = 1;
+        m.parameters = vec!["Ljava/lang/Object;".into(), "I".into()];
+        let c = m.code.as_mut().unwrap();
+        c.registers = 4;
+        c.ins = 3;
+        c.instructions = if bad == 8 {
+            // check-cast v2, Child; invoke-super {v2, v3}
+            vec![0x021f, 1, 0x206f, 0, 0x0032, 0x000a, 0x000f]
+        } else {
+            // invoke-super {v1, v3} on this
+            vec![0x206f, 0, 0x0031, 0x000a, 0x000f]
+        };
     }
     symbols
         .hierarchy
@@ -232,6 +258,82 @@ fn instance_super_receiver_join_requires_exact_this_identity() {
             assert!(source.contains("super.ping("), "{source}");
         }
     }
+}
+
+#[test]
+fn instance_cast_receiver_uses_bridge_and_this_receiver_keeps_super() {
+    let source = native_java::render("sample.Child", &fixture(8, false))
+        .unwrap()
+        .source;
+    assert!(
+        source.contains("._rdx_super_")
+            && source.contains("(Child) value")
+            && source.contains("super.ping(p0)"),
+        "{source}"
+    );
+    let source = native_java::render("sample.Child", &fixture(9, false))
+        .unwrap()
+        .source;
+    assert!(
+        source.contains("super.ping(") && !source.contains("_rdx_super_"),
+        "{source}"
+    );
+}
+
+#[test]
+fn same_arity_super_overloads_decline_the_bridge() {
+    assert!(native_java::render("sample.Child", &fixture(10, false)).is_err());
+}
+
+#[test]
+#[ignore = "requires javac/java; root runs serially"]
+fn jvm_instance_cast_bridge_preserves_nonvirtual_dispatch_null_and_cast() {
+    use std::{fs, process::Command};
+    let base = std::env::temp_dir().join(format!("rdx-instance-super-{}", std::process::id()));
+    fs::create_dir_all(base.join("sample")).unwrap();
+    fs::write(
+        base.join("sample/Child.java"),
+        native_java::render("sample.Child", &fixture(8, false))
+            .unwrap()
+            .source,
+    )
+    .unwrap();
+    fs::write(base.join("sample/Parent.java"),"package sample; public class Parent { static final java.io.IOException ERROR=new java.io.IOException(); public int ping(int value)throws java.io.IOException {if(value<0)throw ERROR;return value+10;} }").unwrap();
+    fs::write(base.join("sample/Check.java"),r#"package sample; public class Check {public static void main(String[] args){
+Child c=new Child(); if(c.bridge(c,3)!=13 || c.ping(3)!=99)throw new AssertionError();
+try{c.bridge(c,-1);throw new AssertionError();}catch(Throwable e){if(e!=Parent.ERROR)throw new AssertionError(e);}
+try{c.bridge(null,1);throw new AssertionError();}catch(NullPointerException expected){}
+try{c.bridge(new Parent(),1);throw new AssertionError();}catch(ClassCastException expected){}
+System.out.print("ok");}}
+"#).unwrap();
+    let out = Command::new("javac")
+        .args([
+            "-Xlint:all",
+            "-Werror",
+            "sample/Child.java",
+            "sample/Parent.java",
+            "sample/Check.java",
+        ])
+        .current_dir(&base)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new("java")
+        .args(["-cp", ".", "sample.Check"])
+        .current_dir(&base)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"ok");
+    fs::remove_dir_all(base).unwrap();
 }
 
 #[test]

@@ -221,7 +221,8 @@ fn draw_edge(
     tint: Color32,
     zoom: f32,
 ) {
-    let stroke = Stroke::new(if highlighted { 2.5 } else { 0.9 }, tint);
+    let width = if highlighted { 2.5_f32 } else { 0.9 };
+    let stroke = Stroke::new(width, tint);
     let head = (16.0 * zoom).clamp(7.0, 18.0) * if highlighted { 1.15 } else { 1.0 };
     let dash = (DASH * zoom).clamp(4.0, 10.0);
     let dashes = |points: &[Pos2]| {

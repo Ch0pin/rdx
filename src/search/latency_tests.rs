@@ -55,6 +55,8 @@ fn ranked_search_preserves_complete_source_results_across_queries() {
             &mut |u| collect(&mut expected, u),
             &mut |_, _| {},
             1,
+            0,
+            0,
         );
         let mut cache = SearchCache::default();
         let result = run_search(
@@ -83,7 +85,7 @@ fn ranked_search_preserves_complete_source_results_across_queries() {
             &cancel,
             |_| {},
             |_, _| {},
-            0,
+            &ScanOptions::default(),
         );
         assert_eq!(warm.hits, result.hits);
         assert_eq!(cache.source_fetches, fetched);
@@ -113,7 +115,7 @@ fn candidate_planning_is_interactive_and_cancellable() {
         &cancel,
         |_| {},
         |_, _| cancel.store(true, Ordering::Relaxed),
-        0,
+        &ScanOptions::default(),
     );
     assert!(summary.cancelled);
     assert_eq!(cache.source_fetches, 0);
@@ -173,6 +175,8 @@ fn apk_general_search_first_results() {
                         &mut emit,
                         &mut |_, _| {},
                         1,
+                        0,
+                        0,
                     );
                     baseline_fetches = baseline_cache.source_fetches;
                     summary
@@ -253,6 +257,8 @@ fn apk_general_search_complete_sample() {
                     },
                     &mut |_, _| {},
                     workers,
+                    0,
+                    0,
                 );
                 eprintln!(
                     "SEARCH_COMPLETE {}",
@@ -397,6 +403,8 @@ fn apk_code_search_profile() {
             &mut |_| {},
             &mut |_, _| {},
             0,
+            0,
+            0,
         );
         let seconds = started.elapsed().as_secs_f64();
         let (entries, payloads, metadata, payload_bytes) = cache.index_stats();
@@ -490,6 +498,8 @@ fn apk_code_search_scaling() {
             &mut |_| {},
             &mut |_, _| {},
             workers,
+            0,
+            0,
         );
         let seconds = started.elapsed().as_secs_f64();
         eprintln!(

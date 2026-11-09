@@ -511,6 +511,10 @@ pub struct App {
     search_cache: Arc<Mutex<search::SearchCache>>,
     search_cancel: Option<Arc<AtomicBool>>,
     search_id: u64,
+    /// The scan that stopped at the result limit, ready to continue.
+    search_continuation: Option<SearchContinuation>,
+    /// The query of the running or last search.
+    search_query: SearchQuery,
     pending_search_metadata: Vec<(String, String)>,
     interactive_requests: Arc<Mutex<Vec<InteractiveRequest>>>,
     settings_store: SettingsStore,
@@ -646,6 +650,8 @@ impl App {
             search_cache: Arc::new(Mutex::new(search::SearchCache::default())),
             search_cancel: None,
             search_id: 0,
+            search_continuation: None,
+            search_query: SearchQuery::default(),
             pending_search_metadata: Vec::new(),
             interactive_requests: Arc::new(Mutex::new(Vec::new())),
             settings_store,
@@ -774,7 +780,8 @@ impl App {
         }
         // Commit a drag when released rather than syncing disk for every pixel moved.
         if (preferences.font_size != self.last_preferences.font_size
-            || preferences.search_workers != self.last_preferences.search_workers)
+            || preferences.search_workers != self.last_preferences.search_workers
+            || preferences.search.max_results != self.last_preferences.search.max_results)
             && ctx.input(|input| input.pointer.primary_down())
         {
             return;
@@ -824,6 +831,7 @@ impl App {
         }
         self.call_graph = crate::call_graph_window::CallGraphWindow::default();
         self.generation += 1;
+        self.search_continuation = None;
         self.application_icon = None;
         self.search_cache = Arc::new(Mutex::new(search::SearchCache::default()));
         self.engine = None;
@@ -1665,6 +1673,35 @@ impl App {
         });
     }
     fn start_search(&mut self, query: SearchQuery, ctx: &egui::Context) {
+        // A fresh run drops the resume point of the stopped scan.
+        self.search_continuation = None;
+        let limit = self.search.max_results;
+        self.launch_search(query, None, limit, ctx);
+    }
+    /// Continue the scan that stopped at the limit, once the limit has room
+    /// and the query is unchanged.
+    fn continue_search(&mut self, ctx: &egui::Context) {
+        let Some(continuation) = self.search_continuation.take() else {
+            return;
+        };
+        if continuation.query != self.search.query {
+            return;
+        }
+        let room = self.search.room();
+        if room == 0 || self.busy || self.engine.is_none() || self.project.is_none() {
+            self.search_continuation = Some(continuation);
+            return;
+        }
+        self.launch_search(continuation.query, Some(continuation.resume), room, ctx);
+    }
+    fn launch_search(
+        &mut self,
+        query: SearchQuery,
+        resume: Option<search::SearchResume>,
+        limit: usize,
+        ctx: &egui::Context,
+    ) {
+        self.search_query = query.clone();
         let query = match CompiledQuery::new(query) {
             Ok(query) => query,
             Err(error) => {
@@ -1686,7 +1723,16 @@ impl App {
         let archive = self.archive.clone();
         let workers = search::resolve_workers(self.search_workers);
         self.search_id += 1;
-        self.search.begin();
+        if resume.is_some() {
+            self.search.resume();
+        } else {
+            self.search.begin();
+        }
+        let options = search::ScanOptions {
+            workers,
+            limit,
+            resume,
+        };
         self.busy = true;
         self.status = searching_status(workers);
         let search_cache = self.search_cache.clone();
@@ -1732,7 +1778,7 @@ impl App {
                             );
                         }
                     },
-                    workers,
+                    &options,
                 )
             });
             if summary.is_err() {
@@ -2777,7 +2823,17 @@ impl App {
                     self.engine = Some(engine);
                     self.search_cancel = None;
                     match summary {
-                        Ok(summary) => self.search.finish(summary),
+                        Ok(mut summary) => {
+                            let resume = summary.resume.take();
+                            self.search.finish(summary);
+                            // The window drops a stop whose query changed meanwhile.
+                            self.search_continuation = resume
+                                .filter(|_| self.search.limited())
+                                .map(|resume| SearchContinuation {
+                                    query: self.search_query.clone(),
+                                    resume,
+                                });
+                        }
                         Err(error) => self.search.error(error),
                     }
                     self.status = self.search.status.clone();
@@ -3896,6 +3952,9 @@ impl eframe::App for App {
         if let Some(query) = actions.start {
             self.start_search(query, ctx);
         }
+        if actions.resume {
+            self.continue_search(ctx);
+        }
         if let Some(hit) = actions.open {
             self.open_search_hit(hit, ctx);
         }
@@ -4021,6 +4080,12 @@ fn parse_workers(text: &str) -> Option<f64> {
 }
 
 /// Status line for a running scan: "Searching project · 8 workers".
+/// A scan that stopped at the result limit, and the query it belongs to.
+struct SearchContinuation {
+    query: SearchQuery,
+    resume: search::SearchResume,
+}
+
 fn searching_status(workers: usize) -> String {
     format!(
         "Searching project · {workers} worker{}",
@@ -4351,6 +4416,8 @@ mod settings_tests {
             search_cache: Arc::new(Mutex::new(search::SearchCache::default())),
             search_cancel: None,
             search_id: 0,
+            search_continuation: None,
+            search_query: SearchQuery::default(),
             pending_search_metadata: Vec::new(),
             interactive_requests: Arc::new(Mutex::new(Vec::new())),
             settings_store: SettingsStore::new(),
@@ -5829,6 +5896,105 @@ mod settings_tests {
         }
         assert_eq!(searching_status(1), "Searching project · 1 worker");
         assert_eq!(searching_status(8), "Searching project · 8 workers");
+    }
+
+    #[test]
+    fn limited_search_continues_from_where_it_stopped() {
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let mut engine = NativeEngine::start().unwrap();
+        let project = engine.open(&fixture).unwrap();
+        let query = SearchQuery {
+            text: "doubleValue".into(),
+            excluded_packages: Vec::new(),
+            ..Default::default()
+        };
+        // Every match in scan order, from an unlimited run.
+        let compiled = CompiledQuery::new(query.clone()).unwrap();
+        let mut expected = Vec::new();
+        let summary = search::run_search(
+            &mut engine,
+            &mut search::SearchCache::default(),
+            0,
+            &project.classes,
+            None,
+            &compiled,
+            &AtomicBool::new(false),
+            |update| {
+                if let search::SearchUpdate::Batch(batch) = update {
+                    expected.extend(batch.iter().map(|hit| (hit.origin.name.clone(), hit.start)));
+                }
+            },
+        );
+        assert!(!summary.limited && summary.resume.is_none());
+        assert!(expected.len() >= 4, "{}", expected.len());
+        let mut app = navigation_test_app();
+        app.project = Some(Arc::new(project));
+        app.engine = Some(engine);
+        let ctx = egui::Context::default();
+        let finish = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.engine.is_none() {
+                app.events(&ctx);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "search did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let shown = |app: &App| -> Vec<(String, usize)> {
+            app.search
+                .results
+                .iter()
+                .map(|hit| (hit.origin.name.clone(), hit.start))
+                .collect()
+        };
+        let half = expected.len() / 2;
+        app.search.query = query.clone();
+        app.search.max_results = half;
+        app.start_search(query.clone(), &ctx);
+        finish(&mut app);
+        assert!(
+            app.search.status.starts_with("Stopped at "),
+            "{}",
+            app.search.status
+        );
+        assert!(app.search.status.contains(" matches (limit)"));
+        assert_eq!(shown(&app), expected[..half]);
+        assert!(app.search_continuation.is_some());
+        // Lowering the limit keeps the results and the resume point.
+        app.search.max_results = half - 1;
+        app.continue_search(&ctx);
+        assert!(app.engine.is_some() && app.search_continuation.is_some());
+        assert_eq!(shown(&app).len(), half);
+        // Raising it continues from the stop instead of starting over.
+        app.search.max_results = expected.len() + 1;
+        app.continue_search(&ctx);
+        assert!(app.engine.is_none(), "the continuation did not start");
+        finish(&mut app);
+        assert!(
+            app.search.status.starts_with("Search complete:"),
+            "{}",
+            app.search.status
+        );
+        assert_eq!(shown(&app), expected);
+        assert!(app.search_continuation.is_none());
+        // A continuation can stop at the limit again and continue again.
+        app.search.max_results = 1;
+        app.start_search(query.clone(), &ctx);
+        finish(&mut app);
+        assert_eq!(shown(&app), expected[..1]);
+        app.search.max_results = 2;
+        app.continue_search(&ctx);
+        finish(&mut app);
+        assert_eq!(shown(&app), expected[..2]);
+        assert!(app.search_continuation.is_some(), "{}", app.search.status);
+        // A changed query drops the resume point.
+        app.search.query.text = "other".into();
+        app.search.max_results = expected.len();
+        app.continue_search(&ctx);
+        assert!(app.engine.is_some() && app.search_continuation.is_none());
     }
 
     #[test]

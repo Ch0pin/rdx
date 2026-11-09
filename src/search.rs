@@ -236,7 +236,36 @@ pub struct SearchSummary {
     pub hits: usize,
     pub skipped: usize,
     pub cancelled: bool,
+    /// The scan stopped at the result limit with work remaining.
+    pub limited: bool,
+    /// Where a limited scan continues; `None` once the scan ran to the end.
+    pub resume: Option<SearchResume>,
     pub errors: Vec<String>,
+}
+
+/// Where a scan stopped at the result limit, so a later run continues from
+/// there instead of starting over.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchResume {
+    /// Classes still to scan, in scan order. The first may already have
+    /// reported some of its matches.
+    pub classes: Vec<String>,
+    /// Matches of the first remaining document that were already reported.
+    pub skip: usize,
+    /// Archive entry position where the resource pass continues, when
+    /// resources are in scope.
+    pub resources_from: Option<usize>,
+}
+
+/// Scan parameters beyond the query.
+#[derive(Clone, Debug, Default)]
+pub struct ScanOptions {
+    /// Requested render workers; `0` chooses automatically.
+    pub workers: usize,
+    /// Matches to report before the scan stops; `0` is unlimited.
+    pub limit: usize,
+    /// Continue a stopped scan instead of starting over.
+    pub resume: Option<SearchResume>,
 }
 
 // Java lexical comments; strings, characters and text blocks shield comment markers.
@@ -329,6 +358,11 @@ fn matches(
         }
     }
     if found.len() < remaining && (is_resource || query.query.code || query.query.comments) {
+        // Definition and alias ranges in order. Regex matches arrive ascending
+        // and never overlap each other, so one cursor over the earlier ranges
+        // finds every overlap in linear time.
+        let earlier: Vec<(usize, usize)> = found.keys().copied().collect();
+        let mut earlier_index = 0;
         let mut lazy_spans = None;
         let all_text = is_resource || (query.query.code && query.query.comments);
         let mut span_index = 0;
@@ -364,7 +398,13 @@ fn matches(
             let end = start + m.as_str().chars().count();
             byte_cursor = m.end();
             char_cursor = end;
-            if found.keys().any(|&(a, b)| a < end && start < b) {
+            while earlier_index < earlier.len() && earlier[earlier_index].1 <= start {
+                earlier_index += 1;
+            }
+            if earlier
+                .get(earlier_index)
+                .is_some_and(|&(first, _)| first < end)
+            {
                 continue;
             }
             found.insert(
@@ -813,7 +853,7 @@ pub fn run_search(
         cancel,
         emit,
         |_, _| {},
-        0,
+        &ScanOptions::default(),
     )
 }
 
@@ -829,15 +869,32 @@ pub fn run_search_interactive(
     cancel: &AtomicBool,
     mut emit: impl FnMut(SearchUpdate),
     mut interactive: impl FnMut(&mut NativeEngine, &mut SearchCache),
-    workers: usize,
+    options: &ScanOptions,
 ) -> SearchSummary {
     cache.reset(project_id, classes.len());
     let q = &query.query;
-    let mut selected = if q.classes || q.methods || q.fields || q.code || q.comments {
-        query.ordered_classes(classes)
+    let limit = if options.limit == 0 {
+        usize::MAX
     } else {
-        Vec::new()
+        options.limit
     };
+    let resume = options.resume.as_ref();
+    // A continuation scans what the stopped run left, in the order it had.
+    let mut selected: Vec<&String> = match resume {
+        Some(resume) => resume.classes.iter().collect(),
+        None if q.classes || q.methods || q.fields || q.code || q.comments => {
+            query.ordered_classes(classes)
+        }
+        None => Vec::new(),
+    };
+    let mut skip = resume.map_or(0, |resume| resume.skip);
+    let resources_from = match resume {
+        Some(resume) => resume.resources_from,
+        None => q.resources.then_some(0),
+    };
+    let resource_count = resources_from.map_or(0, |from| {
+        archive.map_or(0, |a| a.entries.len().saturating_sub(from))
+    });
     if cancel.load(Ordering::Relaxed) {
         return SearchSummary {
             cancelled: true,
@@ -848,7 +905,8 @@ pub fn run_search_interactive(
     // DEX hints change order, never coverage. Generated Java can contain text
     // absent from the DEX pools, so every remaining class stays in the scan.
     // An entirely indexed corpus already searches cheaply without this pass.
-    if !cache.legacy
+    if resume.is_none()
+        && !cache.legacy
         && q.code
         && selected
             .iter()
@@ -868,11 +926,6 @@ pub fn run_search_interactive(
     }
     let mut class_summary = None;
     if !cache.legacy && !q.classes && !q.methods && !q.fields {
-        let resource_count = if q.resources {
-            archive.map_or(0, |a| a.entries.len())
-        } else {
-            0
-        };
         let mut result = streaming::run(
             engine,
             cache,
@@ -896,17 +949,36 @@ pub fn run_search_interactive(
                 });
             },
             &mut interactive,
-            workers,
+            options.workers,
+            limit,
+            skip,
         );
-        if !q.resources || result.cancelled {
+        if !selected.is_empty() {
+            skip = 0;
+        }
+        if result.cancelled || result.limited || resource_count == 0 {
             result.total += resource_count;
+            if let Some(resume) = &mut result.resume {
+                resume.resources_from = resources_from;
+            }
+            return result;
+        }
+        if result.hits >= limit {
+            // The classes ended exactly at the limit; the resources remain.
+            result.total += resource_count;
+            result.limited = true;
+            result.resume = Some(SearchResume {
+                classes: Vec::new(),
+                skip: 0,
+                resources_from,
+            });
             return result;
         }
         selected.clear();
         class_summary = Some(result);
     }
     // Names are cheap metadata: only decompile owners whose definitions can match.
-    if !q.code && !q.comments && !selected.is_empty() {
+    if resume.is_none() && !q.code && !q.comments && !selected.is_empty() {
         let mut candidates = HashSet::new();
         for page in selected.chunks(128) {
             interactive(engine, cache);
@@ -937,18 +1009,28 @@ pub fn run_search_interactive(
         }
         selected.retain(|name| candidates.contains(*name));
     }
-    let entries: Vec<_> = archive
-        .into_iter()
-        .flat_map(|a| &a.entries)
-        .filter(|_| q.resources)
-        .collect();
+    let entries: Vec<_> = match (archive, resources_from) {
+        (Some(archive), Some(from)) => archive
+            .entries
+            .get(from..)
+            .unwrap_or_default()
+            .iter()
+            .collect(),
+        _ => Vec::new(),
+    };
     let mut summary = class_summary.unwrap_or_default();
     summary.total = summary.scanned + selected.len() + entries.len();
     let mut last_progress = std::time::Instant::now();
     let mut prefetched = HashMap::new();
     let mut batches_available = true;
     let definitions_requested = q.classes || q.methods || q.fields;
+    // Where the limit stopped the scan: the item and its reported matches.
+    let mut stopped = None;
     for index in 0..selected.len() + entries.len() {
+        if summary.hits >= limit {
+            stopped = Some((index, 0));
+            break;
+        }
         interactive(engine, cache);
         if cancel.load(Ordering::Relaxed) {
             summary.cancelled = true;
@@ -1106,14 +1188,29 @@ pub fn run_search_interactive(
                 cache.insert(key.clone(), value.clone());
             }
         }
-        summary.scanned += 1;
+        // Only the first document of a continuation has reported matches already.
+        let first_skip = std::mem::take(&mut skip);
+        let mut partial = None;
         match result {
             Ok(Some((document, definitions, note))) => {
-                if let Some(note) = note {
+                let note = note.map(|note| format!("{}: {note}", document.name));
+                let room = limit - summary.hits;
+                // One match past the room tells a cut document from a complete one.
+                let mut batch = matches(
+                    document,
+                    &definitions,
+                    query,
+                    room.saturating_add(first_skip).saturating_add(1),
+                );
+                let reported = first_skip.min(batch.len());
+                batch.drain(..reported);
+                if batch.len() > room {
+                    batch.truncate(room);
+                    partial = Some(reported + room);
+                } else if let Some(note) = note {
                     summary.skipped += 1;
-                    record_error(&mut summary, format!("{}: {note}", document.name));
+                    record_error(&mut summary, note);
                 }
-                let batch = matches(document, &definitions, query, usize::MAX);
                 if !batch.is_empty() {
                     summary.hits += batch.len();
                     emit(SearchUpdate::Batch(batch));
@@ -1129,6 +1226,12 @@ pub fn run_search_interactive(
                 record_error(&mut summary, error);
             }
         }
+        if let Some(reported) = partial {
+            // The cut document reports its remaining matches when the scan continues.
+            stopped = Some((index, reported));
+            break;
+        }
+        summary.scanned += 1;
         if last_progress.elapsed() >= std::time::Duration::from_millis(50)
             || summary.scanned == summary.total
         {
@@ -1140,6 +1243,25 @@ pub fn run_search_interactive(
             });
             last_progress = std::time::Instant::now();
         }
+    }
+    if let Some((index, reported)) = stopped {
+        summary.limited = true;
+        summary.resume = Some(if index < selected.len() {
+            SearchResume {
+                classes: selected[index..]
+                    .iter()
+                    .map(|name| (*name).clone())
+                    .collect(),
+                skip: reported,
+                resources_from,
+            }
+        } else {
+            SearchResume {
+                classes: Vec::new(),
+                skip: reported,
+                resources_from: resources_from.map(|from| from + index - selected.len()),
+            }
+        });
     }
     summary
 }
@@ -1388,6 +1510,136 @@ mod tests {
         assert_eq!(matches(doc, &definitions, &q, 1).len(), 1);
     }
     #[test]
+    fn overlapping_definitions_are_skipped_once_in_order() {
+        // Text matches inside a definition range are reported as that
+        // definition only; the check runs once over the ranges in order.
+        let doc = document("Target Target; Target TargetTarget Target");
+        let definitions = vec![
+            CodeDefinition {
+                start: 7,
+                end: 13,
+                kind: "field".into(),
+                name: "Target".into(),
+            },
+            CodeDefinition {
+                start: 22,
+                end: 34,
+                kind: "method".into(),
+                name: "TargetTarget".into(),
+            },
+        ];
+        let q = CompiledQuery::new(SearchQuery {
+            text: "Target".into(),
+            methods: true,
+            fields: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let hits: Vec<_> = matches(doc, &definitions, &q, usize::MAX)
+            .iter()
+            .map(|hit| (hit.start, hit.end, hit.kind.clone()))
+            .collect();
+        assert_eq!(
+            hits,
+            [
+                (0, 6, "code".to_string()),
+                (7, 13, "field".to_string()),
+                (15, 21, "code".to_string()),
+                (22, 34, "method".to_string()),
+                (35, 41, "code".to_string()),
+            ]
+        );
+    }
+    #[test]
+    fn limited_scan_spans_classes_and_resources_and_resumes_in_order() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let mut engine = NativeEngine::start().unwrap();
+        let project = engine.open(&path).unwrap();
+        let archive = Archive::open(&path).unwrap();
+        let query = CompiledQuery::new(SearchQuery {
+            text: "sample".into(),
+            resources: true,
+            ..Default::default()
+        })
+        .unwrap();
+        type Key = (bool, String, usize, usize);
+        let key = |hit: &SearchHit| -> Key {
+            (
+                matches!(hit.origin.target, SearchTarget::Resource(_)),
+                hit.origin.name.clone(),
+                hit.start,
+                hit.end,
+            )
+        };
+        let mut scan = |cache: &mut SearchCache, options: &ScanOptions, hits: &mut Vec<Key>| {
+            run_search_interactive(
+                &mut engine,
+                cache,
+                1,
+                &project.classes,
+                Some(&archive),
+                &query,
+                &AtomicBool::new(false),
+                |update| {
+                    if let SearchUpdate::Batch(batch) = update {
+                        hits.extend(batch.iter().map(key));
+                    }
+                },
+                |_, _| {},
+                options,
+            )
+        };
+        let mut expected = Vec::new();
+        let full = scan(
+            &mut SearchCache::default(),
+            &ScanOptions::default(),
+            &mut expected,
+        );
+        assert!(!full.limited && full.resume.is_none(), "{:?}", full.errors);
+        assert_eq!(full.scanned, full.total);
+        assert!(expected.iter().any(|hit| hit.0) && expected.iter().any(|hit| !hit.0));
+        let limits: std::collections::BTreeSet<usize> = [1, 2, 3, expected.len() - 1]
+            .into_iter()
+            .filter(|&limit| limit < expected.len())
+            .collect();
+        for limit in limits {
+            let mut cache = SearchCache::default();
+            let mut actual = Vec::new();
+            let mut summary = scan(
+                &mut cache,
+                &ScanOptions {
+                    limit,
+                    ..Default::default()
+                },
+                &mut actual,
+            );
+            assert!(summary.limited, "limit {limit}");
+            assert_eq!(summary.hits, limit, "limit {limit}");
+            assert_eq!(actual, expected[..limit], "limit {limit}");
+            let mut scanned = summary.scanned;
+            let mut runs = 0;
+            while let Some(resume) = summary.resume.take() {
+                assert!(summary.limited, "limit {limit}");
+                summary = scan(
+                    &mut cache,
+                    &ScanOptions {
+                        limit,
+                        resume: Some(resume),
+                        ..Default::default()
+                    },
+                    &mut actual,
+                );
+                scanned += summary.scanned;
+                runs += 1;
+                assert!(runs <= expected.len() + 1, "limit {limit}: no progress");
+            }
+            assert!(!summary.limited, "limit {limit}");
+            assert_eq!(actual, expected, "limit {limit}");
+            assert_eq!(scanned, full.total, "limit {limit}");
+        }
+    }
+    #[test]
     fn cache_reuses_no_hit_documents_and_invalidates_project() {
         let mut cache = SearchCache::default();
         cache.reset(1, 0);
@@ -1610,7 +1862,7 @@ mod tests {
                     cancel.store(true, Ordering::Relaxed);
                 }
             },
-            0,
+            &ScanOptions::default(),
         );
         eprintln!(
             "Phrase search: {:?}; scanned {}; source fetches {}; found {}; errors {:?}",

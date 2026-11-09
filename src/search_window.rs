@@ -1,6 +1,6 @@
 //! Dedicated project-wide text-search window. Searching runs outside the UI thread.
 use crate::search::{SearchHit, SearchQuery, SearchSummary, SearchUpdate};
-use crate::settings::SearchPreferences;
+use crate::settings::{DEFAULT_MAX_RESULTS, MAX_RESULTS_RANGE, SearchPreferences};
 use eframe::egui;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -34,6 +34,8 @@ impl SearchMode {
 pub struct SearchActions {
     pub start: Option<SearchQuery>,
     pub cancel: bool,
+    /// Continue the scan that stopped at the limit, now that it has room.
+    pub resume: bool,
     pub open: Option<SearchHit>,
 }
 
@@ -61,6 +63,20 @@ pub struct SearchWindow {
     exclusion_input: String,
     mode_changed: bool,
     stale_scope: bool,
+    /// Matches a scan reports before it stops; shown in the options row.
+    pub max_results: usize,
+    /// The limit the control showed last, to notice edits.
+    shown_limit: usize,
+    /// The limit changed; a stopped scan continues once the edit settles.
+    limit_edited: bool,
+    /// The last scan stopped at the limit with work remaining.
+    limited: bool,
+    /// Counters of the stopped scan that a continuation builds on.
+    base_scanned: usize,
+    base_hits: usize,
+    base_skipped: usize,
+    /// Time spent by the stopped scans a continuation builds on.
+    elapsed: Duration,
 }
 
 impl Default for SearchWindow {
@@ -89,6 +105,14 @@ impl Default for SearchWindow {
             exclusion_input: String::new(),
             mode_changed: false,
             stale_scope: false,
+            max_results: DEFAULT_MAX_RESULTS,
+            shown_limit: DEFAULT_MAX_RESULTS,
+            limit_edited: false,
+            limited: false,
+            base_scanned: 0,
+            base_hits: 0,
+            base_skipped: 0,
+            elapsed: Duration::ZERO,
         }
     }
 }
@@ -163,6 +187,7 @@ impl SearchWindow {
             self.scanned = 0;
             self.total = 0;
             self.hits = 0;
+            self.limited = false;
             self.status = format!("{} search — enter text to search.", mode.label());
         }
     }
@@ -180,6 +205,7 @@ impl SearchWindow {
             regex: self.query.regex,
             auto_search: self.auto_search,
             keep_open: self.keep_open,
+            max_results: self.max_results,
         }
     }
 
@@ -195,6 +221,10 @@ impl SearchWindow {
         self.query.regex = preferences.regex;
         self.auto_search = preferences.auto_search;
         self.keep_open = preferences.keep_open;
+        self.max_results = preferences
+            .max_results
+            .clamp(*MAX_RESULTS_RANGE.start(), *MAX_RESULTS_RANGE.end());
+        self.shown_limit = self.max_results;
         self.mode().apply(&mut self.query);
     }
 
@@ -214,7 +244,37 @@ impl SearchWindow {
         self.total = 0;
         self.hits = 0;
         self.skipped = 0;
+        self.limited = false;
+        self.base_scanned = 0;
+        self.base_hits = 0;
+        self.base_skipped = 0;
+        self.elapsed = Duration::ZERO;
         self.status = "Starting search…".into();
+    }
+
+    /// Continue a scan that stopped at the limit, keeping what it found.
+    pub fn resume(&mut self) {
+        self.stale_scope = false;
+        self.mode_changed = false;
+        self.running = true;
+        self.cancel_requested = false;
+        self.changed_at = None;
+        self.started_at = Some(Instant::now());
+        self.base_scanned = self.scanned;
+        self.base_hits = self.hits;
+        self.base_skipped = self.skipped;
+        self.limited = false;
+        self.status = "Continuing search…".into();
+    }
+
+    /// The last scan stopped at the limit with work remaining.
+    pub fn limited(&self) -> bool {
+        self.limited
+    }
+
+    /// Matches the limit still allows beyond those listed.
+    pub fn room(&self) -> usize {
+        self.max_results.saturating_sub(self.hits)
     }
 
     pub fn update(&mut self, update: SearchUpdate) {
@@ -229,10 +289,11 @@ impl SearchWindow {
                 hits,
                 skipped,
             } => {
-                self.scanned = scanned;
-                self.total = total;
-                self.hits = hits;
-                self.skipped = skipped;
+                // A continuation reports its own progress on top of the stopped scan.
+                self.scanned = self.base_scanned + scanned;
+                self.total = self.base_scanned + total;
+                self.hits = self.base_hits + hits;
+                self.skipped = self.base_skipped + skipped;
             }
         }
     }
@@ -245,23 +306,34 @@ impl SearchWindow {
             self.started_at = None;
             return;
         }
-        self.scanned = summary.scanned;
-        self.total = summary.total;
-        self.hits = summary.hits;
-        self.skipped = summary.skipped;
-        let state = if summary.cancelled {
-            "Cancelled — partial results"
-        } else if summary.skipped > 0 {
-            "Search complete — partial coverage"
-        } else {
-            "Search complete"
-        };
-        self.status = format!("{state}: {} matches · {} skipped", self.hits, self.skipped);
+        self.scanned = self.base_scanned + summary.scanned;
+        self.total = self.base_scanned + summary.total;
+        self.hits = self.base_hits + summary.hits;
+        self.skipped = self.base_skipped + summary.skipped;
+        self.limited = summary.limited;
         if let Some(started) = self.started_at.take() {
-            self.status
-                .push_str(&format!(" · {:.2} s", started.elapsed().as_secs_f64()));
+            self.elapsed += started.elapsed();
         }
-        self.errors = summary.errors;
+        self.status = if self.limited {
+            format!(
+                "Stopped at {} matches (limit) · {} skipped",
+                thousands(self.hits as f64),
+                self.skipped
+            )
+        } else {
+            let state = if summary.cancelled {
+                "Cancelled — partial results"
+            } else if self.skipped > 0 {
+                "Search complete — partial coverage"
+            } else {
+                "Search complete"
+            };
+            format!("{state}: {} matches · {} skipped", self.hits, self.skipped)
+        };
+        self.status
+            .push_str(&format!(" · {:.2} s", self.elapsed.as_secs_f64()));
+        // A continuation keeps the errors of the scan it continues.
+        self.errors.extend(summary.errors);
         if !self.errors.is_empty() {
             self.status
                 .push_str(&format!(" · {} errors", self.errors.len()));
@@ -277,6 +349,7 @@ impl SearchWindow {
         self.cancel_requested = false;
         self.changed_at = None;
         self.started_at = None;
+        self.limited = false;
         self.status = format!("Search failed: {error}");
         self.errors = vec![error];
     }
@@ -444,6 +517,32 @@ impl SearchWindow {
                         .hint_text("e.g. com.example"),
                 )
                 .on_hover_text("Limits class-based scopes; resources are unaffected.");
+
+                ui.label("Max results:");
+                let limit = ui
+                    .add(
+                        egui::DragValue::new(&mut self.max_results)
+                            .range(MAX_RESULTS_RANGE)
+                            .speed(10.0)
+                            .custom_formatter(|value, _| thousands(value))
+                            .custom_parser(parse_limit),
+                    )
+                    .on_hover_text(
+                        "Stops the scan at this many matches. Raising it after a stop continues from where the scan stopped.",
+                    );
+                if self.max_results != self.shown_limit {
+                    self.shown_limit = self.max_results;
+                    self.limit_edited = true;
+                }
+                // Continue once the edit settles: the drag ends or the field loses focus.
+                if self.limit_edited && !limit.dragged() && !limit.has_focus() {
+                    if !self.limited || self.max_results <= self.hits {
+                        self.limit_edited = false;
+                    } else if !self.running && can_start {
+                        self.limit_edited = false;
+                        actions.resume = true;
+                    }
+                }
             });
             if !can_start && !self.running {
                 ui.label("Open a project, or wait for the current engine operation to finish.");
@@ -692,6 +791,7 @@ impl SearchWindow {
                 self.total = 0;
                 self.hits = 0;
                 self.skipped = 0;
+                self.limited = false;
                 self.status = if self.auto_search {
                     "Waiting to search updated query…".into()
                 } else {
@@ -732,10 +832,32 @@ impl SearchWindow {
     }
 }
 
+/// Digits grouped in thousands, as the limit control and the status show them.
+fn thousands(value: f64) -> String {
+    let digits = format!("{value:.0}");
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// Text typed into the limit control; separators are ignored.
+fn parse_limit(text: &str) -> Option<f64> {
+    text.chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::{HitOrigin, SearchTarget};
+    use crate::search::{HitOrigin, SearchResume, SearchTarget};
     use std::sync::Arc;
 
     #[test]
@@ -972,6 +1094,135 @@ mod tests {
     }
 
     #[test]
+    fn limited_search_reports_the_stop_and_resumes_when_the_limit_is_raised() {
+        let ctx = egui::Context::default();
+        let hit = |start: usize| SearchHit {
+            origin: Arc::new(HitOrigin {
+                target: SearchTarget::Class("sample.Example".into()),
+                name: "sample.Example".into(),
+                syntax: "java".into(),
+                source_hash: None,
+                retained: None,
+            }),
+            start,
+            end: start + 6,
+            line: 1,
+            kind: "code".into(),
+            preview: "return target;".into(),
+            preview_match: 7..13,
+        };
+        let frame = |window: &mut SearchWindow| {
+            let mut actions = SearchActions::default();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                actions = window.show_contents(ctx, true);
+            });
+            actions
+        };
+        let mut window = SearchWindow {
+            visible: true,
+            ..Default::default()
+        };
+        assert_eq!(window.max_results, DEFAULT_MAX_RESULTS);
+        window.query.text = "target".into();
+        window.max_results = 100;
+        window.begin();
+        window.update(SearchUpdate::Batch((0..100).map(hit).collect()));
+        window.finish(SearchSummary {
+            scanned: 10,
+            total: 40,
+            hits: 100,
+            skipped: 1,
+            limited: true,
+            resume: Some(SearchResume::default()),
+            ..Default::default()
+        });
+        assert!(window.limited());
+        assert_eq!(window.room(), 0);
+        assert!(
+            window
+                .status
+                .starts_with("Stopped at 100 matches (limit) · 1 skipped"),
+            "{}",
+            window.status
+        );
+        // Lowering the limit changes nothing.
+        window.max_results = 50;
+        let actions = frame(&mut window);
+        assert!(!actions.resume && actions.start.is_none());
+        assert_eq!(window.results.len(), 100);
+        // Raising it continues the stopped scan with the results kept.
+        window.max_results = 300;
+        let actions = frame(&mut window);
+        assert!(actions.resume && actions.start.is_none());
+        assert!(!frame(&mut window).resume, "one continuation per edit");
+        assert_eq!(window.room(), 200);
+        window.resume();
+        assert!(window.running && !window.limited());
+        assert_eq!(window.results.len(), 100);
+        assert_eq!(window.status, "Continuing search…");
+        window.update(SearchUpdate::Progress {
+            scanned: 5,
+            total: 30,
+            hits: 20,
+            skipped: 0,
+        });
+        assert_eq!(
+            (window.scanned, window.total, window.hits, window.skipped),
+            (15, 40, 120, 1)
+        );
+        window.update(SearchUpdate::Batch((100..150).map(hit).collect()));
+        window.finish(SearchSummary {
+            scanned: 30,
+            total: 30,
+            hits: 50,
+            skipped: 2,
+            ..Default::default()
+        });
+        assert_eq!(window.results.len(), 150);
+        assert!(!window.limited());
+        assert!(
+            window
+                .status
+                .starts_with("Search complete — partial coverage: 150 matches · 3 skipped"),
+            "{}",
+            window.status
+        );
+        // Without a stop, raising the limit starts nothing.
+        window.max_results = 400;
+        assert!(!frame(&mut window).resume);
+        // A changed query drops the stop: the next run is a fresh search.
+        window.max_results = 100;
+        window.begin();
+        window.update(SearchUpdate::Batch((0..100).map(hit).collect()));
+        window.finish(SearchSummary {
+            hits: 100,
+            limited: true,
+            ..Default::default()
+        });
+        assert!(window.limited());
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            window.show_contents(ctx, true);
+            ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("rdx_search_query")));
+        });
+        let typed = egui::RawInput {
+            events: vec![egui::Event::Text(" more".into())],
+            ..Default::default()
+        };
+        let _ = ctx.run(typed, |ctx| {
+            window.show_contents(ctx, true);
+        });
+        assert_eq!(window.query.text, "target more");
+        assert!(!window.limited() && window.results.is_empty());
+        window.max_results = 500;
+        assert!(!frame(&mut window).resume);
+        assert_eq!(thousands(2000.0), "2,000");
+        assert_eq!(thousands(999.0), "999");
+        assert_eq!(thousands(1_000_000.0), "1,000,000");
+        assert_eq!(parse_limit(" 2,500 "), Some(2500.0));
+        assert_eq!(parse_limit("many"), None);
+    }
+
+    #[test]
     fn preferences_restore_all_flags_without_persisting_query() {
         let preferences = SearchPreferences {
             classes: true,
@@ -985,6 +1236,7 @@ mod tests {
             regex: true,
             auto_search: true,
             keep_open: true,
+            max_results: 7500,
         };
         let mut window = SearchWindow::default();
         window.query.text = "transient".into();

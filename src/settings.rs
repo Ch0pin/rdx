@@ -26,6 +26,11 @@ pub fn default_excluded_packages() -> Vec<String> {
     STANDARD_PACKAGES.iter().map(|s| (*s).to_owned()).collect()
 }
 
+/// Matches a search reports before it stops, until the user changes it.
+pub const DEFAULT_MAX_RESULTS: usize = 2000;
+/// Values the result limit accepts.
+pub const MAX_RESULTS_RANGE: std::ops::RangeInclusive<usize> = 100..=1_000_000;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchPreferences {
@@ -40,6 +45,8 @@ pub struct SearchPreferences {
     pub regex: bool,
     pub auto_search: bool,
     pub keep_open: bool,
+    /// Matches a scan reports before it stops.
+    pub max_results: usize,
 }
 
 impl Default for SearchPreferences {
@@ -56,6 +63,7 @@ impl Default for SearchPreferences {
             regex: false,
             auto_search: false,
             keep_open: false,
+            max_results: DEFAULT_MAX_RESULTS,
         }
     }
 }
@@ -110,6 +118,10 @@ impl Settings {
             self.font_size = 15.0;
         }
         self.search_workers = self.search_workers.min(crate::search::MAX_WORKERS);
+        self.search.max_results = self
+            .search
+            .max_results
+            .clamp(*MAX_RESULTS_RANGE.start(), *MAX_RESULTS_RANGE.end());
     }
 }
 
@@ -312,6 +324,7 @@ mod tests {
                 regex: true,
                 auto_search: true,
                 keep_open: true,
+                max_results: 5000,
             },
             search_workers: 4,
         };
@@ -333,6 +346,31 @@ mod tests {
             settings.word_wrap = enabled;
             store.0.save(&settings).unwrap();
             assert_eq!(store.0.load().unwrap().word_wrap, enabled);
+        }
+    }
+
+    #[test]
+    fn max_results_default_persist_and_stay_within_the_accepted_range() {
+        let store = TemporaryStore::new();
+        store.0.save(&Settings::default()).unwrap();
+        fs::write(store.0.path.as_ref().unwrap(), br#"{"font_size":18.0}"#).unwrap();
+        let mut settings = store.0.load().unwrap();
+        assert_eq!(
+            settings.search.max_results, DEFAULT_MAX_RESULTS,
+            "older settings files get the default limit"
+        );
+        for limit in [7500, 100, 1_000_000] {
+            settings.search.max_results = limit;
+            store.0.save(&settings).unwrap();
+            assert_eq!(store.0.load().unwrap().search.max_results, limit);
+        }
+        for (stored, loaded) in [(50, 100), (5_000_000, 1_000_000)] {
+            fs::write(
+                store.0.path.as_ref().unwrap(),
+                format!(r#"{{"search":{{"max_results":{stored}}}}}"#),
+            )
+            .unwrap();
+            assert_eq!(store.0.load().unwrap().search.max_results, loaded);
         }
     }
 

@@ -20,20 +20,44 @@ enum Outcome {
 /// Outcomes resolve in completion order and report in class order, so hit
 /// order and counters match a serial scan while a slow class never idles the
 /// other workers. Documents leave memory at resolution unless they have hits.
+/// Reporting stops at the result limit; a class cut off part-way stays
+/// unreported so a continuation can report the rest of its matches.
 struct Reporter {
     completed: BTreeMap<usize, Outcome>,
     next: usize,
     last_progress: Instant,
+    limit: usize,
+    /// Matches of the first class that a continuation has already reported.
+    skip: usize,
+    /// Matches reported from the class at `next` before the limit cut it off.
+    partial: Option<usize>,
 }
 impl Reporter {
-    fn new() -> Self {
+    fn new(limit: usize, skip: usize) -> Self {
         Self {
             completed: BTreeMap::new(),
             next: 0,
             last_progress: Instant::now(),
+            limit,
+            skip,
+            partial: None,
         }
     }
+    /// Reporting continues while the limit has room.
+    fn wants_more(&self, summary: &SearchSummary) -> bool {
+        self.partial.is_none() && summary.hits < self.limit
+    }
+    /// Matches worth collecting from one class: the limit, the ones a
+    /// continuation skips in its first class, and one more to tell a class
+    /// that ends at the limit from one the limit cuts off.
+    fn room(&self, index: usize) -> usize {
+        self.limit
+            .saturating_add(if index == 0 { self.skip } else { 0 })
+            .saturating_add(1)
+    }
     fn resolve(
+        &self,
+        index: usize,
         name: &str,
         rendered: std::result::Result<CachedValue, String>,
         query: &CompiledQuery,
@@ -42,7 +66,7 @@ impl Reporter {
             Err(error) => Outcome::Failed(format!("{name}: {error}")),
             Ok(None) => Outcome::Skipped,
             Ok(Some((document, definitions, note))) => Outcome::Resolved {
-                hits: matches(document, &definitions, query, usize::MAX),
+                hits: matches(document, &definitions, query, self.room(index)),
                 note,
             },
         }
@@ -52,18 +76,19 @@ impl Reporter {
     }
     /// Classes with a known outcome, reported or still waiting for an earlier class.
     fn resolved(&self) -> usize {
-        self.next + self.completed.len()
+        self.next + self.completed.len() + usize::from(self.partial.is_some())
     }
-    /// Report contiguous outcomes in class order.
+    /// Report contiguous outcomes in class order while the limit has room.
     fn drain(
         &mut self,
         summary: &mut SearchSummary,
         cache: &mut SearchCache,
         emit: &mut impl FnMut(SearchUpdate),
     ) {
-        while let Some(outcome) = self.completed.remove(&self.next) {
-            self.next += 1;
-            summary.scanned += 1;
+        while self.wants_more(summary) {
+            let Some(outcome) = self.completed.remove(&self.next) else {
+                break;
+            };
             match outcome {
                 Outcome::Rejected => cache.index_rejections += 1,
                 Outcome::Skipped => summary.skipped += 1,
@@ -71,7 +96,21 @@ impl Reporter {
                     record_error(summary, error);
                     summary.skipped += 1;
                 }
-                Outcome::Resolved { hits, note } => {
+                Outcome::Resolved { mut hits, note } => {
+                    let reported = if self.next == 0 {
+                        self.skip.min(hits.len())
+                    } else {
+                        0
+                    };
+                    hits.drain(..reported);
+                    let room = self.limit - summary.hits;
+                    if hits.len() > room {
+                        hits.truncate(room);
+                        summary.hits += room;
+                        emit(SearchUpdate::Batch(hits));
+                        self.partial = Some(reported + room);
+                        return;
+                    }
                     if let Some(note) = note {
                         summary.skipped += 1;
                         record_error(summary, note);
@@ -82,7 +121,20 @@ impl Reporter {
                     }
                 }
             }
+            self.next += 1;
+            summary.scanned += 1;
         }
+    }
+    /// The classes a continuation scans once the limit stopped reporting.
+    fn remaining(&self, classes: &[&String]) -> Option<SearchResume> {
+        (self.next < classes.len()).then(|| SearchResume {
+            classes: classes[self.next..]
+                .iter()
+                .map(|name| (*name).clone())
+                .collect(),
+            skip: self.partial.unwrap_or(0),
+            resources_from: None,
+        })
     }
     fn progress(
         &mut self,
@@ -204,6 +256,36 @@ fn render_job(
     }))
     .unwrap_or_else(|_| Err("Native source renderer panicked".into()))
 }
+/// Account for a finished render: free its budget, move the required head and
+/// buffer its outcome for reporting in class order.
+#[allow(clippy::too_many_arguments)]
+fn collect(
+    (index, result, bytes): (usize, Rendered, usize),
+    classes: &[&String],
+    query: &CompiledQuery,
+    budget: &ResultBudget,
+    in_flight: &mut BTreeSet<usize>,
+    next: usize,
+    cache: &mut SearchCache,
+    reporter: &mut Reporter,
+) {
+    budget.release(bytes);
+    in_flight.remove(&index);
+    budget.head(in_flight.first().copied().unwrap_or(next));
+    let name = classes[index];
+    let outcome = match result {
+        Ok((value, prepared)) => {
+            cache.insert_prepared(
+                SearchTarget::Class((*name).clone()),
+                value.clone(),
+                prepared,
+            );
+            reporter.resolve(index, name, Ok(value), query)
+        }
+        Err(error) => reporter.resolve(index, name, Err(error), query),
+    };
+    reporter.buffer(index, outcome);
+}
 fn rendered_bytes(result: &Rendered) -> usize {
     match result {
         Err(error) => error.capacity(),
@@ -228,6 +310,8 @@ pub(super) fn run(
     emit: &mut impl FnMut(SearchUpdate),
     interactive: &mut impl FnMut(&mut NativeEngine, &mut SearchCache),
     workers: usize,
+    limit: usize,
+    skip: usize,
 ) -> SearchSummary {
     run_with_workers(
         engine,
@@ -238,6 +322,8 @@ pub(super) fn run(
         emit,
         interactive,
         resolve_workers(workers),
+        limit,
+        skip,
     )
 }
 
@@ -265,8 +351,12 @@ pub(super) fn run_with_workers(
     emit: &mut impl FnMut(SearchUpdate),
     interactive: &mut impl FnMut(&mut NativeEngine, &mut SearchCache),
     workers: usize,
+    limit: usize,
+    skip: usize,
 ) -> SearchSummary {
     let workers = workers.clamp(1, MAX_WORKERS);
+    // `0` is unlimited; `skip` is what a continuation's first class already reported.
+    let limit = if limit == 0 { usize::MAX } else { limit };
     let window = workers * 16;
     let budget = ResultBudget::new(128 * 1024 * 1024);
     let legacy = cache.legacy;
@@ -316,7 +406,7 @@ pub(super) fn run_with_workers(
             total: classes.len(),
             ..Default::default()
         };
-        let mut reporter = Reporter::new();
+        let mut reporter = Reporter::new(limit, skip);
         // Renders in flight, in class order; the oldest is the budget's required head.
         let mut in_flight = BTreeSet::new();
         let mut next = 0;
@@ -328,7 +418,8 @@ pub(super) fn run_with_workers(
             }
             // Admission resolves indexed classes inline and bounds only renders
             // in flight, so a slow render never starves the workers behind it.
-            while next < classes.len() && in_flight.len() < window {
+            while next < classes.len() && in_flight.len() < window && reporter.wants_more(&summary)
+            {
                 interactive(engine, cache);
                 if cancel.load(Ordering::Relaxed) {
                     summary.cancelled = true;
@@ -351,7 +442,7 @@ pub(super) fn run_with_workers(
                     }
                     value
                 }) {
-                    reporter.buffer(next, Reporter::resolve(name, Ok(value), query));
+                    reporter.buffer(next, reporter.resolve(next, name, Ok(value), query));
                 } else {
                     if jobs_tx.send(next).is_err() {
                         record_error(&mut summary, "Source workers stopped".into());
@@ -361,31 +452,43 @@ pub(super) fn run_with_workers(
                     budget.head(*in_flight.first().unwrap());
                 }
                 next += 1;
+                // Finished renders are collected during admission too, so a run
+                // of indexed classes never delays reporting an earlier render.
+                while let Ok(received) = results_rx.try_recv() {
+                    collect(
+                        received,
+                        classes,
+                        query,
+                        &budget,
+                        &mut in_flight,
+                        next,
+                        cache,
+                        &mut reporter,
+                    );
+                }
                 reporter.drain(&mut summary, cache, emit);
                 reporter.progress(&summary, emit, false);
+            }
+            if !reporter.wants_more(&summary) {
+                // The limit is reached; renders still in flight are kept below.
+                break;
             }
             if in_flight.is_empty() {
                 // Admission only stops with the window open once every class is in.
                 break;
             }
             match results_rx.recv_timeout(Duration::from_millis(20)) {
-                Ok((index, result, bytes)) => {
-                    budget.release(bytes);
-                    in_flight.remove(&index);
-                    budget.head(in_flight.first().copied().unwrap_or(next));
-                    let name = classes[index];
-                    let outcome = match result {
-                        Ok((value, prepared)) => {
-                            cache.insert_prepared(
-                                SearchTarget::Class((*name).clone()),
-                                value.clone(),
-                                prepared,
-                            );
-                            Reporter::resolve(name, Ok(value), query)
-                        }
-                        Err(error) => Reporter::resolve(name, Err(error), query),
-                    };
-                    reporter.buffer(index, outcome);
+                Ok(received) => {
+                    collect(
+                        received,
+                        classes,
+                        query,
+                        &budget,
+                        &mut in_flight,
+                        next,
+                        cache,
+                        &mut reporter,
+                    );
                     reporter.drain(&mut summary, cache, emit);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -403,18 +506,29 @@ pub(super) fn run_with_workers(
             reporter.progress(&summary, emit, false);
         }
         summary.cancelled |= cancel.load(Ordering::Relaxed);
+        if !summary.cancelled && !reporter.wants_more(&summary) {
+            summary.resume = reporter.remaining(classes);
+            summary.limited = summary.resume.is_some();
+        }
         reporter.progress(&summary, emit, true);
         stop.store(true, Ordering::Relaxed);
         budget.stop();
         drop(results_tx);
         drop(jobs_tx);
-        // Dropping the receiver releases any worker blocked on sending a result.
-        drop(results_rx);
         // A worker may be finishing resource decoration when cancellation lands.
         // Keep serving navigation during shutdown as well as during rendering.
         while handles.iter().any(|handle| !handle.is_finished()) {
             interactive(engine, cache);
             std::thread::sleep(Duration::from_millis(5));
+        }
+        // Renders that finished after the scan stopped serve the continuation
+        // or the next search. The channel holds a whole window of results, so
+        // no worker ever blocks on sending one.
+        while let Ok((index, result, bytes)) = results_rx.try_recv() {
+            budget.release(bytes);
+            if let Ok((value, prepared)) = result {
+                cache.insert_prepared(SearchTarget::Class(classes[index].clone()), value, prepared);
+            }
         }
         summary
     });
@@ -532,7 +646,7 @@ mod tests {
                 None,
             ))
         };
-        let mut reporter = Reporter::new();
+        let mut reporter = Reporter::new(usize::MAX, 0);
         let mut summary = SearchSummary {
             total: 3,
             ..Default::default()
@@ -548,12 +662,12 @@ mod tests {
                 );
             }
         };
-        reporter.buffer(2, Reporter::resolve("C", Ok(value("C")), &query));
+        reporter.buffer(2, reporter.resolve(2, "C", Ok(value("C")), &query));
         reporter.buffer(1, Outcome::Rejected);
         reporter.drain(&mut summary, &mut cache, &mut emit);
         assert_eq!(summary.scanned, 0);
         assert_eq!(reporter.resolved(), 2);
-        reporter.buffer(0, Reporter::resolve("A", Err("boom".into()), &query));
+        reporter.buffer(0, reporter.resolve(0, "A", Err("boom".into()), &query));
         reporter.drain(&mut summary, &mut cache, &mut emit);
         assert_eq!(summary.scanned, 3);
         assert_eq!(summary.skipped, 1);
@@ -601,6 +715,8 @@ mod tests {
             },
             &mut |_, _| {},
             4,
+            0,
+            0,
         );
         assert!(first.errors.is_empty(), "{:?}", first.errors);
         assert!(!expected.is_empty());
@@ -628,6 +744,8 @@ mod tests {
                 callbacks += 1;
             },
             12,
+            0,
+            0,
         );
         assert!(second.errors.is_empty(), "{:?}", second.errors);
         assert_eq!(actual, expected);
@@ -657,6 +775,8 @@ mod tests {
                 &mut |_| {},
                 &mut |_, _| {},
                 workers,
+                0,
+                0,
             );
             assert_eq!(summary.scanned, names.len());
             assert_eq!(summary.skipped, names.len());
@@ -698,6 +818,8 @@ mod tests {
                     }
                 },
                 workers,
+                0,
+                0,
             );
             assert!(summary.cancelled);
             assert!(summary.scanned <= window);
@@ -732,10 +854,218 @@ mod tests {
                     }
                 },
                 workers,
+                0,
+                0,
             );
             assert!(summary.cancelled);
             assert_eq!(cache.source_fetches, 0);
             assert_eq!(summary.scanned, 0);
+        }
+    }
+
+    #[test]
+    fn reporter_stops_at_the_limit_and_a_continuation_reports_the_rest() {
+        let query = CompiledQuery::new(SearchQuery {
+            text: "needle".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let value = |name: &str| {
+            Some((
+                Arc::new(SearchDocument {
+                    target: SearchTarget::Class(name.into()),
+                    name: name.into(),
+                    source: "needle needle needle".into(),
+                    syntax: "java".into(),
+                    links: vec![],
+                    source_hash: None,
+                    metadata_complete: true,
+                }),
+                Arc::new(vec![]),
+                Some("partial".to_string()),
+            ))
+        };
+        let names: Vec<String> = ["A", "B", "C"].iter().map(|n| n.to_string()).collect();
+        let classes: Vec<&String> = names.iter().collect();
+        let mut cache = SearchCache::default();
+        let batches = std::cell::RefCell::new(Vec::new());
+        let mut emit = |update| {
+            if let SearchUpdate::Batch(hits) = update {
+                batches.borrow_mut().push(
+                    hits.iter()
+                        .map(|hit| (hit.origin.name.clone(), hit.start))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        };
+        let batch = |items: &[(&str, usize)]| -> Vec<(String, usize)> {
+            items.iter().map(|(n, s)| (n.to_string(), *s)).collect()
+        };
+        // Four matches fit: all of A and the first of B. B stays unreported.
+        let mut summary = SearchSummary {
+            total: 3,
+            ..Default::default()
+        };
+        let mut reporter = Reporter::new(4, 0);
+        for (index, name) in names.iter().enumerate() {
+            reporter.buffer(
+                index,
+                reporter.resolve(index, name, Ok(value(name)), &query),
+            );
+        }
+        reporter.drain(&mut summary, &mut cache, &mut emit);
+        assert_eq!(summary.hits, 4);
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(
+            summary.skipped, 1,
+            "only the reported class counts its note"
+        );
+        assert!(!reporter.wants_more(&summary));
+        assert_eq!(reporter.resolved(), 3);
+        let resume = reporter.remaining(&classes).unwrap();
+        assert_eq!(resume.classes, names[1..]);
+        assert_eq!(resume.skip, 1);
+        assert_eq!(resume.resources_from, None);
+        assert_eq!(
+            *batches.borrow(),
+            vec![batch(&[("A", 0), ("A", 7), ("A", 14)]), batch(&[("B", 0)])]
+        );
+        // The continuation skips B's reported match and finishes the rest.
+        let remaining: Vec<&String> = resume.classes.iter().collect();
+        let mut summary = SearchSummary {
+            total: 2,
+            ..Default::default()
+        };
+        let mut reporter = Reporter::new(usize::MAX, resume.skip);
+        for (index, name) in resume.classes.iter().enumerate() {
+            reporter.buffer(
+                index,
+                reporter.resolve(index, name, Ok(value(name)), &query),
+            );
+        }
+        reporter.drain(&mut summary, &mut cache, &mut emit);
+        assert_eq!(summary.hits, 5);
+        assert_eq!(summary.scanned, 2);
+        assert_eq!(summary.skipped, 2);
+        assert!(reporter.wants_more(&summary));
+        assert!(reporter.remaining(&remaining).is_none());
+        assert_eq!(
+            batches.borrow()[2..],
+            [
+                batch(&[("B", 7), ("B", 14)]),
+                batch(&[("C", 0), ("C", 7), ("C", 14)])
+            ]
+        );
+        // A limit met exactly on a class boundary leaves whole classes.
+        let mut summary = SearchSummary {
+            total: 3,
+            ..Default::default()
+        };
+        let mut reporter = Reporter::new(3, 0);
+        for (index, name) in names.iter().enumerate() {
+            reporter.buffer(
+                index,
+                reporter.resolve(index, name, Ok(value(name)), &query),
+            );
+        }
+        reporter.drain(&mut summary, &mut cache, &mut |_| {});
+        assert_eq!((summary.hits, summary.scanned), (3, 1));
+        let resume = reporter.remaining(&classes).unwrap();
+        assert_eq!((resume.classes.as_slice(), resume.skip), (&names[1..], 0));
+    }
+
+    #[test]
+    fn limited_scan_stops_and_continuations_complete_the_same_results() {
+        use rdx::engine::DecompilerEngine;
+        fn scan(
+            engine: &mut NativeEngine,
+            cache: &mut SearchCache,
+            classes: &[&String],
+            query: &CompiledQuery,
+            limit: usize,
+            skip: usize,
+            hits: &mut Vec<(String, usize, usize)>,
+        ) -> SearchSummary {
+            run_with_workers(
+                engine,
+                cache,
+                classes,
+                query,
+                &AtomicBool::new(false),
+                &mut |update| {
+                    if let SearchUpdate::Batch(batch) = update {
+                        hits.extend(
+                            batch
+                                .iter()
+                                .map(|hit| (hit.origin.name.clone(), hit.start, hit.end)),
+                        );
+                    }
+                },
+                &mut |_, _| {},
+                4,
+                limit,
+                skip,
+            )
+        }
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let mut engine = NativeEngine::start().unwrap();
+        let project = engine.open(&path).unwrap();
+        let classes: Vec<_> = project.classes.iter().collect();
+        let query = CompiledQuery::new(SearchQuery {
+            text: "doubleValue".into(),
+            excluded_packages: Vec::new(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut expected = Vec::new();
+        let full = scan(
+            &mut engine,
+            &mut SearchCache::default(),
+            &classes,
+            &query,
+            0,
+            0,
+            &mut expected,
+        );
+        assert!(!full.limited && full.resume.is_none(), "{:?}", full.errors);
+        assert!(expected.len() > 2, "{}", expected.len());
+        for limit in [1, 2, expected.len() - 1] {
+            let mut cache = SearchCache::default();
+            let mut actual = Vec::new();
+            let mut summary = scan(
+                &mut engine,
+                &mut cache,
+                &classes,
+                &query,
+                limit,
+                0,
+                &mut actual,
+            );
+            assert!(summary.limited, "limit {limit}");
+            assert_eq!(summary.hits, limit);
+            assert_eq!(actual, expected[..limit], "limit {limit}");
+            let mut scanned = summary.scanned;
+            let mut runs = 0;
+            while let Some(resume) = summary.resume.take() {
+                assert!(summary.limited);
+                let remaining: Vec<&String> = resume.classes.iter().collect();
+                summary = scan(
+                    &mut engine,
+                    &mut cache,
+                    &remaining,
+                    &query,
+                    limit,
+                    resume.skip,
+                    &mut actual,
+                );
+                scanned += summary.scanned;
+                runs += 1;
+                assert!(runs <= expected.len() + 1, "limit {limit}: no progress");
+            }
+            assert!(!summary.limited);
+            assert_eq!(actual, expected, "limit {limit}");
+            assert_eq!(scanned, classes.len(), "limit {limit}");
         }
     }
 

@@ -39,6 +39,9 @@ pub struct SearchActions {
     pub open: Option<SearchHit>,
 }
 
+/// Status shown before a search runs.
+const IDLE_STATUS: &str = "Choose a scope and enter text to search.";
+
 pub struct SearchWindow {
     pub visible: bool,
     pub keep_open: bool,
@@ -88,7 +91,7 @@ impl Default for SearchWindow {
             running: false,
             results: Vec::new(),
             query: SearchQuery::default(),
-            status: "Choose a scope and enter text to search.".into(),
+            status: IDLE_STATUS.into(),
             scanned: 0,
             total: 0,
             hits: 0,
@@ -272,6 +275,31 @@ impl SearchWindow {
         self.limited
     }
 
+    /// Closing the window ends the search session: the next open starts with
+    /// an empty query and no results, while the scope options stay as set.
+    /// Hiding the window to show a selected result keeps the session.
+    fn end_session(&mut self) {
+        // The worker still owns the cancelled query until its cancellation
+        // completes. Do not list its late batches in the fresh window.
+        self.stale_scope = self.running;
+        self.query.text.clear();
+        self.results.clear();
+        self.preview_cache.clear();
+        self.result_widths = None;
+        self.selected_result = None;
+        self.errors.clear();
+        self.scanned = 0;
+        self.total = 0;
+        self.hits = 0;
+        self.skipped = 0;
+        self.limited = false;
+        self.base_scanned = 0;
+        self.base_hits = 0;
+        self.base_skipped = 0;
+        self.elapsed = Duration::ZERO;
+        self.status = IDLE_STATUS.into();
+    }
+
     /// Matches the limit still allows beyond those listed.
     pub fn room(&self) -> usize {
         self.max_results.saturating_sub(self.hits)
@@ -381,7 +409,8 @@ impl SearchWindow {
         let before = self.query.clone();
         let auto_before = self.auto_search;
         let mut visible = self.visible;
-        if ctx.input(|input| input.viewport().close_requested()) {
+        let closed = ctx.input(|input| input.viewport().close_requested());
+        if closed {
             visible = false;
         }
         egui::TopBottomPanel::bottom("rdx_search_options").show(ctx, |ui| {
@@ -773,6 +802,9 @@ impl SearchWindow {
             if self.running && !self.cancel_requested {
                 self.cancel_requested = true;
                 actions.cancel = true;
+            }
+            if closed {
+                self.end_session();
             }
             return actions;
         }
@@ -1332,6 +1364,101 @@ mod tests {
         assert!(window.changed_at.is_none());
     }
 
+    fn session_hit(start: usize) -> SearchHit {
+        SearchHit {
+            origin: Arc::new(HitOrigin {
+                target: SearchTarget::Class("sample.Example".into()),
+                name: "sample.Example".into(),
+                syntax: "java".into(),
+                source_hash: None,
+                retained: None,
+            }),
+            start,
+            end: start + 6,
+            line: 1,
+            kind: "code".into(),
+            preview: "return target;".into(),
+            preview_match: 7..13,
+        }
+    }
+
+    fn close_viewport(ctx: &egui::Context, window: &mut SearchWindow) -> SearchActions {
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let mut actions = SearchActions::default();
+        let _ = ctx.run(input, |ctx| actions = window.show_contents(ctx, false));
+        actions
+    }
+
+    #[test]
+    fn closing_window_clears_query_and_results_and_keeps_scope_options() {
+        let ctx = egui::Context::default();
+        let mut window = SearchWindow {
+            visible: true,
+            ..Default::default()
+        };
+        window.query.text = "target".into();
+        window.query.regex = true;
+        window.query.excluded_packages = vec!["a.b".into()];
+        window.update(SearchUpdate::Batch(vec![session_hit(7), session_hit(20)]));
+        window.finish(SearchSummary {
+            scanned: 3,
+            total: 3,
+            hits: 2,
+            ..Default::default()
+        });
+        assert_eq!(window.results.len(), 2);
+        assert_ne!(window.status, IDLE_STATUS);
+
+        let actions = close_viewport(&ctx, &mut window);
+        assert!(!actions.cancel);
+        assert!(!window.visible);
+        assert!(window.query.text.is_empty(), "query text is cleared");
+        assert!(window.results.is_empty(), "results are cleared");
+        assert_eq!((window.scanned, window.total, window.hits), (0, 0, 0));
+        assert_eq!(window.status, IDLE_STATUS);
+        assert!(!window.stale_scope);
+        assert!(window.query.regex, "scope options are kept");
+        assert_eq!(window.query.excluded_packages, vec!["a.b".to_string()]);
+    }
+
+    #[test]
+    fn closing_window_mid_search_cancels_and_ignores_late_batches() {
+        let ctx = egui::Context::default();
+        let mut window = SearchWindow {
+            visible: true,
+            running: true,
+            ..Default::default()
+        };
+        window.query.text = "target".into();
+        window.update(SearchUpdate::Batch(vec![session_hit(7)]));
+
+        let actions = close_viewport(&ctx, &mut window);
+        assert!(actions.cancel);
+        assert!(window.query.text.is_empty());
+        assert!(window.results.is_empty());
+        assert!(
+            window.stale_scope,
+            "the cancelled worker's batches are stale"
+        );
+
+        window.update(SearchUpdate::Batch(vec![session_hit(20)]));
+        assert!(window.results.is_empty(), "late batch is ignored");
+        window.finish(SearchSummary {
+            cancelled: true,
+            ..Default::default()
+        });
+        assert!(!window.running);
+        assert!(!window.stale_scope);
+        assert!(window.results.is_empty());
+        assert!(window.query.text.is_empty());
+    }
+
     #[test]
     fn result_shows_preview_and_opens_on_click() {
         check_result_click(false);
@@ -1466,6 +1593,7 @@ mod tests {
             }],
             ..Default::default()
         };
+        window.query.text = "target".into();
         let render = |window: &mut SearchWindow, time, events| {
             let mut actions = SearchActions::default();
             let output = ctx.run(
@@ -1560,6 +1688,10 @@ mod tests {
         );
         assert_eq!(actions.open.unwrap().start, 7);
         assert_eq!(window.visible, keep_open);
+        assert_eq!(
+            window.query.text, "target",
+            "opening a result keeps the search session"
+        );
         assert_eq!(window.selected_result, Some(0));
         assert!(!actions.cancel);
         window.begin();

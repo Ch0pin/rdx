@@ -180,7 +180,7 @@ Project search remains available with `Cmd/Ctrl+Shift+F`.
 across sessions. Line numbers remain source-line numbers, and code links and
 copied/exported text retain their original positions and content.
 
-**Search → Class / Code / Methods / Fields** opens a separate search window with one selected scope. Code search examines the native representation, which may include DEX disassembly; it cannot yet reproduce all searches against JADX-generated Java. Definition searches use native class/member metadata. Resources, Comments, case sensitivity, regex, Auto search, and Keep open remain separate options.
+**Search → Class / Code / Methods / Fields** opens a separate search window with one selected scope. Code search examines the native representation, which may include DEX disassembly; it cannot yet reproduce all searches against JADX-generated Java. Definition searches use native class/member metadata. Resources, Comments, case sensitivity, regex, Auto search, and Keep open remain separate options. Closing the window clears the query and its results; the scope options are kept for the next search.
 
 **Search → Scan → Workers** sets how many threads a Code search uses to render classes. Auto, the default, uses one fewer than the machine's cores, at most 12, and the menu shows that number. Lower it to keep the machine responsive during a long cold scan; the change applies to the next search and is saved with the other preferences. The status bar shows the count in use while a scan runs.
 

@@ -91,9 +91,7 @@ fn own_source_operands(
             }
             let name = class.symbols.strings.get(name as usize)?;
             let (ret, args) = class.symbols.protos.get(proto as usize)?;
-            let mut methods = class
-                .methods
-                .iter()
+            let mut methods = super::covariant_bridge::declared(class)
                 .filter(|m| m.name.as_ref() == name && m.parameters == *args);
             let Some(target) = methods.next() else {
                 class

@@ -6,6 +6,7 @@ mod cast_cleanup;
 mod caught_checked_throw;
 mod checked_call_bridge;
 mod condition_cleanup;
+pub(crate) mod covariant_bridge;
 mod declaration_types;
 mod display_names;
 mod enums;
@@ -1134,9 +1135,7 @@ fn class_header_prefix(name: &str, class: &DexClass) -> Result<Output> {
     );
     let mut signatures = std::collections::HashSet::new();
     ensure!(
-        class
-            .methods
-            .iter()
+        covariant_bridge::declared(class)
             .all(|m| signatures.insert((m.name.as_ref(), m.parameters.as_slice()))),
         "Duplicate Java method signatures"
     );
@@ -1332,7 +1331,7 @@ pub fn render(name: &str, class: &DexClass) -> Result<DecompiledCode> {
         return plan.render(name, class);
     }
     let mut out = class_prefix(name, class)?;
-    for method in &class.methods {
+    for method in covariant_bridge::declared(class) {
         append_presented_method(&mut out, class, method, render_method(name, class, method)?)?;
     }
     for helper in super_bridge::definitions(class) {
@@ -1391,7 +1390,7 @@ pub(crate) fn render_mixed_reported_with_nested(
     cancelled: &impl Fn() -> bool,
 ) -> Result<(DecompiledCode, serde_json::Value)> {
     let mut errors = std::collections::BTreeMap::new();
-    let mut folded = std::collections::BTreeSet::new();
+    let mut folded = std::collections::BTreeMap::new();
     let code = render_mixed_controlled_reported(
         name,
         class,
@@ -1433,7 +1432,7 @@ fn render_mixed_controlled_reported(
     children: &[&DexClass],
     world: Option<&std::collections::BTreeMap<String, DexClass>>,
     cancelled: &impl Fn() -> bool,
-    folded: Option<&mut std::collections::BTreeSet<String>>,
+    folded: Option<&mut std::collections::BTreeMap<String, String>>,
 ) -> Result<DecompiledCode> {
     ensure!(!cancelled(), "decompilation cancelled");
     if let Ok(plan) = enums::Plan::analyze(class)
@@ -1448,6 +1447,12 @@ fn render_mixed_controlled_reported(
     if let Ok(mut out) = class_prefix(name, class) {
         for method in &class.methods {
             ensure!(!cancelled(), "decompilation cancelled");
+            // A proven covariant bridge is absent from Java source. The DEX
+            // skeleton below still shows it when another member fails.
+            if covariant_bridge::folded(class, method) {
+                attempted.push(None);
+                continue;
+            }
             let result = render_member(method);
             let failed = result.is_err();
             attempted.push(Some(result));
@@ -1458,13 +1463,19 @@ fn render_mixed_controlled_reported(
         if attempted.len() == class.methods.len()
             && attempted
                 .iter()
-                .all(|result| result.as_ref().unwrap().is_ok())
+                .all(|result| result.as_ref().is_none_or(Result::is_ok))
         {
             for (method, result) in class.methods.iter().zip(attempted) {
                 ensure!(!cancelled(), "decompilation cancelled");
+                let Some(result) = result else {
+                    continue;
+                };
                 // Prefix validation already checked every interface modifier.
-                append_presented_method(&mut out, class, method, result.unwrap().unwrap())
+                append_presented_method(&mut out, class, method, result.unwrap())
                     .expect("validated interface method");
+            }
+            if let Some(folded) = folded {
+                *folded = covariant_bridge::folded_methods(name, class);
             }
             ensure!(!cancelled(), "decompilation cancelled");
             for helper in super_bridge::definitions(class) {

@@ -1119,7 +1119,7 @@ impl Plan {
         &self,
         name: &str,
         class: &DexClass,
-    ) -> std::collections::BTreeSet<String> {
+    ) -> std::collections::BTreeMap<String, String> {
         class
             .methods
             .iter()
@@ -1127,7 +1127,12 @@ impl Plan {
                 matches!(m.name.as_ref(), "<clinit>" | "values" | "valueOf")
                     || (self.entries.is_some() && matches!(m.name.as_ref(), "<init>" | "$values"))
             })
-            .map(|m| crate::source_coverage::method_id(name, m))
+            .map(|m| {
+                (
+                    crate::source_coverage::method_id(name, m),
+                    "proven_enum_sugar".to_owned(),
+                )
+            })
             .collect()
     }
 

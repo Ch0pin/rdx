@@ -4,7 +4,7 @@ use crate::{
     native_dex::{DexClass, DexMethod},
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 pub(crate) fn method_id(name: &str, method: &DexMethod) -> String {
     format!(
@@ -158,7 +158,7 @@ pub(crate) fn report(
     class: &DexClass,
     code: &DecompiledCode,
     errors: &BTreeMap<String, String>,
-    folded: &BTreeSet<String>,
+    folded: &BTreeMap<String, String>,
 ) -> Value {
     let chars: Vec<char> = code.source.chars().collect();
     let declarations = declaration_index(code, &chars);
@@ -175,12 +175,8 @@ pub(crate) fn report(
     for method in &class.methods {
         let id = method_id(name, method);
         let declaration = declarations.get(id.as_str()).copied();
-        let (status, representation, reason) = if folded.contains(&id) {
-            (
-                "decompiled",
-                "source_sugar",
-                Some("proven_enum_sugar".to_owned()),
-            )
+        let (status, representation, reason) = if let Some(reason) = folded.get(&id) {
+            ("decompiled", "source_sugar", Some(reason.clone()))
         } else if let Some(d) = declaration {
             let begin = line_starts[line_starts.partition_point(|start| *start <= d.start) - 1];
             let prefix: String = chars[begin..d.start].iter().collect();
@@ -281,7 +277,7 @@ mod tests {
             &class,
             &code,
             &BTreeMap::from([(id.clone(), "unsupported λ🙂\n*/ injected \\u000a".into())]),
-            &BTreeSet::new(),
+            &BTreeMap::new(),
         );
         prepend_incomplete_header(&mut code, &mut coverage);
         assert!(code.source.starts_with("// RDX Java reconstruction incomplete: 1 DEX fallback method(s), 0 omitted method(s).\n"));
@@ -389,7 +385,7 @@ mod tests {
             &class,
             &code,
             &BTreeMap::new(),
-            &BTreeSet::new(),
+            &BTreeMap::new(),
         );
         code.source.insert_str(0, "// é🙂\n");
         code.links[0].start += 6;
@@ -435,7 +431,10 @@ mod tests {
             method_id("sample.Hello", &class.methods[1]),
             "unsupported opcode example".into(),
         )]);
-        let folded = BTreeSet::from([method_id("sample.Hello", &class.methods[3])]);
+        let folded = BTreeMap::from([(
+            method_id("sample.Hello", &class.methods[3]),
+            "proven_enum_sugar".to_owned(),
+        )]);
         let result = report("sample.Hello", &class, &code, &errors, &folded);
         assert_eq!(
             result["counts"],

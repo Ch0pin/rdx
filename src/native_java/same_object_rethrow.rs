@@ -814,7 +814,7 @@ fn established_same_class_header(
     static_call: bool,
     dependency_words: &mut usize,
 ) -> Result<Vec<Arc<str>>> {
-    let mut candidates = class.methods.iter().filter(|candidate| {
+    let mut candidates = super::covariant_bridge::declared(class).filter(|candidate| {
         candidate.declaring_type == class.descriptor
             && candidate.name.as_ref() == name
             && candidate.parameters == args

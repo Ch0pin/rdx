@@ -794,9 +794,7 @@ pub(crate) fn render_nested(
     );
     let mut signatures = HashSet::new();
     ensure!(
-        child
-            .methods
-            .iter()
+        super::covariant_bridge::declared(child)
             .all(|method| signatures.insert((method.name.as_ref(), method.parameters.as_slice()))),
         "Duplicate anonymous Java method signatures"
     );
@@ -868,7 +866,7 @@ pub(crate) fn render_nested(
         })?;
         out.append(indent(code));
     }
-    for method in &child.methods {
+    for method in super::covariant_bridge::declared(child) {
         let captures = if method.name.as_ref() == "<init>" {
             pre_super_captures(child, method, world)?
         } else {

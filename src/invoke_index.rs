@@ -131,10 +131,7 @@ fn sort_shards(directory: &Path, shards: usize) -> Result<()> {
     let sort = |shard: usize| -> Result<()> {
         let path = directory.join(shard.to_string());
         let bytes = fs::read(&path)?;
-        let mut records: Vec<[u8; RECORD]> = bytes
-            .chunks_exact(RECORD)
-            .map(|chunk| chunk.try_into().unwrap())
-            .collect();
+        let mut records: Vec<[u8; RECORD]> = bytes.as_chunks::<RECORD>().0.to_vec();
         records.sort_unstable_by_key(|record| {
             (
                 record_hash(record),
@@ -446,8 +443,10 @@ mod tests {
             let bytes = fs::read(index.directory.0.join(shard.to_string())).unwrap();
             assert_eq!(bytes.len() as u64, index.lengths[shard]);
             let hashes: Vec<u64> = bytes
-                .chunks_exact(RECORD)
-                .map(|chunk| record_hash(chunk.try_into().unwrap()))
+                .as_chunks::<RECORD>()
+                .0
+                .iter()
+                .map(record_hash)
                 .collect();
             assert!(hashes.windows(2).all(|pair| pair[0] <= pair[1]), "{shard}");
         }

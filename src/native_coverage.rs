@@ -49,44 +49,71 @@ impl Coverage {
     }
 }
 
-/// Replace instruction positions with `<pc>` so one diagnostic forms one
-/// category across methods. Type descriptors are kept verbatim; outside them a
-/// position is a hex or decimal number after a position prefix, or a bare
-/// four-digit hex offset that contains a digit.
+/// Replace positions with `<pc>` and registers with `v<n>` so one diagnostic
+/// forms one category across methods. Type descriptors, opcodes, instruction
+/// formats, access flags and synthetic member numbering are kept verbatim.
+/// Debug dumps of loops and region lists collapse to `{ .. }` / `[..]`, and a
+/// chain of nested loop prefixes collapses to one.
 fn normalize_reason(reason: &str) -> String {
     static DESCRIPTOR: OnceLock<Regex> = OnceLock::new();
-    static POSITION: OnceLock<Regex> = OnceLock::new();
+    static LISTS: OnceLock<Regex> = OnceLock::new();
+    static LOOPS: OnceLock<Regex> = OnceLock::new();
+    static TOKEN: OnceLock<Regex> = OnceLock::new();
+    static NESTED: OnceLock<Regex> = OnceLock::new();
     let descriptor =
         DESCRIPTOR.get_or_init(|| Regex::new(r"\[*L[\w/$]+;").expect("static descriptor pattern"));
-    let position = POSITION.get_or_init(|| {
+    let lists = LISTS
+        .get_or_init(|| Regex::new(r"\b(prior|tries)=\[.*?\](;|$)").expect("static list pattern"));
+    let loops = LOOPS.get_or_init(|| Regex::new(r"Loop \{[^{}]*\}").expect("static loop pattern"));
+    let token = TOKEN.get_or_init(|| {
         Regex::new(
-            r"(\bat (?:instruction )?|\bpc=|\bstop=|\btarget=|@)(?:0x[0-9a-fA-F]+|\d+)\b|\b[0-9a-f]{4}\b",
+            r"(?P<keep>\b(?:opcode|format) 0x[0-9a-fA-F]+|\baccess_flags=0x[0-9a-fA-F]+|\$\d+)|(?P<register>\bv\d+\b)|(?P<range>\b(?:0x)?[0-9a-f]+(?:\.\.|->)(?:0x)?[0-9a-f]+\b)|(?P<position>\b(?:0x[0-9a-fA-F]+|[0-9a-f]*\d[0-9a-f]*)\b)",
         )
-        .expect("static position pattern")
+        .expect("static token pattern")
     });
+    let nested = NESTED.get_or_init(|| {
+        Regex::new(r"(?:render loop Loop \{ \.\. \}; pc=<pc>; stop=<pc>: ){2,}")
+            .expect("static nested loop pattern")
+    });
+    let reason = lists.replace_all(reason, "$1=[..]$2");
+    let reason = loops.replace_all(&reason, "Loop { .. }");
     let replace = |text: &str| -> String {
-        position
+        token
             .replace_all(text, |captures: &regex::Captures| {
-                let prefix = captures.get(1).map_or("", |prefix| prefix.as_str());
-                if prefix.is_empty() && !captures[0].bytes().any(|byte| byte.is_ascii_digit()) {
-                    return captures[0].to_string();
+                if let Some(keep) = captures.name("keep") {
+                    keep.as_str().to_string()
+                } else if captures.name("register").is_some() {
+                    "v<n>".to_string()
+                } else if let Some(range) = captures.name("range") {
+                    if range.as_str().contains("->") {
+                        "<pc>-><pc>".to_string()
+                    } else {
+                        "<pc>..<pc>".to_string()
+                    }
+                } else {
+                    "<pc>".to_string()
                 }
-                format!("{prefix}<pc>")
             })
             .into_owned()
     };
     let mut normalized = String::with_capacity(reason.len());
     let mut last = 0;
-    for found in descriptor.find_iter(reason) {
+    for found in descriptor.find_iter(&reason) {
         normalized.push_str(&replace(&reason[last..found.start()]));
         normalized.push_str(found.as_str());
         last = found.end();
     }
     normalized.push_str(&replace(&reason[last..]));
-    normalized
+    nested
+        .replace_all(&normalized, "render loop Loop { .. }; pc=<pc>; stop=<pc>: ")
+        .into_owned()
 }
 
-fn collect(path: &Path, prefix: Option<&str>) -> Result<Coverage> {
+fn collect(
+    path: &Path,
+    prefix: Option<&str>,
+    mut dump: Option<&mut dyn Write>,
+) -> Result<Coverage> {
     let mut engine = NativeDexEngine::default();
     let project = engine.open(path)?;
     let mut coverage = Coverage {
@@ -110,7 +137,7 @@ fn collect(path: &Path, prefix: Option<&str>) -> Result<Coverage> {
             match rdx::native_java::render_method(&name, class, method) {
                 Ok(_) => coverage.reconstructed_methods += 1,
                 Err(error) => {
-                    let reason = error.to_string();
+                    let mut reason = error.to_string();
                     let method_id = format!(
                         "{name}.{}({}){}",
                         method.name,
@@ -118,12 +145,16 @@ fn collect(path: &Path, prefix: Option<&str>) -> Result<Coverage> {
                         method.return_type
                     );
                     if reason == "Unsupported method modifiers" {
-                        coverage.fallback(
-                            &format!("{reason} (access_flags=0x{:08x})", method.access_flags),
-                            &method_id,
-                        );
-                    } else {
-                        coverage.fallback(&reason, &method_id);
+                        reason = format!("{reason} (access_flags=0x{:08x})", method.access_flags);
+                    }
+                    coverage.fallback(&reason, &method_id);
+                    if let Some(dump) = dump.as_deref_mut() {
+                        writeln!(
+                            dump,
+                            "{}\t{method_id}\t{}",
+                            normalize_reason(&reason),
+                            reason.replace(['\t', '\n'], " ")
+                        )?;
                     }
                 }
             }
@@ -132,8 +163,25 @@ fn collect(path: &Path, prefix: Option<&str>) -> Result<Coverage> {
     Ok(coverage)
 }
 
+/// Print the coverage report as JSON. With `RDX_COVERAGE_DUMP=PATH` in the
+/// environment, every fallback is also written to that file as one
+/// tab-separated line: normalized reason, method identifier, raw reason.
 pub fn execute(path: &Path, prefix: Option<&str>) -> Result<()> {
-    let coverage = collect(path, prefix)?;
+    let mut dump = match std::env::var_os("RDX_COVERAGE_DUMP") {
+        Some(target) => Some(std::io::BufWriter::new(
+            std::fs::File::create(&target)
+                .with_context(|| format!("Cannot create {}", target.to_string_lossy()))?,
+        )),
+        None => None,
+    };
+    let coverage = collect(
+        path,
+        prefix,
+        dump.as_mut().map(|writer| writer as &mut dyn Write),
+    )?;
+    if let Some(mut writer) = dump {
+        writer.flush()?;
+    }
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer_pretty(&mut stdout, &coverage)?;
     writeln!(stdout)?;
@@ -592,7 +640,7 @@ mod tests {
     #[test]
     fn fixture_coverage_accounts_for_every_method_and_filters_classes() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hello.dex");
-        let all = collect(&path, None).unwrap();
+        let all = collect(&path, None, None).unwrap();
         assert!(all.selected_classes > 0);
         assert!(all.reconstructed_methods > 0);
         assert_eq!(
@@ -607,7 +655,7 @@ mod tests {
             all.fallback_methods,
             all.fallback_reasons.values().sum::<usize>()
         );
-        let none = collect(&path, Some("no.such.package.")).unwrap();
+        let none = collect(&path, Some("no.such.package."), None).unwrap();
         assert_eq!(none.classes_in_input, all.classes_in_input);
         assert_eq!(none.selected_classes, 0);
         assert_eq!(none.total_methods, 0);
@@ -654,6 +702,46 @@ mod tests {
             ),
             ("at most one value", "at most one value"),
             ("format 0x10 unsupported", "format 0x10 unsupported"),
+            (
+                "Unsupported method modifiers (access_flags=0x00000011)",
+                "Unsupported method modifiers (access_flags=0x00000011)",
+            ),
+            (
+                "render loop Loop { parent: None, start: e, latch: 67, guard: Some(12), exit: 79, tail: None }; pc=0xe; stop=0x7f: try normal exit 1e..67, stop 67: protected flow escapes backward: start=0x1e; end=0x67; pc=0xe; exit=0xe; loop_start=Some(e)",
+                "render loop Loop { .. }; pc=<pc>; stop=<pc>: try normal exit <pc>..<pc>, stop <pc>: protected flow escapes backward: start=<pc>; end=<pc>; pc=<pc>; exit=<pc>; loop_start=Some(e)",
+            ),
+            (
+                "render loop Loop { parent: None, start: 25, latch: 11e, guard: Some(27), exit: 120, tail: None }; pc=0x25; stop=0x121: render loop Loop { parent: None, start: 71, latch: 112, guard: Some(71), exit: 114, tail: None }; pc=0x71; stop=0x11e: undefined register v4",
+                "render loop Loop { .. }; pc=<pc>; stop=<pc>: undefined register v<n>",
+            ),
+            (
+                "loop has an interior entry: 0x11->0x4a header=0x22 latch=0x55 guard=None exit=0x56",
+                "loop has an interior entry: <pc>-><pc> header=<pc> latch=<pc> guard=None exit=<pc>",
+            ),
+            (
+                "unsupported loop interior edge 0x13c->0x141 in 0x130..0x1b8 (latch 0x140, limit 0x140)",
+                "unsupported loop interior edge <pc>-><pc> in <pc>..<pc> (latch <pc>, limit <pc>)",
+            ),
+            (
+                "overlapping loops not reconstructed: header=0x15 latch=0x69 guard=Some(19) exit=0x71 tail=None; prior=[Loop { parent: None, start: e, latch: 5c, guard: Some(19), exit: 71, tail: None }, Loop { parent: None, start: 2, latch: 5, guard: None, exit: 6, tail: None }]",
+                "overlapping loops not reconstructed: header=<pc> latch=<pc> guard=Some(<pc>) exit=<pc> tail=None; prior=[..]",
+            ),
+            (
+                "loop overlaps protected region: loop=Loop { parent: None, start: 20, latch: 2d, guard: Some(20), exit: 44, tail: None }; in_try=false; tries=[DexTryRegion { start: 20, end: 2d, catches: [(Some(Ljava/lang/Exception;), 45)] }]; parent=None",
+                "loop overlaps protected region: loop=Loop { .. }; in_try=false; tries=[..]; parent=None",
+            ),
+            (
+                "loop changes register type Ljava/lang/Object; to I (register v16, slot v300, value v322)",
+                "loop changes register type Ljava/lang/Object; to I (register v<n>, slot v<n>, value v<n>)",
+            ),
+            (
+                "Checked static call exceeds inherited throws contract at 0x12: Landroidx/car/app/AppManager$1;.lambda$onBackPressed$0 throws Landroid/os/RemoteException;",
+                "Checked static call exceeds inherited throws contract at <pc>: Landroidx/car/app/AppManager$1;.lambda$onBackPressed$0 throws Landroid/os/RemoteException;",
+            ),
+            (
+                "guarded join requires identical types or proven null/boolean literal: join=0xfa; register=4; arm=0; value=\"v46\"; type=Lkotlin/Unit;; representative=Ljava/lang/Object;",
+                "guarded join requires identical types or proven null/boolean literal: join=<pc>; register=<pc>; arm=<pc>; value=\"v<n>\"; type=Lkotlin/Unit;; representative=Ljava/lang/Object;",
+            ),
         ] {
             assert_eq!(normalize_reason(raw), normalized);
         }
@@ -672,9 +760,15 @@ mod tests {
             coverage.fallback_reason_samples["unsupported opcode 0x23 at <pc>"],
             vec!["a.Method()V", "z.Method()V"]
         );
-        for index in 0..1_000 {
+        for index in 0..1_000u32 {
+            // Letters outside the hex alphabet keep each reason distinct.
+            let tag: String = index
+                .to_string()
+                .chars()
+                .map(|digit| char::from(b'q' + digit.to_digit(10).unwrap() as u8))
+                .collect();
             coverage.fallback(
-                &format!("reason {index} {}", "x".repeat(300)),
+                &format!("reason {tag} {}", "x".repeat(300)),
                 &format!("sample.Method{index}()V"),
             );
         }

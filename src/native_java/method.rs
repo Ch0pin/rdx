@@ -11320,6 +11320,13 @@ fn protected_normal_exit(
                 ensure!(trampolines.insert(exit), "cyclic protected exit");
                 exit = graph.targets[exit].context("missing protected exit target")?;
             }
+            // A direct backward edge to the enclosing loop header is a Java
+            // `continue`: the nonthrowing branch leaves the protected body
+            // without a normal continuation, and the header stays outside
+            // both the DEX range and the Java try.
+            if loop_start == Some(exit) && exit < start {
+                continue;
+            }
             ensure!(
                 exit >= end,
                 "protected flow escapes backward: start={start:#x}; end={end:#x}; pc={pc:#x}; exit={exit:#x}; loop_start={loop_start:x?}"
@@ -12795,6 +12802,34 @@ fn render_try(
             // the original loop. It has no path back into that loop.
             outside_handlers.insert(handler);
             detached_forward_handlers.insert(handler);
+            continue;
+        }
+        // A catch can begin inside its own protected interval as a bare
+        // `move-exception; goto` stub whose tail lies beyond this stop but
+        // inside the enclosing loop (R8 places such tails after the latch).
+        // Ownership follows the tail: it is rendered as a loop handler.
+        let stub_tail = (handler < stop)
+            .then(|| {
+                let mut pc = handler;
+                if words[pc] as u8 == 0x0d {
+                    pc += graph.widths[pc];
+                }
+                let mut hops = 0;
+                while pc < words.len() && matches!(words[pc] as u8, 0x28..=0x2a) {
+                    hops += 1;
+                    if hops > 8 {
+                        return None;
+                    }
+                    pc = graph.targets[pc]?;
+                }
+                (pc > stop).then_some(pc)
+            })
+            .flatten();
+        if let Some(context) = enclosing_loop
+            && stub_tail.is_some_and(|tail| tail < context.exit)
+        {
+            outside_handlers.insert(handler);
+            loop_handlers.insert(handler);
             continue;
         }
         if handler > stop {

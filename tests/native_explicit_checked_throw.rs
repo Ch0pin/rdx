@@ -175,6 +175,41 @@ fn fresh_string_checked_throw_keeps_message_and_header() {
         assert!(class.methods[0].thrown_types.is_empty());
     }
 }
+fn computed_fixture(words: Vec<u16>) -> DexClass {
+    let mut class = fixture_with_message(words, true);
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols.types.push("Ljava/lang/Object;".into());
+    symbols.types.push("Ljava/lang/String;".into());
+    symbols.strings.push("toString".into());
+    symbols.protos.push(("Ljava/lang/String;".into(), vec![]));
+    symbols.methods.push((1, 1, 2));
+    class
+}
+#[test]
+fn computed_message_checked_throw_keeps_expression_and_header() {
+    // new-instance v0; v1 = this.toString(); new Checked(v1); throw v0
+    let class = computed_fixture(vec![
+        0x0022, 0, 0x106e, 1, 0x0002, 0x010c, 0x2070, 0, 0x0010, 0x0027,
+    ]);
+    let source = native_java::render("sample.Caller", &class).unwrap().source;
+    assert!(source.contains("throw _rdx_checked_throw_"), "{source}");
+    assert!(source.contains("new Checked("), "{source}");
+    assert!(source.contains("toString()"), "{source}");
+    assert!(
+        !source
+            .lines()
+            .find(|line| line.contains(" run("))
+            .unwrap()
+            .contains("throws"),
+        "{source}"
+    );
+    assert!(class.methods[0].thrown_types.is_empty());
+    // Redefining the receiver while computing the message withdraws the proof.
+    let class = computed_fixture(vec![
+        0x0022, 0, 0x106e, 1, 0x0002, 0x000c, 0x2070, 0, 0x0010, 0x0027,
+    ]);
+    assert!(native_java::render("sample.Caller", &class).is_err());
+}
 #[test]
 fn string_checked_shape_requires_exact_arguments_and_throw_receiver() {
     for words in [

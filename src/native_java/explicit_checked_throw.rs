@@ -142,98 +142,112 @@ fn nonnull_field_sites(class: &DexClass, method: &DexMethod) -> Vec<(usize, Stri
     prove().unwrap_or_default()
 }
 
+/// A throw of a freshly constructed checked throwable: `new-instance r, T`,
+/// any computation of the constructor arguments that leaves `r` untouched,
+/// the `T.<init>` call on `r`, and `throw r` immediately after it. Rendering
+/// still evaluates the original constructor exactly once, so argument
+/// expressions may be arbitrary straight-line code.
 fn site(class: &DexClass, method: &DexMethod, pc: usize) -> Option<String> {
     if method.name.as_ref() == "<clinit>" {
         return None;
     }
-    // Constructor arguments remain deliberately bounded to an adjacent constant
-    // String. Rendering still evaluates the original constructor exactly once.
-    [0usize, 2, 3]
-        .into_iter()
-        .find_map(|string_words| site_shape(class, method, pc, string_words))
-}
-
-fn site_shape(
-    class: &DexClass,
-    method: &DexMethod,
-    pc: usize,
-    string_words: usize,
-) -> Option<String> {
     let code = method.code.as_ref()?;
     let words = &code.instructions;
-    let new_pc = pc.checked_sub(5 + string_words)?;
-    let invoke_pc = new_pc + 2 + string_words;
-    let new = *words.get(new_pc)?;
-    let invoke = *words.get(invoke_pc)?;
     let throw = *words.get(pc)?;
-    if new as u8 != 0x22 || throw as u8 != 0x27 || new >> 8 != throw >> 8 {
-        return None;
-    }
-    let receiver = new >> 8;
-    let message = if string_words == 0 {
-        None
-    } else {
-        let constant = *words.get(new_pc + 2)?;
-        if constant as u8 != if string_words == 2 { 0x1a } else { 0x1b } {
-            return None;
-        }
-        let index = usize::from(*words.get(new_pc + 3)?)
-            | if string_words == 3 {
-                usize::from(*words.get(new_pc + 4)?) << 16
-            } else {
-                0
-            };
-        class.symbols.strings.get(index)?;
-        let register = constant >> 8;
-        if register == receiver {
-            return None;
-        }
-        Some(register)
-    };
-    let count = if message.is_some() { 2 } else { 1 };
-    let operands = *words.get(invoke_pc + 2)?;
-    if !((invoke as u8 == 0x70
-        && invoke >> 12 == count
-        && invoke & 0xf00 == 0
-        && operands == (receiver | (message.unwrap_or(0) << 4))
-        && receiver < 16
-        && message.is_none_or(|register| register < 16))
-        || (invoke as u8 == 0x76
-            && invoke >> 8 == count
-            && operands == receiver
-            && message.is_none_or(|register| register == receiver + 1)))
+    // Cheap raw-word prefilter before decoding: a constructor call must end
+    // right before the throw and name the thrown register as its receiver.
+    let invoke_pc = pc.checked_sub(3)?;
+    let invoke = *words.get(invoke_pc)?;
+    let receiver = throw >> 8;
+    if throw as u8 != 0x27
+        || !((invoke as u8 == 0x70 && *words.get(invoke_pc + 2)? & 15 == receiver)
+            || (invoke as u8 == 0x76 && *words.get(invoke_pc + 2)? == receiver))
     {
         return None;
     }
-    let ty = class.symbols.types.get(*words.get(new_pc + 1)? as usize)?;
     let (owner, proto, name) = *class
         .symbols
         .methods
         .get(*words.get(invoke_pc + 1)? as usize)?;
-    let (result, args) = class.symbols.protos.get(proto as usize)?;
-    if class.symbols.types.get(owner as usize)? != ty
-        || class.symbols.strings.get(name as usize)? != "<init>"
+    let ty = class.symbols.types.get(owner as usize)?;
+    let (result, _) = class.symbols.protos.get(proto as usize)?;
+    if class.symbols.strings.get(name as usize)? != "<init>"
         || result.as_ref() != "V"
-        || (if message.is_some() {
-            args.len() != 1 || args[0].as_ref() != "Ljava/lang/String;"
-        } else {
-            !args.is_empty()
-        })
         || !method::explicit_checked_throw_type(class, ty)
     {
         return None;
     }
     // Raw words alone cannot establish instruction boundaries or ownership.
     let ir = crate::native_ir::DecodedMethod::decode(code).ok()?;
-    if ![new_pc, invoke_pc, pc]
-        .into_iter()
-        .all(|at| ir.instructions.iter().any(|i| i.pc == at))
-        || (message.is_some() && !ir.instructions.iter().any(|i| i.pc == new_pc + 2))
+    let throw_index = ir.instructions.iter().position(|i| i.pc == pc)?;
+    let throw = &ir.instructions[throw_index];
+    let init = ir.instructions.get(throw_index.checked_sub(1)?)?;
+    let touches = |operands: &[crate::native_ir::RegisterOperand]| {
+        operands.iter().any(|operand| {
+            operand.register == receiver
+                || (operand.kind == crate::native_ir::ValueKind::Wide64
+                    && operand.register + 1 == receiver)
+        })
+    };
+    if throw.opcode != 0x27
+        || init.pc != invoke_pc
+        || init.pc + init.width != pc
+        || !matches!(init.opcode, 0x70 | 0x76)
+        || init.reads.first()?.register != receiver
+        || touches(&init.reads[1..])
     {
         return None;
     }
+    let mut new_pc = None;
+    for instruction in ir.instructions[..throw_index - 1].iter().rev() {
+        if instruction.opcode == 0x22 && touches(&instruction.writes) {
+            let allocated = instruction
+                .reference
+                .filter(|reference| reference.kind == crate::native_ir::PoolKind::Type)
+                .and_then(|reference| class.symbols.types.get(reference.index as usize))?;
+            if allocated != ty {
+                return None;
+            }
+            new_pc = Some(instruction.pc);
+            break;
+        }
+        // The allocation and its constructor must sit on one straight path
+        // that neither observes nor redefines the uninitialized reference.
+        if matches!(
+            instruction.opcode,
+            0x0d | 0x0e..=0x11 | 0x27..=0x2c | 0x32..=0x3d
+        ) || touches(&instruction.reads)
+            || touches(&instruction.writes)
+        {
+            return None;
+        }
+    }
+    let new_pc = new_pc?;
+    // No other path may join the sequence between the allocation and the
+    // throw: every block inside it has exactly its fallthrough predecessor.
+    let cfg = crate::native_cfg::ControlFlowGraph::build(code).ok()?;
+    for (index, block) in cfg.blocks.iter().enumerate() {
+        if block.start <= new_pc || block.start > pc {
+            continue;
+        }
+        let mut predecessors = cfg.blocks.iter().enumerate().flat_map(|(from, candidate)| {
+            candidate
+                .successors
+                .iter()
+                .filter(move |edge| edge.target == index)
+                .map(move |edge| (from, edge.kind))
+        });
+        let fallthrough = predecessors.next()?;
+        if predecessors.next().is_some()
+            || fallthrough.1 != crate::native_cfg::EdgeKind::Normal
+            || cfg.blocks[fallthrough.0].end != block.start
+        {
+            return None;
+        }
+    }
     Some(ty.to_string())
 }
+
 fn helper_name(class: &DexClass) -> Option<String> {
     if class.access_flags & (0x200 | 0x2000 | 0x4000) != 0
         || class.methods.len() > 8192
@@ -319,4 +333,119 @@ pub(super) fn definitions(class: &DexClass) -> Vec<String> {
     vec![format!(
         "\n    // Preserve the original explicit checked throwable and caller header.\n    @java.lang.SuppressWarnings(\"unchecked\")\n    private static <E extends java.lang.Throwable> java.lang.RuntimeException {name}(java.lang.Throwable failure) throws E {{\n        throw (E) failure;\n    }}\n"
     )]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::site;
+    use crate::native_dex::{DexClass, DexCode, DexMethod, DexSymbols};
+    use std::sync::Arc;
+
+    const CHECKED: &str = "Ljava/io/IOException;";
+
+    // Registers: v0 scratch, v1 the throwable, v2 `this`.
+    fn fixture(words: &[u16]) -> DexClass {
+        let symbols = Arc::new(DexSymbols {
+            types: vec![
+                CHECKED.into(),
+                "Ljava/lang/Object;".into(),
+                "Ljava/lang/String;".into(),
+                "Lsample/Caller;".into(),
+            ],
+            strings: vec!["<init>".into(), "toString".into(), "message".into()],
+            protos: vec![
+                ("V".into(), vec!["Ljava/lang/String;".into()]),
+                ("Ljava/lang/String;".into(), vec![]),
+                ("V".into(), vec![]),
+            ],
+            methods: vec![(0, 0, 0), (1, 1, 1), (0, 2, 0), (1, 2, 0)],
+            ..Default::default()
+        });
+        DexClass {
+            descriptor: "Lsample/Caller;".into(),
+            superclass: Some("Ljava/lang/Object;".into()),
+            interfaces: vec![],
+            access_flags: 1,
+            annotations_offset: 0,
+            static_values_offset: 0,
+            static_values: vec![],
+            fields: vec![],
+            methods: vec![DexMethod {
+                declaring_type: "Lsample/Caller;".into(),
+                name: "run".into(),
+                return_type: "V".into(),
+                parameters: vec![],
+                thrown_types: vec![],
+                access_flags: 1,
+                code: Some(DexCode {
+                    registers: 3,
+                    ins: 1,
+                    outs: 2,
+                    tries: 0,
+                    try_regions: vec![],
+                    instructions: words.to_vec(),
+                    offset: 0,
+                }),
+            }],
+            symbols,
+        }
+    }
+
+    fn prove(words: &[u16], throw_pc: usize) -> Option<String> {
+        let class = fixture(words);
+        site(&class, &class.methods[0], throw_pc)
+    }
+
+    #[test]
+    fn computed_constructor_arguments_prove_the_fresh_throw() {
+        // new-instance v1; v0 = this.toString(); new <init>(v0); throw v1
+        let computed = [
+            0x0122, 0, 0x106e, 1, 0x0002, 0x000c, 0x2070, 0, 0x0001, 0x0127,
+        ];
+        assert_eq!(prove(&computed, 9).as_deref(), Some(CHECKED));
+        // The range form with the argument staged next to the receiver.
+        let range = [
+            0x0122, 0, 0x106e, 1, 0x0002, 0x020c, 0x0276, 0, 0x0001, 0x0127,
+        ];
+        assert_eq!(prove(&range, 9).as_deref(), Some(CHECKED));
+        // A nested allocation for the argument keeps the outer proof.
+        let nested = [
+            0x0122, 0, 0x0022, 1, 0x1070, 3, 0x0000, 0x106e, 1, 0x0000, 0x000c, 0x2070, 0, 0x0001,
+            0x0127,
+        ];
+        assert_eq!(prove(&nested, 14).as_deref(), Some(CHECKED));
+    }
+
+    #[test]
+    fn sequence_rejects_receiver_use_control_transfer_and_joins() {
+        // The receiver is redefined by the argument computation.
+        let redefined = [
+            0x0122, 0, 0x106e, 1, 0x0002, 0x010c, 0x2070, 0, 0x0001, 0x0127,
+        ];
+        assert_eq!(prove(&redefined, 9), None);
+        // The uninitialized receiver is observed before its constructor.
+        let observed = [0x0122, 0, 0x1007, 0x2070, 0, 0x0001, 0x0127];
+        assert_eq!(prove(&observed, 6), None);
+        // A return separates the allocation from its constructor.
+        let returned = [0x0122, 0, 0x000e, 0x001a, 0x0002, 0x2070, 0, 0x0001, 0x0127];
+        assert_eq!(prove(&returned, 8), None);
+        // The throw does not follow the constructor directly.
+        let detached = [0x0122, 0, 0x001a, 0x0002, 0x2070, 0, 0x0001, 0x0000, 0x0127];
+        assert_eq!(prove(&detached, 8), None);
+        // Two allocations join before one shared constructor call.
+        let joined = [
+            0x0238, 0x0005, 0x0122, 0, 0x0328, 0x0122, 0, 0x001a, 0x0002, 0x2070, 0, 0x0001, 0x0127,
+        ];
+        assert_eq!(prove(&joined, 12), None);
+        // Without the join, the same tail proves.
+        let straight = [0x0122, 0, 0x001a, 0x0002, 0x2070, 0, 0x0001, 0x0127];
+        assert_eq!(prove(&straight, 7).as_deref(), Some(CHECKED));
+        // The allocation names another type than the constructor.
+        let retyped = [0x0122, 1, 0x001a, 0x0002, 0x2070, 0, 0x0001, 0x0127];
+        assert_eq!(prove(&retyped, 7), None);
+        // The constructor owner is no checked throwable.
+        let mut class = fixture(&straight);
+        Arc::get_mut(&mut class.symbols).unwrap().methods[0].0 = 1;
+        assert_eq!(site(&class, &class.methods[0], 7), None);
+    }
 }

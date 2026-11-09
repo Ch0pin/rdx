@@ -5749,6 +5749,7 @@ mod settings_tests {
             end: start + 6,
             line: 1,
             kind: "Code".into(),
+            node: String::new(),
             preview: "target".into(),
             preview_match: 0..6,
         }
@@ -5939,6 +5940,7 @@ mod settings_tests {
                 end: start + needle.len(),
                 line: 2,
                 kind: "method".into(),
+                node: String::new(),
                 preview: needle.into(),
                 preview_match: 0..needle.len(),
             }
@@ -6292,6 +6294,7 @@ mod settings_tests {
                     end,
                     line,
                     kind: kind.into(),
+                    node: String::new(),
                     preview: needle.into(),
                     preview_match: 0..needle.len(),
                 },

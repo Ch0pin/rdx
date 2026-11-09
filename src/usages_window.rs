@@ -292,13 +292,15 @@ impl UsagesWindow {
                                 galley,
                                 ui.visuals().text_color(),
                             );
-                            if response
-                                .on_hover_text(format!(
-                                    "{} · {}:{}\n{}",
-                                    hit.kind, hit.origin.name, hit.line, hit.preview
-                                ))
-                                .clicked()
-                            {
+                            let response = response.on_hover_text(format!(
+                                "{} · {}:{}\n{}",
+                                hit.kind, hit.origin.name, hit.line, hit.preview
+                            ));
+                            // A single click selects; only a double click opens the code.
+                            if response.clicked() {
+                                self.selected_result = Some(index);
+                            }
+                            if response.double_clicked() {
                                 self.selected_result = Some(index);
                                 actions.open = Some(hit.clone());
                             }
@@ -412,6 +414,7 @@ mod tests {
                 end: 13,
                 line: 1,
                 kind: "code".into(),
+                node: String::new(),
                 preview: "return target;".into(),
                 preview_match: 7..13,
             }],
@@ -492,14 +495,19 @@ mod tests {
             0.2,
             vec![egui::Event::PointerMoved(point), button(true)],
         );
-        let (actions, output) = render(&mut window, 0.3, vec![button(false)]);
+        let (actions, _) = render(&mut window, 0.3, vec![button(false)]);
+        assert!(actions.open.is_none(), "a single click only selects");
+        assert_eq!(window.selected_result, Some(0));
+        assert!(window.visible);
+        render(&mut window, 0.4, vec![button(true)]);
+        let (actions, output) = render(&mut window, 0.5, vec![button(false)]);
         assert!(
             output.viewport_output[&egui::ViewportId::ROOT]
                 .commands
                 .iter()
                 .any(|command| matches!(command, egui::ViewportCommand::Focus))
         );
-        assert_eq!(actions.open.unwrap().start, 7);
+        assert_eq!(actions.open.unwrap().start, 7, "a double click opens");
         assert_eq!(window.visible, keep_open);
         assert_eq!(window.selected_result, Some(0));
         assert!(!actions.cancel);

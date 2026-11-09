@@ -398,6 +398,7 @@ fn hits(mut result: ClassUsages) -> Result<Vec<SearchHit>, String> {
             end: reference.end,
             line,
             kind: reference.enclosing,
+            node: String::new(),
             preview,
             preview_match: start..end,
         });

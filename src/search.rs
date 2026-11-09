@@ -216,9 +216,23 @@ pub struct SearchHit {
     pub end: usize,
     pub line: usize,
     pub kind: String,
+    /// The enclosing declaration the way jadx names result nodes:
+    /// `pkg.Class.method(Params) Return`, `pkg.Class.field Type`, or the
+    /// class alone outside every member.
+    pub node: String,
     pub preview: String,
     /// UTF-8 byte range of this hit within the bounded preview.
     pub preview_match: std::ops::Range<usize>,
+}
+impl SearchHit {
+    /// The result-list node: the enclosing declaration, else `class:line`.
+    pub fn title(&self) -> String {
+        if self.node.is_empty() {
+            format!("{}:{}", self.origin.name, self.line)
+        } else {
+            self.node.clone()
+        }
+    }
 }
 pub enum SearchUpdate {
     Batch(Vec<SearchHit>),
@@ -319,6 +333,116 @@ fn comments(source: &str) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+/// Member declarations in source order with the node label each one shows.
+fn member_nodes(document: &SearchDocument, definitions: &[CodeDefinition]) -> Vec<(usize, String)> {
+    let members: Vec<_> = definitions
+        .iter()
+        .filter(|d| matches!(d.kind.as_str(), "method" | "field"))
+        .collect();
+    if members.is_empty() {
+        return Vec::new();
+    }
+    let starts: HashSet<usize> = members.iter().map(|d| d.start).collect();
+    let mut labels = HashMap::new();
+    for link in &document.links {
+        if starts.contains(&link.start) {
+            labels.entry(link.start).or_insert(link.label.as_str());
+        }
+    }
+    let mut nodes: Vec<_> = members
+        .into_iter()
+        .map(|d| {
+            let label = labels.get(&d.start).map_or_else(
+                || format!("{}.{}", document.name, d.name),
+                |label| member_node(label),
+            );
+            (d.start, label)
+        })
+        .collect();
+    nodes.sort_by_key(|(start, _)| *start);
+    nodes
+}
+
+/// `pkg.Class.method(Ljava/lang/String;I)V` → `pkg.Class.method(String, int) void`;
+/// `pkg.Class.field:Ljava/lang/String;` → `pkg.Class.field String`.
+pub fn member_node(label: &str) -> String {
+    if let Some((head, rest)) = label.split_once('(')
+        && let Some((parameters, ret)) = rest.rsplit_once(')')
+    {
+        let parameters: Vec<_> = descriptors(parameters)
+            .into_iter()
+            .map(simple_type)
+            .collect();
+        return format!("{head}({}) {}", parameters.join(", "), simple_type(ret));
+    }
+    match label.rsplit_once(':') {
+        Some((head, ty)) => format!("{head} {}", simple_type(ty)),
+        None => label.to_owned(),
+    }
+}
+
+/// Splits a DEX parameter list into its type descriptors.
+fn descriptors(mut list: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    while !list.is_empty() {
+        let dimensions = list.bytes().take_while(|b| *b == b'[').count();
+        let end = match list.as_bytes().get(dimensions) {
+            Some(b'L') => list[dimensions..]
+                .find(';')
+                .map_or(list.len(), |i| dimensions + i + 1),
+            Some(_) => dimensions + 1,
+            None => list.len(),
+        };
+        let end = if list.is_char_boundary(end) {
+            end
+        } else {
+            list.len()
+        };
+        out.push(&list[..end]);
+        list = &list[end..];
+    }
+    out
+}
+
+/// The simple Java name of one descriptor: `[Ljava/lang/String;` → `String[]`.
+fn simple_type(descriptor: &str) -> String {
+    let dimensions = descriptor.bytes().take_while(|b| *b == b'[').count();
+    let base = &descriptor[dimensions..];
+    let name = match base {
+        "V" => "void",
+        "Z" => "boolean",
+        "B" => "byte",
+        "S" => "short",
+        "C" => "char",
+        "I" => "int",
+        "J" => "long",
+        "F" => "float",
+        "D" => "double",
+        _ => base
+            .strip_prefix('L')
+            .and_then(|class| class.strip_suffix(';'))
+            .map_or(base, |class| {
+                class.rsplit(['/', '.']).next().unwrap_or(class)
+            }),
+    };
+    format!("{name}{}", "[]".repeat(dimensions))
+}
+
+/// The member declared before the hit, or the one declared on the hit's own row.
+fn enclosing_node(nodes: &[(usize, String)], start: usize, rest: &str, class: &str) -> String {
+    let next = nodes.partition_point(|(member, _)| *member <= start);
+    let same_row = nodes
+        .get(next)
+        .filter(|(member, _)| member - start <= 512)
+        .is_some_and(|(member, _)| !rest.chars().take(member - start).any(|c| c == '\n'));
+    let index = if same_row {
+        Some(next)
+    } else {
+        next.checked_sub(1)
+    };
+    index.map_or_else(|| class.to_owned(), |index| nodes[index].1.clone())
 }
 
 fn matches(
@@ -424,6 +548,11 @@ fn matches(
         }
     }
     let origin = HitOrigin::indexed(&document);
+    let nodes = if found.is_empty() {
+        Vec::new()
+    } else {
+        member_nodes(&document, definitions)
+    };
     let (mut byte_cursor, mut char_cursor, mut line, mut row_start) = (0, 0, 1, 0);
     found
         .into_iter()
@@ -439,6 +568,7 @@ fn matches(
             }
             byte_cursor = byte;
             char_cursor = start;
+            let node = enclosing_node(&nodes, start, &source[byte..], &document.name);
             let before: Vec<char> = source[row_start..byte].chars().rev().take(61).collect();
             let mut preview = String::new();
             if before.len() > 60 {
@@ -464,6 +594,7 @@ fn matches(
                 end,
                 line,
                 kind,
+                node,
                 preview,
                 preview_match: match_start..match_end,
             }
@@ -1508,6 +1639,93 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].kind, "class");
         assert_eq!(matches(doc, &definitions, &q, 1).len(), 1);
+    }
+    #[test]
+    fn hits_name_their_enclosing_member() {
+        let source = "package sample;\npublic class Example {\n    private String target;\n    public void run(String p0) {\n        this.target = p0;\n    }\n    public boolean check() {\n        return this.target != null;\n    }\n}\n";
+        let mut doc = document(source);
+        let at = |needle: &str| source.find(needle).unwrap();
+        let mut definitions = vec![CodeDefinition {
+            start: at("Example {"),
+            end: at("Example {") + 7,
+            kind: "class".into(),
+            name: "sample.Example".into(),
+        }];
+        let members = [
+            (
+                at("target;"),
+                6,
+                "field",
+                "target",
+                "sample.Example.target:Ljava/lang/String;",
+            ),
+            (
+                at("run("),
+                3,
+                "method",
+                "run",
+                "sample.Example.run(Ljava/lang/String;)V",
+            ),
+            (
+                at("check("),
+                5,
+                "method",
+                "check",
+                "sample.Example.check()Z",
+            ),
+        ];
+        for (start, len, kind, name, label) in members {
+            Arc::get_mut(&mut doc).unwrap().links.push(CodeLink {
+                start,
+                end: start + len,
+                label: label.into(),
+            });
+            definitions.push(CodeDefinition {
+                start,
+                end: start + len,
+                kind: kind.into(),
+                name: name.into(),
+            });
+        }
+        let query = |text: &str| {
+            CompiledQuery::new(SearchQuery {
+                text: text.into(),
+                code: true,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let nodes: Vec<_> = matches(doc.clone(), &definitions, &query("target"), 100)
+            .iter()
+            .map(|hit| hit.node.clone())
+            .collect();
+        assert_eq!(
+            nodes,
+            [
+                "sample.Example.target String",
+                "sample.Example.run(String) void",
+                "sample.Example.check() boolean",
+            ]
+        );
+        let hits = matches(doc.clone(), &definitions, &query("void"), 100);
+        assert_eq!(
+            hits[0].node, "sample.Example.run(String) void",
+            "a hit before the name on the declaration row belongs to that member"
+        );
+        assert_eq!(hits[0].title(), "sample.Example.run(String) void");
+        let hits = matches(doc.clone(), &definitions, &query("class"), 100);
+        assert_eq!(
+            hits[0].node, "example.Target",
+            "class-level hits name the class"
+        );
+        let hits = matches(doc, &[], &query("target"), 100);
+        assert_eq!(hits[0].node, "example.Target");
+        assert_eq!(
+            member_node("a.B.f([I[Ljava/lang/String;J)[B"),
+            "a.B.f(int[], String[], long) byte[]"
+        );
+        assert_eq!(member_node("a.B.f:D"), "a.B.f double");
+        assert_eq!(member_node("a.B"), "a.B");
     }
     #[test]
     fn overlapping_definitions_are_skipped_once_in_order() {

@@ -130,7 +130,7 @@ impl SearchWindow {
         ui.fonts(|fonts| {
             for hit in &self.results[count..] {
                 let font = egui::FontId::monospace(13.0);
-                let title = format!("{}:{}", hit.origin.name, hit.line);
+                let title = hit.title();
                 widths.x = widths.x.max(
                     fonts
                         .layout_no_wrap(title, font.clone(), egui::Color32::WHITE)
@@ -641,7 +641,7 @@ impl SearchWindow {
                     for index in rows {
                         let hit = &self.results[index];
                         ui.push_id(index, |ui| {
-                            let title = format!("{}:{}", hit.origin.name, hit.line);
+                            let title = hit.title();
                             let (rect, response) = ui.allocate_exact_size(
                                 egui::vec2(table_width, row_height - ui.spacing().item_spacing.y),
                                 egui::Sense::click(),
@@ -726,13 +726,15 @@ impl SearchWindow {
                                 galley,
                                 ui.visuals().text_color(),
                             );
-                            if response
-                                .on_hover_text(format!(
-                                    "{} · {}:{}\n{}",
-                                    hit.kind, hit.origin.name, hit.line, hit.preview
-                                ))
-                                .clicked()
-                            {
+                            let response = response.on_hover_text(format!(
+                                "{} · {}:{}\n{}",
+                                hit.kind, hit.origin.name, hit.line, hit.preview
+                            ));
+                            // A single click selects; only a double click opens the code.
+                            if response.clicked() {
+                                self.selected_result = Some(index);
+                            }
+                            if response.double_clicked() {
                                 self.selected_result = Some(index);
                                 actions.open = Some(hit.clone());
                             }
@@ -1140,6 +1142,7 @@ mod tests {
             end: start + 6,
             line: 1,
             kind: "code".into(),
+            node: "sample.Example.run() void".into(),
             preview: "return target;".into(),
             preview_match: 7..13,
         };
@@ -1377,6 +1380,7 @@ mod tests {
             end: start + 6,
             line: 1,
             kind: "code".into(),
+            node: "sample.Example.run() void".into(),
             preview: "return target;".into(),
             preview_match: 7..13,
         }
@@ -1483,6 +1487,7 @@ mod tests {
                 end: 13,
                 line: 1,
                 kind: "code".into(),
+                node: "sample.Example.run() void".into(),
                 preview: preview.clone(),
                 preview_match: 7..13,
             }],
@@ -1561,6 +1566,9 @@ mod tests {
         };
         render(&mut window, 0.4, vec![button(true)]);
         let (actions, _) = render(&mut window, 0.5, vec![button(false)]);
+        assert!(actions.open.is_none(), "a single click only selects");
+        render(&mut window, 0.6, vec![button(true)]);
+        let (actions, _) = render(&mut window, 0.7, vec![button(false)]);
         assert_eq!(actions.open.unwrap().start, 7);
         window.begin();
         assert!(window.result_widths.is_none());
@@ -1588,6 +1596,7 @@ mod tests {
                 end: 13,
                 line: 1,
                 kind: "code".into(),
+                node: "sample.Example.run() void".into(),
                 preview: "return target;".into(),
                 preview_match: 7..13,
             }],
@@ -1627,7 +1636,7 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("{needle} is painted"))
         };
-        let node_x = text_x("sample.Example:1");
+        let node_x = text_x("sample.Example.run() void");
         let code_x = text_x("return target;");
         assert!(
             (node_x - text_x("Node")).abs() < 10.0,
@@ -1679,14 +1688,19 @@ mod tests {
             0.2,
             vec![egui::Event::PointerMoved(point), button(true)],
         );
-        let (actions, output) = render(&mut window, 0.3, vec![button(false)]);
+        let (actions, _) = render(&mut window, 0.3, vec![button(false)]);
+        assert!(actions.open.is_none(), "a single click only selects");
+        assert_eq!(window.selected_result, Some(0));
+        assert!(window.visible);
+        render(&mut window, 0.4, vec![button(true)]);
+        let (actions, output) = render(&mut window, 0.5, vec![button(false)]);
         assert!(
             output.viewport_output[&egui::ViewportId::ROOT]
                 .commands
                 .iter()
                 .any(|command| matches!(command, egui::ViewportCommand::Focus))
         );
-        assert_eq!(actions.open.unwrap().start, 7);
+        assert_eq!(actions.open.unwrap().start, 7, "a double click opens");
         assert_eq!(window.visible, keep_open);
         assert_eq!(
             window.query.text, "target",

@@ -192,7 +192,7 @@ impl Cache {
         // A scoped request never waits for or builds unrelated global postings.
         // Once the global build exceeds its budget, remember the execution mode,
         // not a failed result. Every subsequent query remains fully searchable.
-        let streaming = !query.package.is_empty() || self.streaming.load(Ordering::Relaxed);
+        let streaming = !query.package.is_unrestricted() || self.streaming.load(Ordering::Relaxed);
         let built = if streaming {
             None
         } else {
@@ -228,7 +228,7 @@ struct Query {
     matcher: Regex,
     kind: String,
     occurrence: String,
-    package: String,
+    package: crate::package_scope::PackageScope,
     offset: usize,
     limit: usize,
 }
@@ -300,13 +300,7 @@ impl Query {
             .build()?;
         let limit = number(args, "limit", 100)?;
         ensure!((1..=500).contains(&limit), "limit must be 1..500");
-        let package = args
-            .get("package_prefix")
-            .map_or(Ok(""), |v| {
-                v.as_str().context("package_prefix must be a string")
-            })?
-            .trim_end_matches('.')
-            .to_owned();
+        let package = crate::package_scope::PackageScope::from_args(args)?;
         Ok(Self {
             array_components: args["include_array_components"].as_bool().unwrap_or(false),
             matcher,
@@ -336,11 +330,7 @@ pub(crate) fn validate(args: &Value) -> Result<()> {
 
 impl Query {
     fn accepts_class(&self, owner: &str) -> bool {
-        self.package.is_empty()
-            || owner == self.package
-            || owner
-                .strip_prefix(&self.package)
-                .is_some_and(|s| s.starts_with('.'))
+        self.package.matches(owner)
     }
     fn matches_symbol(&self, symbol: &Symbol) -> bool {
         (self.kind == "all" || self.kind == symbol.kind.name())
@@ -446,7 +436,7 @@ fn stream(
         "next_offset":(next<stream.total).then_some(next),"exhausted":next==stream.total,
         "source_hash":format!("{:x}",stream.digest.finalize()),"index_hash":null,"index_complete":false,
         "coverage_complete":true,"scanned_classes":scanned,"skipped_classes":0,
-        "out_of_scope_classes":classes.len()-scanned,"package_prefix":stream.query.package,
+        "out_of_scope_classes":classes.len()-scanned,"package_scope":stream.query.package.describe(),
         "scanned_code_methods":builder.index.code_methods,"indexed_classes":0,
         "dynamic_instruction_sites_excluded":builder.index.dynamic_sites,
         "scope":IDENTIFIER_SCOPE}),
@@ -932,6 +922,43 @@ mod tests {
         index
             .search(&Query::parse(&args).unwrap(), &AtomicBool::new(false))
             .unwrap()
+    }
+    #[test]
+    fn package_scope_lists_stream_each_listed_root() {
+        let cancel = AtomicBool::new(false);
+        let all = Cache::default()
+            .search(classes(), &json!({"query":"parse"}), &cancel)
+            .unwrap();
+        let listed = Cache::default()
+            .search(
+                classes(),
+                &json!({"query":"parse","package_prefix":["app.","other"]}),
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(listed["execution_mode"], "streaming");
+        assert_eq!(listed["total"], all["total"]);
+        assert_eq!(listed["scanned_classes"], 2);
+        assert_eq!(listed["package_scope"]["prefixes"], json!(["app", "other"]));
+        let app = Cache::default()
+            .search(
+                classes(),
+                &json!({"query":"parse","package_prefix":"app"}),
+                &cancel,
+            )
+            .unwrap();
+        let pseudo = Cache::default()
+            .search(
+                classes(),
+                &json!({"query":"parse","package_prefix":["app","obfuscated-root"]}),
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(pseudo["total"], app["total"]);
+        assert_eq!(pseudo["scanned_classes"], 1);
+        assert_eq!(pseudo["out_of_scope_classes"], 1);
+        assert_eq!(pseudo["package_scope"]["obfuscated_root"], true);
+        assert!(Query::parse(&json!({"query":"parse","package_prefix":[5]})).is_err());
     }
     #[test]
     fn memory_shared_cache_pressure_uses_complete_streaming_results() {

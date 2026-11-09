@@ -105,7 +105,7 @@ fn method_source_forced_dex_is_one_raw_method_with_stable_paging_and_lookup() {
     assert_eq!(forced["source_hash"], crate::engine::source_identity(text));
     let class = engine.dex_class("sample.Target").unwrap();
     let method = crate::method_lookup::resolve(class, id).unwrap();
-    let expected = crate::native_engine::disassembly::render_method(method, &class.symbols);
+    let expected = crate::native_engine::disassembly::render_method(class, method);
     assert_eq!(text, expected.source);
     let mut assembled = String::new();
     let mut offset = 0;
@@ -283,7 +283,7 @@ fn method_source_requested_disassembly_is_distinct_from_failed_reconstruction() 
     let owner = crate::method_lookup::owner(&id).unwrap();
     let class = engine.dex_class(owner).unwrap();
     let method = crate::method_lookup::resolve(class, &id).unwrap();
-    let expected = crate::native_engine::disassembly::render_method(method, &class.symbols);
+    let expected = crate::native_engine::disassembly::render_method(class, method);
     assert_eq!(raw, expected.source);
     assert!(raw.contains("monitor-enter"));
     assert!(!raw.contains("reconstruction failed"));
@@ -299,4 +299,135 @@ fn method_source_requested_disassembly_is_distinct_from_failed_reconstruction() 
     drop(engine);
     drop(directory);
     assert!(!path.exists(), "temporary DEX fixture must be removed");
+}
+
+#[test]
+fn method_source_call_sites_carry_dex_offsets_registers_and_text_positions() {
+    let (mut engine, project) = opened();
+    let cancel = AtomicBool::new(false);
+    let id = "sample.Caller.compute()I";
+    let plain = dispatch(
+        &mut engine,
+        &project,
+        "get_method_source",
+        &json!({"method_id":id}),
+        &cancel,
+    )
+    .unwrap();
+    assert!(plain.get("call_sites").is_none());
+    let java = dispatch(
+        &mut engine,
+        &project,
+        "get_method_source",
+        &json!({"method_id":id,"include_call_sites":true}),
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(java["text"], plain["text"]);
+    assert_eq!(java["source_hash"], plain["source_hash"]);
+    let table = &java["call_sites"];
+    assert_eq!(table["total"], 2);
+    assert_eq!(table["truncated"], false);
+    assert!(
+        table["offset_unit"]
+            .as_str()
+            .unwrap()
+            .contains("16-bit DEX code units")
+    );
+    let items = table["items"].as_array().unwrap();
+    assert_eq!(items[0]["callee_method_id"], "sample.Target.<init>()V");
+    assert_eq!(items[0]["dispatch"], "direct");
+    assert_eq!(items[0]["constant_arguments"]["status"], "analyzed");
+    assert_eq!(items[0]["constant_arguments"]["arguments"], json!([]));
+    let call = &items[1];
+    assert_eq!(call["callee_method_id"], "sample.Target.doubleValue(I)I");
+    assert_eq!(call["call_site_offset"], 7);
+    assert_eq!(call["call_site_offset_hex"], "0x0007");
+    assert_eq!(call["dispatch"], "virtual (declared target)");
+    let argument = &call["constant_arguments"]["arguments"][0];
+    assert_eq!(argument["argument_index"], 0);
+    assert_eq!(argument["register"], 1);
+    assert_eq!(argument["descriptor"], "I");
+    assert_eq!(argument["status"], "constant");
+    assert_eq!(argument["kind"], "bits32");
+    assert_eq!(argument["value"], 21);
+    let mapping = &call["source_mapping"];
+    assert_eq!(mapping["status"], "unique_target_reference");
+    assert_eq!(mapping["reconstruction_status"], "decompiled");
+    assert_eq!(mapping["source_hash"], java["source_hash"]);
+    assert_eq!(mapping["location"]["source_hash"], java["source_hash"]);
+    let line = mapping["location"]["line"].as_u64().unwrap() as usize;
+    let column = mapping["location"]["column"].as_u64().unwrap() as usize;
+    let text_line = java["text"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .nth(line - 1)
+        .unwrap();
+    let at_column: String = text_line.chars().skip(column - 1).collect();
+    assert!(at_column.starts_with("doubleValue(21)"), "{text_line}");
+    // The same offsets identify the sites in the call-graph projection.
+    let graph = dispatch(
+        &mut engine,
+        &project,
+        "get_call_graph",
+        &json!({"method_id":id,"projection":"call_sites"}),
+        &cancel,
+    )
+    .unwrap();
+    let graph_offsets: Vec<_> = graph["call_sites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|site| site["callee_method_id"] == "sample.Target.doubleValue(I)I")
+        .map(|site| site["call_site_offset"].clone())
+        .collect();
+    assert_eq!(graph_offsets, vec![json!(7)]);
+    // Requested DEX text maps every invoke to its offset line.
+    let dex = dispatch(
+        &mut engine,
+        &project,
+        "get_method_source",
+        &json!({"method_id":id,"format":"dex","include_call_sites":true}),
+        &cancel,
+    )
+    .unwrap();
+    let text = dex["text"].as_str().unwrap();
+    let dex_items = dex["call_sites"]["items"].as_array().unwrap();
+    assert_eq!(dex_items.len(), 2);
+    for item in dex_items {
+        let mapping = &item["source_mapping"];
+        assert_eq!(mapping["status"], "exact_dex_line");
+        assert_eq!(mapping["reconstruction_status"], "dex-requested");
+        let line = mapping["location"]["line"].as_u64().unwrap() as usize;
+        let marker = format!("{:04x}:", item["call_site_offset"].as_u64().unwrap());
+        let text_line = text.lines().nth(line - 1).unwrap();
+        assert!(text_line.trim_start().starts_with(&marker), "{text_line}");
+        assert!(
+            text_line.contains(item["callee_method_id"].as_str().unwrap()),
+            "{text_line}"
+        );
+    }
+    assert_eq!(
+        dex_items[1]["constant_arguments"]["arguments"][0]["value"],
+        21
+    );
+    // Paging the text keeps the complete table.
+    let paged = dispatch(
+        &mut engine,
+        &project,
+        "get_method_source",
+        &json!({"method_id":id,"include_call_sites":true,"limit":10}),
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(paged["text"].as_str().unwrap().chars().count(), 10);
+    assert_eq!(paged["call_sites"]["total"], 2);
+    assert_eq!(paged["call_sites"]["items"], java["call_sites"]["items"]);
+    let scoped = json!({"instance_id":"i","project_id":"p","method_id":id});
+    let mut flag = scoped.clone();
+    flag["include_call_sites"] = json!(true);
+    validate("get_method_source", &flag).unwrap();
+    flag["include_call_sites"] = json!("yes");
+    assert!(validate("get_method_source", &flag).is_err());
 }

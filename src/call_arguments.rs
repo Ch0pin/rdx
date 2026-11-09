@@ -180,6 +180,12 @@ pub(crate) fn analyze(
         for pc in &block.instructions {
             ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
             let i = instructions[pc];
+            if wanted.contains(pc) && matches!(i.opcode, 0xfa | 0xfb) {
+                out.insert(
+                    *pc,
+                    json!({"status":"unresolved","reason":"invoke-polymorphic (MethodHandle) argument analysis is not supported"}),
+                );
+            }
             if wanted.contains(pc) && matches!(i.opcode,0x6e..=0x72|0x74..=0x78) {
                 let index = i.reference.context("Invoke missing method operand")?.index as usize;
                 let (_, proto, _) = c
@@ -305,6 +311,18 @@ mod tests {
                 &BTreeSet::from([9])
             )
             .is_err()
+        );
+    }
+    #[test]
+    fn polymorphic_invokes_report_an_explicit_unsupported_reason() {
+        let c = fixture(vec![0x10fa, 0, 0, 0, 0x000e]);
+        let record = at(&c, 0);
+        assert_eq!(record["status"], "unresolved");
+        assert!(
+            record["reason"]
+                .as_str()
+                .unwrap()
+                .contains("invoke-polymorphic")
         );
     }
     #[test]

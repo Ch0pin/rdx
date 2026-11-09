@@ -533,18 +533,15 @@ pub(super) fn scan(
         .iter()
         .map(|c| (c.descriptor.as_ref(), *c))
         .collect();
-    let scoped: Vec<_> = classes
-        .iter()
-        .copied()
-        .filter(|c| {
-            let name = type_name(&c.descriptor);
-            prefix.is_empty()
-                || name == prefix
-                || name
-                    .strip_prefix(prefix)
-                    .is_some_and(|s| s.starts_with('.'))
-        })
-        .collect();
+    let in_scope = |c: &DexClass| {
+        let name = type_name(&c.descriptor);
+        prefix.is_empty()
+            || name == prefix
+            || name
+                .strip_prefix(prefix)
+                .is_some_and(|s| s.starts_with('.'))
+    };
+    let scoped: Vec<_> = classes.iter().copied().filter(|c| in_scope(c)).collect();
     let mut scan = Scan {
         work: Work {
             remaining: budget,
@@ -739,10 +736,12 @@ pub(super) fn scan(
         && mappings.recovery_complete
         && !links.budget_exhausted
         && links.sites_truncated == 0;
+    let work_budget_exhausted = scan.work.remaining == 0 || links.budget_exhausted;
+    let outside_prefix = retrofit_outside_prefix(classes, prefix, &mappings, &mut scan.work)?;
     Ok(
         json!({"items":scan.page.items,"matching_candidates_so_far":scan.page.total,
         "coverage":{"detector":"known_network_usage","complete":complete,"selected_classes":scoped.len(),"visited_classes":scan.classes,
-            "detectors_run":["okhttp_contracts","named_network_calls","named_network_fields","retrofit_annotations","retrofit_service_inventory"],"retrofit_parser_candidates":mappings.parser_candidates,"retrofit_parser_ambiguous":mappings.ambiguous,"retrofit_recovery_complete":mappings.recovery_complete,"retrofit_recovery_status":mappings.status(),"retrofit_recovered_roles":mappings.recovered_roles(),"retrofit_creation":{"model_resolved":links.model_resolved,"candidate_methods":links.candidate_methods,"scanned_methods":links.scanned_methods,"unsupported_methods":links.unsupported_methods,"budget_exhausted":links.budget_exhausted,"sites_seen":links.sites_seen,"sites_retained":links.sites_seen-links.sites_truncated,"sites_truncated":links.sites_truncated,"supported_scope":"branch-free local methods up to 2048 code units, no try regions; exact create(Class) reference, class constant, tracked builder receiver and literal base URL when available"},"work_budget_exhausted":scan.work.remaining==0 || links.budget_exhausted,
+            "detectors_run":["okhttp_contracts","named_network_calls","named_network_fields","retrofit_annotations","retrofit_service_inventory"],"retrofit_parser_candidates":mappings.parser_candidates,"retrofit_parser_ambiguous":mappings.ambiguous,"retrofit_recovery_complete":mappings.recovery_complete,"retrofit_recovery_status":mappings.status(),"retrofit_recovered_roles":mappings.recovered_roles(),"retrofit_creation":{"model_resolved":links.model_resolved,"candidate_methods":links.candidate_methods,"scanned_methods":links.scanned_methods,"unsupported_methods":links.unsupported_methods,"budget_exhausted":links.budget_exhausted,"sites_seen":links.sites_seen,"sites_retained":links.sites_seen-links.sites_truncated,"sites_truncated":links.sites_truncated,"supported_scope":"branch-free local methods up to 2048 code units, no try regions; exact create(Class) reference, class constant, tracked builder receiver and literal base URL when available"},"work_budget_exhausted":work_budget_exhausted,"retrofit_annotations_outside_prefix":outside_prefix,
             "errors":scan.errors,"error_count":scan.error_count,"scope":"Exact named OkHttp/Retrofit descriptors and conservatively mapped Retrofit annotations in selected classes. Service methods are static declarations; creation and base URL links require separate object dataflow evidence. Reflection and unsupported flows remain unresolved."}}),
     )
 }
@@ -815,6 +814,8 @@ pub(super) fn services(
         && mappings.recovery_complete
         && !links.budget_exhausted
         && links.sites_truncated == 0;
+    let work_budget_exhausted = scan.work.remaining == 0;
+    let outside_prefix = retrofit_outside_prefix(classes, prefix, &mappings, &mut scan.work)?;
     if complete {
         ensure!(offset <= scan.page.total, "Invalid service row offset");
     }
@@ -828,9 +829,80 @@ pub(super) fn services(
             "creation_model_resolved":links.model_resolved,"creation_candidate_methods":links.candidate_methods,
             "creation_scanned_methods":links.scanned_methods,"creation_unsupported_methods":links.unsupported_methods,
             "creation_budget_exhausted":links.budget_exhausted,"creation_sites_seen":links.sites_seen,
-            "creation_sites_truncated":links.sites_truncated,"work_budget_exhausted":scan.work.remaining==0,
+            "creation_sites_truncated":links.sites_truncated,"work_budget_exhausted":work_budget_exhausted,"retrofit_annotations_outside_prefix":outside_prefix,
             "scope":"Runtime-visible interface method annotations with exact or conservatively recovered Retrofit roles. Rows are static declarations. Creation links cover branch-free local methods only; model assumptions, dynamic values and external control remain explicit."},
         "empty_result_note":if scan.page.total==0 {Some("No recognized Retrofit service-method annotations in this scope; renamed or unsupported parser variants remain possible.")} else {None::<&str>}}),
+    )
+}
+/// Count runtime-visible Retrofit declarations that `package_prefix` excluded,
+/// so a zero result on an obfuscated build names the renamed top-level packages.
+/// Exact `retrofit2.http` descriptors and conservatively recovered renamed
+/// annotation classes both count. Null when no prefix was supplied.
+fn retrofit_outside_prefix(
+    classes: &[&DexClass],
+    prefix: &str,
+    mappings: &retrofit::Mappings,
+    work: &mut Work<'_>,
+) -> Result<Value> {
+    if prefix.is_empty() {
+        return Ok(Value::Null);
+    }
+    let mut owners = 0usize;
+    let mut methods = 0usize;
+    let mut examples = Vec::new();
+    let mut complete = true;
+    for c in classes.iter().copied() {
+        let name = type_name(&c.descriptor);
+        if name == prefix
+            || name
+                .strip_prefix(prefix)
+                .is_some_and(|s| s.starts_with('.'))
+        {
+            continue;
+        }
+        if !work.take(1)? {
+            complete = false;
+            break;
+        }
+        let Some(directory) = c.symbols.annotations.get(&c.annotations_offset) else {
+            continue;
+        };
+        let role = |set: &Option<DexAnnotationSet>, parameter: bool| {
+            set.as_ref().is_some_and(|set| {
+                set.iter().any(|a| {
+                    a.visibility == 1
+                        && c.symbols.types.get(a.type_idx as usize).is_some_and(|ty| {
+                            annotation_role(ty, parameter).is_some()
+                                || mappings.get(ty).is_some_and(|m| {
+                                    recovered_annotation_role(m.name, parameter).is_some()
+                                })
+                        })
+                })
+            })
+        };
+        let annotated = (0..c.methods.len())
+            .filter(|&mi| {
+                directory
+                    .methods
+                    .get(mi)
+                    .is_some_and(|set| role(set, false))
+                    || directory
+                        .parameters
+                        .get(mi)
+                        .is_some_and(|sets| sets.iter().any(|set| role(set, true)))
+            })
+            .count();
+        if annotated > 0 {
+            owners += 1;
+            methods += annotated;
+            if examples.len() < 10 {
+                examples.push(name);
+            }
+        }
+    }
+    Ok(
+        json!({"classes":owners,"methods":methods,"examples":examples,"examples_limit":10,"complete":complete,
+        "scope":"Classes outside package_prefix declaring runtime-visible retrofit2.http or recovered Retrofit method/parameter annotations; counted, not scanned for other evidence"}),
     )
 }
 #[cfg(test)]

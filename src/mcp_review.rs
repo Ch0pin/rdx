@@ -314,7 +314,12 @@ pub(super) fn call_arguments(
         .as_array_mut()
         .context("include_const_args requires projection=call_sites")?;
     let mut groups = std::collections::BTreeMap::<String, Vec<(usize, usize)>>::new();
+    let mut allocations = Vec::new();
     for (index, site) in sites.iter().enumerate() {
+        if site["kind"] == "lambda_creation" {
+            allocations.push(index);
+            continue;
+        }
         let id = site["caller_method_id"]
             .as_str()
             .context("Missing caller ID")?;
@@ -322,6 +327,9 @@ pub(super) fn call_arguments(
             .as_u64()
             .context("Missing call offset")? as usize;
         groups.entry(id.to_owned()).or_default().push((index, pc));
+    }
+    for index in allocations {
+        sites[index]["constant_arguments"] = json!({"status":"not_applicable","reason":"lambda_creation evidence is a new-instance allocation; constant arguments apply to invoke sites only"});
     }
     let mut work = 0;
     let mut bytes = 0;
@@ -340,7 +348,7 @@ pub(super) fn call_arguments(
         })();
         for (index, pc) in positions {
             let mut value = match &run {
-                Ok(values) => values.get(&pc).cloned().unwrap_or_else(||json!({"status":"unresolved","reason":"Call site is unreachable or unsupported"})),
+                Ok(values) => values.get(&pc).cloned().unwrap_or_else(||json!({"status":"unresolved","reason":"Call site is in code unreachable from the method entry; no constant state exists for it"})),
                 Err(error) => json!({"status":"unresolved","reason":format!("{error:#}")}),
             };
             let size = serde_json::to_vec(&value)?.len();
@@ -360,9 +368,150 @@ pub(super) fn call_arguments(
     Ok(())
 }
 
+/// Keeps only call sites whose constant proof binds `argument_index` to
+/// `argument_literal`. Excluded (different proven constant) and unresolved
+/// sites stay visible as compact records so negative coverage remains bounded.
+pub(super) fn argument_filter(result: &mut Value, args: &Value) -> Result<()> {
+    let index = args["argument_index"]
+        .as_u64()
+        .context("argument_index must be an integer")? as usize;
+    let literal = &args["argument_literal"];
+    ensure!(
+        literal.is_string() || literal.is_i64(),
+        "argument_literal must be a string or a signed 32-bit integer"
+    );
+    let sites = result["call_sites"]
+        .as_array_mut()
+        .context("argument_index/argument_literal require projection=call_sites")?;
+    let page_total = sites.len();
+    let (mut matched, mut excluded, mut unresolved) = (Vec::new(), Vec::new(), Vec::new());
+    for site in sites.drain(..) {
+        let compact = |reason: Value, proven: Option<&Value>| {
+            let mut record = json!({"caller_method_id":site["caller_method_id"],"call_site_offset":site["call_site_offset"],
+                "invoke_instruction":site["invoke_instruction"],"depth":site["depth"],"reason":reason});
+            if let Some(argument) = proven {
+                record["argument"] = argument.clone();
+            }
+            record
+        };
+        let proof = &site["constant_arguments"];
+        if proof["status"] != "analyzed" {
+            let reason = proof["reason"]
+                .as_str()
+                .unwrap_or("constant argument analysis unavailable for this call site");
+            unresolved.push(compact(json!(reason), None));
+            continue;
+        }
+        let arguments = proof["arguments"].as_array().cloned().unwrap_or_default();
+        let Some(argument) = arguments.get(index) else {
+            excluded.push(compact(
+                json!(format!(
+                    "argument_index {index} exceeds the invoke's parameter count ({})",
+                    arguments.len()
+                )),
+                None,
+            ));
+            continue;
+        };
+        if argument["status"] != "constant" {
+            let reason = argument["reason"].as_str().unwrap_or(
+                "value is not a single proven constant on every reachable CFG path (merged registers, exception entry, arithmetic, field, parameter or call result)",
+            );
+            unresolved.push(compact(json!(reason), Some(argument)));
+            continue;
+        }
+        let same = match (literal, argument["kind"].as_str()) {
+            (Value::String(wanted), Some("string")) => argument["value"] == *wanted,
+            (Value::Number(wanted), Some("bits32")) => {
+                argument["value"].as_i64() == wanted.as_i64()
+            }
+            _ => false,
+        };
+        if same {
+            matched.push(site);
+        } else {
+            excluded.push(compact(
+                json!("proven constant differs from argument_literal"),
+                Some(argument),
+            ));
+        }
+    }
+    result["argument_filter"] = json!({
+        "argument_index":index,"argument_literal":literal,"page_total":page_total,
+        "matched":matched.len(),"excluded":excluded.len(),"unresolved":unresolved.len(),
+        "semantics":"Applied to this page only; follow next_offset for remaining pages. matched sites prove the literal at argument_index via intraprocedural constant flow and keep constant_arguments. excluded sites prove a different constant, kind or parameter count. unresolved sites are neither proven nor refuted and need manual review. Receiver excluded from indexing. constant_arguments_hash covers the analyzed page before filtering."
+    });
+    result["call_sites"] = json!(matched);
+    result["excluded_call_sites"] = json!(excluded);
+    result["unresolved_call_sites"] = json!(unresolved);
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn site(offset: u64, proof: Value) -> Value {
+        json!({"caller_method_id":"app.Caller.run()V","call_site_offset":offset,"depth":1,
+            "invoke_instruction":format!("{offset:04x}: invoke-virtual"),"constant_arguments":proof})
+    }
+    fn constant(index: usize, kind: &str, value: Value) -> Value {
+        json!({"status":"analyzed","arguments":[{"argument_index":index,"register":1,"descriptor":"Ljava/lang/String;","status":"constant","kind":kind,"value":value}]})
+    }
+    #[test]
+    fn argument_filter_partitions_matched_excluded_and_unresolved() {
+        let mut result = json!({"call_sites":[
+            site(1, constant(0, "string", json!("token"))),
+            site(2, constant(0, "string", json!("other"))),
+            site(3, constant(0, "bits32", json!(0))),
+            site(4, json!({"status":"analyzed","arguments":[{"argument_index":0,"register":2,"descriptor":"Ljava/lang/String;","status":"unresolved"}]})),
+            site(5, json!({"status":"unresolved","reason":"Caller definition unavailable"})),
+            site(6, json!({"status":"analyzed","arguments":[]})),
+        ],"returned_count":6});
+        argument_filter(
+            &mut result,
+            &json!({"argument_index":0,"argument_literal":"token"}),
+        )
+        .unwrap();
+        let summary = &result["argument_filter"];
+        assert_eq!(summary["page_total"], 6);
+        assert_eq!(summary["matched"], 1);
+        assert_eq!(summary["excluded"], 3);
+        assert_eq!(summary["unresolved"], 2);
+        assert_eq!(result["call_sites"][0]["call_site_offset"], 1);
+        assert_eq!(
+            result["call_sites"][0]["constant_arguments"]["status"],
+            "analyzed"
+        );
+        let excluded = result["excluded_call_sites"].as_array().unwrap();
+        assert_eq!(excluded[0]["argument"]["value"], "other");
+        assert_eq!(excluded[1]["argument"]["kind"], "bits32");
+        assert!(
+            excluded[2]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("parameter count (0)")
+        );
+        let unresolved = result["unresolved_call_sites"].as_array().unwrap();
+        assert_eq!(unresolved[0]["call_site_offset"], 4);
+        assert_eq!(unresolved[0]["argument"]["register"], 2);
+        assert_eq!(unresolved[1]["reason"], "Caller definition unavailable");
+        assert_eq!(result["returned_count"], 6);
+        let mut by_int = json!({"call_sites":[site(7, constant(0, "bits32", json!(21)))]});
+        argument_filter(
+            &mut by_int,
+            &json!({"argument_index":0,"argument_literal":21}),
+        )
+        .unwrap();
+        assert_eq!(by_int["argument_filter"]["matched"], 1);
+        let mut missing = json!({"graph":[]});
+        assert!(
+            argument_filter(
+                &mut missing,
+                &json!({"argument_index":0,"argument_literal":"x"})
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn annotation_presence_distinguishes_absence_unused_types_and_filtered_matches() {
         use crate::native_dex::{self, DexAnnotation, DexAnnotationDirectory};
@@ -427,6 +576,8 @@ mod tests {
         assert_eq!(first["next_offset"], 1);
         assert_eq!(first["requested_type_present"], true);
         assert_eq!(first["items"][0]["annotation_type"], "Lqj/o;");
+        assert_eq!(first["matched_types"], json!(["Lqj/o;"]));
+        assert_eq!(first["matched_types_complete"], true);
         assert_eq!(first, query(json!({"annotation_type":"Lqj/o;", "limit":1})));
         let second = query(json!({"annotation_type":"qj.o", "offset":1, "limit":1}));
         assert_eq!(second["total"], 2);
@@ -437,6 +588,111 @@ mod tests {
                 [Ok(("sample.One", &classes[0]))],
                 &json!({"annotation_type":"qj.o"}),
                 &AtomicBool::new(true)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn annotation_simple_name_and_prefix_modes_match_relocated_types() {
+        use crate::native_dex::{self, DexAnnotation, DexAnnotationDirectory};
+        let mut c = native_dex::parse(include_bytes!("../tests/fixtures/hello.dex"))
+            .unwrap()
+            .classes
+            .remove(0);
+        c.methods.retain(|m| m.name.as_ref() == "answer");
+        c.annotations_offset = 1;
+        let annotation = |type_idx| {
+            Arc::from(vec![Arc::new(DexAnnotation {
+                visibility: 1,
+                type_idx,
+                elements: vec![],
+            })])
+        };
+        let mut symbols = DexSymbols {
+            types: vec![
+                "Lretrofit2/http/GET;".into(),
+                "Lff/a/GET;".into(),
+                "Lretrofit2/http/Url;".into(),
+                "Lretrofit2/Call;".into(),
+            ],
+            ..Default::default()
+        };
+        symbols.annotations.insert(
+            1,
+            Arc::new(DexAnnotationDirectory {
+                class: Some(annotation(0)),
+                methods: vec![Some(annotation(1))],
+                parameters: vec![vec![Some(annotation(2))]],
+                ..Default::default()
+            }),
+        );
+        c.symbols = Arc::new(symbols);
+        let cancel = AtomicBool::new(false);
+        let query = |args: Value| annotation_classes([Ok(("ff.g", &c))], &args, &cancel).unwrap();
+        let simple = query(json!({"annotation_type":"GET","match_mode":"simple_name"}));
+        assert_eq!(simple["total"], 2, "{simple}");
+        assert_eq!(simple["match_mode"], "simple_name");
+        assert_eq!(simple["annotation_type"], "GET");
+        assert_eq!(simple["requested_type_present"], true);
+        assert_eq!(simple["warnings"], json!([]));
+        assert_eq!(
+            simple["matched_types"],
+            json!(["Lff/a/GET;", "Lretrofit2/http/GET;"])
+        );
+        assert_eq!(simple["items"][0]["element"], "class");
+        assert_eq!(
+            simple["items"][0]["annotation_type"],
+            "Lretrofit2/http/GET;"
+        );
+        assert_eq!(simple["items"][1]["element"], "method");
+        assert_eq!(simple["items"][1]["annotation_type"], "Lff/a/GET;");
+        // Qualified spellings reduce to the same simple name.
+        for spelling in ["retrofit2.http.GET", "Lretrofit2/http/GET;", "ff/a/GET"] {
+            assert_eq!(
+                query(json!({"annotation_type":spelling,"match_mode":"simple_name"}))["total"],
+                2
+            );
+        }
+        let prefix = query(json!({"annotation_type":"retrofit2.http","match_mode":"prefix"}));
+        assert_eq!(prefix["total"], 2, "{prefix}");
+        assert_eq!(prefix["annotation_type"], "retrofit2/http");
+        assert_eq!(
+            prefix["matched_types"],
+            json!(["Lretrofit2/http/GET;", "Lretrofit2/http/Url;"])
+        );
+        assert_eq!(prefix["items"][1]["element"], "parameter");
+        assert_eq!(prefix["items"][1]["parameter_index"], 0);
+        assert_eq!(
+            query(json!({"annotation_type":"retrofit2.http.U","match_mode":"prefix"}))["total"],
+            1
+        );
+        // Presence follows the mode: retrofit2.Call exists but is not used as
+        // an annotation, while nothing in the tables starts with okhttp3.
+        let unused = query(json!({"annotation_type":"retrofit2.Call","match_mode":"prefix"}));
+        assert_eq!(unused["total"], 0);
+        assert_eq!(unused["requested_type_present"], true);
+        let absent = query(json!({"annotation_type":"okhttp3","match_mode":"prefix"}));
+        assert_eq!(absent["total"], 0);
+        assert_eq!(absent["requested_type_present"], false);
+        assert_eq!(absent["warnings"][0]["code"], "ANNOTATION_TYPE_ABSENT");
+        assert!(
+            absent["warnings"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("internal-name prefix \"okhttp3\"")
+        );
+        let missing = query(json!({"annotation_type":"Nope","match_mode":"simple_name"}));
+        assert_eq!(missing["requested_type_present"], false);
+        assert_eq!(missing["warnings"][0]["code"], "ANNOTATION_TYPE_ABSENT");
+        let exact = query(json!({"annotation_type":"retrofit2.http.GET"}));
+        assert_eq!(exact["total"], 1);
+        assert_eq!(exact["match_mode"], "exact_descriptor");
+        assert!(
+            annotation_classes(
+                [Ok(("ff.g", &c))],
+                &json!({"annotation_type":"GET","match_mode":"fuzzy"}),
+                &cancel
             )
             .is_err()
         );

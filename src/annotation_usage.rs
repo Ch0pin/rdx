@@ -5,11 +5,11 @@ use crate::{
     native_dex::{DexAnnotationSet, DexClass},
     native_engine::disassembly,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -138,30 +138,105 @@ pub(super) fn annotation_sets(
     }
     Ok(())
 }
+/// How `annotation_type` selects DEX annotation types.
+enum AnnotationQuery {
+    /// The complete descriptor, `Lretrofit2/http/GET;`.
+    Exact(String),
+    /// The simple class name after the last package separator, `GET`.
+    SimpleName(String),
+    /// A literal prefix of the internal name, `retrofit2/http`.
+    Prefix(String),
+}
+impl AnnotationQuery {
+    fn parse(args: &Value) -> Result<Self> {
+        let requested = args["annotation_type"]
+            .as_str()
+            .context("Missing annotation_type")?;
+        let internal = requested
+            .strip_prefix('L')
+            .and_then(|s| s.strip_suffix(';'))
+            .unwrap_or(requested)
+            .replace('.', "/");
+        ensure!(!internal.is_empty(), "annotation_type must not be empty");
+        Ok(
+            match args["match_mode"].as_str().unwrap_or("exact_descriptor") {
+                "exact_descriptor" => Self::Exact(format!("L{internal};")),
+                "simple_name" => {
+                    let name = internal
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default();
+                    ensure!(!name.is_empty(), "annotation_type has no simple name");
+                    Self::SimpleName(name.to_owned())
+                }
+                "prefix" => Self::Prefix(internal),
+                other => bail!(
+                    "Invalid match_mode {other:?}; use exact_descriptor, simple_name or prefix"
+                ),
+            },
+        )
+    }
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::Exact(_) => "exact_descriptor",
+            Self::SimpleName(_) => "simple_name",
+            Self::Prefix(_) => "prefix",
+        }
+    }
+    fn pattern(&self) -> &str {
+        match self {
+            Self::Exact(s) | Self::SimpleName(s) | Self::Prefix(s) => s,
+        }
+    }
+    fn matches(&self, descriptor: &str) -> bool {
+        match self {
+            Self::Exact(d) => descriptor == d,
+            Self::SimpleName(name) => {
+                descriptor
+                    .strip_prefix('L')
+                    .and_then(|s| s.strip_suffix(';'))
+                    .and_then(|s| s.rsplit('/').next())
+                    == Some(name)
+            }
+            Self::Prefix(prefix) => descriptor
+                .strip_prefix('L')
+                .and_then(|s| s.strip_suffix(';'))
+                .is_some_and(|s| s.starts_with(prefix)),
+        }
+    }
+    fn absence_message(&self) -> String {
+        let selector = match self {
+            Self::Exact(d) => format!("The annotation descriptor {d} is absent from"),
+            Self::SimpleName(n) => format!("No annotation type with simple name {n:?} exists in"),
+            Self::Prefix(p) => format!("No class type with internal-name prefix {p:?} exists in"),
+        };
+        format!(
+            "{selector} the loaded DEX type tables. Obfuscation, removal, or an incorrect name may explain this. Zero matches do not establish that equivalent annotations or API endpoints are absent. Retry with match_mode simple_name or prefix, inspect get_class_disassembly annotation directives on a known owner, or use find_network_stacks, which recovers renamed Retrofit annotation roles."
+        )
+    }
+}
+/// Bounded distinct annotation types matched in the current scan.
+const MATCHED_TYPE_LIMIT: usize = 200;
 pub(crate) fn scan_classes<'a>(
     classes: impl IntoIterator<Item = Result<(&'a str, &'a crate::native_dex::DexClass)>>,
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
-    let requested = args["annotation_type"]
-        .as_str()
-        .context("Missing annotation_type")?;
-    let descriptor = if requested.starts_with('L') && requested.ends_with(';') {
-        requested.to_owned()
-    } else {
-        format!("L{};", requested.replace('.', "/"))
-    };
+    let query = AnnotationQuery::parse(args)?;
     let element = args["element"].as_str().unwrap_or("all");
     let mut page = Page::new(args)?;
     let mut seen_tables = HashSet::new();
     let mut type_present = false;
+    let mut matched_types = BTreeSet::new();
+    let mut matched_types_complete = true;
     for class in classes {
         ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
         let (name, c) = class?;
         // Presence is project-wide, independent of result filters. Each shared
         // DEX type table is checked once; no Java reconstruction or index build.
         if !type_present && seen_tables.insert(Arc::as_ptr(&c.symbols)) {
-            type_present = c.symbols.types.iter().any(|ty| ty.as_ref() == descriptor);
+            type_present = c.symbols.types.iter().any(|ty| query.matches(ty));
         }
         if !package_matches(name, args) {
             continue;
@@ -172,15 +247,23 @@ pub(crate) fn scan_classes<'a>(
             }
             for annotation in set.iter() {
                 ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-                if c.symbols
+                let Some(descriptor) = c
+                    .symbols
                     .types
                     .get(annotation.type_idx as usize)
-                    .is_none_or(|t| t.as_ref() != descriptor)
-                {
+                    .filter(|t| query.matches(t))
+                else {
                     continue;
+                };
+                if matched_types.len() < MATCHED_TYPE_LIMIT
+                    || matched_types.contains(descriptor.as_ref())
+                {
+                    matched_types.insert(descriptor.to_string());
+                } else {
+                    matched_types_complete = false;
                 }
                 let mut item = owner.clone();
-                item["annotation_type"] = json!(descriptor);
+                item["annotation_type"] = json!(descriptor.as_ref());
                 item["visibility"] = json!(annotation.visibility);
                 item["values"] =
                     elements_value(&annotation.elements, &c.symbols, &mut (256 * 1024))?;
@@ -192,8 +275,10 @@ pub(crate) fn scan_classes<'a>(
     }
     ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
     let mut result = page.finish()?;
-    result["annotation_type"] = json!(descriptor);
-    result["match_mode"] = json!("exact_descriptor");
+    result["annotation_type"] = json!(query.pattern());
+    result["match_mode"] = json!(query.mode());
+    result["matched_types"] = json!(matched_types);
+    result["matched_types_complete"] = json!(matched_types_complete);
     result["requested_type_present"] = json!(type_present);
     result["type_presence_scope"] =
         json!("DEX type tables of all loaded classes, before result filters");
@@ -202,11 +287,11 @@ pub(crate) fn scan_classes<'a>(
     } else {
         json!([{
             "code": "ANNOTATION_TYPE_ABSENT",
-            "message": "The requested annotation descriptor is absent from the loaded DEX type tables. Obfuscation, removal, or an incorrect name may explain this. Zero exact-descriptor usages do not establish that equivalent annotations or API endpoints are absent. Query the actual DEX annotation name; no semantic alias was inferred."
+            "message": query.absence_message()
         }])
     };
     result["scope"] = json!(
-        "Complete covers explicit exact-descriptor DEX annotation usages within the supplied filters, not semantic equivalents under obfuscation. Parameter_index excludes the receiver. No inherited annotations or annotation defaults inferred."
+        "Complete covers explicit DEX annotation usages whose type matches match_mode (exact descriptor, simple name after the last package separator, or literal internal-name prefix) within the supplied filters, not semantic equivalents under obfuscation. Parameter_index excludes the receiver. No inherited annotations or annotation defaults inferred."
     );
     Ok(result)
 }

@@ -49,6 +49,7 @@ mod method_lookup;
 pub mod integer_references;
 
 mod identifier_search;
+mod package_scope;
 
 mod call_arguments;
 

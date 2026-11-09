@@ -545,7 +545,7 @@ fn project_request(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
-    let normalized = feedback::method_aliases(name, args)?;
+    let normalized = feedback::aliases(name, args)?;
     let args = &normalized;
     if name == "get_export_status" || name == "cancel_export" {
         return project
@@ -692,12 +692,23 @@ fn project_request(
             let mut records =
                 crate::manifest_summary::query_resolved(&xml, args, engine.resource_table(), false)
                     .map_err(anyhow::Error::msg)?;
+            if args.get("exported_state").is_some() {
+                records.retain(|record| {
+                    record["record_type"] == "component"
+                        && crate::manifest_summary::exported_matches(record, args)
+                });
+            }
             crate::manifest_summary::project_records(&mut records, args);
             let hash = crate::engine::source_identity(&serde_json::to_string(&records)?);
-            let mut result = page(records, args)?;
-            result["format"] = json!("records");
+            let mut result = if args["format"] == "counts" {
+                crate::manifest_summary::record_counts(&records)
+            } else {
+                let mut result = page(records, args)?;
+                result["format"] = json!("records");
+                result["offset_unit"] = json!("matching records");
+                result
+            };
             result["source_hash"] = json!(hash);
-            result["offset_unit"] = json!("matching records");
             result
         } else {
             let mut summary = crate::manifest_summary::render(
@@ -834,6 +845,10 @@ fn write_response(writer: &mut impl Write, value: &Value) -> Result<()> {
 fn required<'a>(v: &'a Value, k: &str) -> Result<&'a str> {
     v[k].as_str().with_context(|| format!("Missing {k}"))
 }
+fn package_prefix_schema() -> Value {
+    json!({"type":["string","array"],"items":{"type":"string","minLength":1},"maxItems":64,
+        "description":"Package or class prefix matched at '.' boundaries, an array of such prefixes combined with OR, or the pseudo-prefix \"obfuscated-root\" (default-package classes and classes whose package segments are all at most three characters, such as wr.b$a or tk.a). Trailing dots are ignored."})
+}
 fn page(items: Vec<Value>, args: &Value) -> Result<Value> {
     let offset = args["offset"].as_u64().unwrap_or(0) as usize;
     let limit = args["limit"].as_u64().unwrap_or(100) as usize;
@@ -855,11 +870,23 @@ fn text_page(text: String, args: &Value, format: &str) -> Result<Value> {
     ensure!(start <= total, "Invalid offset");
     let end = start.saturating_add(limit).min(total);
     let hash = crate::engine::source_identity(&text);
+    check_source_hash(args, &hash)?;
     Ok(
         json!({"text":text.chars().skip(start).take(limit).collect::<String>(),"format":format,"source_hash":hash,"offset":start,"total_chars":total,"next_offset":(end<total).then_some(end),
             "returned_chars":end-start,"page_end":end,"has_more":end<total,"full_text_in_response":start==0 && end==total,
-            "offset_unit":"Unicode scalar characters","pagination_note":if start!=0 || end<total {Some("This is a source slice. Follow next_offset with the same source_hash; absence from this page does not establish absence from the class.")} else {None}}),
+            "offset_unit":"Unicode scalar characters","pagination_note":if start!=0 || end<total {Some(SLICE_NOTE)} else {None}}),
     )
+}
+const SLICE_NOTE: &str = "This is a source slice. Request the next page with the same selector and offset=next_offset. source_hash identifies the complete document; pass it back as the optional source_hash argument so a changed document fails with SOURCE_CHANGED instead of paging inconsistently. Absence from this page does not establish absence from the document.";
+/// Optional caller-supplied hash of the complete document being paged.
+fn check_source_hash(args: &Value, hash: &str) -> Result<()> {
+    if let Some(expected) = args["source_hash"].as_str() {
+        ensure!(
+            expected == hash,
+            "SOURCE_CHANGED: the current document hashes to {hash}, not the supplied source_hash {expected}; restart paging from offset 0"
+        );
+    }
+    Ok(())
 }
 /// Pin executable identity before an on-disk application update can replace it.
 pub fn capture_build_identity() {
@@ -876,8 +903,10 @@ fn build_identity() -> Value {
 
 fn manifest_filtered(args: &Value) -> bool {
     args["format"] == "records"
+        || args["format"] == "counts"
         || [
             "component_type",
+            "exported_state",
             "component",
             "host",
             "scheme",
@@ -991,7 +1020,9 @@ fn search_code(
     if args["mode"] == "identifiers" {
         return engine.search_identifiers(args, cancel);
     }
-    if args["pagination"] == "hits" {
+    // Hits pagination returns only matching occurrences; the class-window
+    // contract stays available for callers that page by class index.
+    if args["pagination"] != "classes" {
         return source_search::search_hits(engine, project, args, cancel);
     }
     let query = required(args, "query")?;
@@ -999,19 +1030,11 @@ fn search_code(
         !query.is_empty() && query.len() <= 4096,
         "Query must contain 1..4096 bytes"
     );
-    let package = args["package_prefix"]
-        .as_str()
-        .unwrap_or("")
-        .trim_end_matches('.');
+    let scope = crate::package_scope::PackageScope::from_args(args)?;
     let classes: Vec<_> = project
         .classes
         .iter()
-        .filter(|c| {
-            package.is_empty()
-                || c.as_str() == package
-                || c.strip_prefix(package)
-                    .is_some_and(|tail| tail.starts_with('.'))
-        })
+        .filter(|class| scope.matches(class))
         .collect();
     let offset = args["offset"].as_u64().unwrap_or(0) as usize;
     let limit = args["limit"].as_u64().unwrap_or(25) as usize;
@@ -1073,7 +1096,7 @@ fn search_code(
         }
     }
     Ok(
-        json!({"items":items,"scope":"generated Java and mixed DEX; case-sensitive literal plus exact numeric aliases for resolved resource links; resource files excluded","offset":offset,"scanned_classes":scanned,"total_classes":classes.len(),"page_status":source_search::page_status(items.is_empty(),next.is_some(),!errors.is_empty()),"errors":errors,"next_offset":next,"next_source_offset":next.map(|_|next_source),"exhausted":next.is_none()}),
+        json!({"items":items,"pagination":"classes","scope":"generated Java and mixed DEX; case-sensitive literal plus exact numeric aliases for resolved resource links; resource files excluded","offset":offset,"limit":limit,"scanned_classes":scanned,"total_classes":classes.len(),"page_status":source_search::page_status(items.is_empty(),next.is_some(),!errors.is_empty()),"errors":errors,"next_offset":next,"next_source_offset":next.map(|_|next_source),"exhausted":next.is_none(),"package_scope":scope.describe(),"hint":source_search::identifier_hint(query,items.is_empty(),next.is_none())}),
     )
 }
 
@@ -1164,7 +1187,15 @@ fn dispatch(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
-    let mut normalized = feedback::method_aliases(name, args)?;
+    let mut normalized = feedback::aliases(name, args)?;
+    let mut selection = None;
+    if let Some(key) = method_selector(name)
+        && let Some(requested) = normalized[key].as_str().map(str::to_owned)
+    {
+        let chosen = select_method(engine, project, &requested, name == "get_call_graph")?;
+        normalized[key] = json!(chosen.method_id);
+        selection = Some((key, requested, chosen));
+    }
     if class_scoped(name)
         && (name != "find_instantiations"
             || args.get("class_id").is_some()
@@ -1195,8 +1226,12 @@ fn dispatch(
         normalized["class_id"] = json!(resolved);
     }
     let mut result = dispatch_resolved(engine, project, name, &normalized, cancel)?;
-    if name == "get_call_graph" && args["include_const_args"] == true {
+    let argument_filter = name == "get_call_graph" && args.get("argument_literal").is_some();
+    if name == "get_call_graph" && (args["include_const_args"] == true || argument_filter) {
         review::call_arguments(engine, &mut result, cancel)?;
+    }
+    if argument_filter {
+        review::argument_filter(&mut result, args)?;
     }
     if name == "get_call_graph" {
         navigation::enrich(engine, &mut result, args, cancel)?;
@@ -1210,7 +1245,69 @@ fn dispatch(
             .cloned()
             .unwrap_or(Value::Null);
     }
+    if let Some((key, requested, chosen)) = selection {
+        if key == "method_id" {
+            result["requested_method_id"] = json!(requested);
+            if matches!(name, "get_method_source" | "get_call_graph") {
+                result["method_id"] = json!(chosen.method_id);
+            }
+        }
+        result["method_selection"] = json!({"parameter":key,"requested_method_id":requested,"method_id":chosen.method_id,
+            "status":if chosen.exact {"exact"} else {"unique_candidate"},"owner_qualified":chosen.owner_qualified,
+            "scope":crate::method_lookup::SELECTION_SCOPE});
+    }
     Ok(result)
+}
+/// Parameters that name one method and accept short owners or incomplete
+/// selectors.
+fn method_selector(name: &str) -> Option<&'static str> {
+    match name {
+        "get_method_source"
+        | "get_call_graph"
+        | "export_source"
+        | "resolve_reference"
+        | "resolve_switch_case_callers" => Some("method_id"),
+        "get_lambda_branch" => Some("caller_method_id"),
+        "find_instantiations" => Some("allocating_method_id"),
+        _ => None,
+    }
+}
+struct MethodSelection {
+    method_id: String,
+    exact: bool,
+    owner_qualified: bool,
+}
+/// A short or unloaded owner resolves like a class selector before overload
+/// selection. Complete signatures of unloaded owners stay exact only where the
+/// tool accepts targets outside the loaded DEX set.
+fn select_method(
+    engine: &NativeEngine,
+    project: &Project,
+    requested: &str,
+    external_allowed: bool,
+) -> Result<MethodSelection> {
+    let id = crate::method_lookup::normalize(requested)?;
+    let owner = crate::method_lookup::owner(&id)?.to_owned();
+    let qualified = if engine.dex_class(&owner).is_some() {
+        id.clone()
+    } else {
+        match resolve_class_id(project, &owner) {
+            Ok(resolved) => format!("{resolved}{}", &id[owner.len()..]),
+            Err(_) if external_allowed && crate::method_lookup::complete(&id) => id.clone(),
+            Err(error) if crate::method_lookup::complete(&id) => return Err(error),
+            Err(error) => bail!(
+                "{error:#}; an incomplete method selector needs a loaded declaring class to list overloads; otherwise supply the exact DEX signature, e.g. {} or {}, with parameter descriptors in parentheses and a return descriptor after ')' (V for void)",
+                crate::method_lookup::EXAMPLE,
+                crate::method_lookup::SMALI_EXAMPLE
+            ),
+        }
+    };
+    let selection = crate::method_lookup::select(&qualified, |name| engine.dex_class(name))?;
+    Ok(MethodSelection {
+        owner_qualified: qualified != id,
+        method_id: selection.method_id,
+        exact: selection.exact,
+    })
 }
 fn class_scoped(name: &str) -> bool {
     matches!(
@@ -1236,6 +1333,7 @@ fn method_source_page(text: String, args: &Value, format: &str) -> Result<Value>
     let start = args["offset"].as_u64().unwrap_or(0) as usize;
     ensure!(start <= total, "Invalid method-local offset");
     let hash = crate::engine::source_identity(&text);
+    check_source_hash(args, &hash)?;
     let result = json!({"text":text.chars().skip(start).collect::<String>(),"format":format,"source_hash":hash,"offset":start,"total_chars":total,"next_offset":Value::Null});
     ensure!(
         serde_json::to_vec(&result)?.len() < MAX_FRAME as usize - 65536,
@@ -1320,7 +1418,17 @@ fn dispatch_resolved(
                 },
             )?;
             let report = engine.method_source(&id, requested_format, cancel)?;
+            let call_sites = (args["include_call_sites"] == true)
+                .then(|| navigation::call_site_table(engine, &id, requested_format == crate::engine::MethodSourceFormat::Dex, &report, cancel))
+                .transpose()?;
             let mut result = method_source_page(report.code.source, args, report.format)?;
+            if let Some(call_sites) = call_sites {
+                result["call_sites"] = call_sites;
+                ensure!(
+                    serde_json::to_vec(&result)?.len() < MAX_FRAME as usize - 65536,
+                    "METHOD_SOURCE_TOO_LARGE: page the text with explicit limit and offset, or omit include_call_sites"
+                );
+            }
             result["method_id"] = json!(id);
             result["requested_method_id"] = json!(requested);
             result["offset_unit"] = json!("Unicode scalar characters relative to this method source");
@@ -1580,7 +1688,7 @@ fn tools_list() -> Value {
         ),
         (
             "find_annotation_usages",
-            "Find explicit exact-descriptor DEX annotation usages on classes, fields, methods and parameters, with decoded values and original IDs. annotation_type accepts FQCN or descriptor. Returns requested_type_present and an ANNOTATION_TYPE_ABSENT warning when the type is absent from loaded DEX tables; zero matches do not exclude obfuscated equivalents. Pagination counts matching annotations; parameter_index excludes receiver.",
+            "Find explicit DEX annotation usages on classes, fields, methods and parameters, with decoded values and original IDs. annotation_type accepts FQCN or descriptor; match_mode selects exact_descriptor (default), simple_name (GET matches retrofit2.http.GET and a relocated ff.a.GET) or prefix (retrofit2.http matches every Retrofit HTTP annotation). Items report their actual annotation_type and the response lists matched_types. Returns requested_type_present and an ANNOTATION_TYPE_ABSENT warning when the type is absent from loaded DEX tables; zero matches do not exclude obfuscated equivalents. Pagination counts matching annotations; parameter_index excludes receiver.",
             vec!["annotation_type"],
             true,
         ),
@@ -1628,7 +1736,7 @@ fn tools_list() -> Value {
         ),
         (
             "find_network_stacks",
-            "Find networking evidence owned by package_prefix (dependencies may be outside it): exact OkHttp calls/contracts, structural maps, and Retrofit service methods including conservatively recovered renamed annotations. Service records retain original annotation descriptors, decoded explicit values, HTTP verb/path or dynamic URL, and header/query parameter indices when proven. Same-method builder/baseUrl/build/create links require one tracked object and a literal URL. Unsupported flows remain unresolved. kind distinguishes api_usage, retrofit_service_method and structural_stack. Runtime activity and external control are not inferred. Offset/limit page records, max 100.",
+            "Find networking evidence owned by package_prefix (dependencies may be outside it): exact OkHttp calls/contracts, structural maps, and Retrofit service methods including conservatively recovered renamed annotations. Obfuscated builds often declare Retrofit service interfaces and SDK endpoints in renamed top-level packages, so omit package_prefix for an app-wide inventory; a RETROFIT_SERVICES_OUTSIDE_PREFIX warning counts Retrofit-annotated classes the prefix excluded. Service records retain original annotation descriptors, decoded explicit values, HTTP verb/path or dynamic URL, and header/query parameter indices when proven. Same-method builder/baseUrl/build/create links require one tracked object and a literal URL. Unsupported flows remain unresolved. kind distinguishes api_usage, retrofit_service_method and structural_stack. @Url/@HeaderMap identify argument-supplied values, not external control. Runtime activity and external control are not inferred. Offset/limit page records, max 100.",
             vec![],
             true,
         ),
@@ -1682,19 +1790,19 @@ fn tools_list() -> Value {
         ),
         (
             "get_all_classes",
-            "List class names and IDs, optionally filtered by query.",
+            "List class names and IDs, optionally filtered by query and package_prefix (one prefix, an array, or obfuscated-root for short R8-style roots such as wr.b$a).",
             vec![],
             true,
         ),
         (
             "search_classes_by_keyword",
-            "Search class names by literal substring (not method bodies).",
+            "Search class names by literal substring (not method bodies). package_prefix scopes the search to one prefix, an array of prefixes, or obfuscated-root (default-package classes and short R8-style roots such as wr.b$a or tk.a).",
             vec!["query"],
             true,
         ),
         (
             "search_code",
-            "mode=identifiers searches original DEX identifiers without decompilation. Method-reference queries use a direct per-DEX method-table filter without building the global index. search_mode=scan and compact projections return bounded resumable pages: pass next_cursor as resume_cursor with unchanged filters; total is null until coverage_complete. projection=summary returns counts and callers returns unique enclosing methods. Package-scoped queries stream only matching classes; global index overflow automatically uses a complete bounded streaming scan. coverage_complete describes requested-scope coverage independently of index_complete. Offset-based index/streaming pages use next_offset; resumable scan pages use next_cursor and expose progressive counts. query matches class/method/field names or full IDs, with exact/contains, case_sensitive, symbol_kind and occurrence filters. Full projection retains instruction evidence. Excludes generated names, locals, comments, strings and runtime dispatch. mode=source (default) searches generated Java and mixed DEX by case-sensitive literal substring. No resources. pagination=hits scans across classes until limit matches (default 100, max 500) or a 20-second between-class time budget; follow cursors until exhausted. Default pagination=classes scans 25 classes (max 500), at most 100 matches per response. Resume using next_offset AND next_source_offset with the same query/package_prefix; no-match is conclusive only after all pages with no errors.",
+            "mode=identifiers searches original DEX identifiers without decompilation. Method-reference queries use a direct per-DEX method-table filter without building the global index. search_mode=scan and compact projections return bounded resumable pages: pass next_cursor as resume_cursor with unchanged filters; total is null until coverage_complete. projection=summary returns counts and callers returns unique enclosing methods. Package-scoped queries stream only matching classes; global index overflow automatically uses a complete bounded streaming scan. coverage_complete describes requested-scope coverage independently of index_complete. Offset-based index/streaming pages use next_offset; resumable scan pages use next_cursor and expose progressive counts. query matches class/method/field names or full IDs, with exact/contains, case_sensitive, symbol_kind and occurrence filters. Full projection retains instruction evidence. Excludes generated names, locals, comments, strings and runtime dispatch. mode=source (default) searches generated Java and mixed DEX by case-sensitive literal substring. No resources. Default pagination=hits returns only matching occurrences, scanning across classes until limit matches (default 100, max 500) or a 20-second between-class time budget; follow next_offset AND next_source_offset until exhausted. pagination=classes scans limit classes per page (default 25, max 500) with at most 100 matches per response. package_prefix takes one prefix, an array of prefixes, or the pseudo-prefix obfuscated-root (default-package classes and classes whose package segments are all at most three characters, such as wr.b$a or tk.a). Resume with the same query, package_prefix and pagination; no-match is conclusive only after all pages with no errors. Generated-source text has no precomputed index: prefer mode=identifiers for class/method/field names and find_string_references for DEX string literals.",
             vec!["query"],
             true,
         ),
@@ -1724,7 +1832,7 @@ fn tools_list() -> Value {
         ),
         (
             "get_class_disassembly",
-            "Read native RDX DEX disassembly, not assemblable Smali.",
+            "Read native RDX DEX disassembly, not assemblable Smali. Class, field, method and parameter annotations are emitted as .annotation <build|runtime|system> <Type> blocks with name = value lines (.end annotation); parameter annotations sit under .param <zero-based index> inside the method. Retrofit @GET/@Url/@Path values, Kotlin metadata and dalvik system annotations are therefore visible at DEX level regardless of obfuscated interface names.",
             vec!["class_id"],
             true,
         ),
@@ -1836,6 +1944,8 @@ fn tools_list() -> Value {
         if name=="find_annotation_usages" {
             properties.insert("element".into(),json!({"type":"string","enum":["all","class","field","method","parameter"],"default":"all"}));
             properties.insert("package_prefix".into(),json!({"type":"string"}));
+            properties.insert("match_mode".into(),json!({"type":"string","enum":["exact_descriptor","simple_name","prefix"],"default":"exact_descriptor",
+                "description":"exact_descriptor compares the complete descriptor; simple_name compares the class name after the last package separator, so GET matches retrofit2.http.GET and relocated copies; prefix matches a literal FQCN or package prefix such as retrofit2.http on the internal name"}));
         }
         if name=="search_resources" {
             properties.insert("scope".into(),json!({"type":"string","enum":["resource_table","assets"],"default":"resource_table","description":"assets searches UTF-8 asset contents and paths, one paginated record per matching file; skipped binary/oversized files are explicit"}));
@@ -1848,6 +1958,9 @@ fn tools_list() -> Value {
         }
         if ["get_method_source","export_source"].contains(&name) {
             properties.insert("format".into(),json!({"type":"string","enum":["auto","dex"],"default":"auto","description":"auto attempts Java with explicit DEX fallback; dex requests native RDX DEX disassembly directly"}));
+        }
+        if name=="get_method_source" {
+            properties.insert("include_call_sites".into(),json!({"type":"boolean","default":false,"description":"Add call_sites: every invoke of this method with its DEX offset, callee, argument registers with proven constants, and the position in this text when the callee is referenced once (rdx-dex text maps every offset)"}));
         }
         if name=="find_field_references" {
             properties.insert("field".into(),json!({"type":"string","minLength":1,"description":"Alias for field_id; accepts Lpkg/Class;->name:type and pkg.Class.name:type"}));
@@ -1884,15 +1997,15 @@ fn tools_list() -> Value {
         if name=="get_manifest_summary" {
             for key in ["component", "host", "scheme", "path", "permission", "query"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
             properties.insert("component_type".into(),json!({"type":"string","enum":["activity","activity-alias","service","receiver","provider"]}));
-            properties.insert("format".into(),json!({"type":"string","enum":["markdown","records","exposure"]}));
+            properties.insert("format".into(),json!({"type":"string","enum":["markdown","records","exposure","counts"],"description":"markdown (default) pages the GUI summary; records, or any filter, returns structured component and permission records; exposure summarizes an unfiltered manifest; counts returns one unpaged object of matching component totals per type and effective exported state"}));
         }
         if ["get_manifest_summary", "get_manifest_components"].contains(&name) {
+            properties.insert("exported_state".into(),json!({"type":"string","enum":["true","false","unresolved"],"description":"Effective resolved android:exported state; selects component records only, so permission records are excluded"}));
             properties.insert("route_match_mode".into(),json!({"type":"string","enum":["exact","contains"],"description":"Case-sensitive literal matching for host, scheme and declared path attributes. If omitted, host/scheme are exact and path uses contains. This searches declarations, not Android runtime URI matching."}));
             properties.insert("projection".into(),json!({"type":"string","enum":["full","compact"],"default":"full"}));
             properties.insert("fields".into(),json!({"type":"string","minLength":1,"description":"Comma-separated record field names; overrides projection. Activity launch fields preserve declared/default/inherited/unresolved state; unknown fields return allowed_fields.","x-allowed-fields":crate::manifest_summary::RECORD_FIELDS}));
         }
         if name=="get_manifest_components" {
-            properties.insert("exported_state".into(),json!({"type":"string","enum":["true","false","unresolved"]}));
             properties.insert("max_bytes".into(),json!({"type":"integer","minimum":1024,"maximum":1048576,"default":32768,"description":"Maximum serialized items bytes; pagination preserves complete records. Metadata is additional."}));
             for key in ["class_name", "host", "scheme", "path", "permission", "query"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
             properties.insert("match_mode".into(),json!({"type":"string","enum":["exact","contains"],"default":"contains","description":"Applies to class_name only; use route_match_mode for host, scheme and path"}));
@@ -1913,15 +2026,25 @@ fn tools_list() -> Value {
             properties.insert("symbol_kind".into(),json!({"type":"string","enum":["all","class","method","field"],"default":"all","description":"Identifier mode only"}));
             properties.insert("occurrence".into(),json!({"type":"string","enum":["all","declaration","reference"],"default":"all","description":"Identifier mode only"}));
 
-            properties.insert("pagination".into(),json!({"type":"string","enum":["classes","hits"],"description":"Source mode defaults to classes; hits pages source occurrences across classes. Identifier mode defaults to hits and accepts only hits."}));
-            properties.insert("package_prefix".into(),json!({"type":"string"}));
+            properties.insert("pagination".into(),json!({"type":"string","enum":["classes","hits"],"default":"hits","description":"hits (default) returns only matching source occurrences across classes until limit matches or a 20-second budget; classes scans limit classes per page. Identifier mode accepts only hits."}));
             properties.insert("source_offset".into(),json!({"type":"integer","minimum":0}));
+        }
+        if ["search_code","get_all_classes","search_classes_by_keyword"].contains(&name) {
+            properties.insert("package_prefix".into(),package_prefix_schema());
+        }
+        if ["get_method_source","get_class_source","get_class_disassembly","get_android_manifest","get_resource_file","get_manifest_summary"].contains(&name) {
+            properties.insert("source_hash".into(),json!({"type":"string","minLength":1,"description":"Optional source_hash from an earlier page of the same document; the request fails with SOURCE_CHANGED when the current text hashes differently"}));
         }
         if ["get_call_graph","get_call_graph_batch"].contains(&name) {
             properties.insert("dispatch_through_superclasses".into(),json!({"type":"boolean","default":false,"description":"Direct callers with call_sites only: include virtual invokes to overridden superclass declarations as possible dispatch; preserve raw target and separate counts"}));
             properties.insert("dispatch_through_interfaces".into(),json!({"type":"boolean","default":false,"description":"Direct callers with call_sites only: include interface-typed invokes as possible dispatch, preserving raw target and separate counts"}));
+            properties.insert("semantic_edges".into(),json!({"type":"boolean","default":false,"description":"Caller queries only, any depth or projection: add labelled inferred edges for every traversed method (lambda_creation from new-instance of callback classes; possible_interface_dispatch and possible_virtual_dispatch from supertype-typed invokes) with separate counts, a 2048-method budget and a completeness report; subsumes and conflicts with dispatch_through_* options"}));
             for key in ["include_source_locations","include_forwarders"] {properties.insert(key.into(),json!({"type":"boolean","default":false,"description":"call_sites only: optional bounded source mapping or verified static-forwarder metadata"}));}
             properties.insert("include_const_args".into(),json!({"type":"boolean","default":false,"description":"call_sites only: conservative CFG constant argument analysis for the returned page; unresolved values are explicit"}));
+            if name=="get_call_graph" {
+                properties.insert("argument_index".into(),json!({"type":"integer","minimum":0,"maximum":255,"description":"call_sites only, with argument_literal: zero-based parameter position (receiver excluded) that must be proven equal to argument_literal; implies include_const_args"}));
+                properties.insert("argument_literal".into(),json!({"type":["string","integer"],"description":"call_sites only, with argument_index: exact string literal or signed 32-bit integer the argument must be proven to carry; call_sites keeps proven matches, excluded_call_sites and unresolved_call_sites bound the negative coverage per page"}));
+            }
             properties.insert("direct_only".into(),json!({"type":"boolean","default":false}));
             properties.insert("projection".into(),json!({"type":"string","enum":["graph","call_sites"],"default":"graph"}));
             for key in ["package_prefix", "class_name", "annotation"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
@@ -1943,8 +2066,15 @@ fn tools_list() -> Value {
             properties.remove("offset");properties.remove("limit");
         }
         if ["get_all_classes","get_all_resource_file_names","get_strings","get_dex_strings"].contains(&name){properties.insert("query".into(),json!({"type":"string"}));}
-        if properties.contains_key("method_id") {
-            for alias in ["method_signature","signature"] { properties.insert(alias.into(),json!({"type":"string","minLength":1,"description":"Alias for method_id; conflicting selectors are rejected"})); }
+        for (canonical, names) in feedback::argument_aliases(name) {
+            for alias in names {
+                let property = match canonical {
+                    "values" => json!({"anyOf":[{"type":"integer"},{"type":"string","minLength":1,"maxLength":32},{"type":"array","minItems":1,"maxItems":64,"items":{"anyOf":[{"type":"integer"},{"type":"string","minLength":1,"maxLength":32}]}}],"description":"Alias for values; one value or a list"}),
+                    "method_ids" => json!({"type":["string","array"],"description":"Alias for method_ids; one method selector or a list"}),
+                    _ => json!({"type":"string","minLength":1,"description":format!("Alias for {canonical}; conflicting values are rejected")}),
+                };
+                properties.insert((*alias).into(),property);
+            }
         }
         let mut schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
         if class_scoped(name) { schema["anyOf"] = json!([{"required":["class_id"]},{"required":["class_name"]}]); }
@@ -1956,15 +2086,18 @@ fn tools_list() -> Value {
         if name=="find_field_references" { schema["anyOf"].as_array_mut().unwrap().push(json!({"required":["field"]})); }
         if name=="export_source" {schema["anyOf"]=json!([{"required":["class_name"]},{"required":["method_id"]}]);}
         if name=="get_resource_value" {schema["anyOf"]=json!([{"required":["resource_id"]},{"required":["resource_name"]}]);}
-        if schema["properties"].get("method_id").is_some() {
-            if schema["required"].as_array().unwrap().iter().any(|v| v=="method_id") {
-                schema["required"].as_array_mut().unwrap().retain(|v|v!="method_id");
-                schema["anyOf"]=json!([{"required":["method_id"]}]);
+        for (canonical, names) in feedback::argument_aliases(name) {
+            if schema["required"].as_array().unwrap().iter().any(|v| v==canonical) {
+                schema["required"].as_array_mut().unwrap().retain(|v| v!=canonical);
+                match schema["anyOf"].as_array_mut() {
+                    None => schema["anyOf"]=json!([{"required":[canonical]}]),
+                    Some(alternatives) => for option in alternatives { option["required"].as_array_mut().unwrap().push(json!(canonical)); },
+                }
             }
             if let Some(alternatives)=schema["anyOf"].as_array_mut() {
                 let originals=alternatives.clone();
-                for option in originals { if option["required"].as_array().is_some_and(|a|a.iter().any(|v|v=="method_id")) {
-                    for alias in ["method_signature","signature"] { let mut variant=option.clone(); for key in variant["required"].as_array_mut().unwrap() { if key=="method_id" { *key=json!(alias); } } alternatives.push(variant); }
+                for option in originals { if option["required"].as_array().is_some_and(|a|a.iter().any(|v|v==canonical)) {
+                    for alias in names { let mut variant=option.clone(); for key in variant["required"].as_array_mut().unwrap() { if key==canonical { *key=json!(*alias); } } alternatives.push(variant); }
                 } }
             }
         }
@@ -1998,7 +2131,7 @@ fn validate(name: &str, args: &Value) -> Result<()> {
 }
 
 fn validate_arguments(name: &str, args: &Value) -> Result<()> {
-    let normalized = feedback::method_aliases(name, args)?;
+    let normalized = feedback::aliases(name, args)?;
     let args = &normalized;
     let tools = tools_list();
     let tool = tools["tools"]
@@ -2009,6 +2142,20 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
         .context("Unknown tool")?;
     let schema = &tool["inputSchema"];
     let object = args.as_object().context("Arguments must be an object")?;
+    // A misspelled parameter is reported before any missing selector, with the
+    // accepted names, so the retry needs no schema lookup.
+    for key in object.keys() {
+        if schema["properties"][key].is_null() {
+            let accepted = schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("Unknown argument: {key}; accepted arguments: {accepted}");
+        }
+    }
     for key in schema["required"].as_array().unwrap() {
         let key = key.as_str().unwrap();
         ensure!(object.contains_key(key), "Missing {key}");
@@ -2032,7 +2179,6 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
     }
     for (key, value) in object {
         let property = &schema["properties"][key];
-        ensure!(!property.is_null(), "Unknown argument: {key}");
         if name == "get_call_graph_batch" && key == "method_ids" {
             let methods = value.as_array().context("method_ids must be an array")?;
             ensure!(
@@ -2044,10 +2190,26 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
             );
         } else if name == "find_integer_references" && key == "values" {
             ensure!(value.is_array(), "values must be an array");
+        } else if name == "get_call_graph" && key == "argument_literal" {
+            ensure!(
+                value
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty() && s.len() <= 4096)
+                    || value.as_i64().is_some_and(|v| i32::try_from(v).is_ok()),
+                "argument_literal must be a nonempty string of at most 4096 bytes or a signed 32-bit integer"
+            );
         } else if name == "resolve_switch_case_callers" && key == "case" {
             ensure!(
                 value.as_i64().is_some_and(|v| i32::try_from(v).is_ok()),
                 "case must be a signed 32-bit integer"
+            );
+        } else if property["type"] == json!(["string", "array"]) {
+            ensure!(
+                value.is_string()
+                    || value
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(Value::is_string)),
+                "{key} must be a string or an array of strings"
             );
         } else if property["type"] == "string" {
             ensure!(value.is_string(), "{key} must be a string");
@@ -2125,8 +2287,29 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
             "include_const_args requires projection=call_sites"
         );
     }
+    if name == "get_call_graph"
+        && (args.get("argument_index").is_some() || args.get("argument_literal").is_some())
+    {
+        ensure!(
+            args.get("argument_index").is_some() && args.get("argument_literal").is_some(),
+            "argument_index and argument_literal must be supplied together"
+        );
+        ensure!(
+            args["projection"] == "call_sites",
+            "argument_index/argument_literal require projection=call_sites"
+        );
+    }
     if name == "find_integer_references" {
         crate::integer_references::validate(args)?;
+    }
+    if [
+        "search_code",
+        "get_all_classes",
+        "search_classes_by_keyword",
+    ]
+    .contains(&name)
+    {
+        crate::package_scope::PackageScope::from_args(args)?;
     }
     if name == "search_code" {
         if args["mode"] == "identifiers" {
@@ -2174,6 +2357,13 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
                     || manifest_filtered(args),
                 "projection and fields require records format or a manifest filter"
             );
+            ensure!(
+                args["format"] != "counts"
+                    || ["projection", "fields", "offset", "limit"]
+                        .iter()
+                        .all(|key| args.get(*key).is_none()),
+                "counts format returns one unpaged object; projection, fields, offset and limit do not apply"
+            );
         }
     }
     if name == "get_manifest_summary" && manifest_filtered(args) {
@@ -2187,6 +2377,17 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
             args["direct_only"] != true || args["depth"].as_u64().unwrap_or(1) == 1,
             "direct_only requires depth=1 when depth is supplied"
         );
+        if args["semantic_edges"] == true {
+            ensure!(
+                args["direction"] == "callers",
+                "semantic_edges requires direction=callers"
+            );
+            ensure!(
+                args["dispatch_through_interfaces"] != true
+                    && args["dispatch_through_superclasses"] != true,
+                "semantic_edges already includes transitive interface and virtual dispatch; omit dispatch_through_interfaces and dispatch_through_superclasses"
+            );
+        }
         ensure!(
             args["projection"] == "call_sites"
                 || (args.get("offset").is_none() && args.get("limit").is_none()),
@@ -2737,6 +2938,165 @@ mod tests {
     }
 
     #[test]
+    fn package_scope_lists_obfuscated_root_and_source_hash_checks_round_trip() {
+        let dir = TestDir::new();
+        let (_server, record, args) = start(&dir, "navigation.apk");
+        let mut listing = args.clone();
+        listing["limit"] = json!(500);
+        let all = remote(&record, "get_all_classes", &listing).unwrap();
+        assert_eq!(all["data"]["next_offset"], Value::Null);
+        let names: Vec<String> = all["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["class_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(names.iter().any(|name| name.starts_with("sample.")));
+        let in_sample = |name: &String| crate::package_scope::prefix_matches("sample", name);
+        let obfuscated = |name: &String| crate::package_scope::is_obfuscated_root(name);
+
+        let mut keyword = args.clone();
+        keyword["query"] = json!("Target");
+        keyword["package_prefix"] = json!("sample");
+        let scoped = remote(&record, "search_classes_by_keyword", &keyword).unwrap();
+        let expected = names
+            .iter()
+            .filter(|name| name.contains("Target") && in_sample(name))
+            .count();
+        assert!(expected > 0);
+        assert_eq!(scoped["data"]["total"], expected);
+        assert_eq!(
+            scoped["data"]["package_scope"]["prefixes"],
+            json!(["sample"])
+        );
+        keyword["package_prefix"] = json!(["sample.", "obfuscated-root"]);
+        let combined = remote(&record, "search_classes_by_keyword", &keyword).unwrap();
+        let expected = names
+            .iter()
+            .filter(|name| name.contains("Target") && (in_sample(name) || obfuscated(name)))
+            .count();
+        assert_eq!(combined["data"]["total"], expected);
+        assert_eq!(combined["data"]["package_scope"]["obfuscated_root"], true);
+        keyword["package_prefix"] = json!("obfuscated-root");
+        let only = remote(&record, "search_classes_by_keyword", &keyword).unwrap();
+        let expected = names
+            .iter()
+            .filter(|name| name.contains("Target") && obfuscated(name))
+            .count();
+        assert_eq!(only["data"]["total"], expected);
+        if expected == 0 {
+            assert!(
+                only["data"]["suggestions"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("sample.Target"))
+            );
+            assert!(
+                only["data"]["suggestions_scope"]
+                    .as_str()
+                    .unwrap()
+                    .contains("ignoring package_prefix")
+            );
+        }
+
+        let mut search = args.clone();
+        search["query"] = json!("return");
+        search["package_prefix"] = json!(["sample"]);
+        let hits = remote(&record, "search_code", &search).unwrap();
+        assert_eq!(hits["data"]["pagination"], "hits");
+        assert_eq!(
+            hits["data"]["total_classes"],
+            names.iter().filter(|name| in_sample(name)).count()
+        );
+        assert!(!hits["data"]["items"].as_array().unwrap().is_empty());
+        assert_eq!(hits["data"]["package_scope"]["prefixes"], json!(["sample"]));
+        search["query"] = json!("NoSuchIdentifierAnywhere");
+        let empty = remote(&record, "search_code", &search).unwrap();
+        assert_eq!(empty["data"]["items"], json!([]));
+        assert_eq!(empty["data"]["exhausted"], true);
+        assert!(
+            empty["data"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("mode=identifiers")
+        );
+        search["query"] = json!("return");
+        search["package_prefix"] = json!("obfuscated-root");
+        let outside = remote(&record, "search_code", &search).unwrap();
+        assert_eq!(
+            outside["data"]["total_classes"],
+            names.iter().filter(|name| obfuscated(name)).count()
+        );
+        assert_eq!(outside["data"]["package_scope"]["obfuscated_root"], true);
+
+        let mut identifiers = args.clone();
+        identifiers["mode"] = json!("identifiers");
+        identifiers["query"] = json!("Target");
+        identifiers["package_prefix"] = json!(["sample", "obfuscated-root"]);
+        let scoped = remote(&record, "search_code", &identifiers).unwrap();
+        assert_eq!(scoped["data"]["execution_mode"], "streaming");
+        assert!(scoped["data"]["total"].as_u64().unwrap() > 0);
+        assert_eq!(
+            scoped["data"]["package_scope"]["prefixes"],
+            json!(["sample"])
+        );
+        assert_eq!(scoped["data"]["package_scope"]["obfuscated_root"], true);
+
+        for (tool, value, message) in [
+            (
+                "search_code",
+                json!(5),
+                "must be a string or an array of strings",
+            ),
+            ("search_code", json!([""]), "must not be empty"),
+            (
+                "search_classes_by_keyword",
+                json!(["com.a, com.b"]),
+                "pass several prefixes as an array",
+            ),
+            (
+                "get_all_classes",
+                json!([7]),
+                "must be a string or an array of strings",
+            ),
+        ] {
+            let mut bad = args.clone();
+            bad["query"] = json!("x");
+            bad["package_prefix"] = value;
+            let error = format!("{:#}", validate(tool, &bad).unwrap_err());
+            assert!(error.contains(message), "{tool}: {error}");
+        }
+
+        let mut source = args.clone();
+        source["class_id"] = json!("sample.Target");
+        source["limit"] = json!(40);
+        let first = remote(&record, "get_class_source", &source).unwrap();
+        assert_eq!(first["data"]["has_more"], true);
+        let note = first["data"]["pagination_note"].as_str().unwrap();
+        assert!(note.contains("optional source_hash argument"), "{note}");
+        assert!(!note.contains("same source_hash"), "{note}");
+        source["offset"] = first["data"]["next_offset"].clone();
+        source["source_hash"] = first["data"]["source_hash"].clone();
+        let second = remote(&record, "get_class_source", &source).unwrap();
+        assert_eq!(second["data"]["source_hash"], first["data"]["source_hash"]);
+        assert_eq!(second["data"]["offset"], first["data"]["next_offset"]);
+        source["source_hash"] = json!("stale");
+        let error = format!(
+            "{:#}",
+            remote(&record, "get_class_source", &source).unwrap_err()
+        );
+        assert!(error.contains("SOURCE_CHANGED"), "{error}");
+        let mut method = args.clone();
+        method["method_id"] = json!("sample.Target.doubleValue(I)I");
+        method["source_hash"] = json!("stale");
+        let error = format!(
+            "{:#}",
+            remote(&record, "get_method_source", &method).unwrap_err()
+        );
+        assert!(error.contains("SOURCE_CHANGED"), "{error}");
+    }
+
+    #[test]
     fn code_search_resumes_and_manifest_summary_keeps_project_identity() {
         let dir = TestDir::new();
         let (_server, record, args) = start(&dir, "navigation.apk");
@@ -2755,6 +3115,7 @@ mod tests {
         let mut query = args.clone();
         query["query"] = json!("return");
         query["limit"] = json!(1);
+        query["pagination"] = json!("classes");
         let mut found = Vec::new();
         for _ in 0..100 {
             let result = remote(&record, "search_code", &query).unwrap();
@@ -2768,6 +3129,12 @@ mod tests {
             query["source_offset"] = result["data"]["next_source_offset"].clone();
         }
         assert!(!found.is_empty());
+        let mut default_mode = args.clone();
+        default_mode["query"] = json!("return");
+        let hits = remote(&record, "search_code", &default_mode).unwrap();
+        assert_eq!(hits["data"]["pagination"], "hits");
+        assert_eq!(hits["data"]["limit"], 100);
+        assert!(!hits["data"]["items"].as_array().unwrap().is_empty());
         for hit in found {
             let mut source_args = args.clone();
             source_args["class_id"] = hit["class_id"].clone();
@@ -3155,46 +3522,73 @@ mod tests {
         }
     }
     #[test]
-    fn call_graph_incomplete_selectors_return_candidates_in_both_projections() {
+    fn call_graph_incomplete_selectors_select_unique_overloads_or_list_candidates() {
         let dir = TestDir::new();
         let (_server, record, mut args) = start(&dir, "navigation.apk");
         for projection in [None, Some("graph"), Some("call_sites")] {
             if let Some(projection) = projection {
                 args["projection"] = json!(projection);
             }
-            for method in [
-                "sample.Target.doubleValue",
-                "Lsample/Target;->doubleValue",
-                "sample.Target.doubleValue(I)",
-                "Lsample/Target;->doubleValue(I)",
-            ] {
+            for method in ["sample.Target.doubleValue", "Lsample/Target;->doubleValue"] {
                 args["method_id"] = json!(method);
                 validate("get_call_graph", &args).unwrap();
                 let error = remote(&record, "get_call_graph", &args)
                     .unwrap_err()
                     .to_string();
+                assert!(error.contains("AMBIGUOUS_METHOD"), "{error}");
                 assert!(error.contains("sample.Target.doubleValue(I)I"), "{error}");
-                assert!(error.contains("no overload was selected"), "{error}");
                 assert!(
-                    error.contains("Lpkg/Class;->method(Ljava/lang/String;)V"),
+                    error.contains(
+                        "sample.Target.doubleValue(Ljava/lang/String;)Ljava/lang/String;"
+                    ),
                     "{error}"
                 );
-                assert!(
-                    error.contains("a return descriptor after ')' (V for void)"),
-                    "{error}"
-                );
+                assert!(error.contains("\"candidate_count\":2"), "{error}");
             }
             args["method_id"] = json!("sample.Target.doubleValue(I)I");
-            let dotted = remote(&record, "get_call_graph", &args).unwrap();
-            args["method_id"] = json!("Lsample/Target;->doubleValue(I)I");
-            let smali = remote(&record, "get_call_graph", &args).unwrap();
-            for key in ["nodes", "edges", "items"] {
-                assert_eq!(dotted["data"][key], smali["data"][key], "{key}");
+            let exact = remote(&record, "get_call_graph", &args).unwrap();
+            assert_eq!(exact["data"]["method_selection"]["status"], "exact");
+            assert_eq!(exact["data"]["method_selection"]["owner_qualified"], false);
+            for method in [
+                "sample.Target.doubleValue(I)",
+                "Lsample/Target;->doubleValue(I)",
+                "Target.doubleValue(I)",
+                "Target.doubleValue(I)I",
+                "Lsample/Target;->doubleValue(I)I",
+            ] {
+                args["method_id"] = json!(method);
+                let selected = remote(&record, "get_call_graph", &args).unwrap();
+                for key in ["nodes", "edges", "items", "root_method_id"] {
+                    assert_eq!(exact["data"][key], selected["data"][key], "{method} {key}");
+                }
+                let selection = &selected["data"]["method_selection"];
+                assert_eq!(selected["data"]["requested_method_id"], method);
+                assert_eq!(
+                    selected["data"]["method_id"],
+                    "sample.Target.doubleValue(I)I"
+                );
+                assert_eq!(selection["method_id"], "sample.Target.doubleValue(I)I");
+                assert_eq!(
+                    selection["status"],
+                    if method.ends_with('I') {
+                        "exact"
+                    } else {
+                        "unique_candidate"
+                    },
+                    "{method}"
+                );
+                assert_eq!(
+                    selection["owner_qualified"],
+                    method.starts_with("Target."),
+                    "{method}"
+                );
             }
             args["method_id"] = json!("Lpkg/Class;->m()");
             let error = remote(&record, "get_call_graph", &args)
                 .unwrap_err()
                 .to_string();
+            assert!(error.contains("SYMBOL_NOT_FOUND"), "{error}");
+            assert!(error.contains("pkg.Class"), "{error}");
             assert!(
                 error.contains("pkg.Class.method(Ljava/lang/String;)V"),
                 "{error}"
@@ -3207,6 +3601,17 @@ mod tests {
                 error.contains("a return descriptor after ')' (V for void)"),
                 "{error}"
             );
+            // Complete external selectors keep their call-graph semantics.
+            args["method_id"] = json!("Lpkg/Class;->m()V");
+            let external = remote(&record, "get_call_graph", &args).unwrap();
+            assert_eq!(external["data"]["method_selection"]["status"], "exact");
+            assert_eq!(external["data"]["root_method_id"], "pkg.Class.m()V");
+            args["method_id"] = json!("Target.missing");
+            let error = remote(&record, "get_call_graph", &args)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("SYMBOL_NOT_FOUND"), "{error}");
+            assert!(error.contains("get_methods_of_class"), "{error}");
         }
     }
 
@@ -3241,12 +3646,123 @@ mod tests {
             let response = remote(&record, tool, &args).unwrap();
             assert_eq!(response["identity"]["project_id"], scope["project_id"]);
         }
+        // Simple-name and prefix annotation queries reach the DEX annotation
+        // directories without knowing the (possibly renamed) package.
+        let mut args = scope.clone();
+        args.as_object_mut().unwrap().extend(
+            json!({"annotation_type":"Signature","match_mode":"simple_name"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        validate("find_annotation_usages", &args).unwrap();
+        let simple = remote(&record, "find_annotation_usages", &args).unwrap();
+        assert_eq!(simple["data"]["match_mode"], "simple_name");
+        assert_eq!(
+            simple["data"]["matched_types"],
+            json!(["Ldalvik/annotation/Signature;"])
+        );
+        assert!(simple["data"]["total"].as_u64().unwrap() >= 1, "{simple}");
+        let mut args = scope.clone();
+        args.as_object_mut().unwrap().extend(
+            json!({"annotation_type":"dalvik.annotation","match_mode":"prefix","element":"class"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let prefix = remote(&record, "find_annotation_usages", &args).unwrap();
+        assert_eq!(prefix["data"]["annotation_type"], "dalvik/annotation");
+        assert!(
+            prefix["data"]["matched_types"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("Ldalvik/annotation/InnerClass;")),
+            "{prefix}"
+        );
+        assert!(
+            prefix["data"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["element"] == "class"),
+            "{prefix}"
+        );
+        assert!(
+            validate(
+                "find_annotation_usages",
+                &json!({"instance_id":"i","project_id":"p","annotation_type":"GET","match_mode":"fuzzy"})
+            )
+            .is_err()
+        );
         let mut args = scope.clone();
         args.as_object_mut().unwrap().extend(json!({"method_id":"sample.Target.doubleValue(I)I","direction":"callers","projection":"call_sites","include_const_args":true}).as_object().unwrap().clone());
         let result = remote(&record, "get_call_graph", &args).unwrap();
         assert_eq!(
             result["data"]["call_sites"][0]["constant_arguments"]["status"],
             "analyzed"
+        );
+        for (literal, matched, excluded) in [(json!(21), 1, 0), (json!(22), 0, 1)] {
+            let mut args = scope.clone();
+            args.as_object_mut().unwrap().extend(json!({"method_id":"sample.Target.doubleValue(I)I","direction":"callers","projection":"call_sites","argument_index":0,"argument_literal":literal}).as_object().unwrap().clone());
+            validate("get_call_graph", &args).unwrap();
+            let data = &remote(&record, "get_call_graph", &args).unwrap()["data"];
+            assert_eq!(data["argument_filter"]["page_total"], 1);
+            assert_eq!(data["argument_filter"]["matched"], matched);
+            assert_eq!(data["argument_filter"]["excluded"], excluded);
+            assert_eq!(data["argument_filter"]["unresolved"], 0);
+            assert_eq!(data["call_sites"].as_array().unwrap().len(), matched);
+            assert_eq!(
+                data["excluded_call_sites"].as_array().unwrap().len(),
+                excluded
+            );
+            assert_eq!(data["matching_total"], 1);
+            if matched == 1 {
+                assert_eq!(
+                    data["call_sites"][0]["constant_arguments"]["arguments"][0]["value"],
+                    21
+                );
+            } else {
+                assert_eq!(data["excluded_call_sites"][0]["argument"]["value"], 21);
+                assert_eq!(
+                    data["excluded_call_sites"][0]["caller_method_id"],
+                    "sample.Caller.compute()I"
+                );
+            }
+        }
+        for (extra, message) in [
+            (json!({"argument_index":0}), "supplied together"),
+            (json!({"argument_literal":"token"}), "supplied together"),
+            (
+                json!({"argument_index":0,"argument_literal":"token","projection":"graph"}),
+                "require projection=call_sites",
+            ),
+            (
+                json!({"argument_index":0,"argument_literal":"","projection":"call_sites"}),
+                "nonempty string",
+            ),
+            (
+                json!({"argument_index":0,"argument_literal":true,"projection":"call_sites"}),
+                "signed 32-bit integer",
+            ),
+        ] {
+            let mut args = scope.clone();
+            args.as_object_mut().unwrap().extend(
+                json!({"method_id":"sample.Target.doubleValue(I)I","direction":"callers"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let error = format!("{:#}", validate("get_call_graph", &args).unwrap_err());
+            assert!(error.contains(message), "{error}");
+        }
+        let mut args = scope.clone();
+        args.as_object_mut().unwrap().extend(json!({"method_ids":["sample.Target.doubleValue(I)I"],"argument_index":0,"argument_literal":21}).as_object().unwrap().clone());
+        assert!(
+            format!("{:#}", validate("get_call_graph_batch", &args).unwrap_err())
+                .contains("Unknown argument: argument_index")
         );
         let out =
             std::env::temp_dir().join(format!("rdx-reviewer-service-{}", random_id().unwrap()));
@@ -3335,7 +3851,7 @@ mod tests {
     }
 
     // A compiled XML fixture verifies the endpoint decodes the archive itself.
-    fn component_manifest_binary() -> Vec<u8> {
+    pub(super) fn component_manifest_binary() -> Vec<u8> {
         fn words(values: &[u32]) -> Vec<u8> {
             values.iter().flat_map(|v| v.to_le_bytes()).collect()
         }

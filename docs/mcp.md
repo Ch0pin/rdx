@@ -44,6 +44,24 @@ stops its old service. Standalone/headless services load their own project once.
    `class_name`. Restarting the server changes project identity;
    stale project requests are rejected.
 
+Parameter aliases: every tool advertises the alias names it accepts in its
+schema, and an alias is rewritten to its canonical parameter before validation,
+so the pair never changes meaning. `find_string_references` takes `query` and
+accepts `value`, `string`, `literal`, or `text`; `find_type_references` and
+`find_layout_references` take `class_name` and accept `type_name`, `class_id`,
+or `type`; `find_integer_references` takes `values` and accepts `value` (one
+value or a list); `find_config_key_consumers` takes `key` and accepts `query`,
+`value`, or `config_key`; the `search_*` tools and the optional `query` of
+`get_all_classes`, `get_all_resource_file_names`, `get_strings`, and
+`get_dex_strings` accept `keyword`, `text`, or `value`; method tools accept
+`method_signature` or `signature` for `method_id`; and `get_call_graph_batch`
+accepts `method_id`, `method_signature`, or `signature` for `method_ids`,
+wrapping one selector into a one-element list. An alias supplied alongside its
+canonical parameter must carry the same value; otherwise the call fails with
+`CONFLICTING_ARGUMENTS` (method selectors: `CONFLICTING_METHOD_SELECTORS`). An
+unknown parameter name fails with `Unknown argument: <name>; accepted
+arguments: ...`, listing every accepted name, before any missing-selector check.
+
 A missing FQCN returns `SYMBOL_NOT_FOUND` with JSON-formatted `candidates`,
 `candidate_count`, and `candidates_truncated`. Suggestions list loaded classes
 with the same exact simple name, sorted by FQCN, capped at 20 IDs and 16 KiB.
@@ -64,13 +82,45 @@ suggestions preserve exact FQCN and unique short-name selection rules.
 | DEX analysis | `find_field_references`, `get_lambda_branch`, `resolve_switch_case_callers`, `find_network_stacks`, `find_config_key_consumers`, `find_instantiations`, `find_integer_references`, `find_annotation_usages`, `find_type_references`, `find_webview_chooser_flows` |
 | DEX strings | `get_dex_strings` (strings from the DEX containing `class_id`), `find_string_references` |
 
-`search_classes_by_keyword` searches literal class-name substrings only.
+`search_classes_by_keyword` searches literal class-name substrings only; its
+`package_prefix` accepts one prefix, an array of prefixes, or `obfuscated-root`.
 `search_code` searches generated Java and mixed DEX source using a case-sensitive
-literal query by default; `mode: "identifiers"` searches the native symbol index.
+literal query by default, paging matching occurrences across classes;
+`mode: "identifiers"` searches the native symbol index.
 Use `search_resources` for decoded ARSC names and values across configurations.
 Class identifiers currently follow the native engine's class-name identity.
 Disassembly is `rdx-dex`, not assemblable Smali. Java source can contain explicit
 DEX fallbacks. Method IDs retain full DEX signatures.
+
+`rdx-dex` output emits DEX annotations as directives next to their owners, so
+annotation values are readable even when class, interface, or annotation names
+are obfuscated. Class annotations follow `.implements`; field annotations follow
+the `.field` line; method annotations open the method body; parameter annotations
+sit under `.param <index>` (zero-based, receiver excluded) and close with
+`.end param`. Each block is `.annotation <build|runtime|system> <Type>`, one
+`name = value` line per element, and `.end annotation`. Values render strings
+quoted and escaped, numbers with `t`/`s`/`L`/`f` suffixes for byte/short/long/
+float, types as dotted names, enum constants as field IDs, arrays in braces, and
+nested annotations as `@Type(name = value)`. Strings beyond 2048 characters,
+arrays beyond 64 items and nesting beyond 8 levels are cut with an explicit
+`/* +N ... */` or `@<nesting limit>` marker; invalid DEX indices print as
+`<invalid s index N>`. A Retrofit service therefore shows its `@GET`/`@Url`/
+`@Path` values in `get_class_disassembly` and in `get_method_source` with
+`format: "dex"`, and `dalvik.annotation.Signature` exposes generic signatures.
+
+```text
+.method ff.g.a(Ljava/lang/String;)Lretrofit2/Call; // access=0x401
+    .annotation runtime retrofit2.http.GET
+        value = "v1/profile/{id}"
+    .end annotation
+    .param 0 // zero-based, receiver excluded; type Ljava/lang/String;
+        .annotation runtime retrofit2.http.Path
+            value = "id"
+        .end annotation
+    .end param
+    // No DEX code item (abstract/native declaration).
+.end method
+```
 
 List responses contain `next_offset`; text responses use Unicode character
 `offset` and `next_offset`. Continue until `next_offset` is null. Text paging
@@ -169,20 +219,49 @@ selection remains exact.
 Use `direction: "callers"` to trace into a method, `"callees"` (default) to
 follow outgoing calls, or `"both"`. Edges always point from caller to callee.
 
-An incomplete selector such as `sample.Target.doubleValue` or
-`sample.Target.doubleValue(I)` returns bounded same-name declaration candidates,
-including their parameter and return descriptors. Candidates come from the
-requested class and known superclass chain; constructors use only their own
-class. Retry with an exact candidate. No overload is selected automatically.
-For example, `Lpkg/Class;->m()` is incomplete because it omits the return
-descriptor; a void method is `Lpkg/Class;->m()V` or `pkg.Class.m()V`.
-The error includes examples of both formats and explains the required return
-descriptor, even when no declaration candidates are available.
+Method selectors may be short. A missing return descriptor, as in
+`sample.Target.doubleValue(I)`, selects the one declaration with that name and
+those parameters; a bare name such as `sample.Caller.compute` selects the one
+declaration with that name. Candidates come from the requested class and its
+known superclass chain (up to 256 types); constructors use only their own
+class. The response then carries `requested_method_id`, the selected
+`method_id`, and `method_selection` with `status` (`exact` or
+`unique_candidate`), `owner_qualified`, and the selection `scope`. A short or
+unique simple-name owner such as `Target.doubleValue(I)I` or
+`LandingActivity.m2` resolves like a class selector first; ambiguous short
+owners fail with `AMBIGUOUS_CLASS`. Several matching overloads fail with
+`AMBIGUOUS_METHOD` and list them with parameter and return descriptors, so one
+can be retried exactly; no overload is chosen silently. No match fails with
+`SYMBOL_NOT_FOUND` and the bounded same-name declarations. Complete signatures
+of classes outside the loaded DEX set keep their external semantics. An
+incomplete selector for an unloaded class cannot be completed; the error shows
+both ID formats and the required return descriptor, for example
+`Lpkg/Class;->m()V` or `pkg.Class.m()V` for a void method.
+`get_call_graph_batch` applies the same selection per entry; an ambiguous entry
+is reported in that entry's `error` and counted in `failed_queries` while the
+other entries proceed.
 
 The response includes numbered nodes, method IDs, distance from the root,
 component classifications, available declarations, call-site counts, and
 component-path highlights. `truncated` reports the 5,000-node/20,000-edge cap;
-`depth_boundary_reached` reports that nodes reached the requested depth.
+`depth_boundary_reached` is true when some traversed method lies at the
+requested depth, so its own neighbors were not expanded and deeper
+relationships may exist; false means every reachable method in the requested
+direction was expanded before the limit (`depth_boundary_semantics` repeats
+this). Every response also carries `resolved_root_method_id`: when `method_id`
+names a member its class inherits rather than declares, traversal uses the
+declaring ancestor, `root_resolution_note` says so, and callers include invokes
+naming any class that resolves to that declaration. `root_body` is `code`,
+`no_code` (abstract or native declaration) or `not_loaded` (class outside the
+DEX set). Graph node IDs for non-root methods are declaring methods resolved
+through known superclasses (`node_id_semantics`).
+
+Method bodies whose instructions cannot be decoded (reserved opcodes, truncated
+instructions or invalid symbol indexes) do not pass DEX verification and
+contribute no calls. They never fail a query silently: `scan_complete` is false
+and `undecodable_methods` lists `count` plus up to 25 `samples` with the method
+and the decode error. The scope is every loaded method for caller or
+bidirectional queries and only the reachable bodies for callee queries.
 The graph is returned as one response, without pagination. The first caller or
 bidirectional query builds a project-owned disk invoke index. Subsequent queries
 reuse its per-direction shards. Candidates are verified against the original
@@ -192,7 +271,7 @@ a fresh cache. Failed or cancelled builds can be retried. Callee-only queries
 walk reachable methods directly.
 
 `get_instance_info.invoke_index` reports `state`, `scanned_classes`,
-`total_classes`, `invoke_sites`, and `active_batches`. Poll it from the same MCP
+`total_classes`, `invoke_sites`, `undecodable_methods`, and `active_batches`. Poll it from the same MCP
 connection while a query runs. Cancellation is cooperative during construction,
 shard scans, traversal, and between method reconstructions. The gateway's 120-second
 request deadline still applies; a cancelled build publishes no partial index.
@@ -222,16 +301,23 @@ and `direct_matching_total` counts only depth-1 matches. Method selectors accept
 The compact projection returns one record per DEX call site, including
 `caller_method_id`, `caller_signature`, `callee_method_id`, and
 `call_site_offset` in DEX code units. Multiple calls in the same caller remain
-separate. Evidence fields include `raw_callee_method_id`, `dex_entry`,
+separate. Evidence fields include `raw_callee_method_id` (the operand exactly as
+encoded), `resolved_callee_method_id` (the declaring method reached through
+known superclasses, or the raw operand when nothing resolves), `dex_entry`,
 `method_index` (local to that DEX), `invoke_instruction` (readable raw invoke), `invoke_opcode`, `invoke_words` (numeric
-16-bit instruction words), and `caller_code_offset_bytes`. The raw operand is
+16-bit instruction words), and `caller_code_offset_bytes`, the `code_off` of the
+caller's `code_item` header inside `dex_entry`. The instruction array starts 16
+bytes after that header, so the invoke lives at
+`caller_code_offset_bytes + 16 + 2 * call_site_offset` within the DEX file. The raw operand is
 resolved using the caller's own DEX table. `matching_total` counts all matching records; follow `next_offset`
 until null. `source_hash` identifies the complete ordered matching record set
 and stays stable across pages. Compact enumeration is independent of the graph node/edge caps.
 `offset` and `limit` apply only to `projection: "call_sites"` (maximum 500).
 
-Optional filters combine with AND: `package_prefix` matches package boundaries,
-`class_name` is an exact FQCN, `annotation` matches a method or class annotation
+Optional filters combine with AND: `package_prefix` matches package boundaries
+(`app`, `app.` and `app/` are equivalent; a bare `.` is rejected rather than
+matching nothing), `class_name` is an exact class in FQCN, slash or descriptor
+form (`app.Root`, `app/Root`, `Lapp/Root;`), `annotation` matches a method or class annotation
 by descriptor or FQCN, and `component_type` is `activity`, `service`, `receiver`,
 or `provider`, based on known DEX ancestry. Filters select neighboring method
 declarations after depth-bounded traversal; intermediate methods remain
@@ -241,9 +327,15 @@ the callee operand declared at the DEX instruction even when hierarchy lookup
 resolves it to an inherited implementation.
 
 This is a static graph. It resolves inherited aliases through known superclass
-metadata, but does not infer runtime virtual targets, reflection or Intent
-routing. External method bodies cannot be expanded. The GUI graph continues
-to follow outgoing calls; direction selection is currently an MCP feature.
+metadata, but not through interface default methods: an invoke naming an
+interface member keeps that interface as its resolved callee. It does not infer
+runtime virtual targets, reflection or Intent routing. `invoke-polymorphic`
+sites appear with their declared `MethodHandle` target and no argument
+analysis; `invoke-custom` (lambda bootstrap) instructions are not call sites, so
+lambda bodies are reached only through their synthetic methods. External method
+bodies cannot be expanded. The GUI graph follows the same rules and a test keeps
+its nodes, edges and dispatch suggestions identical to the `graph` projection;
+direction selection is currently an MCP feature.
 
 `find_direct_subclasses` follows immediate superclass edges. Use `find_implementations` with `class_id` to list concrete direct and indirect implementations of an interface or class; it supports the same instance/project scope and offset/limit pagination.
 
@@ -268,14 +360,22 @@ classes retain their usual Java header.
 For paged text, `returned_chars`, `page_end`, `has_more`, and
 `full_text_in_response` describe the returned slice. `full_text_in_response: true`
 means this response contains the complete document. Follow `next_offset` until
-null and retain `source_hash`; a terminal page starting after zero is still a
-slice. Coverage remains class-wide even when only a small source slice is returned.
+null with the same selector; a terminal page starting after zero is still a
+slice. `source_hash` identifies the complete document, not a request cursor.
+Pass it back as the optional `source_hash` argument of `get_class_source`,
+`get_method_source`, `get_class_disassembly`, `get_android_manifest`,
+`get_resource_file` or `get_manifest_summary` to fail with `SOURCE_CHANGED`
+instead of paging a document that changed underneath. Coverage remains
+class-wide even when only a small source slice is returned.
 
 ### Method source
 
-`get_method_source` requires `instance_id`, `project_id`, and either an exact
+`get_method_source` requires `instance_id`, `project_id`, and either a
 `method_id` or `class_name` plus `method_name` (optional `descriptor`). For
-example, `sample.Target.doubleValue(I)I` selects that overload alone.
+example, `sample.Target.doubleValue(I)I` selects that overload alone. Short
+selectors such as `Target.doubleValue(I)` or `Caller.compute` resolve as
+described for `get_call_graph`; the response echoes `requested_method_id`, the
+selected `method_id`, and `method_selection`.
 
 The response renders only the requested method. It contains `method_id`, `text`,
 `format` (`java` or `rdx-dex`), `requested_format` (`auto` or `dex`),
@@ -309,30 +409,63 @@ method. If a complete response exceeds the transport budget, request explicit
 pages using the same method and project IDs. Oversized responses report an
 error rather than silently truncating source.
 
+`include_call_sites: true` adds a `call_sites` table that ties the rendered
+text back to the bytecode. `items` lists every invoke instruction of the
+selected method in DEX order (bounded to 500; `total` and `truncated` report
+the rest) with `call_site_offset` (16-bit code units, the same unit as
+`get_call_graph` call sites and the rdx-dex line markers),
+`call_site_offset_hex`, `dispatch`, `callee_method_id`, `constant_arguments`,
+and `source_mapping`. `constant_arguments` names each argument's DEX `register`
+and the string or 32-bit constant proven to reach it on every path, so a folded
+Java argument such as `f3(true, true)` can be traced to `const/4 v0, 1` at a
+specific offset; anything not proven stays `unresolved`. `source_mapping`
+places the invoke in this response's text: `exact_dex_line` for rdx-dex text,
+`unique_target_reference` when the callee is referenced exactly once in both
+the DEX body and the Java text, otherwise `ambiguous` with up to eight
+`candidate_locations`. The Java mapping is a structural association, not an
+instruction emission trace; `reconstruction_status` reports `decompiled`,
+`dex-requested`, or `dex-fallback`. The table covers the whole method
+regardless of text paging. To find the callers that pass a specific constant,
+use `get_call_graph` with `direction: "callers"` and `argument_literal`.
+
 ## Bounded code search
 
-Set `pagination: "hits"` to page by occurrences across the APK. `limit` then
-bounds matches (default 100, maximum 500), rather than classes. The server scans
-until that limit, the end of the filtered class list, or a 20-second budget
-checked between class renders. One expensive class may exceed that budget;
-cancellation remains cooperative. Resume with **both** `next_offset` and
-`next_source_offset`, using the same query, prefix and pagination mode.
-`scan_boundary` explains each page boundary; `scanned_classes` and `total_classes`
-show progress. `page_error_count` includes all failed renders even when the
-bounded `errors` detail list is truncated. This mode reduces round trips;
-uncached generated-source search still needs Java reconstruction. For DEX string
-literals use `find_string_references`, which indexes literal operands directly.
+Source-mode `search_code` pages by occurrences across the APK by default
+(`pagination: "hits"`). `limit` bounds matches (default 100, maximum 500), not
+classes, so a page is never empty while matches remain. The server scans until
+that limit, the end of the filtered class list, or a 20-second budget checked
+between class renders. One expensive class may exceed that budget; cancellation
+remains cooperative. Resume with **both** `next_offset` and `next_source_offset`,
+using the same query, `package_prefix` and pagination mode. `scan_boundary`
+explains each page boundary; `scanned_classes` and `total_classes` show
+progress. `page_error_count` includes all failed renders even when the bounded
+`errors` detail list is truncated. Generated-source text has no precomputed
+index: uncached search still reconstructs each scanned class. An
+identifier-shaped query on an empty or unfinished page carries a `hint` naming
+`mode: "identifiers"`, which searches DEX class, method and field names from the
+symbol index without decompiling. For DEX string literals use
+`find_string_references`, which indexes literal operands directly.
 
-The default `pagination: "classes"` preserves the previous contract:
+`package_prefix` accepts a single prefix, an array of prefixes, or the
+pseudo-prefix `obfuscated-root` on `search_code` (both modes), `get_all_classes`
+and `search_classes_by_keyword`. Each prefix matches the named class itself or
+classes below it at a `.` boundary; entries combine with OR and trailing dots are
+ignored. `obfuscated-root` selects default-package classes and classes whose
+every package segment has at most three characters, such as `wr.b$a`, `tk.a` or
+`a.b.C`: a superset heuristic for R8/ProGuard package renaming that also admits
+short conventional roots such as `com.a`. Pair it with the application prefix,
+for example `["com.example.app", "obfuscated-root"]`, to cover relocated classes
+that a single prefix misses. Responses echo the applied scope as
+`package_scope`. Other scoped tools still take one string prefix.
 
-`search_code` requires `instance_id`, `project_id` and `query`. Optionally set
-`package_prefix` (package boundary match), `offset` (class index), `limit`
-(classes to scan, default 25, maximum 500), and `source_offset` (Unicode character
-offset inside the first class). Each response contains at most 100 matches.
-Resume with both `next_offset` and `next_source_offset`, keeping the query and
-package prefix unchanged. Continue until `exhausted` is true, and check every
-page's `errors` before interpreting an empty result as absence. A failed class
-is reported and does not silently count as successfully searched.
+`pagination: "classes"` keeps the class-window contract: `offset` is a class
+index, `limit` counts classes to scan (default 25, maximum 500), and
+`source_offset` is the Unicode character offset inside the first class. Each
+response contains at most 100 matches. Resume with both `next_offset` and
+`next_source_offset`, keeping the query, scope and pagination unchanged. Continue
+until `exhausted` is true, and check every page's `errors` before interpreting an
+empty result as absence. A failed class is reported and does not silently count
+as successfully searched.
 
 Hits include `class_id`, `source_hash`, Unicode `start`/`end`, one-based `line`,
 and a bounded snippet. Source hashes identify generated text; the response
@@ -412,6 +545,19 @@ within the same intent-filter. Records preserve separate data elements and
 relative-filter groups, including their declared allow/block attributes.
 `matching_filter_indexes` identifies matching filters. These are declaration
 queries; runtime route delivery and callback reachability require separate proof.
+
+`exported_state: "true"`, `"false"` or `"unresolved"` selects component records by
+their effective resolved `android:exported` state and excludes permission records.
+`format: "counts"` returns one unpaged object instead of records: `components`
+carries overall and per-`component_type` totals split into `exported`,
+`non_exported` and `unresolved_exported` buckets, `permissions` counts matching
+permission records by declaration tag, and `source_hash` identifies the same
+filtered record set, so a later `format: "records"` query with identical filters
+and default projection pages exactly the counted records. `projection`, `fields`,
+`offset` and `limit` do not apply to counts. Whole-manifest `coverage` accompanies
+every structured response for comparison with filtered counts. On manifests with
+hundreds of components, start with counts, then page `exported_state: "true"` or
+one `component_type` with `projection: "compact"` or an explicit `fields` list.
 
 Both tools resolve `@string`, `@integer`, and `@bool` references (including
 package-qualified names and numeric IDs) before filtering, using the default
@@ -814,14 +960,20 @@ format in both directions.
 parameter descriptor is accepted in both forms: `pkg.Class.method:(I)V` and
 `Lpkg/Class;->method:(I)V`. This separator is normalized to the canonical ID
 without guessing an overload. The response reports the canonical `method_id`
-and the original `requested_method_id`. A wrong/missing descriptor returns
-`SYMBOL_NOT_FOUND` with JSON-formatted `candidates`, `candidate_count` and
-`candidates_truncated` in the error message. Candidates are actual same-name
-declarations in the requested class; exact parameter matches rank first when
-only the return type differs. At most 20 IDs / 16 KiB of candidate text are
-included. Use `get_methods_of_class` for the full list. No candidate is selected
-automatically. Unknown names return an empty candidate list. This assistance is
-for source-method lookup; call graphs retain their external-symbol semantics.
+and the original `requested_method_id`. A missing return descriptor or a bare
+method name selects the one matching declaration
+(`method_selection.status: "unique_candidate"`); several matches return
+`AMBIGUOUS_METHOD` and a wrong descriptor returns `SYMBOL_NOT_FOUND`, both with
+JSON-formatted `candidates`, `candidate_count`, `candidates_truncated`, `scope`,
+and a `hint` in the error message. Candidates are actual same-name declarations
+in the requested class and its known superclass chain; exact parameter matches
+rank first when only the return type differs. At most 20 IDs / 16 KiB of
+candidate text are included. Use `get_methods_of_class` for the full list.
+Unknown names return an empty candidate list. The same selection applies to
+`get_call_graph`, `export_source`, `resolve_reference`,
+`resolve_switch_case_callers`, `get_lambda_branch` (`caller_method_id`), and
+`find_instantiations` (`allocating_method_id`); call graphs retain their
+external-symbol semantics for complete signatures.
 
 
 ## Integer constant references
@@ -987,27 +1139,46 @@ pagination:
 {"instance_id":"INSTANCE","project_id":"PROJECT","mode":"identifiers","query":"ServerDrivenActionService","symbol_kind":"class","occurrence":"reference","package_prefix":"com.mercadolibre.android.sc_feed","limit":500}
 ```
 
-Pass that object to `search_code`. Source-mode `limit` counts classes by default
-(25, maximum 500); `pagination: "hits"` instead pages source matches.
+Pass that object to `search_code`. Source-mode `limit` counts matching
+occurrences by default (`pagination: "hits"`, 100, maximum 500);
+`pagination: "classes"` instead counts classes to scan (25, maximum 500).
 
 `find_annotation_usages` accepts `annotation_type` as an FQCN or DEX descriptor,
-`element: "all"|"class"|"field"|"method"|"parameter"`, and `package_prefix`.
-Results include owner IDs, zero-based parameter indices excluding the receiver,
-DEX entry, visibility (0 build / 1 runtime / 2 system), and typed decoded values.
-It searches explicit declarations, including obfuscated annotation names. It does
-not infer inherited annotations or fill in annotation defaults. Pages count
-matching annotations; follow `next_offset`. Oversized individual annotation
-values fail explicitly instead of being silently truncated.
+`element: "all"|"class"|"field"|"method"|"parameter"`, `package_prefix`, and
+`match_mode`:
 
-The response includes the canonical `annotation_type`, `match_mode:
-"exact_descriptor"`, and `requested_type_present`. Type presence checks DEX type
-tables of all loaded classes before applying package or element filters; it does
-not require an annotation class definition. An absent type returns a structured
-`warnings` entry with code `ANNOTATION_TYPE_ABSENT`. Obfuscation, removal, or an
-incorrect name can explain absence. A present type with zero filtered usages
-returns an empty warnings array. `complete: true` describes the exact-descriptor
-scan within the supplied filters, not coverage of semantic equivalents under
-obfuscation. Use the actual DEX annotation name; semantic aliases are not inferred.
+- `exact_descriptor` (default) matches the complete descriptor, for example
+  `retrofit2.http.GET` or `Lretrofit2/http/GET;`.
+- `simple_name` matches the class name after the last package separator, so
+  `GET` finds `retrofit2.http.GET` and a relocated `ff.a.GET` alike. Qualified
+  spellings reduce to their simple name. Nested names keep their `$` segment.
+- `prefix` matches a literal FQCN or package prefix on the internal name, so
+  `retrofit2.http` finds every Retrofit HTTP annotation and `retrofit2.http.`
+  stops at the package boundary.
+
+Results include owner IDs, zero-based parameter indices excluding the receiver,
+DEX entry, visibility (0 build / 1 runtime / 2 system), the item's actual
+`annotation_type` descriptor, and typed decoded values. It searches explicit
+declarations, including obfuscated annotation names. It does not infer inherited
+annotations or fill in annotation defaults. Pages count matching annotations;
+follow `next_offset`. Oversized individual annotation values fail explicitly
+instead of being silently truncated.
+
+The response includes the normalized `annotation_type` pattern, the effective
+`match_mode`, `matched_types` (distinct matched descriptors, bounded at 200 with
+`matched_types_complete`), and `requested_type_present`. Type presence applies
+the same match mode to DEX type tables of all loaded classes before package or
+element filters; it does not require an annotation class definition. An absent
+type returns a structured `warnings` entry with code `ANNOTATION_TYPE_ABSENT`.
+Obfuscation, removal, or an incorrect name can explain absence. A present type
+with zero filtered usages returns an empty warnings array. `complete: true`
+describes the scan for the selected match mode within the supplied filters, not
+coverage of semantic equivalents under obfuscation. Semantic aliases are not
+inferred here: an obfuscated annotation class renamed to `a.b` is found by its
+actual name, by a prefix covering its package, or through `get_class_disassembly`
+annotation directives on a known service. For Retrofit specifically,
+`find_network_stacks` recovers renamed annotation roles from the bundled parser's
+control flow and reports them under `retrofit_recovered_roles`.
 
 `get_method_source` also accepts `class_name` plus `method_name` and optional
 `descriptor` (for example `(Ljava/lang/String;)V`). `find_field_references`
@@ -1045,12 +1216,28 @@ Arguments exclude the receiver and retain their parameter descriptor and source
 register. Literal size/work budgets are reported explicitly. A preceding nearby
 string is never assumed to be an argument without register-flow evidence.
 
+To exhaust the callers that pass one specific value, add `argument_index` (zero-based,
+receiver excluded) and `argument_literal` (exact string, or a signed 32-bit integer)
+to the same query. This implies the constant-argument analysis and partitions the
+returned page: `call_sites` keeps only invokes whose dataflow proves the literal at
+that position (each retains `constant_arguments` as the proof), `excluded_call_sites`
+lists invokes that provably carry a different constant, kind or parameter count,
+and `unresolved_call_sites` lists invokes the analysis could neither prove nor
+refute (merged registers, exception entries, arithmetic, fields, parameters, call
+results) with the reason and the source register. `argument_filter` reports the
+counts for the page so the negative coverage stays bounded: every site on the page
+is in exactly one of the three lists. The filter is applied per page; `matching_total`,
+`offset` and `next_offset` keep their unfiltered meaning, so follow `next_offset`
+until it is null before claiming the writer has been exhausted. The parameters are
+accepted only with `projection: "call_sites"` and are not available on
+`get_call_graph_batch`.
+
 ### Reviewer discovery and XML queries
 
 All queries below require `instance_id` and `project_id`. New scans support cancellation and stable occurrence pagination (`offset`, `limit <= 500`), bounded response pages, and explicit error coverage. `complete` describes the documented scan, never application security coverage.
 
-- `get_all_classes` and `search_classes_by_keyword` accept `case_sensitive:false`. Returned IDs preserve case; an empty case-sensitive search includes up to 20 case-insensitive near matches. Resolution never silently substitutes a case variant. Missing-class errors describe absence from the loaded DEX set, without asserting runtime loading.
-- Validation errors include `accepted_parameters` containing the tool input schema and selector alternatives. Singular IDs and plural batch IDs retain their separate meanings.
+- `get_all_classes` and `search_classes_by_keyword` accept `case_sensitive:false`. Returned IDs preserve case; an empty case-sensitive search includes up to 20 case-insensitive near matches. Resolution never silently substitutes a case variant. Missing-class errors describe absence from the loaded DEX set, without asserting runtime loading. `package_prefix` accepts one prefix, an array of prefixes, or `obfuscated-root`; near-match `suggestions` ignore it and say so in `suggestions_scope`.
+- Validation errors include `accepted_parameters` containing the tool input schema and selector alternatives; an unknown parameter name is reported with every accepted name. `get_call_graph_batch` wraps a single `method_id` alias into `method_ids`; the plural result shape is unchanged.
 - `find_type_references(class_name, package_prefix?)` pages exact original DEX type references. Use FQCN or a DEX descriptor. It includes class literals, casts, type checks, allocations, inheritance, field/parameter/return declaration types, and explicit class/field/method/parameter annotation types with decoded values. Annotation hits follow identifier hits; the combined source hash covers both. Array component matches preserve the actual array operand. Annotation defaults and nested value types are outside this projection.
 - `search_kotlin_metadata(query, case_sensitive?, package_prefix?)` searches `kotlin.Metadata.d2`, returning owning DEX class, table index and matched string. These are discovery evidence, **not verified original-name aliases**: a d2 entry may describe a referenced type or member. Canonical lookup continues to use DEX identities.
 
@@ -1105,15 +1292,64 @@ When APK optimization replaces application attribute names with decimal resource
 
 ### Interface caller expansion
 
-Use `get_call_graph(method_id, direction="callers", projection="call_sites", depth=1, dispatch_through_interfaces=true)` to include invokes through known ancestor interface declarations. The original `callee_method_id`, `raw_callee_method_id`, opcode and offset remain unchanged. Rows have `relationship="exact_declared_call"` or `"possible_interface_dispatch"`; inferred rows add `possible_implementation_method_id`. `exact_matching_total` and `possible_dispatch_total` keep the counts separate. A runtime receiver may select another implementation. The opt-in is limited to direct caller call-site queries; batch queries can pass the same option.
+Use `get_call_graph(method_id, direction="callers", projection="call_sites", depth=1, dispatch_through_interfaces=true)` to include `invoke-interface` and `invoke-virtual` sites whose raw target names the root member on any interface the root class implements, directly or through superinterfaces and superclasses, whether or not that interface redeclares the member and whether or not it is loaded. The original `callee_method_id`, `raw_callee_method_id`, opcode and offset remain unchanged. Rows have `relationship="exact_declared_call"` or `"possible_interface_dispatch"`; inferred rows add `possible_implementation_method_id`. `exact_matching_total` and `possible_dispatch_total` keep the counts separate. A runtime receiver may select another implementation. The opt-in is limited to direct caller call-site queries; batch queries can pass the same option. Transitive expansion of the same inference, for every traversed method, is the `semantic_edges` option below.
 
 Superclass dispatch uses `dispatch_through_superclasses=true` with the same
-direct caller projection. It includes `invoke-virtual` sites targeting known
-overridden superclass declarations, including abstract bases, and labels them
-`possible_virtual_dispatch`. `invoke-super`, static and direct calls are excluded
-from inferred dispatch. The raw declared target remains available; possible
-receiver dispatch is separate from exact calls. Both dispatch options can be
-combined.
+direct caller projection. It includes `invoke-virtual` sites whose raw target
+names the root member on a superclass of the root class (declaring or not,
+abstract or concrete, loaded or framework) and labels them
+`possible_virtual_dispatch`. Superclasses count only while the root method
+overrides their declarations under the runtime's rules. The first loaded
+superclass declaration the root does not override is named in
+`dispatch_superclass_stop`; neither it nor the non-declaring superclasses below
+it are inferred, because an invoke on any of them resolves to that declaration.
+A final declaration, or a package-private one in another package, also
+excludes every superclass above it, since it holds their vtable slot; a private
+or static declaration is a direct method, so superclasses above it stay
+possible. Overriding is transitive, so a same-package intermediate override
+carries a cross-package subclass through. Unloaded superclasses and interfaces
+anywhere in the ancestry remain possible targets. `invoke-super`, static and
+direct calls, and sites on sibling or unrelated receiver types are never
+inferred. Both options can be
+combined. `dispatch_expansion` reports what happened: `applied`,
+`not_requested`, or a `skipped_*` reason when the root is not a concrete
+instance method declared by its own loaded class (constructors, static and
+private methods, abstract or interface declarations, inherited-only members and
+unloaded classes get no inference). Inherited-only roots instead resolve to the
+declaring ancestor, and every invoke that resolves there is reported as exact.
+
+### Semantic edges
+
+Caller graphs stop where the application hands control to a framework: a
+listener is registered and later invoked through an interface, or a lambda
+object is created and later run. `get_call_graph(method_id, direction="callers",
+semantic_edges=true)`, and the same option on `get_call_graph_batch`, adds
+labelled inferred edges for every traversed method, in both projections and at
+any depth, and traverses their sources too. Three producers exist.
+`lambda_creation` links a `new-instance` of a callback class to each concrete
+instance method of that class; a class qualifies when it is synthetic,
+anonymous (`Outer$1`), named with `Lambda`, or extends a Kotlin lambda or
+continuation base, and `callback_class_marker` names the rule that matched.
+`possible_interface_dispatch` and `possible_virtual_dispatch` are the dispatch
+expansion above applied to each traversed method. Declared calls keep
+`relationship="exact_declared_call"`; inferred rows have
+`relationship="semantic_edge"`, a `kind`, `semantic_target_method_id` (the
+traversed method the edge leads to) and `confidence` (`exact_allocation` for an
+allocation whose callback relationship is inferred, `possible` for dispatch).
+Allocation rows carry `instruction`, `opcode_value`, `instruction_words`,
+`allocated_class_id` and a null `callee_method_id`; their `call_site_offset` is
+the `new-instance` offset. `semantic_edge_total` and `semantic_edge_kinds` are
+counted apart from `exact_matching_total`; graph edges add `semantic_edges`
+beside `call_sites`, so an edge supported only by inference shows
+`call_sites=0`. The `semantic_edges` object in every response states `enabled`,
+`complete`, `methods_expanded`, the per-query `method_budget` (2048 traversed
+methods) and `skipped_samples`. Not covered, and left absent rather than
+guessed: invoke-custom lambdas, named listener classes without those markers,
+reflection, LiveData, Flow or RxJava value delivery, dependency-injection
+factories, and Intent, Handler or executor delivery. `semantic_edges` requires
+`direction="callers"` and conflicts with `dispatch_through_*`, which it
+subsumes. Source locations, forwarders and constant arguments mark allocation
+rows `not_applicable`.
 
 ### Asset contents
 
@@ -1173,7 +1409,21 @@ setter/build semantics are labelled conditional on their recovered fingerprint.
 Dynamic values, branched callers, fields, and unsupported flows stay unresolved.
 
 The package prefix selects evidence owners at package boundaries; dependencies
-may be anywhere in the loaded DEX set. Named API evidence is ordered before
+may be anywhere in the loaded DEX set. Obfuscated builds commonly declare Retrofit
+service interfaces, and SDK endpoints such as upload or fallback services, in
+renamed top-level packages (`ff.g`, `a.b.c`) rather than under the application
+ID, so a prefix matching the application ID can exclude every service. When
+`package_prefix` is set, both projections count Retrofit-annotated classes
+outside the prefix (exact `retrofit2.http` descriptors and recovered renamed
+annotation classes alike) and, if any exist, add a `warnings` entry with code
+`RETROFIT_SERVICES_OUTSIDE_PREFIX` carrying `classes`, `methods`, up to ten
+`examples` and `count_complete`. The raw count is in
+`coverage.detector_coverage[0].retrofit_annotations_outside_prefix` for the
+combined inventory and in `coverage.retrofit_annotations_outside_prefix` for
+`projection: "services"`. Repeat the query without `package_prefix`, or with the
+example packages, to include them. Retrofit detection keys on annotation
+descriptors and recovered roles, never on interface names, so renamed service
+interfaces are found either way. Named API evidence is ordered before
 structural maps. `offset`/`next_offset` page the combined evidence list (default
 25, maximum 100). Counts represent evidence records, not unique runtime clients
 or stacks. The same class may have multiple distinct records.
@@ -1248,8 +1498,9 @@ not interchangeable with instruction offsets.
 
 Source-mode `search_code` includes `page_status.complete` and an explanatory
 message when a zero-hit page still has unscanned classes or occurrences. Resume
-its cursors or choose `mode: "identifiers"` for DEX symbol searches. Identifier
-filters require that mode. `format: "dex"` returns RDX's labeled DEX listing;
+its cursors or choose `mode: "identifiers"` for DEX symbol searches; an
+identifier-shaped query on such a page also carries a `hint` naming that mode.
+Identifier filters require that mode. `format: "dex"` returns RDX's labeled DEX listing;
 it is not advertised as assemblable Smali.
 
 `list_nav_deeplinks` includes `hotwire_annotation` records for exact
@@ -1281,9 +1532,14 @@ as a cancellable background MCP request; health checks remain available.
 ### Reviewer query reliability
 
 Method-addressed tools with a singular `method_id` also accept
-`method_signature` or `signature`. Matching selector values are accepted;
-conflicting selectors fail explicitly. Batch `method_ids` and constructor
-`caller_method_id` remain distinct selectors.
+`method_signature` or `signature`; `get_call_graph_batch` accepts one
+`method_id`, `method_signature`, or `signature` for `method_ids`. Reviewer
+query parameters accept the aliases listed under "Parameter aliases" at the top
+of this document (`value` for `query`, `type_name` for `class_name`, `value`
+for `values`, `query` for `key`, `keyword` for `query`). Matching values are
+accepted; conflicting values fail explicitly with
+`CONFLICTING_METHOD_SELECTORS` or `CONFLICTING_ARGUMENTS`. Constructor
+`caller_method_id` remains a distinct selector.
 
 Instance selection lists reachable running `candidates` independently of result
 pagination. `matching_candidate_discovery_incomplete` means a matching pair can

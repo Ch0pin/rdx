@@ -615,6 +615,78 @@ pub fn component_coverage(xml: &str) -> Result<serde_json::Value, String> {
     )
 }
 
+/// Effective exported tallies for one group of component records.
+#[derive(Default)]
+struct ExportedTally {
+    total: usize,
+    exported: usize,
+    non_exported: usize,
+    unresolved: usize,
+}
+impl ExportedTally {
+    fn add(&mut self, effective: &serde_json::Value) {
+        self.total += 1;
+        match effective {
+            serde_json::Value::Bool(true) => self.exported += 1,
+            serde_json::Value::Bool(false) => self.non_exported += 1,
+            _ => self.unresolved += 1,
+        }
+    }
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({"total":self.total,"exported":self.exported,"non_exported":self.non_exported,"unresolved_exported":self.unresolved})
+    }
+}
+
+/// Unpaged totals for an already filtered record set. Component buckets follow the
+/// effective resolved `android:exported` state; permission records are counted by
+/// declaration tag. Declaration counts only; nothing here establishes reachability.
+pub fn record_counts(records: &[serde_json::Value]) -> serde_json::Value {
+    use serde_json::json;
+    let mut components = ExportedTally::default();
+    let mut by_type = std::collections::BTreeMap::<String, ExportedTally>::new();
+    let mut permissions = 0usize;
+    let mut by_declaration = std::collections::BTreeMap::<String, usize>::new();
+    for record in records {
+        match record["record_type"].as_str() {
+            Some("component") => {
+                let effective = &record["exported_state"]["effective"];
+                components.add(effective);
+                by_type
+                    .entry(
+                        record["component_type"]
+                            .as_str()
+                            .unwrap_or("unknown")
+                            .to_owned(),
+                    )
+                    .or_default()
+                    .add(effective);
+            }
+            Some("permission") => {
+                permissions += 1;
+                *by_declaration
+                    .entry(
+                        record["declaration"]
+                            .as_str()
+                            .unwrap_or("unknown")
+                            .to_owned(),
+                    )
+                    .or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+    let mut components = components.json();
+    components["by_type"] = json!(
+        by_type
+            .iter()
+            .map(|(kind, tally)| (kind.clone(), tally.json()))
+            .collect::<serde_json::Map<_, _>>()
+    );
+    json!({"format":"counts","total":records.len(),"components":components,
+        "permissions":{"total":permissions,"by_declaration":by_declaration},
+        "scope":"Matching records after the supplied filters. Exported buckets use the effective resolved android:exported state; unresolved_exported counts components whose state could not be resolved from resources. Declaration counts only, not runtime reachability or authorization."})
+}
+
 /// Look up decoded-manifest component declarations. `class_name` contains matches
 /// are literal and case-sensitive; exact matches expand relative and unqualified
 /// names using the manifest package. Aliases also match their target activity.
@@ -1749,6 +1821,39 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_counts_bucket_components_by_type_and_effective_state() {
+        use serde_json::json;
+        let records = vec![
+            json!({"record_type":"component","component_type":"activity","exported_state":{"effective":true}}),
+            json!({"record_type":"component","component_type":"activity","exported_state":{"effective":false}}),
+            json!({"record_type":"component","component_type":"activity","exported_state":{"effective":null}}),
+            json!({"record_type":"component","component_type":"provider","exported_state":{"effective":true}}),
+            json!({"record_type":"component","component_type":"receiver"}),
+            json!({"record_type":"permission","declaration":"uses-permission","name":"a"}),
+            json!({"record_type":"permission","declaration":"uses-permission","name":"b"}),
+            json!({"record_type":"permission","declaration":"permission","name":"c"}),
+        ];
+        let counts = record_counts(&records);
+        assert_eq!(counts["format"], "counts");
+        assert_eq!(counts["total"], 8);
+        assert_eq!(
+            counts["components"],
+            json!({"total":5,"exported":2,"non_exported":1,"unresolved_exported":2,"by_type":{
+                "activity":{"total":3,"exported":1,"non_exported":1,"unresolved_exported":1},
+                "provider":{"total":1,"exported":1,"non_exported":0,"unresolved_exported":0},
+                "receiver":{"total":1,"exported":0,"non_exported":0,"unresolved_exported":1}}})
+        );
+        assert_eq!(
+            counts["permissions"],
+            json!({"total":3,"by_declaration":{"permission":1,"uses-permission":2}})
+        );
+        assert_eq!(
+            record_counts(&[])["components"],
+            json!({"total":0,"exported":0,"non_exported":0,"unresolved_exported":0,"by_type":{}})
+        );
+    }
 
     #[test]
     fn preserves_filter_boundaries_and_export_defaults() {

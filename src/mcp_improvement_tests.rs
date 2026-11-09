@@ -189,6 +189,183 @@ fn discovery_and_manifest_schemas_reject_invalid_values() {
         args[key] = value;
         assert!(validate("get_manifest_summary", &args).is_err(), "{args}");
     }
+    let counts = json!({"instance_id":"instance","project_id":"project","format":"counts","exported_state":"true","component_type":"activity"});
+    validate("get_manifest_summary", &counts).unwrap();
+    for (key, value) in [
+        ("projection", json!("compact")),
+        ("fields", json!("name")),
+        ("offset", json!(0)),
+        ("limit", json!(10)),
+        ("exported_state", json!("maybe")),
+    ] {
+        let mut args = counts.clone();
+        args[key] = value;
+        assert!(validate("get_manifest_summary", &args).is_err(), "{args}");
+    }
+    let mut exposure = counts.clone();
+    exposure["format"] = json!("exposure");
+    assert!(validate("get_manifest_summary", &exposure).is_err());
+    let mut exported_markdown = json!({"instance_id":"instance","project_id":"project","format":"markdown","exported_state":"false","limit":128000});
+    assert!(validate("get_manifest_summary", &exported_markdown).is_err());
+    exported_markdown["limit"] = json!(500);
+    validate("get_manifest_summary", &exported_markdown).unwrap();
+}
+
+/// Starts a server on `path` and returns the registration plus identity arguments.
+fn manifest_server(path: PathBuf, dir: &Scratch) -> (Server, Registration, Value) {
+    let server = Server::start_in(path, dir.0.clone(), random_id().unwrap()).unwrap();
+    let record: Registration =
+        serde_json::from_slice(&fs::read(&server.registration).unwrap()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = server.status();
+        assert_ne!(status.state, "Failed", "{}", status.last_error);
+        if status.state == "Running" {
+            let base = json!({"instance_id":server.instance_id,"project_id":status.project_id});
+            return (server, record, base);
+        }
+        assert!(std::time::Instant::now() < deadline, "project did not load");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Counts, exported filtering and record paging must describe one record set.
+fn check_manifest_counts(record: &Registration, base: &Value) -> Value {
+    let data = |args: &Value| remote(record, "get_manifest_summary", args).unwrap()["data"].clone();
+    let number = |value: &Value| value.as_u64().unwrap();
+    let mut counts_args = base.clone();
+    counts_args["format"] = json!("counts");
+    validate("get_manifest_summary", &counts_args).unwrap();
+    let counts = data(&counts_args);
+    assert_eq!(counts["format"], "counts");
+    assert!(counts.get("items").is_none() && counts.get("next_offset").is_none());
+    let components = counts["components"].clone();
+    assert_eq!(components["total"], counts["coverage"]["total"]);
+    assert_eq!(
+        number(&components["exported"])
+            + number(&components["non_exported"])
+            + number(&components["unresolved_exported"]),
+        number(&components["total"])
+    );
+    for (kind, total) in counts["coverage"]["by_kind"].as_object().unwrap() {
+        assert_eq!(&components["by_type"][kind]["total"], total, "{kind}");
+    }
+    assert_eq!(
+        counts["coverage"]["filters"]["effective_matching"],
+        json!({})
+    );
+    let mut records_args = base.clone();
+    records_args["format"] = json!("records");
+    records_args["limit"] = json!(500);
+    let records = data(&records_args);
+    assert_eq!(records["total"], counts["total"]);
+    assert_eq!(records["source_hash"], counts["source_hash"]);
+    assert_eq!(
+        records["items"].as_array().unwrap().len(),
+        number(&counts["total"]) as usize
+    );
+    for (state, bucket) in [
+        ("true", "exported"),
+        ("false", "non_exported"),
+        ("unresolved", "unresolved_exported"),
+    ] {
+        let mut args = base.clone();
+        args["exported_state"] = json!(state);
+        args["limit"] = json!(500);
+        let page = data(&args);
+        assert_eq!(page["format"], "records");
+        assert_eq!(page["total"], components[bucket], "{state}");
+        for item in page["items"].as_array().unwrap() {
+            assert_eq!(item["record_type"], "component");
+            let effective = &item["exported_state"]["effective"];
+            match state {
+                "true" => assert_eq!(effective, &json!(true)),
+                "false" => assert_eq!(effective, &json!(false)),
+                _ => assert!(effective.is_null()),
+            }
+        }
+        assert_eq!(page["coverage"]["filters"]["exported_state"], state);
+        assert_eq!(
+            page["coverage"]["filters"]["effective_matching"]["exported_state"]["mode"],
+            "exact"
+        );
+        assert_eq!(page["coverage"]["total"], counts["coverage"]["total"]);
+        let mut filtered = base.clone();
+        filtered["exported_state"] = json!(state);
+        filtered["format"] = json!("counts");
+        let filtered = data(&filtered);
+        assert_eq!(filtered["components"]["total"], components[bucket]);
+        assert_eq!(filtered["components"][bucket], components[bucket]);
+        assert_eq!(filtered["permissions"]["total"], 0);
+        assert_eq!(filtered["total"], page["total"]);
+        assert_eq!(filtered["source_hash"], page["source_hash"]);
+    }
+    let mut combined = base.clone();
+    combined["exported_state"] = json!("true");
+    combined["component_type"] = json!("activity");
+    combined["format"] = json!("counts");
+    let combined = data(&combined);
+    assert_eq!(
+        combined["components"]["total"],
+        components["by_type"]["activity"]["exported"]
+    );
+    assert!(
+        combined["components"]["by_type"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|kind| kind == "activity")
+    );
+    assert_eq!(
+        combined["coverage"]["filters"]["component_type"],
+        "activity"
+    );
+    counts
+}
+
+#[test]
+fn manifest_counts_and_exported_filter_agree_with_records() {
+    let dir = Scratch::new();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+    let (_server, record, base) = manifest_server(fixture, &dir);
+    let counts = check_manifest_counts(&record, &base);
+    assert_eq!(counts["components"]["total"], 3, "{counts}");
+    assert_eq!(counts["components"]["non_exported"], 3, "{counts}");
+    assert_eq!(counts["permissions"]["total"], 0, "{counts}");
+}
+
+#[test]
+fn manifest_counts_split_exported_and_non_exported_declarations() {
+    use std::io::Write;
+    let dir = Scratch::new();
+    let path = dir.0.join("components.apk");
+    let mut archive = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    archive.start_file("AndroidManifest.xml", options).unwrap();
+    archive
+        .write_all(&super::tests::component_manifest_binary())
+        .unwrap();
+    archive.start_file("classes.dex", options).unwrap();
+    archive
+        .write_all(include_bytes!("../tests/fixtures/hello.dex"))
+        .unwrap();
+    archive.finish().unwrap();
+    let (_server, record, base) = manifest_server(path, &dir);
+    let counts = check_manifest_counts(&record, &base);
+    let components = &counts["components"];
+    assert_eq!(components["total"], 2, "{components}");
+    assert_eq!(components["non_exported"], 1, "{components}");
+    assert_eq!(components["by_type"]["activity"]["non_exported"], 1);
+    assert_eq!(components["by_type"]["activity-alias"]["total"], 1);
+    assert_eq!(components["by_type"]["activity-alias"]["non_exported"], 0);
+    let mut args = base.clone();
+    args["exported_state"] = json!("false");
+    args["fields"] = json!("name,exported_state");
+    let page = remote(&record, "get_manifest_summary", &args).unwrap()["data"].clone();
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page["items"][0]["name"], "sample.Entry");
+    assert_eq!(page["items"][0]["exported_state"]["effective"], false);
+    assert_eq!(page["items"][0].as_object().unwrap().len(), 2);
 }
 
 #[test]
@@ -1007,4 +1184,80 @@ fn smali_field_alias_normalizes_without_changing_owner_or_type() {
         source_search::page_status(true, false, true)["complete"],
         false
     );
+}
+
+#[test]
+fn semantic_edges_flag_validates_and_reports_metadata() {
+    let dir = Scratch::new();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+    let (_server, record, base) = manifest_server(fixture, &dir);
+    let mut args = base.clone();
+    args["method_id"] = json!("sample.Target.doubleValue(I)I");
+    args["direction"] = json!("callers");
+    args["semantic_edges"] = json!(true);
+    validate("get_call_graph", &args).unwrap();
+    let mut both = args.clone();
+    both["direction"] = json!("both");
+    let error = validate("get_call_graph", &both).unwrap_err().to_string();
+    assert!(error.contains("direction=callers"), "{error}");
+    let mut conflict = args.clone();
+    conflict["dispatch_through_interfaces"] = json!(true);
+    let error = validate("get_call_graph", &conflict)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("omit dispatch_through"), "{error}");
+    let mut text_flag = args.clone();
+    text_flag["semantic_edges"] = json!("true");
+    assert!(validate("get_call_graph", &text_flag).is_err());
+
+    let graph = remote(&record, "get_call_graph", &args).unwrap()["data"].clone();
+    assert_eq!(graph["semantic_edges"]["enabled"], true, "{graph}");
+    assert_eq!(graph["semantic_edges"]["complete"], true);
+    assert_eq!(graph["semantic_edges"]["method_budget"], 2048);
+    assert!(
+        graph["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["semantic_edges"].is_number())
+    );
+    let mut sites = args.clone();
+    sites["projection"] = json!("call_sites");
+    sites["depth"] = json!(3);
+    sites["include_const_args"] = json!(true);
+    sites["include_forwarders"] = json!(true);
+    sites["include_source_locations"] = json!(true);
+    let page = remote(&record, "get_call_graph", &sites).unwrap()["data"].clone();
+    let total = |key: &str| page[key].as_u64().unwrap();
+    assert_eq!(
+        total("semantic_edge_total")
+            + total("exact_matching_total")
+            + total("possible_dispatch_total"),
+        total("matching_total"),
+        "{page}"
+    );
+    assert!(page["semantic_edge_kinds"].is_object());
+    assert!(total("matching_total") > 0, "{page}");
+    for row in page["call_sites"].as_array().unwrap() {
+        assert!(row["constant_arguments"]["status"].is_string(), "{row}");
+        assert!(row["source_mapping"]["status"].is_string(), "{row}");
+        assert!(row["relationship"].is_string(), "{row}");
+    }
+    let mut plain = base.clone();
+    plain["method_id"] = json!("sample.Target.doubleValue(I)I");
+    plain["direction"] = json!("callers");
+    let plain = remote(&record, "get_call_graph", &plain).unwrap()["data"].clone();
+    assert_eq!(plain["semantic_edges"], json!({"enabled":false}));
+
+    let mut batch = base.clone();
+    batch["method_ids"] = json!(["sample.Target.doubleValue(I)I"]);
+    batch["semantic_edges"] = json!(true);
+    validate("get_call_graph_batch", &batch).unwrap();
+    let result = remote(&record, "get_call_graph_batch", &batch).unwrap();
+    assert_eq!(
+        result["data"]["results"][0]["data"]["semantic_edges"]["enabled"], true,
+        "{result}"
+    );
+    batch["direction"] = json!("callees");
+    assert!(validate("get_call_graph_batch", &batch).is_err());
 }

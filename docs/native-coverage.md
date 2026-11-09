@@ -16,8 +16,9 @@ renderer. `fallback_methods` counts the remainder, grouped by the first reason
 that stopped reconstruction. Each concrete method is attempted once; generated
 text and navigation metadata are dropped immediately. Diagnostics retain at most
 256 categories with 256 characters per category; excess categories are aggregated.
-Opcode failure positions are removed so the same unsupported opcode groups
-together. Loading still uses the native engine's existing input and metadata limits.
+Instruction positions in a reason are replaced with `<pc>` so the same diagnostic
+groups together across methods. Loading still uses the native engine's existing
+input and metadata limits.
 
 This measures method-renderer coverage, not whole-class Java validity, semantic
 equivalence, or performance. Class-level metadata restrictions may still require

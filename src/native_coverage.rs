@@ -1,8 +1,9 @@
 //! Method-level reconstruction coverage, with bounded aggregate diagnostics.
 use anyhow::{Context, Result};
 use rdx::{engine::DecompilerEngine, native_engine::NativeDexEngine};
+use regex::Regex;
 use serde::Serialize;
-use std::{collections::BTreeMap, io::Write, path::Path};
+use std::{collections::BTreeMap, io::Write, path::Path, sync::OnceLock};
 
 const MAX_REASONS: usize = 256;
 const MAX_REASON_CHARS: usize = 256;
@@ -28,13 +29,10 @@ pub(crate) struct Coverage {
 impl Coverage {
     fn fallback(&mut self, reason: &str, method_id: &str) {
         self.fallback_methods += 1;
-        // Keep opcode categories stable across instruction positions.
-        let reason = if reason.starts_with("unsupported opcode ") {
-            reason.split(" at ").next().unwrap_or(reason)
-        } else {
-            reason
-        };
-        let mut key: String = reason.chars().take(MAX_REASON_CHARS).collect();
+        let mut key: String = normalize_reason(reason)
+            .chars()
+            .take(MAX_REASON_CHARS)
+            .collect();
         if !self.fallback_reasons.contains_key(&key)
             && self.fallback_reasons.len() >= MAX_REASONS - 1
         {
@@ -49,6 +47,43 @@ impl Coverage {
             samples.truncate(MAX_SAMPLES_PER_REASON);
         }
     }
+}
+
+/// Replace instruction positions with `<pc>` so one diagnostic forms one
+/// category across methods. Type descriptors are kept verbatim; outside them a
+/// position is a hex or decimal number after a position prefix, or a bare
+/// four-digit hex offset that contains a digit.
+fn normalize_reason(reason: &str) -> String {
+    static DESCRIPTOR: OnceLock<Regex> = OnceLock::new();
+    static POSITION: OnceLock<Regex> = OnceLock::new();
+    let descriptor =
+        DESCRIPTOR.get_or_init(|| Regex::new(r"\[*L[\w/$]+;").expect("static descriptor pattern"));
+    let position = POSITION.get_or_init(|| {
+        Regex::new(
+            r"(\bat (?:instruction )?|\bpc=|\bstop=|\btarget=|@)(?:0x[0-9a-fA-F]+|\d+)\b|\b[0-9a-f]{4}\b",
+        )
+        .expect("static position pattern")
+    });
+    let replace = |text: &str| -> String {
+        position
+            .replace_all(text, |captures: &regex::Captures| {
+                let prefix = captures.get(1).map_or("", |prefix| prefix.as_str());
+                if prefix.is_empty() && !captures[0].bytes().any(|byte| byte.is_ascii_digit()) {
+                    return captures[0].to_string();
+                }
+                format!("{prefix}<pc>")
+            })
+            .into_owned()
+    };
+    let mut normalized = String::with_capacity(reason.len());
+    let mut last = 0;
+    for found in descriptor.find_iter(reason) {
+        normalized.push_str(&replace(&reason[last..found.start()]));
+        normalized.push_str(found.as_str());
+        last = found.end();
+    }
+    normalized.push_str(&replace(&reason[last..]));
+    normalized
 }
 
 fn collect(path: &Path, prefix: Option<&str>) -> Result<Coverage> {
@@ -579,13 +614,62 @@ mod tests {
     }
 
     #[test]
+    fn reasons_normalize_instruction_positions() {
+        for (raw, normalized) in [
+            (
+                "invalid super receiver at instruction 0x1a",
+                "invalid super receiver at instruction <pc>",
+            ),
+            (
+                "effectful instruction at 0004 between allocation and constructor",
+                "effectful instruction at <pc> between allocation and constructor",
+            ),
+            (
+                "Precise rethrow requires Ljava/lang/Throwable; at instruction 0x16",
+                "Precise rethrow requires Ljava/lang/Throwable; at instruction <pc>",
+            ),
+            (
+                "unresolved pc=0x3c stop=0x40",
+                "unresolved pc=<pc> stop=<pc>",
+            ),
+            (
+                "branch crosses region boundary: 0018 -> 0050, stop 0044, backward proven false",
+                "branch crosses region boundary: <pc> -> <pc>, stop <pc>, backward proven false",
+            ),
+            (
+                "control flow join for 003e/003f crosses region boundary 0068 (next 0080)",
+                "control flow join for <pc>/<pc> crosses region boundary <pc> (next <pc>)",
+            ),
+            (
+                "goto crosses region boundary: pc=0x1a; target=0x28; stop=0x30; in_try=false",
+                "goto crosses region boundary: pc=<pc>; target=<pc>; stop=<pc>; in_try=false",
+            ),
+            (
+                "unsupported opcode 0x23 at 8",
+                "unsupported opcode 0x23 at <pc>",
+            ),
+            (
+                "dead store to [Lcom/a/b/c0de; at instruction 0x4",
+                "dead store to [Lcom/a/b/c0de; at instruction <pc>",
+            ),
+            ("at most one value", "at most one value"),
+            ("format 0x10 unsupported", "format 0x10 unsupported"),
+        ] {
+            assert_eq!(normalize_reason(raw), normalized);
+        }
+    }
+
+    #[test]
     fn reasons_group_opcode_positions_and_bound_diagnostic_memory() {
         let mut coverage = Coverage::default();
         coverage.fallback("unsupported opcode 0x23 at 8", "z.Method()V");
         coverage.fallback("unsupported opcode 0x23 at 400", "a.Method()V");
-        assert_eq!(coverage.fallback_reasons["unsupported opcode 0x23"], 2);
         assert_eq!(
-            coverage.fallback_reason_samples["unsupported opcode 0x23"],
+            coverage.fallback_reasons["unsupported opcode 0x23 at <pc>"],
+            2
+        );
+        assert_eq!(
+            coverage.fallback_reason_samples["unsupported opcode 0x23 at <pc>"],
             vec!["a.Method()V", "z.Method()V"]
         );
         for index in 0..1_000 {

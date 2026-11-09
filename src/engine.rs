@@ -941,10 +941,17 @@ impl NativeEngine {
         offset: usize,
         hash: &str,
         depth: usize,
+        direction: crate::call_graph::Direction,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<crate::call_graph::CallGraph> {
         let target = self.resolve_method_xref_target(class, offset, hash, false)?;
-        crate::call_graph::build(&self.native, &target.id, depth, cancel)
+        crate::call_graph::build_direction(
+            &self.native,
+            &target.id,
+            depth,
+            direction.as_str(),
+            cancel,
+        )
     }
 
     /// Manifest exported state per component class, including loaded superclasses of declared

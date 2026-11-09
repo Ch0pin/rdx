@@ -1,5 +1,5 @@
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
-use rdx::call_graph::{CallGraph, Component, Exposure, Node, owner};
+use rdx::call_graph::{CallGraph, Component, Direction, Edge, Exposure, Node, owner};
 use std::{
     collections::HashMap,
     sync::{
@@ -26,6 +26,8 @@ pub struct CallGraphWindow {
     pub origin: Option<(String, usize, String)>,
     pub cancel: Option<Arc<AtomicBool>>,
     pub depth: usize,
+    /// Direction requested for the next build; a change rebuilds the graph at once.
+    pub direction: Direction,
     zoom: f32,
     /// Displacement of each node from its column/row slot, in unscaled units.
     offsets: Vec<Vec2>,
@@ -40,6 +42,7 @@ impl Default for CallGraphWindow {
             origin: None,
             cancel: None,
             depth: 20,
+            direction: Direction::Callers,
             zoom: 0.8,
             offsets: Vec::new(),
         }
@@ -264,6 +267,7 @@ impl CallGraphWindow {
             offsets,
             zoom,
             depth,
+            direction,
             cancel,
             status,
             ..
@@ -276,6 +280,19 @@ impl CallGraphWindow {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.add(egui::DragValue::new(depth).range(1..=100).prefix("Depth: "));
+                ui.separator();
+                ui.add_enabled_ui(cancel.is_none(), |ui| {
+                    for option in Direction::ALL {
+                        if ui
+                            .selectable_value(direction, option, option.label())
+                            .on_hover_text(option.description())
+                            .changed()
+                        {
+                            rebuild = true;
+                        }
+                    }
+                });
+                ui.separator();
                 ui.add(
                     egui::Slider::new(zoom, 0.01..=2.0)
                         .logarithmic(true)
@@ -305,7 +322,13 @@ impl CallGraphWindow {
                     }
                 }
             });
-            ui.label("Outgoing static calls · virtual/interface calls use declared targets · Intent destinations are not inferred.")
+            let built = graph.as_ref().map_or(*direction, |g| g.direction);
+            let flow = match built {
+                Direction::Callers => "Incoming",
+                Direction::Callees => "Outgoing",
+                Direction::Both => "Incoming and outgoing",
+            };
+            ui.label(format!("{flow} static calls · virtual/interface calls use declared targets · Intent destinations are not inferred."))
                 .on_hover_text("Component colors follow the manifest exported state of the class or of a declared subclass: red components accept intents from other apps, blue ones are declared without external access. Exported state is a manifest property; it does not prove that this method runs for an external intent. Starting a service does not establish execution of an app callback; framework and lifecycle dispatch are not inferred. Constructor/provider callers do not establish active route registration or runtime intent delivery.");
             ui.horizontal(|ui| {
                 ui.label("Components:");
@@ -337,17 +360,45 @@ impl CallGraphWindow {
             }
             let exposure = exposure.as_ref();
             let reaches: Vec<_> = graph.nodes.iter().map(|n| reach(exposure, n)).collect();
-            let masks = graph.reachability(|n| reach(exposure, n).map_or(0, |(r, _)| r.bit()));
-            ui.label("All discovered calls shown · highlighted edges lead to components · drag a node to move it · drag the canvas to pan");
-            let columns = graph.nodes.iter().map(|n| n.depth).max().unwrap_or(0) + 1;
-            let mut rows = vec![0usize; columns];
-            let slots: Vec<Vec2> = graph
-                .nodes
+            // Callee graphs highlight the paths into components, caller graphs the paths out
+            // of them towards the selected method; a bidirectional graph shows both.
+            let seed = |n: &Node| reach(exposure, n).map_or(0, |(r, _)| r.bit());
+            let zeros = || vec![0u8; graph.nodes.len()];
+            let leads_to = if graph.direction == Direction::Callers {
+                zeros()
+            } else {
+                graph.reachability(seed)
+            };
+            let comes_from = if graph.direction == Direction::Callees {
+                zeros()
+            } else {
+                graph.reachable_from(seed)
+            };
+            let edge_mask = |edge: &Edge| leads_to[edge.to] | comes_from[edge.from];
+            let node_mask: Vec<u8> = leads_to
                 .iter()
-                .map(|node| {
-                    let row = rows[node.depth];
-                    rows[node.depth] += 1;
-                    Vec2::new(node.depth as f32 * COLUMN, row as f32 * ROW)
+                .zip(&comes_from)
+                .map(|(to, from)| to | from)
+                .collect();
+            let highlight = match graph.direction {
+                Direction::Callers => "highlighted edges come from components",
+                Direction::Callees => "highlighted edges lead to components",
+                Direction::Both => "highlighted edges connect components",
+            };
+            ui.label(format!("All discovered calls shown · {highlight} · drag a node to move it · drag the canvas to pan"));
+            // Callers sit left of the root and callees right of it, so every arrow reads
+            // left to right.
+            let columns = graph.columns();
+            let first = columns.iter().copied().min().unwrap_or(0);
+            let span = columns.iter().copied().max().unwrap_or(0) - first + 1;
+            let mut rows = vec![0usize; span as usize];
+            let slots: Vec<Vec2> = columns
+                .iter()
+                .map(|&column| {
+                    let column = (column - first) as usize;
+                    let row = rows[column];
+                    rows[column] += 1;
+                    Vec2::new(column as f32 * COLUMN, row as f32 * ROW)
                 })
                 .collect();
             let positions: Vec<Vec2> = slots
@@ -376,17 +427,18 @@ impl CallGraphWindow {
                     .iter()
                     .map(|r| r.center_top() + Vec2::new(0.0, SPHERE_DROP) * z)
                     .collect();
-                let plain = graph.edges.iter().filter(|e| masks[e.to] == 0);
-                let highlighted = graph.edges.iter().filter(|e| masks[e.to] != 0);
+                let plain = graph.edges.iter().filter(|e| edge_mask(e) == 0);
+                let highlighted = graph.edges.iter().filter(|e| edge_mask(e) != 0);
                 for edge in plain.chain(highlighted) {
-                    let tint = Reach::from_mask(masks[edge.to])
+                    let mask = edge_mask(edge);
+                    let tint = Reach::from_mask(mask)
                         .map_or(ui.visuals().weak_text_color(), |r| r.color(ui.visuals()));
                     draw_edge(
                         ui.painter(),
                         [centers[edge.from], centers[edge.to]],
                         RADIUS * z,
                         rects[edge.from].top().min(rects[edge.to].top()),
-                        masks[edge.to] != 0,
+                        mask != 0,
                         tint,
                         z,
                     );
@@ -402,8 +454,8 @@ impl CallGraphWindow {
                         .map_or(ui.visuals().text_color(), |(r, _)| r.color(ui.visuals()));
                     let rim = if node.component.is_some() {
                         tint
-                    } else if masks[i] != 0 {
-                        ui.visuals().selection.stroke.color
+                    } else if let Some(reach) = Reach::from_mask(node_mask[i]) {
+                        reach.color(ui.visuals())
                     } else {
                         ui.visuals().weak_text_color()
                     };
@@ -440,6 +492,16 @@ impl CallGraphWindow {
                     let mut hover = node.method.clone();
                     if let Some((reach, detail)) = &reaches[i] {
                         hover.push_str(&format!("\n{}\nManifest: {detail}", reach.label()));
+                    } else {
+                        if let Some(reach) = Reach::from_mask(leads_to[i]) {
+                            hover.push_str(&format!("\nLeads to a component: {}", reach.label()));
+                        }
+                        if let Some(reach) = Reach::from_mask(comes_from[i]) {
+                            hover.push_str(&format!(
+                                "\nReached from a component: {}",
+                                reach.label()
+                            ));
+                        }
                     }
                     let response = ui
                         .interact(rect, ui.id().with(i), Sense::click_and_drag())
@@ -506,7 +568,74 @@ mod tests {
             truncated: false,
             dispatch_targets: vec![],
             dispatch_targets_truncated: false,
+            direction: Direction::Callees,
         }
+    }
+    fn exported_main() -> ExposureMap {
+        HashMap::from([(
+            "app.Main".to_owned(),
+            Exposure {
+                exported: Some(true),
+                details: vec!["activity: true (explicit)".into()],
+            },
+        )])
+    }
+    /// Centers of the node spheres, left to right, taken from their rim strokes.
+    fn spheres(output: &egui::FullOutput) -> Vec<Pos2> {
+        let mut centers: Vec<Pos2> = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Circle(circle)
+                    if circle.radius > 40.0 && circle.stroke.width > 0.0 =>
+                {
+                    Some(circle.center)
+                }
+                _ => None,
+            })
+            .collect();
+        centers.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+        centers
+    }
+    /// Screen rectangle of the first rendered text equal to `text`.
+    fn text_rect(output: &egui::FullOutput, text: &str) -> Rect {
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(shape) if shape.galley.text() == text => {
+                    Some(Rect::from_min_size(shape.pos, shape.galley.size()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("text {text:?} rendered"))
+    }
+    fn click(
+        ctx: &egui::Context,
+        window: &mut CallGraphWindow,
+        pos: Pos2,
+    ) -> (Option<String>, bool) {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let frame = |events| egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(
+            frame(vec![egui::Event::PointerMoved(pos), button(true)]),
+            |ctx| {
+                window.show_contents(ctx);
+            },
+        );
+        let mut result = (None, false);
+        let _ = ctx.run(frame(vec![button(false)]), |ctx| {
+            result = window.show_contents(ctx);
+        });
+        result
     }
     fn arrowheads(output: &egui::FullOutput) -> usize {
         output
@@ -558,21 +687,16 @@ mod tests {
                 visible: true,
                 ..Default::default()
             };
-            window.set_graph(
-                Some(sample_graph()),
-                Some(HashMap::from([(
-                    "app.Main".to_owned(),
-                    Exposure {
-                        exported: Some(true),
-                        details: vec!["activity: true (explicit)".into()],
-                    },
-                )])),
-            );
+            window.set_graph(Some(sample_graph()), Some(exported_main()));
             let output = ctx.run(egui::RawInput::default(), |ctx| {
                 window.show_contents(ctx);
             });
             assert!(!output.shapes.is_empty());
             assert_eq!(arrowheads(&output), 2, "one arrowhead per edge");
+            assert!(output.shapes.iter().any(|clipped| matches!(
+                &clipped.shape,
+                egui::Shape::Text(shape) if shape.galley.text().starts_with("Outgoing static calls")
+            )));
             let cancel = Arc::new(AtomicBool::new(false));
             window.cancel = Some(cancel.clone());
             window.visible = false;
@@ -638,6 +762,72 @@ mod tests {
             assert_ne!(reach.color(&light), reach.color(&dark));
         }
         assert_ne!(Reach::Exported.color(&light), Reach::Internal.color(&light));
+    }
+    #[test]
+    fn callers_flow_into_the_root_from_the_left() {
+        assert_eq!(CallGraphWindow::default().direction, Direction::Callers);
+        let ctx = egui::Context::default();
+        let mut window = CallGraphWindow {
+            visible: true,
+            ..Default::default()
+        };
+        let mut graph = sample_graph();
+        graph.direction = Direction::Callers;
+        graph.nodes[1].depth = 1;
+        graph.edges = vec![Edge {
+            from: 1,
+            to: 0,
+            sites: 3,
+        }];
+        window.set_graph(Some(graph), Some(exported_main()));
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            window.show_contents(ctx);
+        });
+        let centers = spheres(&output);
+        assert_eq!(centers.len(), 2, "{centers:?}");
+        let (caller, root) = (centers[0], centers[1]);
+        assert!(caller.x < root.x, "the caller sits left of the root");
+        let tips: Vec<Pos2> = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Path(path) if path.closed && path.points.len() == 3 => {
+                    Some(path.points[0])
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tips.len(), 1);
+        assert!(
+            tips[0].x > (caller.x + root.x) / 2.0 && tips[0].x < root.x,
+            "the arrowhead points into the root: {tips:?}"
+        );
+        // The exported Activity reaches the root, so both rims carry the exported color.
+        let red = Reach::Exported.color(&ctx.style().visuals);
+        let rims = output
+            .shapes
+            .iter()
+            .filter(|clipped| matches!(
+                &clipped.shape,
+                egui::Shape::Circle(circle) if circle.radius > 40.0 && circle.stroke.color == red
+            ))
+            .count();
+        assert_eq!(rims, 2);
+        assert!(output.shapes.iter().any(|clipped| matches!(
+            &clipped.shape,
+            egui::Shape::Text(shape) if shape.galley.text().starts_with("Incoming static calls")
+        )));
+        // Choosing another direction asks for a rebuild, except while a build is running.
+        let (selected, rebuild) = click(&ctx, &mut window, text_rect(&output, "Callees").center());
+        assert_eq!((selected, rebuild), (None, true));
+        assert_eq!(window.direction, Direction::Callees);
+        window.cancel = Some(Arc::new(AtomicBool::new(false)));
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            window.show_contents(ctx);
+        });
+        let (_, rebuild) = click(&ctx, &mut window, text_rect(&output, "Both").center());
+        assert!(!rebuild);
+        assert_eq!(window.direction, Direction::Callees);
     }
     #[test]
     fn nodes_follow_pointer_drags_and_reset_with_a_new_graph() {

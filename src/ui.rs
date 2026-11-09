@@ -1024,15 +1024,16 @@ impl App {
         self.call_graph.status = "Building call graph…".into();
         let cancel = Arc::new(AtomicBool::new(false));
         self.call_graph.cancel = Some(cancel.clone());
-        let (tx, generation, ctx, depth) = (
+        let (tx, generation, ctx, depth, direction) = (
             self.tx.clone(),
             self.generation,
             ctx.clone(),
             self.call_graph.depth,
+            self.call_graph.direction,
         );
         thread::spawn(move || {
             let result = engine
-                .call_graph_at(&class, offset, &hash, depth, &cancel)
+                .call_graph_at(&class, offset, &hash, depth, direction, &cancel)
                 .map_err(|e| format!("{e:#}"))
                 .map(|graph| (graph, engine.component_exposure().ok()));
             let _ = tx.send(Event::CallGraph(generation, engine, result));

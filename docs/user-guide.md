@@ -224,24 +224,39 @@ Right-click a method declaration or call and choose **Method references →
 Call graph…**. The graph opens in an independent native window that can be
 resized or moved to another monitor. All collected methods and call edges are displayed. Circular nodes
 use shading and shadows for a 3D appearance, and every edge carries an arrowhead at
-the callee. Full paths leading to Activities, Services, BroadcastReceivers, and
-ContentProviders are highlighted, including intermediate helper calls. Other calls
-stay visible with subdued edges.
+the callee.
 
-Component nodes and the highlighted edges leading to them take their color from the
-manifest exported state of the component class: **red** when the class, or a declared
+The **Callers / Callees / Both** selector chooses which calls the graph follows.
+**Callers**, the default, walks the methods that invoke the selected method and
+their callers in turn, so the selected method sits at the right edge and every
+arrow flows into it. **Callees** walks the methods the selected method invokes, with
+the selected method at the left edge. **Both** combines the two around the selected
+method. Changing the selector rebuilds the graph at once.
+
+Full paths between the selected method and Activities, Services,
+BroadcastReceivers, and ContentProviders are highlighted, including intermediate
+helper calls: in a callers graph the paths that start at a component and reach the
+selected method, in a callees graph the paths that lead from it to a component.
+Other calls stay visible with subdued edges.
+
+Component nodes and the highlighted edges take their color from the manifest
+exported state of the component class: **red** when the class, or a declared
 subclass, is exported and therefore reachable from other apps, **blue** when every
 declaration denies external access, **amber** when the manifest leaves the flag
 unresolved or no manifest is available, and grey when no declaration names the class.
-Hover a component node for the manifest lines behind its color, including
-`activity-alias` declarations and the declared subclasses of a base class. The label
-inside the node still names the component kind. Exported state is a manifest
-property; it does not prove that the method runs for an external intent.
+Helper methods on a highlighted path, including the selected method itself, carry
+the same rim color, so a red rim on the selected method in a callers graph means an
+exported component has a static call path to it. Hover a component node for the
+manifest lines behind its color, including `activity-alias` declarations and the
+declared subclasses of a base class; hover a helper method to see which component
+state reaches it. The label inside a component node still names the component kind.
+Exported state is a manifest property; it does not prove that the method runs for an
+external intent.
 
 The graph starts at **depth 20**, adjustable from 1 to 100. Change depth and press
 **Rebuild**. Use **Zoom**, **Fit graph**, and drag-to-pan to explore larger graphs.
 Drag a node to move it anywhere on the canvas; edges follow, and **Reset layout**
-returns every node to its depth column. Rebuilding also resets the layout.
+returns every node to its column. Rebuilding also resets the layout.
 Click an available node to open the exact method; hover for its full signature.
 Component classification follows superclass ancestry, including custom base
 classes, rather than relying on class-name suffixes.

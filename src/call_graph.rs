@@ -40,6 +40,48 @@ pub struct Edge {
     pub to: usize,
     pub sites: usize,
 }
+/// Which call edges a graph follows from its root method.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Direction {
+    /// Methods that call the root, then their callers.
+    Callers,
+    /// Methods the root calls, then their callees.
+    #[default]
+    Callees,
+    /// Callers and callees together.
+    Both,
+}
+impl Direction {
+    pub const ALL: [Self; 3] = [Self::Callers, Self::Callees, Self::Both];
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|d| d.as_str() == text)
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Callers => "callers",
+            Self::Callees => "callees",
+            Self::Both => "both",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Callers => "Callers",
+            Self::Callees => "Callees",
+            Self::Both => "Both",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Callers => {
+                "Methods that call the selected method, and their callers, up to the depth."
+            }
+            Self::Callees => {
+                "Methods the selected method calls, and their callees, up to the depth."
+            }
+            Self::Both => "Callers and callees of the selected method together.",
+        }
+    }
+}
 #[derive(Debug, Default)]
 pub struct CallGraph {
     pub nodes: Vec<Node>,
@@ -47,6 +89,8 @@ pub struct CallGraph {
     pub truncated: bool,
     pub dispatch_targets: Vec<String>,
     pub dispatch_targets_truncated: bool,
+    /// Direction the graph was built in; edges always point from caller to callee.
+    pub direction: Direction,
 }
 /// Manifest exported state of a class, merged over its own declarations and over declared
 /// components that inherit from it.
@@ -252,13 +296,10 @@ pub fn build_direction(
     cancel: &AtomicBool,
 ) -> Result<CallGraph> {
     ensure!((1..=100).contains(&depth), "Call graph depth must be 1–100");
-    ensure!(
-        ["callers", "callees", "both"].contains(&direction),
-        "Invalid direction"
-    );
+    let direction = Direction::parse(direction).context("Invalid direction")?;
     let root_owner = owner(root).context("Select a method")?;
     let mut incoming: HashMap<String, Vec<native_xrefs::CallSite>> = HashMap::new();
-    if direction != "callees" {
+    if direction != Direction::Callees {
         for class in engine.graph_classes() {
             ensure!(!cancel.load(Ordering::Relaxed), "Call graph cancelled");
             for site in native_xrefs::call_sites(class, None, cancel)? {
@@ -274,6 +315,7 @@ pub fn build_direction(
     let mut graph = CallGraph {
         dispatch_targets,
         dispatch_targets_truncated,
+        direction,
         ..Default::default()
     };
     graph.nodes.push(Node {
@@ -292,7 +334,7 @@ pub fn build_direction(
             continue;
         }
         let method = &graph.nodes[current].method;
-        let outgoing = if direction != "callers" {
+        let outgoing = if direction != Direction::Callers {
             if let Some((class, method)) = body(engine, method) {
                 native_xrefs::call_sites(
                     engine.class(&class).context("Missing call owner")?,
@@ -370,9 +412,21 @@ impl CallGraph {
     }
     /// Propagates each node's seed bits to every node that can reach it, including cycles.
     pub fn reachability(&self, seed: impl Fn(&Node) -> u8) -> Vec<u8> {
-        let mut incoming = vec![Vec::new(); self.nodes.len()];
+        self.propagate(seed, |edge| (edge.to, edge.from))
+    }
+    /// Propagates each node's seed bits to every node reachable from it, including cycles.
+    pub fn reachable_from(&self, seed: impl Fn(&Node) -> u8) -> Vec<u8> {
+        self.propagate(seed, |edge| (edge.from, edge.to))
+    }
+    fn propagate(
+        &self,
+        seed: impl Fn(&Node) -> u8,
+        step: impl Fn(&Edge) -> (usize, usize),
+    ) -> Vec<u8> {
+        let mut next = vec![Vec::new(); self.nodes.len()];
         for edge in &self.edges {
-            incoming[edge.to].push(edge.from);
+            let (source, target) = step(edge);
+            next[source].push(target);
         }
         let mut masks: Vec<u8> = self.nodes.iter().map(seed).collect();
         let mut queue: VecDeque<_> = masks
@@ -380,16 +434,38 @@ impl CallGraph {
             .enumerate()
             .filter_map(|(i, &m)| (m != 0).then_some(i))
             .collect();
-        while let Some(to) = queue.pop_front() {
-            for &from in &incoming[to] {
-                let merged = masks[from] | masks[to];
-                if merged != masks[from] {
-                    masks[from] = merged;
-                    queue.push_back(from);
+        while let Some(source) = queue.pop_front() {
+            for &target in &next[source] {
+                let merged = masks[target] | masks[source];
+                if merged != masks[target] {
+                    masks[target] = merged;
+                    queue.push_back(target);
                 }
             }
         }
         masks
+    }
+    /// Signed layout column per node: a callee sits one column right of the method that
+    /// reached it and a caller one column left, so arrows read left to right whichever
+    /// direction the graph was built in. Each node takes its column from the edge that
+    /// discovered it; a node without edges falls back to its depth.
+    pub fn columns(&self) -> Vec<i32> {
+        let mut columns: Vec<Option<i32>> = vec![None; self.nodes.len()];
+        if let Some(root) = columns.first_mut() {
+            *root = Some(0);
+        }
+        for edge in &self.edges {
+            match (columns[edge.from], columns[edge.to]) {
+                (Some(from), None) => columns[edge.to] = Some(from + 1),
+                (None, Some(to)) => columns[edge.from] = Some(to - 1),
+                _ => {}
+            }
+        }
+        columns
+            .iter()
+            .zip(&self.nodes)
+            .map(|(column, node)| column.unwrap_or(node.depth as i32))
+            .collect()
     }
     pub fn component_paths(&self) -> Vec<bool> {
         self.component_reachability()
@@ -620,10 +696,53 @@ mod tests {
             truncated: false,
             dispatch_targets: vec![],
             dispatch_targets_truncated: false,
+            direction: Direction::Callees,
         };
         assert_eq!(graph.component_reachability(), vec![2, 2, 2, 2, 0]);
         assert_eq!(graph.nodes.len(), 5); // unrelated node remains in the graph
         assert_eq!(graph.component_paths(), vec![true, true, true, true, false]);
         assert_eq!(owner("a.b.C.m(Ljava/lang/String;)V"), Some("a.b.C"));
+    }
+    #[test]
+    fn columns_and_forward_propagation_follow_discovery_edges() {
+        let node = |i: usize, depth: usize, component: Option<Component>| Node {
+            method: format!("C.m{i}()V"),
+            depth,
+            component,
+            available: true,
+        };
+        let edge = |from, to| Edge { from, to, sites: 1 };
+        // Discovery order of a bidirectional build: node 1 calls the root, the root calls
+        // node 2, node 3 also calls node 2, node 4 calls node 1, node 5 was cut off before
+        // its edge was recorded.
+        let graph = CallGraph {
+            nodes: vec![
+                node(0, 0, None),
+                node(1, 1, Some(Component::Activity)),
+                node(2, 1, None),
+                node(3, 2, None),
+                node(4, 2, Some(Component::Service)),
+                node(5, 3, None),
+            ],
+            edges: vec![edge(1, 0), edge(0, 2), edge(3, 2), edge(4, 1), edge(2, 0)],
+            direction: Direction::Both,
+            ..Default::default()
+        };
+        assert_eq!(graph.columns(), vec![0, -1, 1, 0, -2, 3]);
+        // Forward propagation marks what the components lead to; the cycle 0 → 2 → 0 is
+        // covered and the unrelated caller 3 stays clear.
+        let seed = |n: &Node| match n.component {
+            Some(Component::Activity) => 1,
+            Some(Component::Service) => 2,
+            _ => 0,
+        };
+        assert_eq!(graph.reachable_from(seed), vec![3, 3, 3, 0, 2, 0]);
+        assert_eq!(graph.reachability(seed), vec![0, 1, 0, 0, 3, 0]);
+        assert_eq!(Direction::parse("callers"), Some(Direction::Callers));
+        assert_eq!(Direction::parse("sideways"), None);
+        for direction in Direction::ALL {
+            assert_eq!(Direction::parse(direction.as_str()), Some(direction));
+        }
+        assert_eq!(Direction::default(), Direction::Callees);
     }
 }

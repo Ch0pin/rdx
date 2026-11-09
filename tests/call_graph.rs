@@ -1,5 +1,5 @@
 use rdx::{
-    call_graph,
+    call_graph::{self, Direction},
     engine::{DecompilerEngine, NativeEngine},
     native_engine::NativeDexEngine,
 };
@@ -19,7 +19,14 @@ fn graph_from_dex_and_exact_navigation() {
         .start;
     let cancel = AtomicBool::new(false);
     let graph = engine
-        .call_graph_at("sample.Caller", offset, &source.source_hash, 3, &cancel)
+        .call_graph_at(
+            "sample.Caller",
+            offset,
+            &source.source_hash,
+            3,
+            Direction::Callees,
+            &cancel,
+        )
         .unwrap();
     assert!(graph.nodes[0].method.starts_with("sample.Caller.compute("));
     let index = graph
@@ -41,12 +48,26 @@ fn graph_from_dex_and_exact_navigation() {
     );
     assert!(
         engine
-            .call_graph_at("sample.Caller", offset, "stale", 3, &cancel)
+            .call_graph_at(
+                "sample.Caller",
+                offset,
+                "stale",
+                3,
+                Direction::Callees,
+                &cancel
+            )
             .is_err()
     );
     assert!(
         engine
-            .call_graph_at("sample.Caller", offset, &source.source_hash, 0, &cancel)
+            .call_graph_at(
+                "sample.Caller",
+                offset,
+                &source.source_hash,
+                0,
+                Direction::Callees,
+                &cancel
+            )
             .is_err()
     );
     assert!(
@@ -56,10 +77,39 @@ fn graph_from_dex_and_exact_navigation() {
                 offset,
                 &source.source_hash,
                 3,
+                Direction::Callees,
                 &AtomicBool::new(true)
             )
             .is_err()
     );
+    // The callers walk from the callee finds the same edge from the other side, and lays
+    // the caller out one column to the left of the root.
+    let target = engine.decompile_with_metadata("sample.Target").unwrap();
+    let offset = target
+        .definitions
+        .iter()
+        .find(|d| d.name == "doubleValue")
+        .unwrap()
+        .start;
+    let callers = engine
+        .call_graph_at(
+            "sample.Target",
+            offset,
+            &target.source_hash,
+            3,
+            Direction::Callers,
+            &cancel,
+        )
+        .unwrap();
+    assert_eq!(callers.direction, Direction::Callers);
+    assert_eq!(callers.nodes[0].method, "sample.Target.doubleValue(I)I");
+    let caller = callers
+        .nodes
+        .iter()
+        .position(|n| n.method.starts_with("sample.Caller.compute("))
+        .unwrap();
+    assert!(callers.edges.iter().any(|e| e.from == caller && e.to == 0));
+    assert_eq!(callers.columns()[caller], -1);
 }
 #[test]
 fn graph_depth_bounds_and_external_nodes() {

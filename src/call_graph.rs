@@ -48,6 +48,16 @@ pub struct CallGraph {
     pub dispatch_targets: Vec<String>,
     pub dispatch_targets_truncated: bool,
 }
+/// Manifest exported state of a class, merged over its own declarations and over declared
+/// components that inherit from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Exposure {
+    /// `Some(true)` when any declaration is exported, `None` when a declaration leaves the flag
+    /// unresolved, `Some(false)` when every declaration denies external access.
+    pub exported: Option<bool>,
+    /// One line per contributing manifest declaration.
+    pub details: Vec<String>,
+}
 
 pub fn owner(method: &str) -> Option<&str> {
     method
@@ -76,12 +86,66 @@ fn component(mut name: String, parent: impl Fn(&str) -> Option<String>) -> Optio
     }
     None
 }
-fn parent(engine: &NativeDexEngine, name: &str) -> Option<String> {
+pub(crate) fn parent(engine: &NativeDexEngine, name: &str) -> Option<String> {
     engine
         .class(name)?
         .superclass
         .as_deref()
         .map(crate::native_engine::disassembly::type_name)
+}
+/// Exported state per class, keyed by Java class name. Each declared component contributes to
+/// its target class and to every loaded superclass, so a base class inherits the exposure of
+/// the components built on it. `parent` returns the superclass of a loaded class, or `None`
+/// for classes outside the DEX, which end the walk without an entry.
+pub fn exposure_map(
+    components: &[crate::manifest_summary::ManifestComponent],
+    parent: impl Fn(&str) -> Option<String>,
+) -> HashMap<String, Exposure> {
+    let mut map: HashMap<String, Exposure> = HashMap::new();
+    for component in components {
+        if component.target.is_empty() {
+            continue;
+        }
+        let state = if component.is_exported() {
+            Some(true)
+        } else if component.exported.starts_with("false") {
+            Some(false)
+        } else {
+            None
+        };
+        let declaration = if component.kind == "activity-alias" {
+            format!("alias {}: {}", component.name, component.exported)
+        } else {
+            format!("{}: {}", component.kind, component.exported)
+        };
+        let mut class = component.target.clone();
+        let mut seen = HashSet::new();
+        let mut inherited = false;
+        while seen.insert(class.clone()) && seen.len() <= 256 {
+            let next = parent(&class);
+            if inherited && next.is_none() {
+                break;
+            }
+            let entry = map.entry(class.clone()).or_insert_with(|| Exposure {
+                exported: Some(false),
+                details: Vec::new(),
+            });
+            entry.exported = match (entry.exported, state) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (None, _) | (_, None) => None,
+                _ => Some(false),
+            };
+            entry.details.push(if inherited {
+                format!("{declaration} (via subclass {})", component.target)
+            } else {
+                declaration.clone()
+            });
+            let Some(next) = next else { break };
+            class = next;
+            inherited = true;
+        }
+    }
+    map
 }
 fn body(engine: &NativeDexEngine, target: &str) -> Option<(String, String)> {
     let original = owner(target)?;
@@ -296,21 +360,21 @@ pub fn build_direction(
 impl CallGraph {
     /// All helper nodes that can reach each component kind, including cycles.
     pub fn component_reachability(&self) -> Vec<u8> {
+        self.reachability(|n| match n.component {
+            Some(Component::Activity) => 1,
+            Some(Component::Service) => 2,
+            Some(Component::Receiver) => 4,
+            Some(Component::Provider) => 8,
+            None => 0,
+        })
+    }
+    /// Propagates each node's seed bits to every node that can reach it, including cycles.
+    pub fn reachability(&self, seed: impl Fn(&Node) -> u8) -> Vec<u8> {
         let mut incoming = vec![Vec::new(); self.nodes.len()];
         for edge in &self.edges {
             incoming[edge.to].push(edge.from);
         }
-        let mut masks: Vec<u8> = self
-            .nodes
-            .iter()
-            .map(|n| match n.component {
-                Some(Component::Activity) => 1,
-                Some(Component::Service) => 2,
-                Some(Component::Receiver) => 4,
-                Some(Component::Provider) => 8,
-                None => 0,
-            })
-            .collect();
+        let mut masks: Vec<u8> = self.nodes.iter().map(seed).collect();
         let mut queue: VecDeque<_> = masks
             .iter()
             .enumerate()
@@ -417,6 +481,103 @@ mod tests {
         }
         assert_eq!(component("app.Cycle".into(), |n| Some(n.into())), None);
         assert_eq!(component("ActivityLikeName".into(), |_| None), None);
+    }
+    #[test]
+    fn exposure_map_merges_declarations_and_propagates_to_loaded_superclasses() {
+        use crate::manifest_summary::ManifestComponent;
+        let declare = |kind: &str, name: &str, target: &str, exported: &str| ManifestComponent {
+            kind: kind.into(),
+            name: name.into(),
+            target: target.into(),
+            exported: exported.into(),
+            enabled: "true".into(),
+            launcher: false,
+            filters: vec![],
+            details: vec![],
+        };
+        let components = [
+            declare(
+                "activity",
+                "app.Main",
+                "app.Main",
+                "true (inferred from intent filters)",
+            ),
+            declare("activity", "app.Hidden", "app.Hidden", "false (explicit)"),
+            declare(
+                "activity-alias",
+                "app.Door",
+                "app.Hidden",
+                "true (explicit)",
+            ),
+            declare(
+                "activity",
+                "app.Quiet",
+                "app.Quiet",
+                "false (inferred from intent filters)",
+            ),
+            declare(
+                "service",
+                "app.Legacy",
+                "app.Legacy",
+                "Unresolved (missing exported on target SDK 31+)",
+            ),
+            declare("activity-alias", "app.Broken", "", "true (explicit)"),
+        ];
+        // Loaded classes and their superclasses; framework classes are not loaded.
+        let hierarchy = HashMap::from([
+            ("app.Main", "app.Base"),
+            ("app.Hidden", "app.Base"),
+            ("app.Quiet", "lib.Compat"),
+            ("app.Base", "lib.Compat"),
+            ("lib.Compat", "android.app.Activity"),
+            ("app.Legacy", "android.app.Service"),
+        ]);
+        let map = exposure_map(&components, |name| {
+            hierarchy.get(name).map(|parent| (*parent).to_owned())
+        });
+        assert_eq!(map["app.Main"].exported, Some(true));
+        assert_eq!(
+            map["app.Hidden"].exported,
+            Some(true),
+            "alias exports the target"
+        );
+        assert_eq!(
+            map["app.Hidden"].details,
+            vec![
+                "activity: false (explicit)".to_owned(),
+                "alias app.Door: true (explicit)".to_owned()
+            ]
+        );
+        assert_eq!(map["app.Quiet"].exported, Some(false));
+        assert_eq!(map["app.Legacy"].exported, None);
+        assert_eq!(map["app.Base"].exported, Some(true));
+        assert_eq!(map["app.Base"].details.len(), 3);
+        assert!(
+            map["app.Base"]
+                .details
+                .iter()
+                .all(|line| line.ends_with("(via subclass app.Main)")
+                    || line.ends_with("(via subclass app.Hidden)"))
+        );
+        assert_eq!(map["lib.Compat"].exported, Some(true));
+        assert_eq!(map["lib.Compat"].details.len(), 4);
+        assert!(
+            !map.contains_key("android.app.Activity"),
+            "framework classes stay out"
+        );
+        assert!(!map.contains_key("android.app.Service"));
+        assert!(
+            !map.contains_key(""),
+            "aliases without a target are skipped"
+        );
+        assert!(!map.contains_key("app.Door"), "alias names are not classes");
+        assert_eq!(map.len(), 6);
+        // Unresolved beats internal once no exported declaration is present.
+        let mixed = [
+            declare("provider", "app.P", "app.P", "false (explicit)"),
+            declare("provider", "app.P", "app.P", "Unresolved (target SDK)"),
+        ];
+        assert_eq!(exposure_map(&mixed, |_| None)["app.P"].exported, None);
     }
     #[test]
     fn full_paths_are_marked_without_marking_unrelated_branches() {

@@ -947,6 +947,18 @@ impl NativeEngine {
         crate::call_graph::build(&self.native, &target.id, depth, cancel)
     }
 
+    /// Manifest exported state per component class, including loaded superclasses of declared
+    /// components. Fails when the manifest is unavailable or does not parse.
+    pub fn component_exposure(
+        &mut self,
+    ) -> Result<std::collections::HashMap<String, crate::call_graph::Exposure>> {
+        let xml = self.read_resource("AndroidManifest.xml")?;
+        let components = crate::manifest_summary::components(&xml).map_err(anyhow::Error::msg)?;
+        Ok(crate::call_graph::exposure_map(&components, |name| {
+            crate::call_graph::parent(&self.native, name)
+        }))
+    }
+
     pub fn navigate_graph_method(&mut self, symbol: &str) -> Result<NavigationResult> {
         self.navigate_graph_method_shared(symbol)
             .map(SharedNavigationResult::into_owned)
@@ -1507,6 +1519,33 @@ mod navigation_cache_tests {
     use super::*;
     use std::sync::Arc;
 
+    #[test]
+    fn component_exposure_follows_every_manifest_declaration() {
+        let mut engine = NativeEngine::start().unwrap();
+        engine
+            .open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk"))
+            .unwrap();
+        let map = engine.component_exposure().unwrap();
+        let xml = engine.read_resource("AndroidManifest.xml").unwrap();
+        let components = crate::manifest_summary::components(&xml).unwrap();
+        assert!(!components.is_empty());
+        for component in components.iter().filter(|c| !c.target.is_empty()) {
+            let entry = &map[&component.target];
+            assert!(
+                entry
+                    .details
+                    .iter()
+                    .any(|line| line.ends_with(&component.exported)),
+                "{}: {:?}",
+                component.target,
+                entry.details
+            );
+            if component.is_exported() {
+                assert_eq!(entry.exported, Some(true));
+            }
+        }
+        assert!(!map.contains_key("android.app.Activity"));
+    }
     #[test]
     fn memory_shared_navigation_uses_the_cached_payload_and_owned_compatibility_is_isolated() {
         let mut engine = NativeEngine::start().unwrap();

@@ -52,7 +52,13 @@ enum Event {
     CallGraph(
         u64,
         NativeEngine,
-        Result<rdx::call_graph::CallGraph, String>,
+        Result<
+            (
+                rdx::call_graph::CallGraph,
+                Option<crate::call_graph_window::ExposureMap>,
+            ),
+            String,
+        >,
     ),
     Archive(u64, Arc<Archive>),
     AppIcon(u64, image::RgbaImage),
@@ -1014,7 +1020,7 @@ impl App {
         };
         self.busy = true;
         self.call_graph.origin = Some((class.clone(), offset, hash.clone()));
-        self.call_graph.graph = None;
+        self.call_graph.set_graph(None, None);
         self.call_graph.status = "Building call graph…".into();
         let cancel = Arc::new(AtomicBool::new(false));
         self.call_graph.cancel = Some(cancel.clone());
@@ -1027,7 +1033,8 @@ impl App {
         thread::spawn(move || {
             let result = engine
                 .call_graph_at(&class, offset, &hash, depth, &cancel)
-                .map_err(|e| format!("{e:#}"));
+                .map_err(|e| format!("{e:#}"))
+                .map(|graph| (graph, engine.component_exposure().ok()));
             let _ = tx.send(Event::CallGraph(generation, engine, result));
             ctx.request_repaint();
             ctx.request_repaint_of(crate::call_graph_window::CallGraphWindow::viewport_id());
@@ -2772,13 +2779,18 @@ impl App {
                     self.busy = false;
                     self.call_graph.cancel = None;
                     match result {
-                        Ok(graph) => {
+                        Ok((graph, exposure)) => {
                             self.call_graph.status = format!(
-                                "{} methods · {} edges · click a method to open it",
+                                "{} methods · {} edges · click a method to open it{}",
                                 graph.nodes.len(),
-                                graph.edges.len()
+                                graph.edges.len(),
+                                if exposure.is_none() {
+                                    " · manifest unavailable, exported state unknown"
+                                } else {
+                                    ""
+                                }
                             );
-                            self.call_graph.graph = Some(graph);
+                            self.call_graph.set_graph(Some(graph), exposure);
                         }
                         Err(error) => self.call_graph.status = error,
                     }

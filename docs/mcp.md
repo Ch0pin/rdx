@@ -268,7 +268,8 @@ reuse its per-direction shards. Candidates are verified against the original
 DEX class/name/prototype before emission. The cache is shared by immutable
 project snapshots and discarded when the project is released; reopening starts
 a fresh cache. Failed or cancelled builds can be retried. Callee-only queries
-walk reachable methods directly.
+walk reachable methods directly. The GUI call graph window shares the same
+index for its Callers and Both graphs.
 
 `get_instance_info.invoke_index` reports `state`, `scanned_classes`,
 `total_classes`, `invoke_sites`, `undecodable_methods`, and `active_batches`. Poll it from the same MCP

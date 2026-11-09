@@ -945,13 +945,28 @@ impl NativeEngine {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<crate::call_graph::CallGraph> {
         let target = self.resolve_method_xref_target(class, offset, hash, false)?;
-        crate::call_graph::build_direction(
-            &self.native,
-            &target.id,
-            depth,
-            direction.as_str(),
-            cancel,
-        )
+        match direction {
+            // Callee graphs scan only the bodies they reach, which is cheap.
+            crate::call_graph::Direction::Callees => crate::call_graph::build_direction(
+                &self.native,
+                &target.id,
+                depth,
+                direction.as_str(),
+                cancel,
+            ),
+            // Reverse edges come from the project-wide invoke index shared with
+            // MCP queries, so only the first build pays for scanning every class.
+            crate::call_graph::Direction::Callers | crate::call_graph::Direction::Both => {
+                crate::call_graph::graph_cached(
+                    &self.native,
+                    &target.id,
+                    depth,
+                    direction,
+                    cancel,
+                    &self.invoke_index,
+                )
+            }
+        }
     }
 
     /// Manifest exported state per component class, including loaded superclasses of declared
@@ -1761,6 +1776,37 @@ mod navigation_cache_tests {
                         })
                         .collect();
                     gui_edges.sort();
+                    let cached = crate::call_graph::graph_cached(
+                        &engine.native,
+                        root,
+                        depth,
+                        crate::call_graph::Direction::parse(direction).unwrap(),
+                        &cancel,
+                        &engine.invoke_index,
+                    )
+                    .unwrap();
+                    let cached_nodes: BTreeSet<(String, usize)> = cached
+                        .nodes
+                        .iter()
+                        .map(|n| (n.method.clone(), n.depth))
+                        .collect();
+                    assert_eq!(cached_nodes, gui_nodes, "{context}");
+                    let mut cached_edges: Vec<(String, String, usize)> = cached
+                        .edges
+                        .iter()
+                        .map(|e| {
+                            (
+                                cached.nodes[e.from].method.clone(),
+                                cached.nodes[e.to].method.clone(),
+                                e.sites,
+                            )
+                        })
+                        .collect();
+                    cached_edges.sort();
+                    assert_eq!(cached_edges, gui_edges, "{context}");
+                    assert_eq!(cached.truncated, gui.truncated, "{context}");
+                    assert_eq!(cached.direction.as_str(), direction, "{context}");
+                    assert_eq!(cached.dispatch_targets, gui.dispatch_targets, "{context}");
                     let names: Vec<&str> = query["nodes"]
                         .as_array()
                         .unwrap()
@@ -1792,6 +1838,94 @@ mod navigation_cache_tests {
             }
         }
         assert!(edges_seen > 0);
+    }
+
+    #[test]
+    fn gui_callers_graph_shares_the_invoke_index() {
+        use crate::call_graph::{CallGraph, Direction};
+        use std::collections::BTreeSet;
+        let mut engine = opened();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let source = engine.decompile_with_metadata("sample.Target").unwrap();
+        let offset = source
+            .definitions
+            .iter()
+            .find(|d| d.name == "doubleValue")
+            .unwrap()
+            .start;
+        let hash = source.source_hash.clone();
+        let callees = engine
+            .call_graph_at(
+                "sample.Target",
+                offset,
+                &hash,
+                3,
+                Direction::Callees,
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(callees.direction, Direction::Callees);
+        assert_eq!(engine.invoke_index.status()["state"], "not_built");
+        let shape = |graph: &CallGraph| {
+            let nodes: BTreeSet<_> = graph
+                .nodes
+                .iter()
+                .map(|n| {
+                    (
+                        n.method.clone(),
+                        n.depth,
+                        n.component.map(|c| c.label()),
+                        n.available,
+                    )
+                })
+                .collect();
+            let edges: BTreeSet<_> = graph
+                .edges
+                .iter()
+                .map(|e| {
+                    (
+                        graph.nodes[e.from].method.clone(),
+                        graph.nodes[e.to].method.clone(),
+                        e.sites,
+                    )
+                })
+                .collect();
+            (
+                nodes,
+                edges,
+                graph.truncated,
+                graph.dispatch_targets.clone(),
+            )
+        };
+        for direction in [Direction::Callers, Direction::Both] {
+            let graph = engine
+                .call_graph_at("sample.Target", offset, &hash, 3, direction, &cancel)
+                .unwrap();
+            assert_eq!(engine.invoke_index.status()["state"], "ready");
+            assert_eq!(graph.direction, direction);
+            assert_eq!(graph.nodes[0].method, "sample.Target.doubleValue(I)I");
+            assert!(graph.edges.iter().any(|e| {
+                e.to == 0
+                    && graph.nodes[e.from]
+                        .method
+                        .starts_with("sample.Caller.compute(")
+            }));
+            let legacy = crate::call_graph::build_direction(
+                &engine.native,
+                "sample.Target.doubleValue(I)I",
+                3,
+                direction.as_str(),
+                &cancel,
+            )
+            .unwrap();
+            assert_eq!(shape(&graph), shape(&legacy));
+        }
+        // The index the window built is the one MCP queries reuse.
+        let args = serde_json::json!({"direction":"callers","projection":"graph"});
+        let query = engine
+            .call_graph_query_by_id("sample.Target.doubleValue(I)I", &args, &cancel)
+            .unwrap();
+        assert_eq!(query["invoke_index_cached"], true);
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Project-owned disk postings. Fingerprints select candidates; raw DEX verifies each hit.
+//! Project-owned disk postings, sorted by fingerprint within each shard so a lookup
+//! binary-searches its run instead of scanning the shard. Raw DEX verifies each hit.
 use super::{Catalog, Lookup, ScanFailures, check_cancel, scan_method};
 use crate::{
     native_dex::{DexClass, DexMethod},
@@ -10,8 +11,8 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
-    io::{BufReader, BufWriter, Read, Write},
-    path::PathBuf,
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, TryLockError,
         atomic::{AtomicUsize, Ordering},
@@ -120,6 +121,50 @@ pub(super) struct Index {
     raw: HashSet<u64>,
     pub(super) failures: ScanFailures,
 }
+fn record_hash(record: &[u8; RECORD]) -> u64 {
+    u64::from_le_bytes(record[..8].try_into().unwrap())
+}
+/// Order every shard by (fingerprint, class, method, pc) so equal fingerprints
+/// form one contiguous, deterministic run. Shards are sorted a few at a time in
+/// parallel; each holds a small fraction of the postings.
+fn sort_shards(directory: &Path, shards: usize) -> Result<()> {
+    let sort = |shard: usize| -> Result<()> {
+        let path = directory.join(shard.to_string());
+        let bytes = fs::read(&path)?;
+        let mut records: Vec<[u8; RECORD]> = bytes
+            .chunks_exact(RECORD)
+            .map(|chunk| chunk.try_into().unwrap())
+            .collect();
+        records.sort_unstable_by_key(|record| {
+            (
+                record_hash(record),
+                u32::from_le_bytes(record[8..12].try_into().unwrap()),
+                u32::from_le_bytes(record[12..16].try_into().unwrap()),
+                u32::from_le_bytes(record[16..20].try_into().unwrap()),
+            )
+        });
+        let mut writer = BufWriter::with_capacity(65536, File::create(&path)?);
+        for record in &records {
+            writer.write_all(record)?;
+        }
+        writer.flush()?;
+        Ok(())
+    };
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|worker| {
+                let sort = &sort;
+                scope.spawn(move || (worker..shards).step_by(workers).try_for_each(sort))
+            })
+            .collect();
+        handles.into_iter().try_for_each(|handle| {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("Invoke index sort panicked; retry request"))?
+        })
+    })
+}
 fn write_record(
     writers: &mut [BufWriter<File>],
     shard: usize,
@@ -189,6 +234,8 @@ impl Index {
             .collect::<std::io::Result<Vec<_>>>()?;
         drop(writers);
         check_cancel(catalog.cancel)?;
+        sort_shards(&directory.0, SHARDS * 3)?;
+        check_cancel(catalog.cancel)?;
         Ok(Self {
             directory,
             names,
@@ -198,7 +245,9 @@ impl Index {
         })
     }
     /// Visit every posting in `shard` whose fingerprint matches, handing the raw
-    /// DEX position to `visit`, which must verify the exact target itself.
+    /// DEX position to `visit`, which must verify the exact target itself. Postings
+    /// are sorted by fingerprint, so the run is found by binary search and read
+    /// contiguously.
     fn candidates(
         &self,
         catalog: &Catalog<'_>,
@@ -206,20 +255,33 @@ impl Index {
         hash: u64,
         mut visit: impl FnMut(&DexClass, &DexMethod, usize) -> Result<()>,
     ) -> Result<()> {
-        let file = File::open(self.directory.0.join(shard.to_string()))?;
+        let mut file = File::open(self.directory.0.join(shard.to_string()))?;
         ensure!(
             file.metadata()?.len() == self.lengths[shard],
             "Invoke index shard changed; reopen project"
         );
+        let count = self.lengths[shard] / RECORD as u64;
+        let mut record = [0u8; RECORD];
+        let (mut low, mut high) = (0u64, count);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            file.seek(SeekFrom::Start(middle * RECORD as u64))?;
+            file.read_exact(&mut record)?;
+            if record_hash(&record) < hash {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        file.seek(SeekFrom::Start(low * RECORD as u64))?;
         let mut reader = BufReader::with_capacity(65536, file);
-        for n in 0..self.lengths[shard] / RECORD as u64 {
+        for n in 0..count - low {
             if n % 1024 == 0 {
                 check_cancel(catalog.cancel)?;
             }
-            let mut record = [0u8; RECORD];
             reader.read_exact(&mut record)?;
-            if u64::from_le_bytes(record[..8].try_into().unwrap()) != hash {
-                continue;
+            if record_hash(&record) != hash {
+                break;
             }
             let ci = u32::from_le_bytes(record[8..12].try_into().unwrap()) as usize;
             let mi = u32::from_le_bytes(record[12..16].try_into().unwrap()) as usize;
@@ -357,6 +419,58 @@ mod tests {
             index
                 .neighbors(&catalog, "api.Parent.call()V", true)
                 .is_err()
+        );
+    }
+    #[test]
+    fn shards_are_sorted_so_lookups_binary_search_their_run() {
+        let mut classes = fixtures();
+        // Many unrelated postings land between the first and last caller of the
+        // target in scan order; sorting must still bring the run together.
+        for i in 0..64 {
+            let callee = format!("lib.Util{i}.helper()V");
+            classes.push(class(
+                &format!("app.Middle{i:02}"),
+                None,
+                vec![("run", vec![], vec![callee.as_str()])],
+            ));
+        }
+        classes.push(class(
+            "app.Zed",
+            None,
+            vec![("run", vec![], vec!["api.Parent.call()V"])],
+        ));
+        let cancel = AtomicBool::new(false);
+        let catalog = Catalog::new(&classes, &cancel).unwrap();
+        let (index, _) = Cache::default().get(&catalog).unwrap();
+        for shard in 0..SHARDS * 3 {
+            let bytes = fs::read(index.directory.0.join(shard.to_string())).unwrap();
+            assert_eq!(bytes.len() as u64, index.lengths[shard]);
+            let hashes: Vec<u64> = bytes
+                .chunks_exact(RECORD)
+                .map(|chunk| record_hash(chunk.try_into().unwrap()))
+                .collect();
+            assert!(hashes.windows(2).all(|pair| pair[0] <= pair[1]), "{shard}");
+        }
+        let hits = index
+            .neighbors(&catalog, "api.Parent.call()V", true)
+            .unwrap();
+        let callers: Vec<&str> = hits.iter().map(|site| site.caller.as_str()).collect();
+        assert_eq!(
+            callers,
+            ["app.One.run()V", "app.One.run()V", "app.Zed.run()V"]
+        );
+        for i in 0..64 {
+            let hits = index
+                .neighbors(&catalog, &format!("lib.Util{i}.helper()V"), true)
+                .unwrap();
+            assert_eq!(hits.len(), 1, "{i}");
+            assert_eq!(hits[0].caller, format!("app.Middle{i:02}.run()V"));
+        }
+        assert!(
+            index
+                .neighbors(&catalog, "lib.Util99.helper()V", true)
+                .unwrap()
+                .is_empty()
         );
     }
     #[test]

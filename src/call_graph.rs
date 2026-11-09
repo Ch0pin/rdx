@@ -4,7 +4,7 @@ mod query;
 use crate::{native_engine::NativeDexEngine, native_xrefs};
 use anyhow::{Context, Result, ensure};
 pub use query::query;
-pub(crate) use query::{Cache as QueryCache, query_cached};
+pub(crate) use query::{Cache as QueryCache, graph_cached, query_cached};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicBool, Ordering},
@@ -451,14 +451,23 @@ impl CallGraph {
     /// discovered it; a node without edges falls back to its depth.
     pub fn columns(&self) -> Vec<i32> {
         let mut columns: Vec<Option<i32>> = vec![None; self.nodes.len()];
+        let mut adjacent: Vec<Vec<(usize, i32)>> = vec![Vec::new(); self.nodes.len()];
+        for edge in &self.edges {
+            adjacent[edge.from].push((edge.to, 1));
+            adjacent[edge.to].push((edge.from, -1));
+        }
+        let mut queue = VecDeque::new();
         if let Some(root) = columns.first_mut() {
             *root = Some(0);
+            queue.push_back(0);
         }
-        for edge in &self.edges {
-            match (columns[edge.from], columns[edge.to]) {
-                (Some(from), None) => columns[edge.to] = Some(from + 1),
-                (None, Some(to)) => columns[edge.from] = Some(to - 1),
-                _ => {}
+        while let Some(current) = queue.pop_front() {
+            let column = columns[current].unwrap_or(0);
+            for &(next, step) in &adjacent[current] {
+                if columns[next].is_none() {
+                    columns[next] = Some(column + step);
+                    queue.push_back(next);
+                }
             }
         }
         columns
@@ -729,6 +738,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(graph.columns(), vec![0, -1, 1, 0, -2, 3]);
+        // Edge order never decides the layout: a chain recorded callee-first still
+        // places each caller one column further left.
+        let chain = CallGraph {
+            nodes: vec![node(0, 0, None), node(1, 1, None), node(2, 2, None)],
+            edges: vec![edge(2, 1), edge(1, 0)],
+            direction: Direction::Callers,
+            ..Default::default()
+        };
+        assert_eq!(chain.columns(), vec![0, -1, -2]);
         // Forward propagation marks what the components lead to; the cycle 0 → 2 → 0 is
         // covered and the unrelated caller 3 stays clear.
         let seed = |n: &Node| match n.component {

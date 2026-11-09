@@ -2,7 +2,7 @@
 mod index;
 pub(crate) use index::Cache;
 // Exact DEX call-site queries. Filters select results after depth-bounded traversal.
-use super::{CallGraph, Component, Edge, Node, component, dispatch_targets_with, owner};
+use super::{CallGraph, Component, Direction, Edge, Node, component, dispatch_targets_with, owner};
 use crate::{native_dex::DexClass, native_engine::NativeDexEngine, native_xrefs};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -30,6 +30,9 @@ struct Options<'a> {
     component_type: Option<Component>,
     offset: usize,
     limit: usize,
+    /// Expand at most this many methods; later discoveries stay leaves. Never set
+    /// from request arguments: MCP queries traverse fully and report totals.
+    visit_limit: Option<usize>,
 }
 
 fn string_option<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
@@ -157,6 +160,7 @@ impl<'a> Options<'a> {
             component_type,
             offset,
             limit,
+            visit_limit: None,
         })
     }
 }
@@ -341,7 +345,7 @@ fn check_cancel(cancel: &AtomicBool) -> Result<()> {
 
 /// Method bodies whose instructions cannot be decoded contribute no call sites.
 /// They are reported with the result instead of failing or silently vanishing.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct ScanFailures {
     count: usize,
     samples: Vec<Value>,
@@ -417,9 +421,57 @@ fn query_cached_catalog(
     if options.direction == "callees" {
         return query_catalog(catalog, &normalized, args, cancel);
     }
-    let (index, cached) = cache.get(&catalog)?;
-    let canonical = catalog.canonical(&normalized);
-    let dispatch = dispatch_aliases(&catalog, &normalized, &options, cancel)?;
+    let (provided, cached) = indexed_sites(&catalog, &normalized, &options, cancel, cache)?;
+    let mut result = query_catalog_with_sites(catalog, &normalized, args, cancel, Some(provided))?;
+    result["invoke_index_cached"] = json!(cached);
+    result["invoke_index"] = cache.status();
+    Ok(result)
+}
+
+/// Build the graph the GUI window draws, sharing the project's invoke index with
+/// MCP queries so reverse traversals stop rescanning every class. Callers and
+/// bidirectional graphs read the index; callee graphs scan reachable bodies only.
+/// Expansion stops after `NODE_LIMIT` methods, like the legacy builder, so a
+/// popular root or a deep bidirectional walk cannot visit the whole app before
+/// the projection discards everything past the limit anyway.
+pub(crate) fn graph_cached(
+    engine: &NativeDexEngine,
+    root: &str,
+    depth: usize,
+    direction: Direction,
+    cancel: &AtomicBool,
+    cache: &Cache,
+) -> Result<CallGraph> {
+    check_cancel(cancel)?;
+    let args = json!({"direction":direction.as_str(),"depth":depth,"projection":"graph"});
+    let mut options = Options::parse(&args)?;
+    options.visit_limit = Some(NODE_LIMIT);
+    let catalog = Catalog::new(engine.graph_classes(), cancel)?;
+    let normalized = crate::method_lookup::graph_selector(root, |name| catalog.class(name))?;
+    let provided = match direction {
+        Direction::Callees => None,
+        Direction::Callers | Direction::Both => {
+            Some(indexed_sites(&catalog, &normalized, &options, cancel, cache)?.0)
+        }
+    };
+    let traversal = traverse(&catalog, &normalized, &options, cancel, provided)?;
+    let mut graph = project_graph(&catalog, &traversal, &normalized, &options, cancel)?.graph;
+    graph.direction = direction;
+    Ok(graph)
+}
+
+/// Collect every declared invoke a reverse or bidirectional traversal needs from
+/// the shared index, building the index first when the cache is empty.
+fn indexed_sites(
+    catalog: &Catalog<'_>,
+    normalized: &str,
+    options: &Options<'_>,
+    cancel: &AtomicBool,
+    cache: &Cache,
+) -> Result<(Provided, bool)> {
+    let (index, cached) = cache.get(catalog)?;
+    let canonical = catalog.canonical(normalized);
+    let dispatch = dispatch_aliases(catalog, normalized, options, cancel)?;
     // Reverse shards are keyed by the resolved declaration, so an alias naming a
     // non-declaring ancestor is found through its own resolution. Only sites whose
     // raw target names an ancestor type of the root class qualify.
@@ -430,7 +482,7 @@ fn query_cached_catalog(
         .collect();
     let mut initial = vec![];
     for key in &alias_keys {
-        for site in index.neighbors(&catalog, key, true)? {
+        for site in index.neighbors(catalog, key, true)? {
             if dispatch.aliases.contains(&site.callee)
                 && matches!(site.opcode, 0x6e | 0x74 | 0x72 | 0x78)
             {
@@ -440,29 +492,23 @@ fn query_cached_catalog(
     }
     let mut report = SemanticReport::default();
     let (sites, semantic) = collect(
-        &catalog,
+        catalog,
         &canonical,
-        &options,
+        options,
         &*index,
         initial,
         cancel,
         &mut report,
     )?;
-    let mut result = query_catalog_with_sites(
-        catalog,
-        &normalized,
-        args,
-        cancel,
-        Some(Provided {
+    Ok((
+        Provided {
             sites,
             semantic,
             report,
-            failures: &index.failures,
-        }),
-    )?;
-    result["invoke_index_cached"] = json!(cached);
-    result["invoke_index"] = cache.status();
-    Ok(result)
+            failures: index.failures.clone(),
+        },
+        cached,
+    ))
 }
 
 fn callee_sites(
@@ -964,7 +1010,11 @@ fn collect(
                 } else {
                     catalog.canonical(&site.callee)
                 };
-                if visited.insert(next.clone()) {
+                if visited.insert(next.clone())
+                    && options
+                        .visit_limit
+                        .is_none_or(|limit| visited.len() <= limit)
+                {
                     queue.push_back((next, depth + 1));
                 }
                 if seen_sites.insert((site.caller.clone(), site.pc, site.callee.clone())) {
@@ -987,11 +1037,11 @@ fn collect(
 }
 
 /// Traversal output handed to the projection stage by a caller-side collector.
-struct Provided<'f> {
+struct Provided {
     sites: Vec<native_xrefs::CallSite>,
     semantic: Vec<SemanticEdge>,
     report: SemanticReport,
-    failures: &'f ScanFailures,
+    failures: ScanFailures,
 }
 
 fn semantic_record(edge: &SemanticEdge, depth: usize, catalog: &Catalog<'_>) -> Value {
@@ -1029,32 +1079,50 @@ fn query_catalog(
 ) -> Result<Value> {
     query_catalog_with_sites(catalog, root, args, cancel, None)
 }
-fn query_catalog_with_sites(
-    catalog: Catalog<'_>,
+/// Everything a depth-bounded traversal learned before projection.
+struct Traversal {
+    root_key: String,
+    dispatch: Dispatch,
+    sites: Vec<native_xrefs::CallSite>,
+    semantic: Vec<SemanticEdge>,
+    report: SemanticReport,
+    failures: ScanFailures,
+    /// Number of declared sites; higher indexes into `keys` are semantic edges.
+    declared: usize,
+    /// Canonical (caller, callee) pair per declared site or semantic edge.
+    keys: Vec<(String, String)>,
+    canonical_cache: HashMap<String, String>,
+    depths: HashMap<String, usize>,
+    /// Sites whose neighbor passed the filters, keyed by site with the least depth.
+    selected_sites: BTreeMap<usize, usize>,
+    traversed_sites: HashSet<usize>,
+}
+
+/// Walk declared calls from a normalized root up to the requested depth.
+/// Filters never prune the walk; they only decide which sites are selected.
+fn traverse(
+    catalog: &Catalog<'_>,
     root: &str,
-    args: &Value,
+    options: &Options<'_>,
     cancel: &AtomicBool,
-    provided: Option<Provided<'_>>,
-) -> Result<Value> {
-    let options = Options::parse(args)?;
-    let normalized_root = crate::method_lookup::graph_selector(root, |name| catalog.class(name))?;
-    let root = normalized_root.as_str();
+    provided: Option<Provided>,
+) -> Result<Traversal> {
     check_cancel(cancel)?;
     let root_key = catalog.canonical(root);
-    let dispatch = dispatch_aliases(&catalog, root, &options, cancel)?;
+    let dispatch = dispatch_aliases(catalog, root, options, cancel)?;
     let aliases = &dispatch.aliases;
     // Outgoing queries scan only reachable bodies. Reverse traversal needs the
     // project-wide call index, independently of graph projection limits.
     let mut scan = ScanFailures::default();
     let mut report = SemanticReport::default();
     let mut semantic = Vec::new();
-    let (mut sites, failures): (Vec<_>, &ScanFailures) = if let Some(provided) = provided {
+    let (mut sites, failures) = if let Some(provided) = provided {
         semantic = provided.semantic;
         report = provided.report;
         (provided.sites, provided.failures)
     } else if options.direction == "callees" {
-        let sites = callee_sites(&catalog, &root_key, options.depth, cancel, &mut scan)?;
-        (sites, &scan)
+        let sites = callee_sites(catalog, &root_key, options.depth, cancel, &mut scan)?;
+        (sites, scan)
     } else {
         let mut sites = Vec::new();
         let mut allocations = Vec::new();
@@ -1071,11 +1139,11 @@ fn query_catalog_with_sites(
         if options.semantic_edges {
             // The oracle path runs the same collector as the disk index so both
             // agree on which methods were expanded.
-            let lookup = ScanLookup::new(&catalog, sites, allocations)?;
+            let lookup = ScanLookup::new(catalog, sites, allocations)?;
             let (collected, edges) = collect(
-                &catalog,
+                catalog,
                 &root_key,
-                &options,
+                options,
                 &lookup,
                 Vec::new(),
                 cancel,
@@ -1084,7 +1152,7 @@ fn query_catalog_with_sites(
             semantic = edges;
             sites = collected;
         }
-        (sites, &scan)
+        (sites, scan)
     };
     sites.sort_by(|a, b| (&a.caller, a.pc, &a.callee).cmp(&(&b.caller, b.pc, &b.callee)));
     semantic
@@ -1161,7 +1229,7 @@ fn query_catalog_with_sites(
             traversed_sites.insert(i);
             if *filter_cache
                 .entry(next.clone())
-                .or_insert_with(|| catalog.matches(next, &options))
+                .or_insert_with(|| catalog.matches(next, options))
             {
                 selected_sites
                     .entry(i)
@@ -1171,19 +1239,139 @@ fn query_catalog_with_sites(
         }
     }
     check_cancel(cancel)?;
-    let boundary = depths.values().any(|&depth| depth == options.depth);
+    Ok(Traversal {
+        root_key,
+        dispatch,
+        sites,
+        semantic,
+        report,
+        failures,
+        declared,
+        keys,
+        canonical_cache,
+        depths,
+        selected_sites,
+        traversed_sites,
+    })
+}
+
+/// Retained nodes and edges, with the totals the limits were applied to.
+struct GraphProjection {
+    graph: CallGraph,
+    /// Semantic edges folded into each graph edge, in edge order.
+    semantic_counts: Vec<usize>,
+    matching_nodes: usize,
+    matching_edges: usize,
+}
+
+/// Keep the root plus every traversed declaration that passes the filters, then
+/// connect retained nodes. Declared invokes and semantic edges between the same
+/// declarations are counted apart so a graph edge never hides its evidence.
+fn project_graph(
+    catalog: &Catalog<'_>,
+    traversal: &Traversal,
+    root: &str,
+    options: &Options<'_>,
+    cancel: &AtomicBool,
+) -> Result<GraphProjection> {
+    let (dispatch_targets, dispatch_targets_truncated) =
+        dispatch_targets_with(|name| catalog.class(name), root, cancel)?;
+    let mut methods: Vec<_> = traversal
+        .depths
+        .iter()
+        .filter(|(method, _)| **method != traversal.root_key && catalog.matches(method, options))
+        .map(|(method, &depth)| (method.clone(), depth))
+        .collect();
+    methods.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
+    methods.insert(0, (traversal.root_key.clone(), 0));
+    let matching_nodes = methods.len();
+    let matching_keys: HashSet<_> = methods.iter().map(|(method, _)| method.as_str()).collect();
+    let mut counts: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
+    for &i in &traversal.traversed_sites {
+        check_cancel(cancel)?;
+        let (from, to) = &traversal.keys[i];
+        if matching_keys.contains(from.as_str()) && matching_keys.contains(to.as_str()) {
+            let entry = counts
+                .entry((from.clone(), to.clone()))
+                .or_insert((0usize, 0usize));
+            if i < traversal.declared {
+                entry.0 += 1;
+            } else {
+                entry.1 += 1;
+            }
+        }
+    }
+    let matching_edges = counts.len();
+    methods.truncate(NODE_LIMIT);
+    let indices: HashMap<_, _> = methods
+        .iter()
+        .enumerate()
+        .map(|(i, (method, _))| (method.clone(), i))
+        .collect();
+    let mut graph = CallGraph {
+        dispatch_targets,
+        dispatch_targets_truncated,
+        ..Default::default()
+    };
+    for (i, (method, depth)) in methods.into_iter().enumerate() {
+        check_cancel(cancel)?;
+        graph.nodes.push(Node {
+            component: catalog.component(&method),
+            available: catalog.available(&method),
+            method: if i == 0 { root.into() } else { method },
+            depth,
+        });
+    }
+    let mut semantic_counts = Vec::new();
+    for ((from, to), (count, inferred)) in counts {
+        if let (Some(&from), Some(&to)) = (indices.get(&from), indices.get(&to)) {
+            if graph.edges.len() == EDGE_LIMIT {
+                break;
+            }
+            graph.edges.push(Edge {
+                from,
+                to,
+                sites: count,
+            });
+            semantic_counts.push(inferred);
+        }
+    }
+    graph.truncated = matching_nodes > graph.nodes.len() || matching_edges > graph.edges.len();
+    Ok(GraphProjection {
+        graph,
+        semantic_counts,
+        matching_nodes,
+        matching_edges,
+    })
+}
+
+fn query_catalog_with_sites(
+    catalog: Catalog<'_>,
+    root: &str,
+    args: &Value,
+    cancel: &AtomicBool,
+    provided: Option<Provided>,
+) -> Result<Value> {
+    let options = Options::parse(args)?;
+    let normalized_root = crate::method_lookup::graph_selector(root, |name| catalog.class(name))?;
+    let root = normalized_root.as_str();
+    let t = traverse(&catalog, root, &options, cancel, provided)?;
+    let root_key = t.root_key.as_str();
+    let aliases = &t.dispatch.aliases;
+    let declared = t.declared;
+    let boundary = t.depths.values().any(|&depth| depth == options.depth);
     let filters = json!({"package_prefix":&options.package_prefix,"class_name":&options.class_name,"annotation":options.annotation,
         "component_type":options.component_type.map(|c| c.label().to_ascii_lowercase())});
     let metadata = json!({
-        "root_method_id":root,"resolved_root_method_id":root_key,"root_body":catalog.body_state(&root_key),
+        "root_method_id":root,"resolved_root_method_id":root_key,"root_body":catalog.body_state(root_key),
         "direction":options.direction,"depth":options.depth,"direct_only":options.direct_only,
         "projection":options.projection,"filters":filters,"depth_boundary_reached":boundary,
         "depth_boundary_semantics":"true when a traversed method lies at the requested depth; its own neighbors were not expanded, so deeper relationships may exist. false means every method reachable in the requested direction was expanded before the depth limit.",
-        "scan_complete":failures.count() == 0,"undecodable_methods":failures.json(),
+        "scan_complete":t.failures.count() == 0,"undecodable_methods":t.failures.json(),
         "filter_semantics":"Filters select canonical neighbor declarations after traversal; they do not prune traversal. Compact records match the neighbor in the requested traversal direction. Graph nodes retain matching declarations plus the root; edges connect retained nodes. package_prefix and class_name accept dotted, slash or descriptor forms; a trailing dot is ignored.",
         "annotation_semantics":"Exact DEX descriptor or fully qualified type name on the class or method declaration; combined filters use AND.",
         "component_semantics":"Static superclass ancestry classification.",
-        "semantic_edges":report.json(options.semantic_edges),
+        "semantic_edges":t.report.json(options.semantic_edges),
         "analysis":if options.semantic_edges {
             "static DEX declared calls plus labelled semantic edges (lambda_creation from new-instance allocations of callback classes; possible_interface_dispatch and possible_virtual_dispatch from supertype-typed invokes) for every traversed method; inherited aliases resolved through known superclasses; no reflection, Intent target, invoke-custom (lambda) target or data-flow inference"
         } else {
@@ -1197,9 +1385,13 @@ fn query_catalog_with_sites(
         );
     }
     if options.projection == "call_sites" {
-        let total = selected_sites.len();
-        result["direct_matching_total"] =
-            json!(selected_sites.values().filter(|&&depth| depth == 1).count());
+        let total = t.selected_sites.len();
+        result["direct_matching_total"] = json!(
+            t.selected_sites
+                .values()
+                .filter(|&&depth| depth == 1)
+                .count()
+        );
         result["call_site_semantics"] = json!(if options.semantic_edges {
             "Records mix two kinds of evidence, told apart by relationship. exact_declared_call and possible_*_dispatch records are one raw DEX invoke each to callee_method_id. semantic_edge records carry kind: possible_interface_dispatch and possible_virtual_dispatch are also one invoke each, while lambda_creation is one new-instance allocation (opcode new-instance, callee_method_id null, allocated_class_id set) that links the allocating method to semantic_target_method_id. depth is traversal distance from the query root; only depth=1 records are direct root neighbors. call_sites defaults to depth=1; explicit depth includes transitive sites."
         } else {
@@ -1207,13 +1399,13 @@ fn query_catalog_with_sites(
         });
         let record_for = |i: usize, depth: usize| {
             if i >= declared {
-                return semantic_record(&semantic[i - declared], depth, &catalog);
+                return semantic_record(&t.semantic[i - declared], depth, &catalog);
             }
-            let mut row = record(&sites[i], depth, &canonical_cache[&sites[i].callee]);
-            let inferred = aliases.contains(&sites[i].callee)
-                && matches!(sites[i].opcode, 0x6e | 0x74 | 0x72 | 0x78);
+            let mut row = record(&t.sites[i], depth, &t.canonical_cache[&t.sites[i].callee]);
+            let inferred = aliases.contains(&t.sites[i].callee)
+                && matches!(t.sites[i].opcode, 0x6e | 0x74 | 0x72 | 0x78);
             row["relationship"] = json!(if inferred {
-                if matches!(sites[i].opcode, 0x72 | 0x78) {
+                if matches!(t.sites[i].opcode, 0x72 | 0x78) {
                     "possible_interface_dispatch"
                 } else {
                     "possible_virtual_dispatch"
@@ -1226,18 +1418,19 @@ fn query_catalog_with_sites(
             }
             row
         };
-        let inferred = selected_sites
+        let inferred = t
+            .selected_sites
             .keys()
             .filter(|&&i| {
                 i < declared
-                    && aliases.contains(&sites[i].callee)
-                    && matches!(sites[i].opcode, 0x6e | 0x74 | 0x72 | 0x78)
+                    && aliases.contains(&t.sites[i].callee)
+                    && matches!(t.sites[i].opcode, 0x6e | 0x74 | 0x72 | 0x78)
             })
             .count();
         let mut semantic_kinds: BTreeMap<&str, usize> = BTreeMap::new();
-        for &i in selected_sites.keys().filter(|&&i| i >= declared) {
+        for &i in t.selected_sites.keys().filter(|&&i| i >= declared) {
             *semantic_kinds
-                .entry(semantic[i - declared].kind)
+                .entry(t.semantic[i - declared].kind)
                 .or_default() += 1;
         }
         let semantic_selected: usize = semantic_kinds.values().sum();
@@ -1247,18 +1440,19 @@ fn query_catalog_with_sites(
         result["semantic_edge_kinds"] = json!(semantic_kinds);
         result["dispatch_through_interfaces"] = json!(options.interface_dispatch);
         result["dispatch_through_superclasses"] = json!(options.superclass_dispatch);
-        result["dispatch_expansion"] = json!(dispatch.status);
-        result["dispatch_superclass_stop"] = json!(dispatch.stopped_at);
+        result["dispatch_expansion"] = json!(t.dispatch.status);
+        result["dispatch_superclass_stop"] = json!(t.dispatch.stopped_at);
         result["dispatch_expansion_semantics"] = json!(
             "applied: invoke-virtual/invoke-interface sites whose raw target names the root member on a supertype of the root class (declaring or not) are added as possible dispatch. Superclasses count only while the root overrides their declarations under runtime rules. The first loaded superclass declaration the root does not override is named in dispatch_superclass_stop: neither it nor the non-declaring superclasses below it are inferred, because an invoke on any of them resolves to that declaration. A final or foreign-package package-private declaration also excludes every superclass above it (it holds their vtable slot); a private or static declaration is a direct method, so superclasses above it stay possible. Unloaded superclasses and interfaces anywhere in the ancestry remain possible. invoke-super, direct and static calls and sibling or unrelated receiver types are never added. skipped_*: no inference because the root is not a concrete instance method declared by its own loaded class."
         );
         let mut hash = Sha256::new();
-        for (&i, &depth) in &selected_sites {
+        for (&i, &depth) in &t.selected_sites {
             check_cancel(cancel)?;
             hash.update(serde_json::to_vec(&record_for(i, depth))?);
             hash.update(b"\n");
         }
-        let records: Vec<_> = selected_sites
+        let records: Vec<_> = t
+            .selected_sites
             .iter()
             .skip(options.offset)
             .take(options.limit)
@@ -1284,66 +1478,12 @@ fn query_catalog_with_sites(
         check_cancel(cancel)?;
         return Ok(result);
     }
-    let (dispatch_targets, dispatch_targets_truncated) =
-        dispatch_targets_with(|name| catalog.class(name), root, cancel)?;
-    let mut methods: Vec<_> = depths
-        .iter()
-        .filter(|(method, _)| **method != root_key && catalog.matches(method, &options))
-        .map(|(method, &depth)| (method.clone(), depth))
-        .collect();
-    methods.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
-    methods.insert(0, (root_key.clone(), 0));
-    let matching_nodes = methods.len();
-    let matching_keys: HashSet<_> = methods.iter().map(|(method, _)| method.as_str()).collect();
-    // Declared invokes and semantic edges between the same declarations are
-    // counted apart so a graph edge never hides which evidence supports it.
-    let mut counts: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
-    for i in traversed_sites {
-        check_cancel(cancel)?;
-        let (from, to) = &keys[i];
-        if matching_keys.contains(from.as_str()) && matching_keys.contains(to.as_str()) {
-            let entry = counts
-                .entry((from.clone(), to.clone()))
-                .or_insert((0usize, 0usize));
-            if i < declared {
-                entry.0 += 1;
-            } else {
-                entry.1 += 1;
-            }
-        }
-    }
-    let matching_edges = counts.len();
-    methods.truncate(NODE_LIMIT);
-    let indices: HashMap<_, _> = methods
-        .iter()
-        .enumerate()
-        .map(|(i, (method, _))| (method.clone(), i))
-        .collect();
-    let mut graph = CallGraph::default();
-    for (i, (method, depth)) in methods.into_iter().enumerate() {
-        check_cancel(cancel)?;
-        graph.nodes.push(Node {
-            component: catalog.component(&method),
-            available: catalog.available(&method),
-            method: if i == 0 { root.into() } else { method },
-            depth,
-        });
-    }
-    let mut semantic_counts = Vec::new();
-    for ((from, to), (count, inferred)) in counts {
-        if let (Some(&from), Some(&to)) = (indices.get(&from), indices.get(&to)) {
-            if graph.edges.len() == EDGE_LIMIT {
-                break;
-            }
-            graph.edges.push(Edge {
-                from,
-                to,
-                sites: count,
-            });
-            semantic_counts.push(inferred);
-        }
-    }
-    graph.truncated = matching_nodes > graph.nodes.len() || matching_edges > graph.edges.len();
+    let GraphProjection {
+        graph,
+        semantic_counts,
+        matching_nodes,
+        matching_edges,
+    } = project_graph(&catalog, &t, root, &options, cancel)?;
     let masks = graph.component_reachability();
     let kinds = |mask: u8| {
         ["Activity", "Service", "Receiver", "Provider"]
@@ -1366,8 +1506,8 @@ fn query_catalog_with_sites(
     result["edge_limit"] = json!(EDGE_LIMIT);
     result["matching_node_count"] = json!(matching_nodes);
     result["matching_edge_count"] = json!(matching_edges);
-    result["dispatch_targets"] = json!(dispatch_targets);
-    result["dispatch_targets_truncated"] = json!(dispatch_targets_truncated);
+    result["dispatch_targets"] = json!(graph.dispatch_targets);
+    result["dispatch_targets_truncated"] = json!(graph.dispatch_targets_truncated);
     result["dispatch_note"] = json!(
         "Related ancestor declarations are possible dispatch entry points; query their callers separately."
     );
@@ -1682,6 +1822,41 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn visit_limit_stops_expanding_but_keeps_discovered_leaves() {
+        let classes = vec![
+            class("a.A", None, vec![("run", vec![], vec!["a.B.run()V"])]),
+            class("a.B", None, vec![("run", vec![], vec!["a.C.run()V"])]),
+            class("a.C", None, vec![("run", vec![], vec!["a.D.run()V"])]),
+            class("a.D", None, vec![("run", vec![], vec![])]),
+        ];
+        let cancel = AtomicBool::new(false);
+        let catalog = Catalog::new(&classes, &cancel).unwrap();
+        let (index, _) = Cache::default().get(&catalog).unwrap();
+        let args = json!({"direction":"callers","depth":20});
+        let callers = |limit: Option<usize>| {
+            let mut options = Options::parse(&args).unwrap();
+            options.visit_limit = limit;
+            let mut report = SemanticReport::default();
+            let (sites, _) = collect(
+                &catalog,
+                "a.D.run()V",
+                &options,
+                &*index,
+                vec![],
+                &cancel,
+                &mut report,
+            )
+            .unwrap();
+            let mut callers: Vec<String> = sites.into_iter().map(|site| site.caller).collect();
+            callers.sort();
+            callers
+        };
+        // Unbounded: the whole chain. Two expansions: D and C expand, B stays a leaf
+        // and A is never reached.
+        assert_eq!(callers(None), ["a.A.run()V", "a.B.run()V", "a.C.run()V"]);
+        assert_eq!(callers(Some(2)), ["a.B.run()V", "a.C.run()V"]);
+    }
     #[test]
     fn disk_query_matches_full_scan_for_transitive_filtered_and_bidirectional_graphs() {
         let classes = vec![

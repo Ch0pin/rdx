@@ -233,6 +233,12 @@ arrow flows into it. **Callees** walks the methods the selected method invokes, 
 the selected method at the left edge. **Both** combines the two around the selected
 method. Changing the selector rebuilds the graph at once.
 
+Callers and Both graphs read the project's invoke index, the same index MCP
+caller queries use. The first such graph after opening an APK builds the index
+by scanning every class once; later rebuilds at any depth or direction reuse it
+and finish in well under a second on large apps. Callees graphs scan only the
+bodies they reach and never need the index.
+
 Full paths between the selected method and Activities, Services,
 BroadcastReceivers, and ContentProviders are highlighted, including intermediate
 helper calls: in a callers graph the paths that start at a component and reach the

@@ -1,40 +1,208 @@
-//! A single-use platform builder can be represented as Java string conversion.
-//! This is a DEX/SSA proof, not a rewrite of emitted Java text.
+//! A single-use platform StringBuilder chain can be represented as Java string
+//! concatenation. This is a DEX/SSA proof, not a rewrite of emitted Java text.
 use crate::{
     native_calls::{BoundCall, BoundCalls, CallKind, CallTarget},
-    native_cfg::{ControlFlowGraph, instruction_width},
-    native_dex::{DexClass, DexMethod},
+    native_cfg::{ControlFlowGraph, EdgeKind, instruction_width},
+    native_dex::{DexClass, DexCode, DexMethod},
     native_ir::{Instruction, PoolKind},
     native_method::MethodFrontEnd,
-    native_ssa::{DefinitionKind, SsaMethod},
+    native_ssa::{DefinitionKind, SsaMethod, ValueId},
 };
+use std::sync::Arc;
 
 const BUILDER: &str = "Ljava/lang/StringBuilder;";
 const STRING: &str = "Ljava/lang/String;";
 const OBJECT: &str = "Ljava/lang/Object;";
 const MAX_WORDS: usize = 4096;
 const MAX_REGISTERS: u16 = 128;
+const MAX_APPENDS: usize = 16;
+/// Instructions tolerated between the allocation and its constructor call.
+const MAX_PREFIX_GAP: usize = 8;
+/// `append` overloads whose conversion is Java string conversion of the same
+/// operand. The CharSequence and char[] overloads read their operand differently.
+const APPEND_OPERANDS: [&str; 8] = [STRING, OBJECT, "I", "J", "Z", "C", "F", "D"];
 
-pub(super) struct Plan {
-    pub end: usize,
+/// One `append` call of a proved chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Append {
+    pub pc: usize,
+    /// Register holding the appended operand.
     pub argument: usize,
-    pub result: usize,
+    /// Parameter descriptor of the selected overload.
+    pub descriptor: Arc<str>,
+    /// First instruction after the call and any chained move-result.
+    pub next: usize,
+    /// Chained form: the move-result and the register receiving the builder.
+    chained: Option<(usize, u16)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Plan {
+    pub start: usize,
+    pub init: usize,
+    /// Pool string passed to `StringBuilder(String)`.
     pub prefix: String,
+    pub appends: Vec<Append>,
+    pub to_string: usize,
+    /// Register receiving the `toString` result.
+    pub result: usize,
+    /// First instruction after the chain.
+    pub end: usize,
+}
+
+/// Rendering state of a chain whose constructor, appends and `toString` become
+/// one concatenation at `end`. Intermediate instructions render normally.
+pub(super) struct Progress {
+    pub plan: Plan,
+    pub parts: Vec<String>,
+    pub appended: usize,
+}
+
+impl Progress {
+    pub fn new(plan: Plan) -> Self {
+        Self {
+            plan,
+            parts: Vec::new(),
+            appended: 0,
+        }
+    }
+
+    /// The next chain instruction the renderer must reach.
+    pub fn expected(&self) -> usize {
+        if self.parts.is_empty() {
+            self.plan.init
+        } else {
+            self.plan
+                .appends
+                .get(self.appended)
+                .map_or(self.plan.to_string, |append| append.pc)
+        }
+    }
+}
+
+/// Wraps an operand so `+` binds as intended. Literals, names, member chains
+/// and one trailing call or index stay bare.
+pub(super) fn operand(text: &str) -> String {
+    if primary(text) {
+        text.to_string()
+    } else {
+        format!("({text})")
+    }
+}
+
+fn primary(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let Some(&first) = bytes.first() else {
+        return false;
+    };
+    match first {
+        b'"' | b'\'' => return quoted(text, first),
+        b'(' => return balanced(text),
+        _ => {}
+    }
+    let body = text.strip_prefix('-').unwrap_or(text);
+    let Some(&lead) = body.as_bytes().first() else {
+        return false;
+    };
+    if lead.is_ascii_digit() {
+        return numeric(body);
+    }
+    if first == b'-' || !(lead.is_ascii_alphabetic() || lead == b'_' || lead == b'$') {
+        return false;
+    }
+    let name_end = bytes
+        .iter()
+        .position(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'.')))
+        .unwrap_or(bytes.len());
+    let rest = &text[name_end..];
+    rest.is_empty() || ((rest.starts_with('(') || rest.starts_with('[')) && balanced(rest))
+}
+
+fn quoted(text: &str, quote: u8) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 || bytes[bytes.len() - 1] != quote {
+        return false;
+    }
+    let mut escaped = false;
+    for &byte in &bytes[1..bytes.len() - 1] {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == quote {
+            return false;
+        }
+    }
+    !escaped
+}
+
+/// The whole text is one bracket group: depth returns to zero only at the end.
+fn balanced(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut literal: Option<u8> = None;
+    let mut escaped = false;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if let Some(quote) = literal {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == quote {
+                literal = None;
+            }
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' => literal = Some(byte),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.checked_sub(1).unwrap_or(usize::MAX);
+                if depth == 0 && index + 1 != bytes.len() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0 && literal.is_none() && !bytes.is_empty()
+}
+
+fn numeric(body: &str) -> bool {
+    let hex = body.starts_with("0x") || body.starts_with("0X");
+    let bytes = body.as_bytes();
+    bytes.iter().enumerate().all(|(index, &byte)| {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b'.' | b'_')
+            || (!hex
+                && matches!(byte, b'+' | b'-')
+                && index > 0
+                && matches!(bytes[index - 1], b'e' | b'E'))
+    })
 }
 
 fn call(calls: &BoundCalls, pc: usize) -> Option<&BoundCall> {
     calls.calls.iter().find(|call| call.pc == pc)
 }
 
-fn exact_call(
-    class: &DexClass,
+fn single_write(instruction: &Instruction) -> Option<u16> {
+    let [write] = instruction.writes.as_slice() else {
+        return None;
+    };
+    (write.kind.word_count() == 1).then_some(write.register)
+}
+
+/// The parameter descriptors of a bound StringBuilder call with the exact
+/// kind, name, return type and receiver register, verified against the
+/// bound argument descriptors.
+fn builder_call<'a>(
+    class: &'a DexClass,
     call: &BoundCall,
     kind: CallKind,
     name: &str,
-    args: &[&str],
     ret: &str,
-    receiver: usize,
-) -> bool {
+    receiver: u16,
+) -> Option<&'a [Arc<str>]> {
     let CallTarget::Method {
         declaring_type,
         name: actual_name,
@@ -42,102 +210,27 @@ fn exact_call(
         ..
     } = &call.target
     else {
-        return false;
+        return None;
     };
-    call.kind == kind
-        && declaring_type.as_ref() == BUILDER
-        && actual_name.as_ref() == name
-        && call.return_type.as_ref() == ret
-        && call
+    if call.kind != kind
+        || declaring_type.as_ref() != BUILDER
+        || actual_name.as_ref() != name
+        || call.return_type.as_ref() != ret
+        || call
             .receiver
             .as_ref()
-            .is_some_and(|r| usize::from(r.register) == receiver)
-        && class
-            .symbols
-            .protos
-            .get(usize::from(*prototype_index))
-            .is_some_and(|(actual_ret, actual_args)| {
-                actual_ret.as_ref() == ret
-                    && actual_args.len() == args.len()
-                    && actual_args
-                        .iter()
-                        .zip(args)
-                        .all(|(actual, wanted)| actual.as_ref() == *wanted)
-            })
-        && call.arguments.len() == args.len()
-        && call
-            .arguments
+            .is_none_or(|actual| actual.register != receiver)
+    {
+        return None;
+    }
+    let (actual_ret, parameters) = class.symbols.protos.get(usize::from(*prototype_index))?;
+    (actual_ret.as_ref() == ret
+        && parameters.len() == call.arguments.len()
+        && parameters
             .iter()
-            .zip(args)
-            .all(|(actual, wanted)| actual.descriptor.as_ref() == *wanted)
-}
-
-fn single_register(operands: &[crate::native_ir::RegisterOperand]) -> Option<usize> {
-    (operands.len() == 1).then(|| usize::from(operands[0].register))
-}
-
-fn value_id(ssa: &SsaMethod, pc: usize, register: usize, read: bool) -> Option<usize> {
-    let instruction = ssa
-        .instructions
-        .iter()
-        .find(|instruction| instruction.pc == pc)?;
-    let operands = if read {
-        &instruction.reads
-    } else {
-        &instruction.writes
-    };
-    let value = operands
-        .iter()
-        .find(|operand| usize::from(operand.register) == register)?;
-    (value.words.len() == 1).then_some(value.words[0])
-}
-
-fn only_uses(ssa: &SsaMethod, id: usize, expected: &[(usize, usize)]) -> bool {
-    let mut uses = Vec::new();
-    for instruction in &ssa.instructions {
-        for operand in &instruction.reads {
-            if operand.words.contains(&id) {
-                uses.push((instruction.pc, usize::from(operand.register)));
-            }
-        }
-    }
-    uses == expected
-}
-
-fn six_instruction_shape(class: &DexClass, method: &DexMethod, start: usize) -> Option<[usize; 6]> {
-    let code = method.code.as_ref()?;
-    if code.tries != 0
-        || !code.try_regions.is_empty()
-        || code.instructions.len() > MAX_WORDS
-        || code.registers > MAX_REGISTERS
-    {
-        return None;
-    }
-    let words = &code.instructions;
-    if words.get(start).copied()? as u8 != 0x22
-        || class
-            .symbols
-            .types
-            .get(usize::from(*words.get(start + 1)?))?
-            .as_ref()
-            != BUILDER
-    {
-        return None;
-    }
-    let mut pcs = [0; 6];
-    let mut pc = start;
-    for slot in &mut pcs {
-        *slot = pc;
-        pc += instruction_width(words, pc).ok()?.0;
-    }
-    let ops = pcs.map(|pc| words[pc] as u8);
-    (ops[0] == 0x22
-        && matches!(ops[1], 0x1a | 0x1b)
-        && matches!(ops[2], 0x70 | 0x76)
-        && matches!(ops[3], 0x6e | 0x74)
-        && matches!(ops[4], 0x6e | 0x74)
-        && ops[5] == 0x0c)
-        .then_some(pcs)
+            .zip(&call.arguments)
+            .all(|(parameter, argument)| parameter.as_ref() == argument.descriptor.as_ref()))
+    .then_some(parameters.as_slice())
 }
 
 fn pool_signature_matches(
@@ -172,22 +265,58 @@ fn pool_signature_matches(
             })
 }
 
-pub(super) fn plan_at(class: &DexClass, method: &DexMethod, start: usize) -> Option<Plan> {
-    // The cheap opcode/pool filter prevents CFG and SSA work for ordinary
-    // allocations. The selected chain is then proved by canonical identities.
-    let pcs = six_instruction_shape(class, method, start)?;
-    let code = method.code.as_ref()?;
-    // Most builder chains use another append overload. Reject those before
-    // decoding and binding every instruction in the surrounding method.
-    for (pc, name, parameters, result) in [
-        (pcs[2], "<init>", &[STRING][..], "V"),
-        (pcs[3], "append", &[OBJECT][..], BUILDER),
-        (pcs[4], "toString", &[][..], STRING),
-    ] {
-        if !pool_signature_matches(class, code.instructions[pc + 1], name, parameters, result) {
+/// Cheap raw-word filter: a StringBuilder allocation followed within a few
+/// straight-line instructions by a `StringBuilder(String)` constructor call.
+/// Returns that constructor's offset.
+fn prefilter(class: &DexClass, code: &DexCode, start: usize) -> Option<usize> {
+    if code.instructions.len() > MAX_WORDS
+        || code.registers > MAX_REGISTERS
+        || usize::from(code.tries) != code.try_regions.len()
+    {
+        return None;
+    }
+    let words = &code.instructions;
+    if *words.get(start)? as u8 != 0x22
+        || class
+            .symbols
+            .types
+            .get(usize::from(*words.get(start + 1)?))?
+            .as_ref()
+            != BUILDER
+    {
+        return None;
+    }
+    let mut pc = start + 2;
+    for _ in 0..=MAX_PREFIX_GAP {
+        let op = *words.get(pc)? as u8;
+        if matches!(op, 0x70 | 0x76)
+            && pool_signature_matches(class, *words.get(pc + 1)?, "<init>", &[STRING], "V")
+        {
+            return Some(pc);
+        }
+        if matches!(
+            op,
+            0x0d..=0x11 | 0x1d | 0x1e | 0x22 | 0x27..=0x2c | 0x32..=0x3d
+        ) {
             return None;
         }
+        pc += instruction_width(words, pc).ok()?.0;
     }
+    None
+}
+
+fn protection(code: &DexCode, pc: usize) -> Vec<bool> {
+    code.try_regions
+        .iter()
+        .map(|region| (region.start as usize..region.end as usize).contains(&pc))
+        .collect()
+}
+
+pub(super) fn plan_at(class: &DexClass, method: &DexMethod, start: usize) -> Option<Plan> {
+    let code = method.code.as_ref()?;
+    // The raw filter prevents decoding, CFG and SSA work for ordinary
+    // allocations. The selected chain is then proved by canonical identities.
+    let init = prefilter(class, code, start)?;
     let hierarchy = class.symbols.hierarchy.get()?;
     if ![BUILDER, STRING, OBJECT]
         .into_iter()
@@ -196,128 +325,286 @@ pub(super) fn plan_at(class: &DexClass, method: &DexMethod, start: usize) -> Opt
         return None;
     }
     let front = MethodFrontEnd::build(class, method).ok()?;
-    let ir = &front.ir;
-    let index = ir
-        .instructions
-        .binary_search_by_key(&start, |i| i.pc)
-        .ok()?;
-    let ins: &[Instruction] = ir.instructions.get(index..index + 6)?;
-    if !ins.iter().zip(pcs).all(|(i, pc)| i.pc == pc)
-        || ir.instructions.iter().any(|i| {
-            i.branch_target
-                .is_some_and(|target| start < target && target < ins[5].pc + ins[5].width)
-                || i.payload_target
-                    .is_some_and(|target| start < target && target < ins[5].pc + ins[5].width)
+    let ir = front.ir.instructions.as_slice();
+    let at = |pc: usize| ir.binary_search_by_key(&pc, |i| i.pc).ok();
+    let first = at(start)?;
+    let builder = single_write(&ir[first])?;
+    let init_call = call(&front.bound, init)?;
+    let init_parameters = builder_call(class, init_call, CallKind::Direct, "<init>", "V", builder)?;
+    if init_call.result.is_some()
+        || init_parameters.len() != 1
+        || init_parameters[0].as_ref() != STRING
+    {
+        return None;
+    }
+    let prefix_register = init_call.arguments[0].register;
+
+    // Walk the chain in DEX order. Before the first append any straight-line
+    // instruction may intervene; afterwards only moves, constants and field
+    // reads, so no effect is reordered relative to the appended operands'
+    // conversions.
+    let mut appends: Vec<Append> = Vec::new();
+    let mut interior = Vec::new();
+    let mut open_allocation: Option<u16> = None;
+    let mut current = builder;
+    let mut index = at(init)? + 1;
+    let (to_string, result, end, end_index) = loop {
+        let instruction = ir.get(index)?;
+        let bound = call(&front.bound, instruction.pc);
+        if let Some(bound) = bound
+            && let CallTarget::Method {
+                declaring_type,
+                name,
+                ..
+            } = &bound.target
+            && declaring_type.as_ref() == BUILDER
+            && bound
+                .receiver
+                .as_ref()
+                .is_some_and(|receiver| receiver.register == current)
+        {
+            if open_allocation.is_some() {
+                return None;
+            }
+            let moved = ir.get(index + 1).filter(|next| {
+                next.pc == instruction.pc + instruction.width && matches!(next.opcode, 0x0a..=0x0c)
+            });
+            match name.as_ref() {
+                "append" => {
+                    let parameters =
+                        builder_call(class, bound, CallKind::Virtual, "append", BUILDER, current)?;
+                    let [descriptor] = parameters else {
+                        return None;
+                    };
+                    if !APPEND_OPERANDS.contains(&descriptor.as_ref())
+                        || appends.len() == MAX_APPENDS
+                    {
+                        return None;
+                    }
+                    let (next, chained) = match (&bound.result, moved) {
+                        (Some(result), Some(move_result))
+                            if result.move_pc == move_result.pc && move_result.opcode == 0x0c =>
+                        {
+                            current = result.register.register;
+                            (
+                                move_result.pc + move_result.width,
+                                Some((move_result.pc, current)),
+                            )
+                        }
+                        (None, None) => (instruction.pc + instruction.width, None),
+                        _ => return None,
+                    };
+                    appends.push(Append {
+                        pc: instruction.pc,
+                        argument: usize::from(bound.arguments[0].register),
+                        descriptor: descriptor.clone(),
+                        next,
+                        chained,
+                    });
+                    index += if chained.is_some() { 2 } else { 1 };
+                }
+                "toString" => {
+                    if appends.is_empty()
+                        || !builder_call(
+                            class,
+                            bound,
+                            CallKind::Virtual,
+                            "toString",
+                            STRING,
+                            current,
+                        )?
+                        .is_empty()
+                    {
+                        return None;
+                    }
+                    let (Some(result), Some(move_result)) = (&bound.result, moved) else {
+                        return None;
+                    };
+                    if result.move_pc != move_result.pc || move_result.opcode != 0x0c {
+                        return None;
+                    }
+                    break (
+                        instruction.pc,
+                        usize::from(result.register.register),
+                        move_result.pc + move_result.width,
+                        index + 2,
+                    );
+                }
+                _ => return None,
+            }
+            continue;
+        }
+        let op = instruction.opcode;
+        if appends.is_empty() {
+            if matches!(op, 0x0d..=0x11 | 0x1d | 0x1e | 0x27..=0x2c | 0x32..=0x3d) {
+                return None;
+            }
+            match op {
+                0x22 => {
+                    if open_allocation.is_some() {
+                        return None;
+                    }
+                    open_allocation = Some(single_write(instruction)?);
+                }
+                0x70 | 0x76 => {
+                    if let Some(bound) = bound
+                        && let CallTarget::Method { name, .. } = &bound.target
+                        && name.as_ref() == "<init>"
+                        && bound.receiver.as_ref().map(|receiver| receiver.register)
+                            == open_allocation
+                    {
+                        open_allocation = None;
+                    }
+                }
+                _ => {}
+            }
+        } else if matches!(op, 0x01..=0x09 | 0x12..=0x1b | 0x52..=0x58 | 0x60..=0x66) {
+            interior.push(index);
+        } else {
+            return None;
+        }
+        index += 1;
+    };
+
+    let chain = &ir[first..end_index];
+    let membership = protection(code, start);
+    if chain
+        .iter()
+        .any(|instruction| protection(code, instruction.pc) != membership)
+        || ir.iter().any(|instruction| {
+            instruction
+                .branch_target
+                .is_some_and(|target| start < target && target < end)
+                || instruction
+                    .payload_target
+                    .is_some_and(|target| start < target && target < end)
         })
     {
         return None;
     }
-    let builder = single_register(&ins[0].writes)?;
-    let prefix_reg = single_register(&ins[1].writes)?;
-    let result = single_register(&ins[5].writes)?;
-    if builder == prefix_reg || builder == result || prefix_reg == result {
+
+    // The chain is one straight line: consecutive instructions share a block
+    // or are joined by the only normal edge into the later block.
+    let cfg = ControlFlowGraph::build(code).ok()?;
+    for pair in chain.windows(2) {
+        let (from, to) = (
+            *cfg.block_at.get(&pair[0].pc)?,
+            *cfg.block_at.get(&pair[1].pc)?,
+        );
+        if from == to {
+            continue;
+        }
+        let normal: Vec<usize> = cfg.blocks[from]
+            .successors
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Normal)
+            .map(|edge| edge.target)
+            .collect();
+        let incoming: Vec<(usize, EdgeKind)> = cfg
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(source, block)| {
+                block
+                    .successors
+                    .iter()
+                    .filter_map(move |edge| (edge.target == to).then_some((source, edge.kind)))
+            })
+            .collect();
+        if normal != [to] || incoming != [(from, EdgeKind::Normal)] {
+            return None;
+        }
+    }
+
+    // Every builder value is observed by its chain reads alone, so neither the
+    // intermediates nor any handler or merge can see the builder.
+    let ssa = SsaMethod::build(code, &front.ir, &cfg).ok()?;
+    let exclusive = |value: ValueId, reads: &[(usize, u16)]| {
+        ssa.in_no_phi(value)
+            && ssa.only_uses(value, reads)
+            && reads
+                .iter()
+                .all(|&(pc, register)| ssa.value_id(pc, register, true) == Some(value))
+    };
+    let mut segment = ssa.value_id(start, builder, false)?;
+    let mut receiver = builder;
+    let mut reads = vec![(init, builder)];
+    for append in &appends {
+        reads.push((append.pc, receiver));
+        if let Some((move_pc, register)) = append.chained {
+            if !exclusive(segment, &reads) {
+                return None;
+            }
+            segment = ssa.value_id(move_pc, register, false)?;
+            receiver = register;
+            reads.clear();
+        }
+    }
+    reads.push((to_string, receiver));
+    if !exclusive(segment, &reads) {
         return None;
     }
-    let prefix_ref = ins[1].reference?;
-    if prefix_ref.kind != PoolKind::String {
+
+    // The constructor argument is one pool string.
+    let prefix_id = ssa.value_id(init, prefix_register, true)?;
+    let DefinitionKind::Instruction { pc: prefix_pc, .. } = ssa.definitions.get(prefix_id)?.kind
+    else {
         return None;
-    }
+    };
+    let constant = &ir[at(prefix_pc)?];
+    let reference = constant.reference.filter(|reference| {
+        reference.kind == PoolKind::String && matches!(constant.opcode, 0x1a | 0x1b)
+    })?;
     let prefix = class
         .symbols
         .strings
-        .get(usize::try_from(prefix_ref.index).ok()?)?;
-    let init = call(&front.bound, pcs[2])?;
-    let append = call(&front.bound, pcs[3])?;
-    let to_string = call(&front.bound, pcs[4])?;
-    if !exact_call(
-        class,
-        init,
-        CallKind::Direct,
-        "<init>",
-        &[STRING],
-        "V",
-        builder,
-    ) || init.arguments[0].register != prefix_reg as u16
-        || init.result.is_some()
-        || !exact_call(
-            class,
-            append,
-            CallKind::Virtual,
-            "append",
-            &[OBJECT],
-            BUILDER,
-            builder,
-        )
-        || append.result.is_some()
-        || !exact_call(
-            class,
-            to_string,
-            CallKind::Virtual,
-            "toString",
-            &[],
-            STRING,
-            builder,
-        )
-        || !to_string.result.as_ref().is_some_and(|value| {
-            value.move_pc == pcs[5] && usize::from(value.register.register) == result
-        })
-    {
-        return None;
-    }
-    let argument = usize::from(append.arguments[0].register);
-    if [builder, prefix_reg, result].contains(&argument) {
-        return None;
-    }
-    // Only a formal reference parameter has the stable, emitter-owned pN
-    // expression used by this first slice. The implicit receiver is excluded.
-    let mut parameter_register = usize::from(code.registers) - usize::from(code.ins)
-        + usize::from(method.access_flags & 0x0008 == 0);
-    let mut formal_reference = false;
-    for ty in &method.parameters {
-        if parameter_register == argument {
-            formal_reference = ty.starts_with('L') || ty.starts_with('[');
-            break;
+        .get(usize::try_from(reference.index).ok()?)?
+        .clone();
+
+    // Appended operands are defined values, and values written between appends
+    // feed later appends of this chain only.
+    let ssa_instruction = |pc: usize| ssa.instructions.iter().find(|insn| insn.pc == pc);
+    for append in &appends {
+        let operand = ssa_instruction(append.pc)?
+            .reads
+            .iter()
+            .find(|operand| usize::from(operand.register) == append.argument)?;
+        if operand.words.is_empty()
+            || operand.words.iter().any(|&word| {
+                ssa.definitions
+                    .get(word)
+                    .is_none_or(|definition| matches!(definition.kind, DefinitionKind::Undefined))
+            })
+        {
+            return None;
         }
-        parameter_register += usize::from(matches!(ty.as_ref(), "J" | "D")) + 1;
     }
-    if !formal_reference {
-        return None;
+    for &index in &interior {
+        let instruction = &ir[index];
+        for write in &ssa_instruction(instruction.pc)?.writes {
+            for &value in &write.words {
+                if !ssa.in_no_phi(value)
+                    || !ssa.uses(value).iter().all(|&(pc, register)| {
+                        pc > instruction.pc
+                            && appends.iter().any(|append| {
+                                append.pc == pc && append.argument == usize::from(register)
+                            })
+                    })
+                {
+                    return None;
+                }
+            }
+        }
     }
-    let cfg = ControlFlowGraph::build(code).ok()?;
-    let block = cfg.block_at.get(&start)?;
-    if !pcs.iter().all(|pc| cfg.block_at.get(pc) == Some(block)) {
-        return None;
-    }
-    let ssa = SsaMethod::build(code, ir, &cfg).ok()?;
-    let builder_id = value_id(&ssa, pcs[0], builder, false)?;
-    let prefix_id = value_id(&ssa, pcs[1], prefix_reg, false)?;
-    let argument_id = value_id(&ssa, pcs[3], argument, true)?;
-    if !matches!(
-        ssa.definitions.get(argument_id)?.kind,
-        DefinitionKind::Parameter
-    ) || value_id(&ssa, pcs[2], builder, true)? != builder_id
-        || value_id(&ssa, pcs[3], builder, true)? != builder_id
-        || value_id(&ssa, pcs[4], builder, true)? != builder_id
-        || value_id(&ssa, pcs[2], prefix_reg, true)? != prefix_id
-        || !only_uses(
-            &ssa,
-            builder_id,
-            &[(pcs[2], builder), (pcs[3], builder), (pcs[4], builder)],
-        )
-        || !only_uses(&ssa, prefix_id, &[(pcs[2], prefix_reg)])
-        || ssa.phis.iter().any(|phi| {
-            phi.incoming
-                .iter()
-                .any(|(_, id)| *id == builder_id || *id == prefix_id)
-        })
-    {
-        return None;
-    }
+
     Some(Plan {
-        end: pcs[5] + ins[5].width,
-        argument,
+        start,
+        init,
+        prefix,
+        appends,
+        to_string,
         result,
-        prefix: prefix.to_string(),
+        end,
     })
 }
 
@@ -325,7 +612,6 @@ pub(super) fn plan_at(class: &DexClass, method: &DexMethod, start: usize) -> Opt
 mod tests {
     use super::*;
     use crate::native_dex::{DexCode, DexSymbols};
-    use std::sync::Arc;
 
     fn fixture(words: Vec<u16>) -> DexClass {
         DexClass {
@@ -398,6 +684,34 @@ mod tests {
     }
 
     #[test]
+    fn single_append_chain_is_planned_exactly() {
+        let class = fixture(chain());
+        attach_hierarchy(&class, None);
+        let plan = plan_at(&class, &class.methods[0], 0).unwrap();
+        assert_eq!(
+            (plan.start, plan.init, plan.to_string, plan.result, plan.end),
+            (0, 4, 10, 2, 14)
+        );
+        assert_eq!(plan.prefix, "tag:");
+        assert_eq!(plan.appends.len(), 1);
+        assert_eq!(
+            (
+                plan.appends[0].pc,
+                plan.appends[0].argument,
+                plan.appends[0].next
+            ),
+            (7, 3, 10)
+        );
+        assert_eq!(plan.appends[0].descriptor.as_ref(), OBJECT);
+        let mut progress = Progress::new(plan);
+        assert_eq!(progress.expected(), 4);
+        progress.parts.push("\"tag:\"".into());
+        assert_eq!(progress.expected(), 7);
+        progress.appended = 1;
+        assert_eq!(progress.expected(), 10);
+    }
+
+    #[test]
     fn sdk_shadows_missing_hierarchy_and_budget_decline() {
         let class = fixture(chain());
         assert!(plan_at(&class, &class.methods[0], 0).is_none());
@@ -441,7 +755,44 @@ mod tests {
         code.ins = 2;
         code.instructions[12] = 0x0040; // append receives v4, the Object parameter
         attach_hierarchy(&class, None);
-        assert!(six_instruction_shape(&class, &class.methods[0], 3).is_some());
+        assert_eq!(
+            prefilter(&class, class.methods[0].code.as_ref().unwrap(), 3),
+            Some(7)
+        );
         assert!(plan_at(&class, &class.methods[0], 3).is_none());
+    }
+
+    #[test]
+    fn operands_keep_primaries_bare_and_parenthesize_compound_expressions() {
+        for bare in [
+            "p0",
+            "this.a",
+            "v3",
+            "\"a (\\\" b\"",
+            "'c'",
+            "-6",
+            "1.5e-3f",
+            "0x1F",
+            "Hook.read()",
+            "v0.get(1, \"x)\")",
+            "v2[3]",
+            "((int) v3)",
+            "(v1 ? 1 : 0)",
+            "null",
+            "true",
+        ] {
+            assert_eq!(operand(bare), bare, "{bare}");
+        }
+        for compound in [
+            "a + b",
+            "(int) v3",
+            "v0.a().b()",
+            "-v1",
+            "(a) + (b)",
+            "x.y(z)[0]",
+            "\"a\" + \"b\"",
+        ] {
+            assert_eq!(operand(compound), format!("({compound})"), "{compound}");
+        }
     }
 }

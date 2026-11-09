@@ -4693,6 +4693,8 @@ struct Graph {
     proof_contexts: std::cell::RefCell<Vec<std::rc::Rc<structured_argument_region::ProofContext>>>,
     region_liveness: std::cell::RefCell<Vec<RegionLiveness>>,
     shrink_ssa: std::cell::OnceCell<Option<crate::native_ssa::SsaMethod>>,
+    /// Proved StringBuilder chains by allocation offset; None records a decline.
+    concat_plans: std::cell::RefCell<std::collections::HashMap<usize, Option<concat::Plan>>>,
     argument_string_producers: std::cell::OnceCell<std::collections::BTreeSet<usize>>,
     constructor_prefix_strings: std::cell::Cell<Option<(usize, usize)>>,
     exception_snapshot_end: std::cell::Cell<Option<usize>>,
@@ -5733,6 +5735,7 @@ impl Graph {
             proof_contexts: Default::default(),
             region_liveness: Default::default(),
             shrink_ssa: std::cell::OnceCell::new(),
+            concat_plans: Default::default(),
             argument_string_producers: std::cell::OnceCell::new(),
             constructor_prefix_strings: Default::default(),
             exception_snapshot_end: Default::default(),
@@ -6373,6 +6376,15 @@ impl Graph {
             .map_err(|_| anyhow::anyhow!("missing canonical shared branch plan"))?;
         Ok(Some(self.shared_branches[index]))
     }
+    /// The proved StringBuilder chain allocated at `pc`, planned once per method.
+    fn concat_plan(&self, class: &DexClass, method: &DexMethod, pc: usize) -> Option<concat::Plan> {
+        self.concat_plans
+            .borrow_mut()
+            .entry(pc)
+            .or_insert_with(|| concat::plan_at(class, method, pc))
+            .clone()
+    }
+
     fn instruction(&self, pc: usize) -> Result<Option<&crate::native_ir::Instruction>> {
         self.front_end
             .as_ref()
@@ -14582,6 +14594,7 @@ fn render(
     let mut returned = false;
     let mut pending: Option<Value> = None;
     let mut allocation: Option<(usize, String)> = None;
+    let mut concat_fold: Option<concat::Progress> = None;
     let mut class_captures: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
     let mut previous_exception_values = regs.clone();
     let mut early_field_writes = false;
@@ -15084,30 +15097,85 @@ fn render(
             "effectful instruction at {pc:04x} between allocation and constructor"
         );
         let width = instruction.map_or(graph.widths[pc], |insn| insn.width);
-        if op == 0x22
+        if let Some(progress) = concat_fold.as_mut() {
+            // The chain's constructor, appends and toString are skipped here;
+            // every other instruction of the chain renders as usual.
+            let expected = progress.expected();
+            ensure!(
+                pc <= expected,
+                "string concatenation fold skipped a chain instruction"
+            );
+            if pc == expected {
+                ensure!(
+                    pending.is_none() && allocation.is_none(),
+                    "string concatenation fold interrupts instruction state"
+                );
+                if progress.parts.is_empty() {
+                    progress.parts.push(string_literal(&progress.plan.prefix)?);
+                    pc += width;
+                    continue;
+                }
+                if let Some(append) = progress.plan.appends.get(progress.appended) {
+                    let value = register(&regs, append.argument)?;
+                    ensure!(
+                        value.text != "<uninitialized>" && (initialized || value.text != "this"),
+                        "uninitialized concatenation operand"
+                    );
+                    let descriptor = append.descriptor.as_ref();
+                    let text = if value.literal == Some(0) && reference(descriptor) {
+                        "null".to_string()
+                    } else if reference(descriptor) && reference(&value.ty) {
+                        value.text.clone()
+                    } else if descriptor == "I" && matches!(value.ty.as_str(), "B" | "S" | "C") {
+                        format!("((int) {})", value.text)
+                    } else {
+                        argument_at_read(
+                            &value,
+                            descriptor,
+                            append.argument,
+                            class,
+                            method,
+                            graph,
+                            append.pc,
+                        )?
+                    };
+                    progress.parts.push(concat::operand(&text));
+                    progress.appended += 1;
+                    pc = append.next;
+                    continue;
+                }
+                let expression = progress.parts.join(" + ");
+                let (result, end) = (progress.plan.result, progress.plan.end);
+                concat_fold = None;
+                let text = out.local("Ljava/lang/String;", &expression, &[])?;
+                assign(&mut regs, result, text)?;
+                pc = end;
+                if let Some(slots) = exception_slots
+                    && graph
+                        .exception_snapshot_end
+                        .get()
+                        .is_none_or(|snapshot_end| pc < snapshot_end)
+                    && !bare_return_tail(graph, words, pc)
+                {
+                    sync_exception_registers(
+                        slots,
+                        &regs,
+                        &mut previous_exception_values,
+                        out,
+                        false,
+                    )?;
+                }
+                continue;
+            }
+        } else if op == 0x22
             && initialized
             && pending.is_none()
             && allocation.is_none()
-            && exception_slots.is_none()
-            && graph.front_end.is_none()
-            && graph.shared_cfg.is_none()
-            && graph.loops.is_empty()
-            && graph.protected.is_empty()
-            && graph.synchronized.is_empty()
-            && let Some(plan) = concat::plan_at(class, method, pc)
+            && let Some(plan) = graph.concat_plan(class, method, pc)
             && plan.end <= stop
-            && let Some(value) = regs.get(plan.argument).and_then(Option::as_ref)
-            && reference(&value.ty)
-            && value.literal.is_none()
-            && value.text.strip_prefix('p').is_some_and(|digits| {
-                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
-            })
         {
-            let expression = format!("{} + {}", string_literal(&plan.prefix)?, value.text);
-            let text = out.local("Ljava/lang/String;", &expression, &[])?;
-            assign(&mut regs, plan.result, text)?;
-            pc = plan.end;
-            previous_exception_values.clone_from_slice(&regs);
+            concat_fold = Some(concat::Progress::new(plan));
+            pc += width;
             continue;
         }
         if op == 0x1e && synchronized::dispatch_release(graph, pc, &regs, out)? {
@@ -16548,18 +16616,55 @@ fn render(
                                     .instruction(branch.pc)
                                     .ok()
                                     .is_some_and(|known| known.is_none_or(|known| known == branch))
+                        })
+                        && chain.constants.iter().all(|constant| {
+                            graph.widths[constant.pc] == constant.width
+                                && graph.instruction(constant.pc).ok().is_some_and(|known| {
+                                    known.is_none_or(|known| known == constant)
+                                })
                         }),
                     "condition chain source differs from canonical graph"
                 );
-                let predicates = chain
-                    .branches
-                    .iter()
-                    .map(|branch| {
-                        let (left, right) = decoded_condition_sources(branch, regs.len())?;
-                        condition_sources(branch.opcode, left, right, &branch_regs)
-                            .map(|condition| format!("({condition})"))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                // Constants between the branches are proven dead outside their
+                // consuming branch, so both arms may start from the state after
+                // every one of them.
+                let mut chain_regs = branch_regs.clone();
+                let mut predicates = Vec::with_capacity(chain.branches.len());
+                let mut previous = pc;
+                for (index, branch) in chain.branches.iter().enumerate() {
+                    for constant in chain
+                        .constants
+                        .iter()
+                        .filter(|constant| previous < constant.pc && constant.pc < branch.pc)
+                    {
+                        let (dst, literal) = decoded_constant(constant, chain_regs.len())?;
+                        let literal = i32::try_from(literal)
+                            .context("condition chain constant exceeds 32 bits")?;
+                        assign(
+                            &mut chain_regs,
+                            dst,
+                            Value {
+                                text: literal.to_string(),
+                                ty: "I".into(),
+                                literal: Some(literal),
+                                wide_literal: None,
+                                raw_bits32: false,
+                            },
+                        )?;
+                    }
+                    let (left, right) = decoded_condition_sources(branch, regs.len())?;
+                    let opcode = if chain.inverted && index + 1 == chain.branches.len() {
+                        branch.opcode ^ 1
+                    } else {
+                        branch.opcode
+                    };
+                    predicates.push(format!(
+                        "({})",
+                        condition_sources(opcode, left, right, &chain_regs)?
+                    ));
+                    previous = branch.pc;
+                }
+                branch_regs = chain_regs;
                 let condition = predicates.join(" || ");
                 let inverse = format!("!({condition})");
                 let join = graph.join(chain.fallthrough, target, stop, words)?;

@@ -1,17 +1,17 @@
 use rdx::{
-    native_dex::{DexClass, DexCode, DexMethod, DexSymbols},
+    native_dex::{DexClass, DexCode, DexMethod, DexSymbols, DexTryRegion},
     native_java,
 };
 use std::sync::Arc;
 
-fn fixture() -> DexClass {
+fn fixture_without_hierarchy() -> DexClass {
     // new StringBuilder; const-string; init(String); append(Object) with ignored
     // result; toString; move-result; unrelated receiver read/call; return.
     let words = vec![
         0x0022, 0, 0x011a, 0, 0x2070, 0, 0x0010, 0x206e, 1, 0x0030, 0x106e, 2, 0, 0x020c, 0x0071,
         3, 0, 0x1071, 4, 0x0002, 0x0211,
     ];
-    let class = DexClass {
+    DexClass {
         descriptor: "Lsample/Test;".into(),
         superclass: Some("Ljava/lang/Object;".into()),
         interfaces: vec![],
@@ -60,7 +60,11 @@ fn fixture() -> DexClass {
                 offset: 0,
             }),
         }],
-    };
+    }
+}
+
+fn fixture() -> DexClass {
+    let class = fixture_without_hierarchy();
     let hierarchy = rdx::native_hierarchy::TypeHierarchy::from_classes([&class]).unwrap();
     class.symbols.hierarchy.set(Arc::new(hierarchy)).unwrap();
     class
@@ -92,13 +96,13 @@ fn exact_single_use_builder_becomes_ordered_concat_with_valid_links() {
 }
 
 #[test]
-fn alternate_append_overloads_and_extra_builder_use_stay_explicit() {
-    for (descriptor, parameter) in [
-        ("Ljava/lang/String;", "Ljava/lang/String;"),
-        ("Ljava/lang/CharSequence;", "Ljava/lang/CharSequence;"),
-        ("C", "C"),
-        ("I", "I"),
-        ("Z", "Z"),
+fn string_conversion_overloads_fold_while_char_sequence_and_extra_builder_use_stay_explicit() {
+    for (descriptor, parameter, expected) in [
+        ("Ljava/lang/String;", "Ljava/lang/String;", "\"tag:\" + p0"),
+        ("C", "C", "\"tag:\" + p0"),
+        ("I", "I", "\"tag:\" + p0"),
+        ("Z", "Z", "\"tag:\" + p0"),
+        ("I", "C", "\"tag:\" + ((int) p0)"),
     ] {
         let mut class = fixture();
         class.methods[0].parameters = vec![parameter.into()];
@@ -107,11 +111,17 @@ fn alternate_append_overloads_and_extra_builder_use_stay_explicit() {
         let code = native_java::render_method("sample.Test", &class, &class.methods[0])
             .unwrap_or_else(|e| panic!("{descriptor}: {e:#}"));
         assert!(
-            code.source.contains(".append("),
+            code.source.contains(expected) && !code.source.contains(".append("),
             "{descriptor}: {}",
             code.source
         );
     }
+    let mut class = fixture();
+    class.methods[0].parameters = vec!["Ljava/lang/CharSequence;".into()];
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols.protos[1].1[0] = "Ljava/lang/CharSequence;".into();
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains(".append("), "{}", code.source);
     let mut class = fixture();
     let words = &mut class.methods[0].code.as_mut().unwrap().instructions;
     words.splice(14..14, [0x106e, 2, 0]); // an extra ignored toString on the same builder
@@ -136,13 +146,207 @@ fn branch_phi_carrying_builder_identity_stays_explicit() {
 }
 
 #[test]
-fn implicit_this_argument_keeps_existing_builder_route() {
+fn implicit_this_argument_folds_like_any_reference() {
     let mut class = fixture();
     class.methods[0].access_flags = 1; // instance method; v3 is implicit this
     class.methods[0].parameters.clear();
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("\"tag:\" + this"), "{}", code.source);
+    assert!(!code.source.contains(".append("), "{}", code.source);
+}
+
+fn statement_form_words() -> Vec<u16> {
+    // v0 = Hook.read(); new SB v1; const-string v2 "tag:"; v1.<init>(v2);
+    // v3 = this.a; v1.append(v3); const-string v3 "')"; v1.append(v3);
+    // v3 = v1.toString(); Hook.load(v3); return-void
+    vec![
+        0x0071, 5, 0, 0x000c, // invoke-static Hook.read; move-result-object v0
+        0x0122, 0, // new-instance v1 StringBuilder
+        0x021a, 0, // const-string v2 "tag:"
+        0x2070, 0, 0x0021, // invoke-direct {v1, v2} <init>(String)
+        0x4354, 0, // iget-object v3, v4, Test.a
+        0x206e, 7, 0x0031, // invoke-virtual {v1, v3} append(String)
+        0x031a, 11, // const-string v3 "')"
+        0x206e, 7, 0x0031, // invoke-virtual {v1, v3} append(String)
+        0x106e, 2, 1,      // invoke-virtual {v1} toString
+        0x030c, // move-result-object v3
+        0x1071, 6, 3,      // invoke-static {v3} Hook.load
+        0x000e, // return-void
+    ]
+}
+
+#[test]
+fn statement_form_appends_with_interleaved_field_read_and_constant_fold_in_order() {
+    let mut class = multi_fixture_class(statement_form_words());
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    // The field read keeps its own statement; the fold reads the local.
+    let field = code.source.find("java.lang.String v1 = this.a;").unwrap();
+    let concat = code
+        .source
+        .find("java.lang.String v2 = \"tag:\" + v1 + \"')\";")
+        .unwrap();
+    let load = code.source.find("sample.Hook.load(v2);").unwrap();
+    let read = code.source.find("sample.Hook.read();").unwrap();
+    assert!(
+        read < field && field < concat && concat < load,
+        "{}",
+        code.source
+    );
+    assert!(!code.source.contains("StringBuilder"), "{}", code.source);
+    assert!(!code.source.contains(".append("), "{}", code.source);
+    // An effectful instruction after the first append keeps the chain explicit.
+    let words = &mut class.methods[0].code.as_mut().unwrap().instructions;
+    words.splice(16..18, [0x0071, 5, 0, 0x030c]); // v3 = Hook.read() instead of the const-string
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
     assert!(code.source.contains(".append("), "{}", code.source);
-    assert!(!code.source.contains("\"tag:\" + this"), "{}", code.source);
+}
+
+#[test]
+fn chained_appends_with_int_and_char_operands_fold_with_exact_conversions() {
+    // new SB v1; const-string v2 "tag:"; v1.<init>(v2); const/4 v3 = 7;
+    // v1 = v1.append(I v3); v3 = this.b; v1 = v1.append(String v3);
+    // const/16 v3 = 65; v1 = v1.append(C v3); v3 = v1.toString(); Hook.load(v3)
+    let words = vec![
+        0x0122, 0, 0x021a, 0, 0x2070, 0, 0x0021, 0x7312, 0x206e, 8, 0x0031, 0x010c, 0x4354, 1,
+        0x206e, 7, 0x0031, 0x010c, 0x0313, 65, 0x206e, 9, 0x0031, 0x010c, 0x106e, 2, 1, 0x030c,
+        0x1071, 6, 3, 0x000e,
+    ];
+    let class = multi_fixture_class(words);
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(
+        code.source
+            .contains("java.lang.String v1 = \"tag:\" + 7 + v0 + ((char) 65);"),
+        "{}",
+        code.source
+    );
+    assert!(
+        code.source.contains("sample.Hook.load(v1);"),
+        "{}",
+        code.source
+    );
+    assert!(!code.source.contains("StringBuilder"), "{}", code.source);
+}
+
+#[test]
+fn chain_inside_a_try_region_folds_and_keeps_the_handler() {
+    // const-string v2 "tag:" (outside); try { new SB v1; v1.<init>(v2); v0 = Hook.read();
+    // v1.append(v0); v3 = v1.toString() } catch (all) { v3 = "mid:" }; Hook.load(v3)
+    let words = vec![
+        0x021a, 0, // 0: const-string v2 "tag:"
+        0x0122, 0, // 2: new-instance v1
+        0x2070, 0, 0x0021, // 4: <init>(v2)
+        0x0071, 5, 0, 0x000c, // 7: Hook.read(); move-result-object v0
+        0x206e, 7, 0x0001, // 11: append(String v0)
+        0x106e, 2, 1, 0x030c, // 14: toString; move-result-object v3
+        0x0428, // 18: goto +4 -> 22, past the handler
+        0x030d, // 19: move-exception v3 (handler)
+        0x031a, 10, // 20: const-string v3 "mid:"
+        0x1071, 6, 3,      // 22: Hook.load(v3)
+        0x000e, // 25: return-void
+    ];
+    let mut class = multi_fixture_class(words);
+    {
+        let code = class.methods[0].code.as_mut().unwrap();
+        code.tries = 1;
+        code.try_regions = vec![DexTryRegion {
+            start: 2,
+            end: 18,
+            catches: vec![(None, 19)].into(),
+        }];
+    }
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains("\"tag:\" + "), "{}", code.source);
+    assert!(!code.source.contains("StringBuilder"), "{}", code.source);
+    assert!(code.source.contains("catch ("), "{}", code.source);
+    assert!(code.source.contains("\"mid:\""), "{}", code.source);
+}
+
+#[test]
+fn non_literal_prefix_escaping_builder_and_branch_into_chain_stay_explicit() {
+    // Prefix from a call result.
+    let mut words = statement_form_words();
+    words.splice(6..8, [0x0071, 5, 0, 0x020c]); // v2 = Hook.read() instead of const-string
+    let class = multi_fixture_class(words);
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains(".append("), "{}", code.source);
+    // The builder escapes to another call between the appends.
+    let mut words = statement_form_words();
+    words.splice(16..16, [0x1071, 10, 1]); // Hook.consume(v1)
+    let class = multi_fixture_class(words);
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains(".append("), "{}", code.source);
+    // A move between the appends carries the builder past the chain.
+    let mut words = statement_form_words();
+    words.splice(28..28, [0x1071, 10, 0]); // Hook.consume(v0) after Hook.load
+    words.splice(16..16, [0x1007]); // move-object v0, v1
+    let class = multi_fixture_class(words);
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains(".append("), "{}", code.source);
+    // A conditional append is a branch into the chain and declines.
+    let mut words = statement_form_words();
+    words.splice(16..16, [0x0038, 7]); // if-eqz v0 -> the toString call, over one append
+    let class = multi_fixture_class(words);
+    let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(code.source.contains(".append("), "{}", code.source);
+}
+
+fn multi_fixture_class(words: Vec<u16>) -> DexClass {
+    let mut class = fixture_without_hierarchy();
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    // strings 6..=12, types 2..=3, protos 5..=9, fields 0..=1, methods 5..=10
+    symbols.strings.extend([
+        "a".into(),
+        "b".into(),
+        "read".into(),
+        "load".into(),
+        "mid:".into(),
+        "')".into(),
+        "consume".into(),
+    ]);
+    symbols
+        .types
+        .extend(["Lsample/Test;".into(), "Ljava/lang/String;".into()]);
+    symbols.protos.extend([
+        ("Ljava/lang/String;".into(), vec![]),
+        (
+            "Ljava/lang/StringBuilder;".into(),
+            vec!["Ljava/lang/String;".into()],
+        ),
+        ("Ljava/lang/StringBuilder;".into(), vec!["I".into()]),
+        ("Ljava/lang/StringBuilder;".into(), vec!["C".into()]),
+        ("V".into(), vec!["Ljava/lang/Object;".into()]),
+    ]);
+    symbols.fields.extend([(2, 3, 6), (2, 3, 7)]);
+    symbols.methods.extend([
+        (1, 5, 8),  // 5: Hook.read()String
+        (1, 4, 9),  // 6: Hook.load(String)V
+        (0, 6, 2),  // 7: StringBuilder.append(String)
+        (0, 7, 2),  // 8: StringBuilder.append(I)
+        (0, 8, 2),  // 9: StringBuilder.append(C)
+        (1, 9, 12), // 10: Hook.consume(Object)V
+    ]);
+    class.fields = ["a", "b"]
+        .into_iter()
+        .map(|name| rdx::native_dex::DexField {
+            declaring_type: "Lsample/Test;".into(),
+            name: name.into(),
+            field_type: "Ljava/lang/String;".into(),
+            access_flags: 2,
+            is_static: false,
+        })
+        .collect();
+    let method = &mut class.methods[0];
+    method.access_flags = 1;
+    method.parameters.clear();
+    method.return_type = "V".into();
+    method.name = "run".into();
+    let code = method.code.as_mut().unwrap();
+    code.registers = 5;
+    code.ins = 1;
+    code.instructions = words;
+    let hierarchy = rdx::native_hierarchy::TypeHierarchy::from_classes([&class]).unwrap();
+    class.symbols.hierarchy.set(Arc::new(hierarchy)).unwrap();
+    class
 }
 
 #[test]

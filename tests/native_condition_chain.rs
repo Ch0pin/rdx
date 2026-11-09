@@ -1,5 +1,5 @@
 //! Consecutive predicates share their original success body and preserve order.
-pub use rdx::{native_cfg, native_dex, native_ir};
+pub use rdx::{native_cfg, native_dex, native_ir, native_ssa};
 #[path = "../src/native_java/condition_chain.rs"]
 mod certificate;
 use native_dex::{DexClass, DexSymbols, DexTryRegion};
@@ -142,6 +142,138 @@ fn exact_maximal_chain_budget_and_common_protection_are_explicit() {
     let plan = certificate::plan(code, 3).expect("identical original protection");
     assert_eq!(plan.branches.len(), 3);
     assert!(certificate::validate(code, &plan));
+}
+
+/// `if (p0 == 1 || p0 == 5 || p0 == 6)` as d8 emits it: each comparison
+/// constant is loaded into the same register right before its branch.
+fn constant_reload_words() -> Vec<u16> {
+    vec![
+        0x1012, // 0: const/4 v0, #1
+        0x0432, 12,     // 1: if-eq v4, v0 -> 13
+        0x5012, // 3: const/4 v0, #5
+        0x0432, 9,      // 4: if-eq v4, v0 -> 13
+        0x6012, // 6: const/4 v0, #6
+        0x0432, 6, // 7: if-eq v4, v0 -> 13
+        0x0071, 1, 0,      // 9: fallback()
+        0x0d28, // 12: goto 25
+        0x0071, 0, 0,      // 13: effect()
+        0x0312, // 16: const/4 v3, #0
+        0x4335, 8, // 17: if-ge v3, v4 -> 25
+        0x1071, 2, 3, // 19: step(v3)
+        0x03d8, 0x0103, // 22: v3 += 1
+        0xf928, // 24: goto 17
+        0x0071, 3, 0,      // 25: finish()
+        0x000a, // 28: move-result v0
+        0x000f, // 29: return v0
+    ]
+}
+
+#[test]
+fn constants_reloaded_between_branches_fold_into_one_disjunction() {
+    let mut class = fixture(3, 0x32);
+    class.methods[0].code.as_mut().unwrap().instructions = constant_reload_words();
+    let code = class.methods[0].code.as_ref().unwrap();
+    let plan = certificate::plan(code, 1).expect("constant reload chain");
+    assert_eq!(
+        plan.branches
+            .iter()
+            .map(|branch| branch.pc)
+            .collect::<Vec<_>>(),
+        [1, 4, 7]
+    );
+    assert_eq!(
+        plan.constants
+            .iter()
+            .map(|constant| constant.pc)
+            .collect::<Vec<_>>(),
+        [3, 6]
+    );
+    assert_eq!(
+        (plan.target, plan.fallthrough, plan.inverted),
+        (13, 9, false)
+    );
+    assert!(certificate::validate(code, &plan));
+    assert!(certificate::matches(code, &plan));
+    let text = source(&class).unwrap();
+    for call in [
+        "Effects.effect(",
+        "Effects.fallback(",
+        "Effects.step(",
+        "Effects.finish(",
+    ] {
+        assert_eq!(text.matches(call).count(), 1, "call={call}\n{text}");
+    }
+    assert_eq!(text.matches(" || ").count(), 2, "{text}");
+    for literal in ["1", "5", "6"] {
+        assert!(text.contains(&format!("== {literal}")), "{text}");
+    }
+    // A constant that stays live past its branch keeps the chain explicit.
+    let mut class = fixture(3, 0x32);
+    let mut words = constant_reload_words();
+    words[6] = 0x6112; // const/4 v1, #6 leaves v0 = 5 live into the body
+    words[7] = 0x1432; // if-eq v4, v1 -> 13
+    words[12] = 0x1028; // goto 28: finish moves behind the inserted call
+    words.splice(16..16, [0x1071, 2, 0]); // step(v0) inside the body
+    class.methods[0].code.as_mut().unwrap().instructions = words;
+    let code = class.methods[0].code.as_ref().unwrap();
+    native_ir::DecodedMethod::decode(code).unwrap();
+    assert!(certificate::plan(code, 1).is_none());
+}
+
+#[test]
+fn inverted_final_branch_over_the_shared_body_folds() {
+    // if (p0 == 1 || p0 == 5) { effect(); loop } else { fallback(); } finish()
+    let words = vec![
+        0x1012, // 0: const/4 v0, #1
+        0x0432, 5,      // 1: if-eq v4, v0 -> 6
+        0x5012, // 3: const/4 v0, #5
+        0x0433, 14, // 4: if-ne v4, v0 -> 18, falling into the body at 6
+        0x0071, 0, 0,      // 6: effect()
+        0x0312, // 9: const/4 v3, #0
+        0x4335, 11, // 10: if-ge v3, v4 -> 21
+        0x1071, 2, 3, // 12: step(v3)
+        0x03d8, 0x0103, // 15: v3 += 1
+        0xf928, // 17: goto 10
+        0x0071, 1, 0, // 18: fallback()
+        0x0071, 3, 0,      // 21: finish()
+        0x000a, // 24: move-result v0
+        0x000f, // 25: return v0
+    ];
+    let mut class = fixture(3, 0x32);
+    class.methods[0].code.as_mut().unwrap().instructions = words;
+    let code = class.methods[0].code.as_ref().unwrap();
+    let plan = certificate::plan(code, 1).expect("inverted final branch");
+    assert_eq!(
+        plan.branches
+            .iter()
+            .map(|branch| branch.pc)
+            .collect::<Vec<_>>(),
+        [1, 4]
+    );
+    assert_eq!(
+        plan.constants
+            .iter()
+            .map(|constant| constant.pc)
+            .collect::<Vec<_>>(),
+        [3]
+    );
+    assert_eq!(
+        (plan.target, plan.fallthrough, plan.inverted),
+        (6, 18, true)
+    );
+    assert!(certificate::validate(code, &plan));
+    assert!(certificate::matches(code, &plan));
+    let text = source(&class).unwrap();
+    for call in [
+        "Effects.effect(",
+        "Effects.fallback(",
+        "Effects.step(",
+        "Effects.finish(",
+    ] {
+        assert_eq!(text.matches(call).count(), 1, "call={call}\n{text}");
+    }
+    assert_eq!(text.matches(" || ").count(), 1, "{text}");
+    assert!(text.contains("== 1") && text.contains("== 5"), "{text}");
 }
 
 #[test]

@@ -219,6 +219,21 @@ fn statements(source: &str) -> Vec<Statement> {
     let mut cursor = 1;
     block(&lines, &mut cursor)
 }
+/// Splits `source` at the first `op` that sits outside every parenthesis.
+fn split_top<'a>(source: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
+    let mut depth = 0i32;
+    for (i, c) in source.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ if depth == 0 && source[i..].starts_with(op) => {
+                return Some((&source[..i], &source[i + op.len()..]));
+            }
+            _ => {}
+        }
+    }
+    None
+}
 fn expression(source: &str, vars: &HashMap<String, i32>) -> i32 {
     let mut source = source.trim();
     while source.starts_with('(') && source.ends_with(')') {
@@ -239,10 +254,14 @@ fn expression(source: &str, vars: &HashMap<String, i32>) -> i32 {
     if let Some(value) = source.strip_prefix("(java.lang.Object) ") {
         return expression(value, vars);
     }
-    for op in [" == ", " != ", " <= ", " >= ", " < ", " > ", " + ", " * "] {
-        if let Some((a, b)) = source.split_once(op) {
+    for op in [
+        " || ", " && ", " == ", " != ", " <= ", " >= ", " < ", " > ", " + ", " * ",
+    ] {
+        if let Some((a, b)) = split_top(source, op) {
             let (a, b) = (expression(a, vars), expression(b, vars));
             return match op {
+                " || " => i32::from(a != 0 || b != 0),
+                " && " => i32::from(a != 0 && b != 0),
                 " == " => i32::from(a == b),
                 " != " => i32::from(a != b),
                 " <= " => i32::from(a <= b),
@@ -420,13 +439,18 @@ fn forward_branch_bypass_uses_the_shared_continuation_as_join() {
     //
     // The second branch can fall through to the setup block or bypass it.  Its
     // fallthrough makes the setup block reachable from both outer arms, but it
-    // is not a join: the bypass must remain in the nested branch and the add is
-    // the single shared continuation.
+    // is not a join: both guards fold into one disjunction over the setup block
+    // and the add is the single shared continuation.
     let source = check(
         &[0x0238, 4, 0x0239, 4, 0x1012, 0x0128, 0x00d8, 0x0102, 0x000f],
         &["I"],
         3,
         &[vec![i32::MIN], vec![-1], vec![0], vec![1], vec![i32::MAX]],
+    );
+    assert_eq!(
+        source.matches(" || ").count(),
+        1,
+        "guards stayed nested:\n{source}"
     );
     assert_eq!(
         source.matches(" + ").count(),

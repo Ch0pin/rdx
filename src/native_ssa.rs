@@ -92,6 +92,48 @@ struct Step {
 }
 
 impl SsaMethod {
+    /// The single word value an instruction reads from or writes to `register`.
+    /// Wide operands and unrenamed instructions yield None.
+    pub fn value_id(&self, pc: usize, register: u16, read: bool) -> Option<ValueId> {
+        let instruction = self.instructions.iter().find(|insn| insn.pc == pc)?;
+        let operands = if read {
+            &instruction.reads
+        } else {
+            &instruction.writes
+        };
+        let operand = operands
+            .iter()
+            .find(|operand| operand.register == register)?;
+        (operand.words.len() == 1).then_some(operand.words[0])
+    }
+
+    /// Every instruction read of `id`, as (pc, register) in pc order. Phi
+    /// incoming values are not instruction reads.
+    pub fn uses(&self, id: ValueId) -> Vec<(usize, u16)> {
+        let mut uses = Vec::new();
+        for instruction in &self.instructions {
+            for operand in &instruction.reads {
+                if operand.words.contains(&id) {
+                    uses.push((instruction.pc, operand.register));
+                }
+            }
+        }
+        uses
+    }
+
+    /// The instruction reads of `id` are exactly `expected`.
+    pub fn only_uses(&self, id: ValueId, expected: &[(usize, u16)]) -> bool {
+        self.uses(id) == expected
+    }
+
+    /// `id` flows into no phi, so handlers and merges never observe it.
+    pub fn in_no_phi(&self, id: ValueId) -> bool {
+        !self
+            .phis
+            .iter()
+            .any(|phi| phi.result == id || phi.incoming.iter().any(|(_, value)| *value == id))
+    }
+
     pub fn build(code: &DexCode, ir: &DecodedMethod, graph: &ControlFlowGraph) -> Result<Self> {
         Self::build_with_work_limit(code, ir, graph, WORK_LIMIT)
     }

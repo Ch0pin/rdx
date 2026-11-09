@@ -346,12 +346,12 @@ fn composed_forward_regions_preserve_single_shared_tails_and_navigation() {
         let class = fixture(&case);
         let code = native_java::render_method("sample.Composition", &class, &class.methods[0])
             .unwrap_or_else(|e| panic!("{}: {e:#}", case.name));
-        assert!(
-            code.source.matches("if (").count() >= 2,
-            "{}: {}",
-            case.name,
-            code.source
-        );
+        let branches = code.source.matches("if (").count();
+        if case.name == "postdomBypass" {
+            assert_eq!(branches, 1, "{}: {}", case.name, code.source);
+        } else {
+            assert!(branches >= 2, "{}: {}", case.name, code.source);
+        }
         if matches!(case.name, "siblingEffects" | "nestedEffects") {
             for method in ["entry", "a", "b", "c", "d", "combine"] {
                 assert_eq!(
@@ -371,9 +371,14 @@ fn composed_forward_regions_preserve_single_shared_tails_and_navigation() {
             );
         }
         if case.name == "postdomBypass" {
-            // This shared setup may appear in mutually exclusive Java arms;
-            // the JVM trace below proves it executes exactly once when selected.
-            assert!((1..=2).contains(&code.source.matches("Hook.setup()").count()));
+            // Both guards reach the shared setup block, so they fold into one
+            // disjunction and the setup renders exactly once.
+            assert!(
+                code.source.contains("if ((p0 == 0) || (p1 == 0)) {"),
+                "{}",
+                code.source
+            );
+            assert_eq!(code.source.matches("Hook.setup()").count(), 1);
             assert_eq!(code.source.matches("Hook.tail(").count(), 1);
         }
     }

@@ -17,6 +17,13 @@ const COLUMN: f32 = 280.0;
 const ROW: f32 = 155.0;
 const RADIUS: f32 = 52.0;
 const SPHERE_DROP: f32 = 60.0;
+/// Space above the top row for leftward arcs and recursion loops. The curve bounds below
+/// keep every route inside it, so no edge leaves the canvas.
+const LANE: f32 = 70.0;
+/// Largest control offset of a leftward arc; its apex rises three quarters of this.
+const ARC_RISE: f32 = 80.0;
+/// Largest control offset of a same-column bow; it stays within the card width.
+const SIDE_BOW: f32 = 56.0;
 
 pub struct CallGraphWindow {
     pub visible: bool,
@@ -193,32 +200,56 @@ fn arrowhead(painter: &egui::Painter, tip: Pos2, direction: Vec2, length: f32, t
         Stroke::NONE,
     ));
 }
-/// Rim-to-rim edge with an arrowhead at the callee. Leftward and recursive edges are routed
-/// above the cards so they do not cross the columns between them.
+/// Rim-to-rim edge with an arrowhead at the callee. A rightward edge is a straight line.
+/// An edge within one column bows out beside the cards, a leftward edge arcs over the
+/// cards it spans, and a recursive call loops above its own sphere. Arcs and loops rise
+/// less than `LANE` above the card, the space the layout reserves over the top row.
 fn draw_edge(
     painter: &egui::Painter,
     [start, end]: [Pos2; 2],
     radius: f32,
-    top: f32,
     highlighted: bool,
     tint: Color32,
     zoom: f32,
 ) {
-    let direction = if start == end {
-        Vec2::X
-    } else {
-        (end - start).normalized()
-    };
-    let a = start + direction * radius;
-    let b = end - direction * radius;
     let stroke = Stroke::new(if highlighted { 2.5 } else { 0.9 }, tint);
     let head = (16.0 * zoom).clamp(7.0, 18.0) * if highlighted { 1.15 } else { 1.0 };
-    if start == end || b.x <= a.x {
-        let top = top - 12.0;
-        let corner = Pos2::new(b.x - 12.0, top);
-        painter.line(vec![a, Pos2::new(a.x + 12.0, top), corner, b], stroke);
-        arrowhead(painter, b, (b - corner).normalized(), head, tint);
+    let curve = |points: [Pos2; 4]| {
+        painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+            points,
+            false,
+            Color32::TRANSPARENT,
+            stroke,
+        ));
+        let into = (points[3] - points[2]).normalized();
+        arrowhead(painter, points[3], into, head, tint);
+    };
+    let delta = end - start;
+    if start == end {
+        let a = start + Vec2::new(-0.5, -0.866) * radius;
+        let b = start + Vec2::new(0.5, -0.866) * radius;
+        curve([
+            a,
+            a + Vec2::new(-0.9, -1.3) * radius,
+            b + Vec2::new(0.9, -1.3) * radius,
+            b,
+        ]);
+    } else if delta.x.abs() < radius {
+        // Downward edges bow left and upward edges right, so a mutual pair stays apart.
+        let side = if delta.y > 0.0 { -1.0 } else { 1.0 };
+        let reach = side * (delta.y.abs() * 0.25).clamp(0.5 * radius, SIDE_BOW * zoom);
+        let a = start + Vec2::new(side * radius, 0.0);
+        let b = end + Vec2::new(side * radius, 0.0);
+        curve([a, a + Vec2::new(reach, 0.0), b + Vec2::new(reach, 0.0), b]);
+    } else if delta.x < 0.0 {
+        let rise = (delta.x.abs() * 0.35).clamp(0.8 * radius, ARC_RISE * zoom);
+        let a = start - Vec2::new(0.0, radius);
+        let b = end - Vec2::new(0.0, radius);
+        curve([a, a - Vec2::new(0.0, rise), b - Vec2::new(0.0, rise), b]);
     } else {
+        let direction = delta.normalized();
+        let a = start + direction * radius;
+        let b = end - direction * radius;
         painter.line_segment([a, b], stroke);
         arrowhead(painter, b, direction, head, tint);
     }
@@ -398,7 +429,7 @@ impl CallGraphWindow {
                     let column = (column - first) as usize;
                     let row = rows[column];
                     rows[column] += 1;
-                    Vec2::new(column as f32 * COLUMN, row as f32 * ROW)
+                    Vec2::new(column as f32 * COLUMN, LANE + row as f32 * ROW)
                 })
                 .collect();
             let positions: Vec<Vec2> = slots
@@ -437,7 +468,6 @@ impl CallGraphWindow {
                         ui.painter(),
                         [centers[edge.from], centers[edge.to]],
                         RADIUS * z,
-                        rects[edge.from].top().min(rects[edge.to].top()),
                         mask != 0,
                         tint,
                         z,
@@ -509,7 +539,7 @@ impl CallGraphWindow {
                         .on_hover_text(hover);
                     if response.dragged() {
                         let moved = positions[i] + response.drag_delta() / z;
-                        offsets[i] = moved.max(Vec2::ZERO) - slots[i];
+                        offsets[i] = moved.max(Vec2::new(0.0, LANE)) - slots[i];
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                     }
                     if response.clicked() && node.available {
@@ -830,6 +860,106 @@ mod tests {
         assert_eq!(window.direction, Direction::Callees);
     }
     #[test]
+    fn every_edge_route_stays_inside_the_canvas() {
+        let node = |method: &str| Node {
+            method: method.into(),
+            depth: usize::from(method != "app.Root.run()V"),
+            component: None,
+            available: true,
+        };
+        let edge = |from, to| Edge { from, to, sites: 1 };
+        // Root in column 0; Up, Peer and Third call it from rows 0..2 of column -1; Down
+        // is its callee in column +1 and also calls it back and itself.
+        let graph = CallGraph {
+            nodes: vec![
+                node("app.Root.run()V"),
+                node("app.Up.run()V"),
+                node("app.Peer.run()V"),
+                node("app.Third.run()V"),
+                node("app.Down.run()V"),
+            ],
+            edges: vec![
+                edge(1, 0),
+                edge(2, 0),
+                edge(3, 0),
+                edge(0, 4),
+                edge(1, 3),
+                edge(3, 1),
+                edge(4, 0),
+                edge(4, 4),
+            ],
+            truncated: false,
+            dispatch_targets: vec![],
+            dispatch_targets_truncated: false,
+            direction: Direction::Both,
+        };
+        let ctx = egui::Context::default();
+        let mut window = CallGraphWindow {
+            visible: true,
+            ..Default::default()
+        };
+        window.set_graph(Some(graph), None);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1100.0, 750.0))),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            window.show_contents(ctx);
+        });
+        assert_eq!(spheres(&output).len(), 5);
+        let canvas = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Circle(circle) if circle.radius > 40.0 => Some(clipped.clip_rect),
+                _ => None,
+            })
+            .expect("sphere clip rect");
+        let (mut lines, mut heads, mut curves) = (0, 0, Vec::new());
+        for clipped in output.shapes.iter().filter(|c| c.clip_rect == canvas) {
+            let points: Vec<Pos2> = match &clipped.shape {
+                egui::Shape::LineSegment { points, .. } => {
+                    lines += 1;
+                    points.to_vec()
+                }
+                egui::Shape::CubicBezier(curve) => {
+                    curves.push(curve.points);
+                    (0..=16).map(|i| curve.sample(i as f32 / 16.0)).collect()
+                }
+                egui::Shape::Path(path) => {
+                    heads += usize::from(path.closed && path.points.len() == 3);
+                    path.points.clone()
+                }
+                _ => continue,
+            };
+            for point in points {
+                assert!(
+                    canvas.contains(point),
+                    "{point:?} is drawn outside the canvas {canvas:?}"
+                );
+            }
+        }
+        assert_eq!((lines, curves.len(), heads), (4, 4, 8));
+        // The mutual same-column pair bows out on opposite sides; the leftward arc and
+        // the recursion loop rise above the spheres and come down into their targets.
+        let (bows, arcs): (Vec<&[Pos2; 4]>, Vec<&[Pos2; 4]>) = curves
+            .iter()
+            .partition(|points| (points[0].x - points[3].x).abs() < 1.0);
+        assert_eq!(bows.len(), 2);
+        let lefts = bows
+            .iter()
+            .filter(|points| points[1].x < points[0].x)
+            .count();
+        assert_eq!(lefts, 1, "{bows:?}");
+        assert_eq!(arcs.len(), 2);
+        for points in arcs {
+            assert!(
+                points[1].y < points[0].y && points[2].y < points[3].y,
+                "the arc rises over its spheres: {points:?}"
+            );
+        }
+    }
+    #[test]
     fn nodes_follow_pointer_drags_and_reset_with_a_new_graph() {
         let ctx = egui::Context::default();
         let mut window = CallGraphWindow {
@@ -886,6 +1016,35 @@ mod tests {
         let moved = window.offsets[0];
         assert!(moved.x > 0.0 && moved.y > 0.0, "root node moved: {moved:?}");
         assert_eq!(window.offsets[1], Vec2::ZERO);
+        // A drag above the lane reserved for arcs and loops stops at the lane edge.
+        let center = root + Vec2::new(120.0, 75.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let _ = ctx.run(
+            frame(vec![
+                egui::Event::PointerMoved(center),
+                button(center, true),
+            ]),
+            |ctx| {
+                window.show_contents(ctx);
+            },
+        );
+        let far = center - Vec2::new(400.0, 400.0);
+        let _ = ctx.run(frame(vec![egui::Event::PointerMoved(far)]), |ctx| {
+            window.show_contents(ctx);
+        });
+        let _ = ctx.run(frame(vec![button(far, false)]), |ctx| {
+            window.show_contents(ctx);
+        });
+        assert_eq!(
+            window.offsets[0],
+            Vec2::ZERO,
+            "the root stops at its slot on the lane edge"
+        );
         window.set_graph(Some(sample_graph()), None);
         assert!(window.offsets.iter().all(|offset| *offset == Vec2::ZERO));
         window.set_graph(None, None);

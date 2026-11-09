@@ -224,7 +224,9 @@ Right-click a method declaration or call and choose **Method references →
 Call graph…**. The graph opens in an independent native window that can be
 resized or moved to another monitor. All collected methods and call edges are displayed. Circular nodes
 use shading and shadows for a 3D appearance, and every edge carries an arrowhead at
-the callee.
+the callee. Calls between methods in the same column bow out beside their nodes,
+calls that point back to the left arc over the nodes they span, and a recursive
+call loops above its own node, so every edge stays in view.
 
 The **Callers / Callees / Both** selector chooses which calls the graph follows.
 **Callers**, the default, walks the methods that invoke the selected method and

@@ -616,21 +616,26 @@ fn try_region_staging_mode(
     )?;
     // Structured proof preserves exact original alias moves and live receiver
     // identities across all normal paths. Pure staging retains a linear suffix.
-    let ir = if let Some(projection) = &proof_projection {
-        projection
-            .checked_ir(class, method)
-            .context("allocation projection certificate invalid")?
-    } else {
-        crate::native_ir::DecodedMethod::decode(method.code.as_ref().unwrap())?
+    // Every proof over this method shares one decoded, bound and memoized
+    // context; a nested region proves through its enclosing projection.
+    let proofs = match &proof_projection {
+        Some(projection) => {
+            super::structured_argument_region::RegionProofs::Projection(projection.clone())
+        }
+        None => super::structured_argument_region::RegionProofs::Context(
+            graph
+                .proof_context(method)
+                .context("allocation method decoding failed")?,
+        ),
     };
+    let ir = proofs
+        .ir(class, method)
+        .context("allocation projection certificate invalid")?;
     let mut guarded_receivers = std::collections::BTreeSet::new();
     let block_plan = if argument_block {
-        let plan = if let Some(projection) = &proof_projection {
-            projection.prove(class, method, pc, constructor_pc)
-        } else {
-            super::structured_argument_region::prove(class, method, pc, constructor_pc)
-        }
-        .context("no exact structured argument-region proof")?;
+        let plan = proofs
+            .prove(class, method, pc, constructor_pc)
+            .context("no exact structured argument-region proof")?;
         // A region renderer may choose a source cast from a broad Java local.
         // Arguments retain positive raw DEX domain proofs. An Object-typed
         // interface getter receiver instead needs an exact declaration and a
@@ -855,11 +860,12 @@ fn try_region_staging_mode(
         .as_ref()
         .filter(|plan| !plan.nested_initializations.is_empty())
     {
-        let next = super::structured_argument_region::Projection::extend(
+        let next = super::structured_argument_region::Projection::extend_with(
             class,
             method,
             proof_projection.as_deref(),
             plan,
+            proofs.context(),
         )
         .context("allocation projection parent proof invalid")?;
         Some(ProjectionBoundary {
@@ -876,10 +882,7 @@ fn try_region_staging_mode(
         .filter(|plan| !plan.exception_edges.is_empty())
     {
         ensure!(
-            proof_projection.as_deref().map_or_else(
-                || super::structured_argument_region::validate(class, method, plan),
-                |projection| projection.validate(class, method, plan)
-            ),
+            proofs.validate(class, method, plan),
             "internal argument handler canonical proof differs"
         );
         let active = &graph.argument_handler_scopes;
@@ -980,21 +983,13 @@ fn try_region_staging_mode(
     );
     let (expression, refs) = if let Some(plan) = &block_plan {
         ensure!(
-            proof_projection.as_ref().map_or_else(
-                || super::structured_argument_region::validate(class, method, plan),
-                |projection| projection.validate(class, method, plan)
-            ),
+            proofs.validate(class, method, plan),
             "structured argument emission proof differs"
         );
         let next = constructor_pc + graph.widths[constructor_pc];
-        let live = super::super::liveness::analyze(
-            proof_projection
-                .as_ref()
-                .map_or(method.code.as_ref().unwrap(), |projection| {
-                    projection.original_code()
-                }),
-        )
-        .context("structured argument live-out analysis absent")?;
+        let live = graph
+            .region_liveness(proofs.source())
+            .context("structured argument live-out analysis absent")?;
         for (r, value) in regs.iter().enumerate() {
             if !aliases.contains(&r)
                 && live.contains(next, r)

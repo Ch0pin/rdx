@@ -4,6 +4,8 @@ use rdx::{
     native_hierarchy, native_ir, native_java, native_method,
 };
 use std::{fs, process::Command, sync::Arc};
+// The renderer-facing items of the module stay unused in this crate.
+#[allow(dead_code)]
 #[path = "../src/native_java/structured_argument_region.rs"]
 mod proof;
 fn fixture() -> DexClass {
@@ -2885,7 +2887,7 @@ fn projection_revalidation_rejects_fabricated_cached_ir_and_call_bindings() {
     .unwrap();
     let cfg =
         native_cfg::ControlFlowGraph::build(original.methods[0].code.as_ref().unwrap()).unwrap();
-    let mut ir = projection.checked_ir(&staged, &staged.methods[0]).unwrap();
+    let mut ir = (*projection.checked_ir(&staged, &staged.methods[0]).unwrap()).clone();
     let i = ir.instructions.iter_mut().find(|i| i.pc == 6).unwrap();
     i.opcode = 0x12;
     i.writes.push(native_ir::RegisterOperand {

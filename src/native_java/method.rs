@@ -4637,6 +4637,12 @@ impl Drop for ConstructorThrowBoundary<'_> {
     }
 }
 
+/// One memoized proof source and its whole-method liveness.
+type RegionLiveness = (
+    std::rc::Rc<DexMethod>,
+    Option<std::rc::Rc<super::liveness::LiveRegisters>>,
+);
+
 struct Graph {
     local_sequence_floor: usize,
     reserved_names: std::sync::Arc<std::collections::HashSet<String>>,
@@ -4684,6 +4690,8 @@ struct Graph {
     constructor_bindings: std::cell::OnceCell<
         Option<std::collections::HashMap<usize, crate::native_constructors::ConstructorBinding>>,
     >,
+    proof_contexts: std::cell::RefCell<Vec<std::rc::Rc<structured_argument_region::ProofContext>>>,
+    region_liveness: std::cell::RefCell<Vec<RegionLiveness>>,
     shrink_ssa: std::cell::OnceCell<Option<crate::native_ssa::SsaMethod>>,
     argument_string_producers: std::cell::OnceCell<std::collections::BTreeSet<usize>>,
     constructor_prefix_strings: std::cell::Cell<Option<(usize, usize)>>,
@@ -5327,6 +5335,59 @@ impl Graph {
             analyze().ok()
         }).as_ref()?.get(&invoke_pc)
     }
+    /// Shared allocation-region proof inputs for one exact method rendered
+    /// through this graph. A staged region method differs from its original
+    /// and keeps its own context; lookups compare the complete method identity
+    /// and keep the most recently used contexts of the nesting chain.
+    fn proof_context(
+        &self,
+        method: &DexMethod,
+    ) -> Option<std::rc::Rc<structured_argument_region::ProofContext>> {
+        const MAX_PROOF_CONTEXTS: usize = 8;
+        let mut contexts = self.proof_contexts.borrow_mut();
+        if let Some(index) = contexts.iter().position(|context| context.matches(method)) {
+            let context = contexts.remove(index);
+            contexts.push(context.clone());
+            return Some(context);
+        }
+        let context = structured_argument_region::ProofContext::build(std::rc::Rc::new(
+            structured_argument_region::clone_method(method)?,
+        ))?;
+        if contexts.len() >= MAX_PROOF_CONTEXTS {
+            contexts.remove(0);
+        }
+        contexts.push(context.clone());
+        Some(context)
+    }
+    /// Whole-method liveness of one proof source, computed once per source.
+    /// The key is the shared source allocation itself, which stays alive in
+    /// the memo, so a recycled address can never alias another method.
+    fn region_liveness(
+        &self,
+        source: &std::rc::Rc<DexMethod>,
+    ) -> Option<std::rc::Rc<super::liveness::LiveRegisters>> {
+        const MAX_SOURCES: usize = 8;
+        let mut memo = self.region_liveness.borrow_mut();
+        if let Some(index) = memo
+            .iter()
+            .position(|(key, _)| std::rc::Rc::ptr_eq(key, source))
+        {
+            let entry = memo.remove(index);
+            let live = entry.1.clone();
+            memo.push(entry);
+            return live;
+        }
+        let live = source
+            .code
+            .as_ref()
+            .and_then(super::liveness::analyze)
+            .map(std::rc::Rc::new);
+        if memo.len() >= MAX_SOURCES {
+            memo.remove(0);
+        }
+        memo.push((source.clone(), live.clone()));
+        live
+    }
     // Materialize only original string producers flowing into a proved
     // allocation region. Preserve resolution before intervening caller effects;
     // the immutable per-method provenance and structural inputs are cached.
@@ -5669,6 +5730,8 @@ impl Graph {
             caught_checked_effects: Default::default(),
             caught_dispatch_effects: Default::default(),
             constructor_bindings: std::cell::OnceCell::new(),
+            proof_contexts: Default::default(),
+            region_liveness: Default::default(),
             shrink_ssa: std::cell::OnceCell::new(),
             argument_string_producers: std::cell::OnceCell::new(),
             constructor_prefix_strings: Default::default(),

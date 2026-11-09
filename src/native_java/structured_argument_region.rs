@@ -2,12 +2,16 @@
 use crate::{
     native_calls::{BoundCall, BoundCalls},
     native_cfg::{ControlFlowGraph, EdgeKind},
-    native_constructors::ConstructorOrigin,
-    native_dex::{DexClass, DexMethod},
+    native_constructors::{ConstructorBinding, ConstructorOrigin},
+    native_dex::{DexClass, DexCode, DexMethod, DexTryRegion},
     native_ir::{DecodedMethod, PoolKind},
     native_method::MethodAnalysis,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cell::{OnceCell, RefCell},
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct FirstRead {
     pub pc: usize,
@@ -15,6 +19,11 @@ pub(super) struct FirstRead {
     pub words: usize,
 }
 type ProtectedDispatch = (u32, u32, Vec<(Option<String>, u32)>);
+// Memoized proofs keyed by (allocation, constructor).
+type PlanMemo = RefCell<BTreeMap<(usize, usize), Option<Rc<Plan>>>>;
+// The one staged method certified by a projection: its words, handler table
+// and the certified decoding.
+type StagedCertificate = RefCell<Option<(Vec<u16>, Vec<DexTryRegion>, Option<Rc<DecodedMethod>>)>>;
 // Generated resource accessors allocate dozens of nested items in one
 // straight-line argument region. Every owned instruction is still proven.
 const MAX_REGION_NODES: usize = 2048;
@@ -42,9 +51,6 @@ pub(super) struct Plan {
     pub outs: u16,
     pub try_regions: Vec<ProtectedDispatch>,
 }
-pub(super) fn validate(class: &DexClass, method: &DexMethod, plan: &Plan) -> bool {
-    prove(class, method, plan.allocation, plan.constructor).as_ref() == Some(plan)
-}
 pub(super) fn prove(
     class: &DexClass,
     method: &DexMethod,
@@ -52,6 +58,13 @@ pub(super) fn prove(
     constructor: usize,
 ) -> Option<Plan> {
     prove_inner(class, method, allocation, constructor, None)
+}
+/// Uncached reference revalidation for the integration tests; rendering
+/// validates through the shared [`ProofContext`] of the method instead.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(super) fn validate(class: &DexClass, method: &DexMethod, plan: &Plan) -> bool {
+    prove(class, method, plan.allocation, plan.constructor).as_ref() == Some(plan)
 }
 // Shared inputs belong to this exact immutable class/method. Emission still
 // revalidates the resulting plan independently from original DEX instructions.
@@ -69,6 +82,197 @@ pub(super) fn prove_cached(
     inputs: ProofInputs<'_>,
 ) -> Option<Plan> {
     prove_inner(class, method, allocation, constructor, Some(inputs))
+}
+fn same_header(a: &DexMethod, b: &DexMethod) -> bool {
+    a.declaring_type == b.declaring_type
+        && a.name == b.name
+        && a.return_type == b.return_type
+        && a.parameters == b.parameters
+        && a.thrown_types == b.thrown_types
+        && a.access_flags == b.access_flags
+}
+fn same_code(a: &DexCode, b: &DexCode) -> bool {
+    a.registers == b.registers
+        && a.ins == b.ins
+        && a.outs == b.outs
+        && a.tries == b.tries
+        && a.offset == b.offset
+        && a.try_regions == b.try_regions
+        && a.instructions == b.instructions
+}
+/// Complete method identity: header, frame, handler table and every word.
+pub(super) fn same_method(a: &DexMethod, b: &DexMethod) -> bool {
+    same_header(a, b)
+        && match (&a.code, &b.code) {
+            (Some(a), Some(b)) => same_code(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+}
+pub(super) fn clone_method(method: &DexMethod) -> Option<DexMethod> {
+    let code = method.code.as_ref()?;
+    Some(DexMethod {
+        declaring_type: method.declaring_type.clone(),
+        name: method.name.clone(),
+        return_type: method.return_type.clone(),
+        parameters: method.parameters.clone(),
+        thrown_types: method.thrown_types.clone(),
+        access_flags: method.access_flags,
+        code: Some(DexCode {
+            registers: code.registers,
+            ins: code.ins,
+            outs: code.outs,
+            tries: code.tries,
+            try_regions: code.try_regions.clone(),
+            instructions: code.instructions.clone(),
+            offset: code.offset,
+        }),
+    })
+}
+/// Shared inputs of every allocation-region proof over one exact immutable
+/// method. Rendering one method proves and revalidates dozens of nested
+/// regions: decoding, blocks, call binding and constructor identities are
+/// computed once, and each proof is memoized per (allocation, constructor).
+/// Every use first compares the complete method identity, so a
+/// staged region method never borrows the inputs of the method it was carved
+/// from. A memoized plan is the proof of this exact instruction stream; a
+/// revalidation compares against it instead of recomputing the same function.
+pub(super) struct ProofContext {
+    source: Rc<DexMethod>,
+    ir: Rc<DecodedMethod>,
+    analysis: OnceCell<Option<ProofAnalysis>>,
+    plans: PlanMemo,
+}
+struct ProofAnalysis {
+    cfg: ControlFlowGraph,
+    bound: BoundCalls,
+    bindings: Vec<ConstructorBinding>,
+}
+impl ProofContext {
+    pub(super) fn build(source: Rc<DexMethod>) -> Option<Rc<Self>> {
+        let ir = DecodedMethod::decode(source.code.as_ref()?).ok()?;
+        Some(Rc::new(Self {
+            source,
+            ir: Rc::new(ir),
+            analysis: OnceCell::new(),
+            plans: RefCell::new(BTreeMap::new()),
+        }))
+    }
+    pub(super) fn matches(&self, method: &DexMethod) -> bool {
+        same_method(method, &self.source)
+    }
+    pub(super) fn source(&self) -> &Rc<DexMethod> {
+        &self.source
+    }
+    pub(super) fn ir(&self) -> Rc<DecodedMethod> {
+        self.ir.clone()
+    }
+    fn analysis(&self, class: &DexClass) -> Option<&ProofAnalysis> {
+        self.analysis
+            .get_or_init(|| {
+                let code = self.source.code.as_ref()?;
+                if code.instructions.len() > 4096 || code.registers > 256 {
+                    return None;
+                }
+                let analysis = MethodAnalysis::build(class, &self.source).ok()?;
+                let bindings = analysis.constructors().ok()?.bindings;
+                let (_, cfg, bound) = analysis.into_parts();
+                Some(ProofAnalysis {
+                    cfg,
+                    bound,
+                    bindings,
+                })
+            })
+            .as_ref()
+    }
+    /// Prove one region of this exact method. Any other method is proven
+    /// directly without sharing an input.
+    pub(super) fn prove(
+        &self,
+        class: &DexClass,
+        method: &DexMethod,
+        allocation: usize,
+        constructor: usize,
+    ) -> Option<Rc<Plan>> {
+        if !self.matches(method) {
+            return prove(class, method, allocation, constructor).map(Rc::new);
+        }
+        let key = (allocation, constructor);
+        if let Some(plan) = self.plans.borrow().get(&key) {
+            return plan.clone();
+        }
+        let plan = self
+            .analysis(class)
+            .and_then(|analysis| {
+                prove_cached(
+                    class,
+                    method,
+                    allocation,
+                    constructor,
+                    ProofInputs {
+                        ir: &self.ir,
+                        cfg: &analysis.cfg,
+                        bound: &analysis.bound,
+                        bindings: &analysis.bindings,
+                    },
+                )
+            })
+            .map(Rc::new);
+        self.plans.borrow_mut().insert(key, plan.clone());
+        plan
+    }
+    pub(super) fn validate(&self, class: &DexClass, method: &DexMethod, plan: &Plan) -> bool {
+        self.prove(class, method, plan.allocation, plan.constructor)
+            .as_deref()
+            == Some(plan)
+    }
+}
+/// The proof authority of one allocation region: the enclosing projection for
+/// a nested region, otherwise the shared context of the method itself.
+pub(super) enum RegionProofs {
+    Projection(Rc<Projection>),
+    Context(Rc<ProofContext>),
+}
+impl RegionProofs {
+    pub(super) fn context(&self) -> Option<&Rc<ProofContext>> {
+        match self {
+            Self::Projection(_) => None,
+            Self::Context(context) => Some(context),
+        }
+    }
+    pub(super) fn ir(&self, class: &DexClass, method: &DexMethod) -> Option<Rc<DecodedMethod>> {
+        match self {
+            Self::Projection(projection) => projection.checked_ir(class, method),
+            Self::Context(context) => Some(context.ir()),
+        }
+    }
+    pub(super) fn prove(
+        &self,
+        class: &DexClass,
+        method: &DexMethod,
+        allocation: usize,
+        constructor: usize,
+    ) -> Option<Rc<Plan>> {
+        match self {
+            Self::Projection(projection) => {
+                projection.prove(class, method, allocation, constructor)
+            }
+            Self::Context(context) => context.prove(class, method, allocation, constructor),
+        }
+    }
+    pub(super) fn validate(&self, class: &DexClass, method: &DexMethod, plan: &Plan) -> bool {
+        match self {
+            Self::Projection(projection) => projection.validate(class, method, plan),
+            Self::Context(context) => context.validate(class, method, plan),
+        }
+    }
+    /// The original method the proofs are about, never a staged copy.
+    pub(super) fn source(&self) -> &Rc<DexMethod> {
+        match self {
+            Self::Projection(projection) => projection.context.source(),
+            Self::Context(context) => context.source(),
+        }
+    }
 }
 fn prove_inner(
     class: &DexClass,
@@ -789,22 +993,40 @@ fn prove_inner(
 // parent allocation plan. Original instruction widths and edges remain intact.
 #[derive(Clone)]
 pub(super) struct Projection {
-    source: std::rc::Rc<DexMethod>,
+    context: Rc<ProofContext>,
     steps: Vec<Plan>,
+    // One projection certifies the one staged method rendered beneath it. The
+    // certificate is keyed by the complete staged words and handler table.
+    checked: StagedCertificate,
+    plans: PlanMemo,
 }
 impl Projection {
-    pub(super) fn original_code(&self) -> &crate::native_dex::DexCode {
-        self.source
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(super) fn original_code(&self) -> &DexCode {
+        self.context
+            .source()
             .code
             .as_ref()
             .expect("validated projection source code")
     }
-
+    #[cfg(test)]
     pub(super) fn extend(
         class: &DexClass,
         method: &DexMethod,
         previous: Option<&Self>,
         plan: &Plan,
+    ) -> Option<Self> {
+        Self::extend_with(class, method, previous, plan, None)
+    }
+    /// A root projection reuses the method's shared proof context when the
+    /// caller already holds one for this exact method.
+    pub(super) fn extend_with(
+        class: &DexClass,
+        method: &DexMethod,
+        previous: Option<&Self>,
+        plan: &Plan,
+        context: Option<&Rc<ProofContext>>,
     ) -> Option<Self> {
         let mut projection = if let Some(previous) = previous {
             previous.checked_ir(class, method)?;
@@ -815,39 +1037,32 @@ impl Projection {
             {
                 return None;
             }
-
             if previous
-                .prove_source(class, plan.allocation, plan.constructor, &previous.erased())?
-                .as_ref()
-                != plan
+                .prove_source(class, plan.allocation, plan.constructor)
+                .as_deref()
+                != Some(plan)
             {
                 return None;
             }
-            previous.clone()
+            Self {
+                context: previous.context.clone(),
+                steps: previous.steps.clone(),
+                checked: RefCell::new(None),
+                plans: RefCell::new(BTreeMap::new()),
+            }
         } else {
-            if !validate(class, method, plan) {
+            let context = match context.filter(|context| context.matches(method)) {
+                Some(context) => context.clone(),
+                None => ProofContext::build(Rc::new(clone_method(method)?))?,
+            };
+            if !context.validate(class, method, plan) {
                 return None;
             }
-            let code = method.code.as_ref()?;
             Self {
-                source: std::rc::Rc::new(DexMethod {
-                    declaring_type: method.declaring_type.clone(),
-                    name: method.name.clone(),
-                    return_type: method.return_type.clone(),
-                    parameters: method.parameters.clone(),
-                    thrown_types: method.thrown_types.clone(),
-                    access_flags: method.access_flags,
-                    code: Some(crate::native_dex::DexCode {
-                        registers: code.registers,
-                        ins: code.ins,
-                        outs: code.outs,
-                        tries: code.tries,
-                        try_regions: code.try_regions.clone(),
-                        instructions: code.instructions.clone(),
-                        offset: code.offset,
-                    }),
-                }),
+                context,
                 steps: vec![],
+                checked: RefCell::new(None),
+                plans: RefCell::new(BTreeMap::new()),
             }
         };
         if projection.steps.len() >= 16 {
@@ -862,35 +1077,23 @@ impl Projection {
             .flat_map(|plan| plan.alias_moves.iter().copied())
             .collect()
     }
-    fn original_inputs(&self, class: &DexClass) -> Option<ProjectionInputs> {
-        let code = self.source.code.as_ref()?;
-        if code.instructions.len() > 4096 || code.registers > 256 {
-            return None;
-        }
-        let analysis = crate::native_method::MethodAnalysis::build(class, &self.source).ok()?;
-        let constructors = analysis.constructors().ok()?;
-        let bound = BoundCalls::bind(code, analysis.instructions(), &class.symbols).ok()?;
-        Some(ProjectionInputs {
-            ir: analysis.instructions().clone(),
-            cfg: analysis.blocks().clone(),
-            bound,
-            bindings: constructors.bindings,
-        })
-    }
+    // The erased set of a projection is fixed, so each (allocation,
+    // constructor) proof over its source is computed once.
     fn prove_source(
         &self,
         class: &DexClass,
         allocation: usize,
         constructor: usize,
-        erased: &BTreeSet<usize>,
-    ) -> Option<Box<Plan>> {
-        self.prove_source_with(
-            class,
-            allocation,
-            constructor,
-            erased,
-            &self.original_inputs(class)?,
-        )
+    ) -> Option<Rc<Plan>> {
+        let key = (allocation, constructor);
+        if let Some(plan) = self.plans.borrow().get(&key) {
+            return plan.clone();
+        }
+        let plan = self
+            .prove_source_with(class, allocation, constructor, &self.erased())
+            .map(Rc::new);
+        self.plans.borrow_mut().insert(key, plan.clone());
+        plan
     }
     fn prove_source_with(
         &self,
@@ -898,17 +1101,17 @@ impl Projection {
         allocation: usize,
         constructor: usize,
         erased: &BTreeSet<usize>,
-        inputs: &ProjectionInputs,
-    ) -> Option<Box<Plan>> {
-        let code = self.source.code.as_ref()?;
-        let mut ir = inputs.ir.clone();
+    ) -> Option<Plan> {
+        let analysis = self.context.analysis(class)?;
+        let source = self.context.source();
+        let code = source.code.as_ref()?;
+        let mut ir = (*self.context.ir).clone();
         Self::erase_ir(&mut ir, erased)?;
         let mut words = code.instructions.clone();
         for &pc in erased {
             let i = ir.instructions.iter().find(|i| i.pc == pc)?;
             words.get_mut(pc..pc.checked_add(i.width)?)?.fill(0);
         }
-        let source = &self.source;
         let projected = DexMethod {
             declaring_type: source.declaring_type.clone(),
             name: source.name.clone(),
@@ -916,7 +1119,7 @@ impl Projection {
             parameters: source.parameters.clone(),
             thrown_types: source.thrown_types.clone(),
             access_flags: source.access_flags,
-            code: Some(crate::native_dex::DexCode {
+            code: Some(DexCode {
                 registers: code.registers,
                 ins: code.ins,
                 outs: code.outs,
@@ -933,12 +1136,11 @@ impl Projection {
             constructor,
             ProofInputs {
                 ir: &ir,
-                cfg: &inputs.cfg,
-                bound: &inputs.bound,
-                bindings: &inputs.bindings,
+                cfg: &analysis.cfg,
+                bound: &analysis.bound,
+                bindings: &analysis.bindings,
             },
         )
-        .map(Box::new)
     }
     fn erase_ir(ir: &mut DecodedMethod, erased: &BTreeSet<usize>) -> Option<()> {
         for &pc in erased {
@@ -958,18 +1160,16 @@ impl Projection {
         }
         Some(())
     }
-    pub(super) fn checked_ir(&self, class: &DexClass, method: &DexMethod) -> Option<DecodedMethod> {
+    pub(super) fn checked_ir(
+        &self,
+        class: &DexClass,
+        method: &DexMethod,
+    ) -> Option<Rc<DecodedMethod>> {
         if self.steps.is_empty() || self.steps.len() > 16 {
             return None;
         }
-        let source = &self.source;
-        if method.declaring_type != source.declaring_type
-            || method.name != source.name
-            || method.return_type != source.return_type
-            || method.parameters != source.parameters
-            || method.thrown_types != source.thrown_types
-            || method.access_flags != source.access_flags
-        {
+        let source = self.context.source();
+        if !same_header(method, source) {
             return None;
         }
         let original = source.code.as_ref()?;
@@ -983,19 +1183,34 @@ impl Projection {
         {
             return None;
         }
-        let inputs = self.original_inputs(class)?;
+        if let Some((words, regions, certificate)) = self.checked.borrow().as_ref()
+            && *words == staged.instructions
+            && *regions == staged.try_regions
+        {
+            return certificate.clone();
+        }
+        let certificate = self.certify(class, original, staged);
+        *self.checked.borrow_mut() = Some((
+            staged.instructions.clone(),
+            staged.try_regions.clone(),
+            certificate.clone(),
+        ));
+        certificate
+    }
+    fn certify(
+        &self,
+        class: &DexClass,
+        original: &DexCode,
+        staged: &DexCode,
+    ) -> Option<Rc<DecodedMethod>> {
         let mut erased = BTreeSet::new();
         for plan in &self.steps {
-            if self
-                .prove_source_with(class, plan.allocation, plan.constructor, &erased, &inputs)?
-                .as_ref()
-                != plan
-            {
+            if self.prove_source_with(class, plan.allocation, plan.constructor, &erased)? != *plan {
                 return None;
             }
             erased.extend(plan.alias_moves.iter().copied());
         }
-        let mut ir = inputs.ir;
+        let mut ir = (*self.context.ir).clone();
         let mut projected_words = original.instructions.clone();
         for &pc in &erased {
             let i = ir.instructions.iter().find(|i| i.pc == pc)?;
@@ -1030,7 +1245,7 @@ impl Projection {
             return None;
         }
         Self::erase_ir(&mut ir, &erased)?;
-        Some(ir)
+        Some(Rc::new(ir))
     }
     pub(super) fn prove(
         &self,
@@ -1038,21 +1253,13 @@ impl Projection {
         method: &DexMethod,
         allocation: usize,
         constructor: usize,
-    ) -> Option<Plan> {
+    ) -> Option<Rc<Plan>> {
         self.checked_ir(class, method)?;
-        self.prove_source(class, allocation, constructor, &self.erased())
-            .map(|p| *p)
+        self.prove_source(class, allocation, constructor)
     }
     pub(super) fn validate(&self, class: &DexClass, method: &DexMethod, plan: &Plan) -> bool {
         self.prove(class, method, plan.allocation, plan.constructor)
-            .as_ref()
+            .as_deref()
             == Some(plan)
     }
-}
-
-struct ProjectionInputs {
-    ir: DecodedMethod,
-    cfg: ControlFlowGraph,
-    bound: BoundCalls,
-    bindings: Vec<crate::native_constructors::ConstructorBinding>,
 }

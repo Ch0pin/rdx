@@ -70,6 +70,11 @@ impl<'a> MethodAnalysis<'a> {
     pub fn calls(&self) -> &SsaCalls {
         &self.calls
     }
+    /// Hand the shared decoding, blocks and call binding to a caller that keeps
+    /// them alive across many proofs over the same immutable method.
+    pub fn into_parts(self) -> (DecodedMethod, ControlFlowGraph, BoundCalls) {
+        (self.ir, self.cfg, self.bound)
+    }
 
     pub fn constructors(&self) -> Result<ConstructorAnalysis> {
         ConstructorAnalysis::analyze(

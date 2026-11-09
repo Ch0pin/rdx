@@ -3,8 +3,8 @@ use anyhow::{Context, Result, bail, ensure};
 use std::collections::HashSet;
 
 const MAX_DEPTH: usize = 32;
-const MAX_NODES: usize = 256;
-const MAX_CHARS: usize = 16 * 1024;
+const MAX_NODES: usize = 4096;
+const MAX_CHARS: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Symbol {
@@ -239,7 +239,7 @@ impl Allocation {
             "argument block requires a constructor argument"
         );
         ensure!(
-            self.captures.len() <= 64,
+            self.captures.len() <= 1024,
             "argument block capture budget exceeded"
         );
         ensure!(
@@ -264,13 +264,18 @@ impl Allocation {
                     == 1,
             "argument block requires one exact outer allocation"
         );
-        // An ignored void call is a statement, never a value/dependency. Every
-        // nonvoid reference is backward and already assigned when it is read.
+        // An ignored void call or a store is a statement, never a value or a
+        // dependency. Every nonvoid reference is backward and already assigned
+        // when it is read.
         for (index, capture) in self.captures.iter().enumerate() {
             if capture.ty == "void" {
                 ensure!(
-                    discarded.contains(&index) && matches!(capture.expression, Expr::Call { .. }),
-                    "void capture must be a discarded call"
+                    discarded.contains(&index)
+                        && matches!(
+                            capture.expression,
+                            Expr::Call { .. } | Expr::ArrayStore { .. } | Expr::FieldStore { .. }
+                        ),
+                    "void capture must be a discarded call or store"
                 );
             } else {
                 sequence_comparison(&capture.ty)?;

@@ -641,7 +641,7 @@ fn object_typed_provider_capture_keeps_explicit_interface_cast() {
 
 #[test]
 fn long_allocation_window_remains_bounded() {
-    for (length, supported) in [(70, true), (130, true), (260, false)] {
+    for (length, supported) in [(70, true), (1030, true), (2060, false)] {
         let mut words = vec![0x0022, 0];
         words.extend(std::iter::repeat_n(0x0112, length));
         words.extend([0x0071, 0, 0, 0x010a, 0x2070, 1, 0x0010, 0x0011]);
@@ -671,11 +671,11 @@ fn long_linear_allocation_window_is_bounded_and_preserves_call() {
         words.extend([0x2070, 1, 0x0010, 0x0011]);
         class(words, vec!["next", "<init>"], vec![(1, 0, 0), (0, 1, 1)])
     }
-    let class = fixture(130);
+    let class = fixture(1030);
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
     assert_eq!(code.source.matches("sample.Source.next()").count(), 1);
     assert!(code.source.contains("new sample.A("));
-    let over_budget = fixture(260);
+    let over_budget = fixture(2060);
     assert!(
         native_java::render_method("sample.Test", &over_budget, &over_budget.methods[0]).is_err()
     );

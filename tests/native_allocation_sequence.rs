@@ -143,7 +143,7 @@ fn sequencing_rejects_invalid_domains_trace_changes_cycles_and_expansion() {
     assert!(a.render_checked(&e, &["source"]).is_err());
     let (mut a, e) = fixture("int", "first");
     if let Expr::FieldRead { field, .. } = &mut a.captures[1].expression {
-        field.text = "x".repeat(9000);
+        field.text = "x".repeat(40_000);
     }
     assert!(
         a.render_checked(&e, &["source"])

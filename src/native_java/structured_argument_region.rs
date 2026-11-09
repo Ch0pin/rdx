@@ -15,6 +15,10 @@ pub(super) struct FirstRead {
     pub words: usize,
 }
 type ProtectedDispatch = (u32, u32, Vec<(Option<String>, u32)>);
+// Generated resource accessors allocate dozens of nested items in one
+// straight-line argument region. Every owned instruction is still proven.
+const MAX_REGION_NODES: usize = 2048;
+const MAX_NESTED_INITIALIZATIONS: usize = 256;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Plan {
     pub allocation: usize,
@@ -206,11 +210,11 @@ fn prove_inner(
                 .filter(|to| *to < constructor),
         );
         todo.extend(exception_edges.get(&pc).into_iter().flatten().copied());
-        if nodes.len() > 256 {
+        if nodes.len() > MAX_REGION_NODES {
             return None;
         }
     }
-    if nodes.is_empty() || nodes.len() > 256 {
+    if nodes.is_empty() || nodes.len() > MAX_REGION_NODES {
         return None;
     }
     if nodes.iter().any(|pc| !edges.contains_key(pc)) {
@@ -246,7 +250,7 @@ fn prove_inner(
                 return None;
             }
             nodes.insert(cursor);
-            if nodes.len() > 256 {
+            if nodes.len() > MAX_REGION_NODES {
                 return None;
             }
             let next = cursor + instruction.width;
@@ -274,7 +278,7 @@ fn prove_inner(
             return None;
         }
     }
-    if nodes.is_empty() || nodes.len() > 256 {
+    if nodes.is_empty() || nodes.len() > MAX_REGION_NODES {
         return None;
     }
     // The bounded proof owns this argument region. Unrelated method blocks
@@ -396,7 +400,7 @@ fn prove_inner(
         }
         nested_initializations.push((pc, nested.invoke_pc));
     }
-    if nested_initializations.len() > 16 {
+    if nested_initializations.len() > MAX_NESTED_INITIALIZATIONS {
         return None;
     }
     let owned_bound;

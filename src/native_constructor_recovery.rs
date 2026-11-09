@@ -137,9 +137,38 @@ pub(super) fn accessible_platform_noarg_constructor(
     platform_constructor(owner, &[]).is_some_and(|thrown| thrown.is_empty())
 }
 
-/// A named static member has no implicit enclosing-instance constructor input.
-/// A dollar in a descriptor alone establishes neither membership nor staticness.
+/// Flat presentation under the binary name supplies no implicit
+/// enclosing-instance constructor input, so a `$` class keeps exactly the DEX
+/// constructor arguments. A class whose metadata names an enclosing method is
+/// the exception: `anonymous::metadata` may present it nested at its allocation
+/// site, so that proof owns it. Unreadable class metadata could hide that
+/// annotation and is rejected. This rule governs the hierarchy's implicit
+/// constructor proof; declaration recovery uses `metadata_static_member`.
 pub(super) fn independent_constructor_owner(class: &DexClass) -> bool {
+    if !class.descriptor.contains('$') || class.annotations_offset == 0 {
+        return true;
+    }
+    let Some(directory) = class.symbols.annotations.get(&class.annotations_offset) else {
+        return false;
+    };
+    let Some(annotations) = directory.class.as_deref() else {
+        return true;
+    };
+    !annotations.iter().any(|annotation| {
+        class
+            .symbols
+            .types
+            .get(annotation.type_idx as usize)
+            .is_some_and(|ty| ty.as_ref() == "Ldalvik/annotation/EnclosingMethod;")
+    })
+}
+
+/// Constructor recovery synthesizes declarations only for a `$` class whose
+/// metadata proves a named static member: one InnerClass and one EnclosingClass
+/// annotation, flags that agree with the class, and `Outer$name` equal to the
+/// descriptor. Every other `$` class stays with the bounded flat tranche in
+/// `flat_noarg`, whose own obligations govern it.
+pub(super) fn metadata_static_member(class: &DexClass) -> bool {
     if !class.descriptor.contains('$') {
         return true;
     }
@@ -374,7 +403,7 @@ impl LayeredNoargObservations {
 fn legal_nonfinal_parent(class: &DexClass) -> bool {
     class.access_flags & (0x10 | 0x200 | 0x4000) == 0
         && matches!(class.access_flags & 7, 0 | 1)
-        && independent_constructor_owner(class)
+        && metadata_static_member(class)
 }
 
 fn documented_retained_overloads(class: &DexClass) -> Option<HashSet<Vec<Arc<str>>>> {
@@ -423,7 +452,7 @@ fn layered_noarg_candidates_with_budget<'a>(
         if result.len() >= MAX_LAYERED_NOARG_KEYS
             || duplicates.contains(leaf.descriptor.as_ref())
             || leaf.access_flags & (0x200 | 0x400 | 0x4000) != 0
-            || !independent_constructor_owner(leaf)
+            || !metadata_static_member(leaf)
         {
             continue;
         }
@@ -450,7 +479,7 @@ fn layered_noarg_candidates_with_budget<'a>(
         };
         if skipped.access_flags & (0x10 | 0x200 | 0x4000) != 0
             || !matches!(skipped.access_flags & 7, 0 | 1)
-            || !independent_constructor_owner(skipped)
+            || !metadata_static_member(skipped)
             || !class_accessible_from(immediate, skipped)
             || verified_implicit_constructors
                 .get(skipped_name)
@@ -601,7 +630,7 @@ pub(super) fn recover(
         .filter(|class| {
             !duplicates.contains(class.descriptor.as_ref())
                 && class.access_flags & (0x200 | 0x400 | 0x4000) == 0
-                && independent_constructor_owner(class)
+                && metadata_static_member(class)
                 && !class
                     .fields
                     .iter()
@@ -1348,7 +1377,7 @@ fn erased_super_layers<'a>(
             .then_some(layers);
         }
         if layers.len() == 8
-            || !independent_constructor_owner(current)
+            || !metadata_static_member(current)
             || current
                 .fields
                 .iter()
@@ -1678,7 +1707,7 @@ fn recover_observed_super_forwarders(
         if duplicates.contains(parent_name)
             || parent.access_flags & (0x200 | 0x4000 | 0x10) != 0
             || !matches!(parent.access_flags & 7, 0 | 1)
-            || !(independent_constructor_owner(parent)
+            || !(metadata_static_member(parent)
                 || flat_noarg::independent_source_owner(parent, &mut remaining))
             || parent.access_flags & 1 == 0
                 && package(&parent.descriptor) != package(&child.descriptor)
@@ -1784,7 +1813,7 @@ fn recover_observed_super_forwarders(
                 .collect();
             // Flat source ownership supplies no enclosing instance only for
             // this zero-argument erased-constructor tranche.
-            if !args.is_empty() && !independent_constructor_owner(parent) {
+            if !args.is_empty() && !metadata_static_member(parent) {
                 continue;
             }
             if parent

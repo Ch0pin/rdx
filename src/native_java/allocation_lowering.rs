@@ -542,7 +542,7 @@ fn try_region_staging_mode(
     let mut constructor_pc = None;
     let mut count = 0;
     let mut allocations = 0;
-    while cursor < stop && count < 256 {
+    while cursor < stop && count < 2048 {
         count += 1;
         graph.tick()?;
         let op = words[cursor] as u8;
@@ -556,7 +556,7 @@ fn try_region_staging_mode(
         );
         if op == 0x22 {
             allocations += 1;
-            ensure!(allocations <= 16, "nested region staging budget");
+            ensure!(allocations <= 256, "nested region staging budget");
         }
         if matches!(op, 0x70 | 0x76) {
             let (_, _, _, name) = method_symbol(class, words[cursor + 1] as usize)?;
@@ -1255,7 +1255,7 @@ pub(super) fn try_lower(
     let attempt = || -> Result<Lowered> {
         // Large generated injection constructors can exceed 128 instructions.
         // Keep a fixed linear scan cap plus expression-node/output budgets.
-        const MAX_INSTRUCTIONS: usize = 256;
+        const MAX_INSTRUCTIONS: usize = 2048;
         let dst = (words[pc] >> 8) as usize;
         let ty = class
             .symbols
@@ -1314,6 +1314,7 @@ pub(super) fn try_lower(
         let mut instructions = 0;
         loop {
             instructions += 1;
+            graph.tick()?;
             ensure!(
                 instructions <= MAX_INSTRUCTIONS && cursor < words.len() && cursor < stop,
                 "allocation window exceeds budget"
@@ -2354,6 +2355,12 @@ pub(super) fn try_lower(
                         ) {
                             Ok(rendered) => rendered,
                             Err(error) => (|| {
+                                if std::env::var_os("RDX_ALLOCATION_DIAGNOSTIC").is_some() {
+                                    eprintln!(
+                                        "allocation {}.{} @{pc:04x} linear-platform: {error:#}",
+                                        class.descriptor, method.name
+                                    );
+                                }
                                 let ir = crate::native_ir::DecodedMethod::decode(code)?;
                                 let bound = crate::native_calls::BoundCalls::bind(
                                     code,
@@ -2373,7 +2380,13 @@ pub(super) fn try_lower(
                                     &discarded,
                                 )
                             })()
-                            .or_else(|_| {
+                            .or_else(|block_error| {
+                                if std::env::var_os("RDX_ALLOCATION_DIAGNOSTIC").is_some() {
+                                    eprintln!(
+                                        "allocation {}.{} @{pc:04x} linear-argument-block: {block_error:#}",
+                                        class.descriptor, method.name
+                                    );
+                                }
                                 ensure!(
                                     !strict_allocation_order,
                                     "recovered constructor cannot stage allocation: {error}"

@@ -21,7 +21,7 @@ fn shape(class: &DexClass, leaf: bool) -> bool {
         && class.access_flags & !0x11 == 0
         && (!leaf || class.access_flags & 1 != 0)
         && (leaf || class.access_flags & 0x10 == 0)
-        && independent_constructor_owner(class)
+        && metadata_static_member(class)
         && !class.methods.iter().any(|m| m.name.as_ref() == "<init>")
         && {
             let mut names = HashSet::new();

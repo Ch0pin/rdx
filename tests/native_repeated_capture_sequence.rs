@@ -149,7 +149,7 @@ fn changed_effect_order_forward_dependencies_and_output_budget_reject() {
     assert!(a.render_checked(&events, &["uri"]).is_err());
     let (mut a, events) = fixture();
     if let Expr::Call { method, .. } = &mut a.captures[0].expression {
-        method.text = "x".repeat(17000);
+        method.text = "x".repeat(70_000);
     }
     assert!(a.render_checked(&events, &["uri"]).is_err());
 }

@@ -276,9 +276,11 @@ fn metadata_static_member_recovers_implicit_and_observed_parameter_constructors(
 }
 
 #[test]
-fn member_constructor_requires_unique_consistent_static_metadata() {
-    use rdx::native_dex::DexValue;
-    for variant in 0..11 {
+fn flat_member_metadata_variants_keep_the_implicit_constructor() {
+    use rdx::native_dex::{DexAnnotation, DexValue};
+    // The flat presentation keeps the exact DEX constructor arguments whatever
+    // InnerClass/EnclosingClass metadata claims about membership or staticness.
+    for variant in 0..9 {
         let mut leaf = empty_class("Lsample/Outer$Child;", Some("Ljava/lang/Object;"), 1);
         static_member_metadata(&mut leaf);
         let symbols = Arc::get_mut(&mut leaf.symbols).unwrap();
@@ -297,27 +299,82 @@ fn member_constructor_requires_unique_consistent_static_metadata() {
             5 => symbols.types[2] = "Lsample/Other;".into(),
             6 => Arc::make_mut(&mut annotations[0]).elements[0].1 = DexValue::Int(25),
             7 => Arc::make_mut(&mut annotations[0]).visibility = 1,
-            8 => {
-                symbols
-                    .types
-                    .push("Ldalvik/annotation/EnclosingMethod;".into());
-                annotations.push(Arc::new(rdx::native_dex::DexAnnotation {
-                    visibility: 2,
-                    type_idx: 3,
-                    elements: vec![],
-                }));
-            }
-            9 => {
+            _ => {
                 let mut duplicate = (*annotations[0]).clone();
                 duplicate.visibility = 1;
                 annotations.push(Arc::new(duplicate));
             }
-            _ => {
-                leaf.access_flags = 3;
-                Arc::make_mut(&mut annotations[0]).elements[0].1 = DexValue::Int(11);
-            }
         }
         dir.class = Some(annotations.into());
+        assert!(
+            TypeHierarchy::from_classes([&leaf])
+                .unwrap()
+                .equivalent_noarg_constructor(&leaf.descriptor, "Ljava/lang/Object;"),
+            "variant {variant}"
+        );
+    }
+    // Optimizer output often drops nesting metadata entirely or keeps only
+    // language metadata; both are flat classes with the DEX arguments.
+    let leaf = empty_class("Lsample/Outer$1;", Some("Ljava/lang/Object;"), 0x10);
+    assert!(
+        TypeHierarchy::from_classes([&leaf])
+            .unwrap()
+            .equivalent_noarg_constructor(&leaf.descriptor, "Ljava/lang/Object;")
+    );
+    let mut leaf = empty_class("Lsample/Outer$run$1;", Some("Ljava/lang/Object;"), 0x11);
+    static_member_metadata(&mut leaf);
+    let symbols = Arc::get_mut(&mut leaf.symbols).unwrap();
+    symbols.types.push("Lkotlin/Metadata;".into());
+    let dir = Arc::get_mut(symbols.annotations.get_mut(&1).unwrap()).unwrap();
+    dir.class = Some(
+        vec![Arc::new(DexAnnotation {
+            visibility: 1,
+            type_idx: 3,
+            elements: vec![],
+        })]
+        .into(),
+    );
+    assert!(
+        TypeHierarchy::from_classes([&leaf])
+            .unwrap()
+            .equivalent_noarg_constructor(&leaf.descriptor, "Ljava/lang/Object;")
+    );
+}
+
+#[test]
+fn enclosing_method_or_unreadable_metadata_blocks_the_implicit_constructor() {
+    use rdx::native_dex::{DexAnnotation, DexValue};
+    for variant in 0..3 {
+        let mut leaf = empty_class("Lsample/Outer$Child;", Some("Ljava/lang/Object;"), 1);
+        static_member_metadata(&mut leaf);
+        let symbols = Arc::get_mut(&mut leaf.symbols).unwrap();
+        match variant {
+            // An enclosing method hands presentation to the anonymous nesting
+            // proof, which may place the class at its allocation site.
+            0 => {
+                let dir = Arc::get_mut(symbols.annotations.get_mut(&1).unwrap()).unwrap();
+                let mut annotations = dir.class.take().unwrap().to_vec();
+                symbols
+                    .types
+                    .push("Ldalvik/annotation/EnclosingMethod;".into());
+                annotations.push(Arc::new(DexAnnotation {
+                    visibility: 2,
+                    type_idx: 3,
+                    elements: vec![],
+                }));
+                dir.class = Some(annotations.into());
+            }
+            // Class metadata that did not parse could hide that annotation.
+            1 => leaf.annotations_offset = 2,
+            // Illegal class access remains rejected on its own.
+            _ => {
+                leaf.access_flags = 3;
+                let dir = Arc::get_mut(symbols.annotations.get_mut(&1).unwrap()).unwrap();
+                let mut annotations = dir.class.take().unwrap().to_vec();
+                Arc::make_mut(&mut annotations[0]).elements[0].1 = DexValue::Int(11);
+                dir.class = Some(annotations.into());
+            }
+        }
         assert!(
             !TypeHierarchy::from_classes([&leaf])
                 .unwrap()
@@ -448,12 +505,11 @@ fn implicit_constructor_proof_rejects_inaccessible_or_missing_super_constructor(
 }
 
 #[test]
-fn implicit_constructor_proof_rejects_nonconcrete_nested_and_existing_constructors() {
+fn implicit_constructor_proof_rejects_nonconcrete_and_existing_constructors() {
     let parent = parent("Lsample/Base;", 1);
     for (descriptor, flags) in [
         ("Lsample/Child;", 0x401),
         ("Lsample/Child;", 0x201),
-        ("Lsample/Outer$Child;", 1),
         ("Lsample/Child;", 0x4001),
     ] {
         let child = empty_class(descriptor, Some("Lsample/Base;"), flags);

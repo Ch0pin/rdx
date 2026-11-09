@@ -116,6 +116,74 @@ fn nested_capture_fixture() -> DexClass {
     ];
     class
 }
+// Generated resource accessors fill one array with dozens of constructed
+// items inside a single straight-line argument region after a branch.
+fn wide_nested_fixture(items: u16) -> DexClass {
+    let mut class = fixture();
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols.types.push("Lsample/B;".into());
+    symbols.types.push("[Lsample/B;".into());
+    symbols.protos[1].1.push("[Lsample/B;".into());
+    symbols.protos.push(("V".into(), vec![]));
+    symbols.methods.push((2, 2, 1));
+    let code = class.methods[0].code.as_mut().unwrap();
+    code.registers = 6;
+    code.outs = 3;
+    let mut words = vec![
+        0x0022, 0, 0x0538, 7, 0x0071, 0, 0, 0x040a, 0x0228, 0x2412, 0x0313, items, 0x3123, 3,
+    ];
+    for index in 0..items {
+        words.extend([0x0222, 2, 0x1070, 2, 0x0002, 0x0313, index, 0x024d, 0x0301]);
+    }
+    words.extend([0x3070, 1, 0x0140, 0x0011]);
+    code.instructions = words;
+    class
+}
+#[test]
+fn wide_argument_region_keeps_every_nested_initialization_and_store() {
+    let items: u16 = 70;
+    let class = wide_nested_fixture(items);
+    let constructor = 14 + 9 * usize::from(items);
+    let plan = proof::prove(&class, &class.methods[0], 0, constructor).unwrap();
+    assert_eq!(plan.nested_initializations.len(), usize::from(items));
+    let rendered = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
+    assert!(
+        rendered.source.contains("new sample.A(switch (0)"),
+        "{}",
+        rendered.source
+    );
+    assert_eq!(
+        rendered.source.matches("new sample.B()").count(),
+        usize::from(items),
+        "{}",
+        rendered.source
+    );
+    assert_eq!(
+        rendered.source.matches("] = ").count(),
+        usize::from(items),
+        "{}",
+        rendered.source
+    );
+    let array = rendered.source.find("new sample.B[").unwrap();
+    let first_item = rendered.source.find("new sample.B()").unwrap();
+    let first_store = rendered.source.find("] = ").unwrap();
+    assert!(
+        array < first_item && first_item < first_store,
+        "{}",
+        rendered.source
+    );
+    assert!(
+        rendered.source.find("new sample.A").unwrap() < array,
+        "{}",
+        rendered.source
+    );
+    let mut leaking = wide_nested_fixture(items);
+    // Storing an item before its constructor runs must still be refused.
+    let words = &mut leaking.methods[0].code.as_mut().unwrap().instructions;
+    words.swap(16, 21);
+    words.swap(17, 22);
+    assert!(native_java::render_method("sample.Test", &leaking, &leaking.methods[0]).is_err());
+}
 #[test]
 fn nested_expression_capture_declarations_keep_typed_hoisting_metadata() {
     let class = nested_capture_fixture();

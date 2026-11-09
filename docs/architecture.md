@@ -107,7 +107,11 @@ a hit reloads the source from the session index on the engine thread (the search
 thread services the request between classes while a scan runs) and renders the
 class again only when the index holds no record. A render whose hash differs
 from the recorded one opens on the match line rather than trusting stale
-offsets. Find-usages hits keep their source because their documents never enter
+offsets. Every user navigation (opening a hit, choosing a tree node or tab,
+history, go-to-definition) advances a navigation serial; a hit reload carries
+the serial it was issued under and its result is dropped if a newer navigation
+happened meanwhile, so a late reload never steals focus from the view the user
+chose since. Find-usages hits keep their source because their documents never enter
 the index. Native searches cache navigation metadata with matched source.
 Cancellation is checked between classes and resources. There are no source
 handoff files or Java code caches.

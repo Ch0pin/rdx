@@ -87,8 +87,10 @@ enum Event {
         Result<Arc<SharedCode>, String>,
     ),
     InteractiveReady(u64, NativeEngine),
-    /// Source reloaded for a search hit the user opened.
-    HitSource(u64, SearchHit, Result<Arc<SearchDocument>, String>),
+    /// Source reloaded for a search hit the user opened. The second number is
+    /// the navigation serial the open was issued under: a later navigation
+    /// makes the result stale, and the UI drops it instead of stealing focus.
+    HitSource(u64, u64, SearchHit, Result<Arc<SearchDocument>, String>),
     UsagesUpdate(u64, u64, UsageUpdate),
     UsagesDone(u64, u64, NativeEngine, UsageSummary),
     AnalysisDone(u64, u64, Result<serde_json::Value, String>),
@@ -108,8 +110,9 @@ enum InteractiveRequest {
     Metadata(String, String),
     Navigate(String, usize, String),
     NavigateClass(String, JumpLocation),
-    /// Reload the source behind a search hit from the session index.
-    OpenHit(SearchHit),
+    /// Reload the source behind a search hit from the session index, tagged
+    /// with the navigation serial it was issued under.
+    OpenHit(SearchHit, u64),
 }
 
 /// Only the latest jump matters: a newer navigation or hit open replaces any
@@ -137,9 +140,9 @@ impl InteractiveRequest {
         ctx: &egui::Context,
     ) {
         let event = match self {
-            Self::OpenHit(hit) => {
+            Self::OpenHit(hit, serial) => {
                 let result = search::hit_source(engine, cache, archive, &hit.origin);
-                Event::HitSource(generation, hit, result)
+                Event::HitSource(generation, serial, hit, result)
             }
             Self::Metadata(name, hash) => {
                 let result = engine.decompile_shared(&name).map_err(|e| format!("{e:#}"));
@@ -555,6 +558,9 @@ pub struct App {
     pending_history: Option<HistoryJump>,
     cancelled_history: Option<Target>,
     deferred_target: Option<Target>,
+    /// Counts user navigations. Asynchronous view opens carry the serial they
+    /// started under so a result that lands after a newer navigation is ignored.
+    navigation_serial: u64,
     theme: CodeTheme,
     font_size: f32,
     code_font: CodeFont,
@@ -695,6 +701,7 @@ impl App {
             pending_history: None,
             cancelled_history: None,
             deferred_target: None,
+            navigation_serial: 0,
             theme,
             font_size,
             code_font,
@@ -904,6 +911,7 @@ impl App {
         });
     }
     fn choose_target(&mut self, target: Target, ctx: &egui::Context) {
+        self.navigation_serial += 1;
         if let Some(pending) = self.pending_history.take() {
             if pending.destination.target == target {
                 self.pending_history = Some(pending);
@@ -1143,6 +1151,7 @@ impl App {
         });
     }
     fn navigate(&mut self, class: String, position: usize, hash: String, ctx: &egui::Context) {
+        self.navigation_serial += 1;
         let Some(mut engine) = self.engine.take() else {
             if self.search_cancel.is_some() {
                 let mut requests = self
@@ -1179,6 +1188,7 @@ impl App {
         });
     }
     fn navigate_manifest(&mut self, class: String, origin: JumpLocation, ctx: &egui::Context) {
+        self.navigation_serial += 1;
         let Some(mut engine) = self.engine.take() else {
             if self.search_cancel.is_some() {
                 let mut requests = self
@@ -1298,6 +1308,7 @@ impl App {
         if !self.can_history(forward) {
             return;
         }
+        self.navigation_serial += 1;
         let location = (if forward { &self.future } else { &self.history })
             .last()
             .unwrap()
@@ -1792,6 +1803,7 @@ impl App {
         });
     }
     fn open_search_hit(&mut self, hit: SearchHit, ctx: &egui::Context) {
+        self.navigation_serial += 1;
         if let Some(pending) = self.pending_history.take() {
             self.cancelled_history = Some(pending.destination.target);
         }
@@ -1817,7 +1829,10 @@ impl App {
             .interactive_requests
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        replace_pending_navigation(&mut requests, InteractiveRequest::OpenHit(hit));
+        replace_pending_navigation(
+            &mut requests,
+            InteractiveRequest::OpenHit(hit, self.navigation_serial),
+        );
         drop(requests);
         ctx.request_repaint();
     }
@@ -2049,6 +2064,7 @@ impl App {
         if index >= self.tabs.len() {
             return;
         }
+        self.navigation_serial += 1;
         if let Some(pending) = self.pending_history.take() {
             self.cancelled_history = Some(pending.destination.target);
         }
@@ -2065,6 +2081,7 @@ impl App {
             TabAction::ToggleBookmark => self.tabs[index].bookmarked = !self.tabs[index].bookmarked,
             TabAction::UnbookmarkAll => self.tabs.iter_mut().for_each(|tab| tab.bookmarked = false),
             TabAction::Close | TabAction::CloseOthers | TabAction::CloseAll => {
+                self.navigation_serial += 1;
                 if let Some(pending) = self.pending_history.take() {
                     self.cancelled_history = Some(pending.destination.target);
                 }
@@ -2843,7 +2860,20 @@ impl App {
                     self.busy = false;
                     self.engine = Some(engine);
                 }
-                Event::HitSource(generation, hit, result) if generation == self.generation => {
+                Event::HitSource(generation, serial, hit, result)
+                    if generation == self.generation =>
+                {
+                    // The user moved on while the source was loading: the view
+                    // they chose since keeps focus and the late result is dropped.
+                    // A status still announcing this open would otherwise stick.
+                    if serial != self.navigation_serial {
+                        if self.status.starts_with("Opening result")
+                            && self.status.ends_with(&hit.origin.name)
+                        {
+                            self.status.clear();
+                        }
+                        continue;
+                    }
                     match result {
                         Ok(document) => self.open_hit_document(hit, document),
                         Err(error) => self.error(error),
@@ -4457,6 +4487,7 @@ mod settings_tests {
             pending_history: None,
             cancelled_history: None,
             deferred_target: None,
+            navigation_serial: 0,
             theme: CodeTheme::Ocean,
             font_size: 14.0,
             code_font: CodeFont::default(),
@@ -5589,7 +5620,7 @@ mod settings_tests {
         };
         let mut requests = vec![
             InteractiveRequest::Metadata("sample.Hello".into(), "hash".into()),
-            InteractiveRequest::OpenHit(sample_hit("sample.Hello", Some("old"), 3)),
+            InteractiveRequest::OpenHit(sample_hit("sample.Hello", Some("old"), 3), 1),
             InteractiveRequest::Navigate("sample.Hello".into(), 3, "old".into()),
         ];
         replace_pending_navigation(
@@ -5851,6 +5882,146 @@ mod settings_tests {
             panic!("reused view lost its document");
         };
         assert_eq!(document.navigation_position(), hit.start);
+    }
+
+    #[test]
+    fn late_hit_source_does_not_steal_focus_from_a_newer_navigation() {
+        fn class_document(name: &str, source: &str) -> Arc<search::SearchDocument> {
+            Arc::new(search::SearchDocument {
+                target: SearchTarget::Class(name.into()),
+                name: name.into(),
+                source: source.into(),
+                syntax: "java".into(),
+                links: vec![rdx::engine::CodeLink {
+                    start: 6,
+                    end: 11,
+                    label: name.into(),
+                }],
+                source_hash: Some(format!("{name}-hash")),
+                metadata_complete: true,
+            })
+        }
+        fn hit_for(origin: Arc<search::HitOrigin>, source: &str, needle: &str) -> SearchHit {
+            let start = source.find(needle).unwrap();
+            SearchHit {
+                origin,
+                start,
+                end: start + needle.len(),
+                line: 2,
+                kind: "method".into(),
+                preview: needle.into(),
+                preview_match: 0..needle.len(),
+            }
+        }
+        // The engine thread pops a queued open and answers it with the serial
+        // the request carried; the test plays that part without a thread.
+        fn take_queued_open(app: &App) -> (SearchHit, u64) {
+            let request = app.interactive_requests.lock().unwrap().pop();
+            match request {
+                Some(InteractiveRequest::OpenHit(hit, serial)) => (hit, serial),
+                _ => panic!("the open was not queued"),
+            }
+        }
+
+        let mut app = navigation_test_app();
+        let ctx = egui::Context::default();
+        let alpha_source = "class Alpha {}\nvoid alpha() {}\n";
+        let alpha = class_document("sample.Alpha", alpha_source);
+        let unloaded_alpha = Arc::new(search::HitOrigin {
+            target: alpha.target.clone(),
+            name: alpha.name.clone(),
+            syntax: alpha.syntax.clone(),
+            source_hash: alpha.source_hash.clone(),
+            retained: None,
+        });
+        let beta_source = "class Beta {}\nvoid beta() {}\n";
+        let beta = class_document("sample.Beta", beta_source);
+
+        // Result A has no source attached, so opening it queues a reload.
+        app.open_search_hit(hit_for(unloaded_alpha.clone(), alpha_source, "alpha"), &ctx);
+        assert_eq!(app.status, "Opening result · sample.Alpha");
+        assert!(app.tabs.is_empty());
+        let (late_hit, late_serial) = take_queued_open(&app);
+        assert_eq!(late_serial, app.navigation_serial);
+
+        // Before A's source is back the user opens result B, which is retained
+        // and shows at once.
+        app.open_search_hit(
+            hit_for(
+                search::HitOrigin::retaining(beta.clone()),
+                beta_source,
+                "beta",
+            ),
+            &ctx,
+        );
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[app.selected].name, "sample.Beta");
+        let status_after_b = app.status.clone();
+        assert!(
+            status_after_b.ends_with("sample.Beta:2"),
+            "{status_after_b}"
+        );
+
+        // A's source arrives late: B keeps focus and A does not open.
+        app.tx
+            .send(Event::HitSource(
+                app.generation,
+                late_serial,
+                late_hit,
+                Ok(alpha.clone()),
+            ))
+            .unwrap();
+        app.events(&ctx);
+        assert_eq!(app.tabs.len(), 1, "the stale result opened a view");
+        assert_eq!(app.tabs[app.selected].name, "sample.Beta");
+        assert_eq!(app.status, status_after_b);
+
+        // A fresh open of A is answered under its own serial and opens as usual.
+        app.open_search_hit(hit_for(unloaded_alpha.clone(), alpha_source, "alpha"), &ctx);
+        let (hit, serial) = take_queued_open(&app);
+        assert!(serial > late_serial);
+        app.tx
+            .send(Event::HitSource(
+                app.generation,
+                serial,
+                hit,
+                Ok(alpha.clone()),
+            ))
+            .unwrap();
+        app.events(&ctx);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tabs[app.selected].name, "sample.Alpha");
+        assert!(app.status.ends_with("sample.Alpha:2"), "{}", app.status);
+
+        // Switching tabs is a navigation too: a reload failure that lands after
+        // it is dropped rather than shown as an error, and the "Opening result"
+        // status it would have resolved is cleared instead of sticking.
+        let gamma_source = "class Gamma {}\nvoid gamma() {}\n";
+        let gamma = class_document("sample.Gamma", gamma_source);
+        let unloaded_gamma = Arc::new(search::HitOrigin {
+            target: gamma.target.clone(),
+            name: gamma.name.clone(),
+            syntax: gamma.syntax.clone(),
+            source_hash: gamma.source_hash.clone(),
+            retained: None,
+        });
+        app.open_search_hit(hit_for(unloaded_gamma, gamma_source, "gamma"), &ctx);
+        let (hit, serial) = take_queued_open(&app);
+        app.select_tab(0);
+        assert_eq!(app.tabs[app.selected].name, "sample.Beta");
+        assert_eq!(app.status, "Opening result · sample.Gamma");
+        app.tx
+            .send(Event::HitSource(
+                app.generation,
+                serial,
+                hit,
+                Err("source unavailable".into()),
+            ))
+            .unwrap();
+        app.events(&ctx);
+        assert_eq!(app.tabs[app.selected].name, "sample.Beta");
+        assert!(app.status.is_empty(), "{}", app.status);
+        assert!(app.diagnostics.is_empty(), "{:?}", app.diagnostics);
     }
 
     #[test]

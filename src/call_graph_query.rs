@@ -503,13 +503,17 @@ fn callee_sites(
 struct Dispatch {
     aliases: HashSet<String>,
     status: &'static str,
+    /// The first loaded superclass declaration of the member that the root
+    /// does not override; invokes resolving to it never reach the root.
+    stopped_at: Option<String>,
 }
 
-/// Every known or unknown supertype of the root class is an alias owner for the
-/// root member, whether or not that type redeclares it: an `invoke-virtual` or
-/// `invoke-interface` whose receiver is statically typed as a supertype may run
-/// the root override. Siblings and unrelated types never qualify. Only a concrete
-/// instance method declared by its own class can be such a target.
+/// A supertype of the root class is an alias owner for the root member, whether
+/// or not that type redeclares it: an `invoke-virtual` or `invoke-interface`
+/// whose receiver is statically typed as a supertype may run the root override.
+/// Superclasses count only while the root overrides their declarations under
+/// the runtime's rules; siblings and unrelated types never qualify. Only a
+/// concrete instance method declared by its own class can be such a target.
 fn dispatch_aliases(
     catalog: &Catalog<'_>,
     root: &str,
@@ -520,6 +524,7 @@ fn dispatch_aliases(
         return Ok(Dispatch {
             aliases: HashSet::new(),
             status: "not_requested",
+            stopped_at: None,
         });
     }
     dispatch_aliases_for(
@@ -531,7 +536,28 @@ fn dispatch_aliases(
     )
 }
 
+/// Package of a dotted class name; the empty string for the default package.
+fn package(class: &str) -> &str {
+    class.rsplit_once('.').map_or("", |(package, _)| package)
+}
+
 /// Alias owners for `root` through interfaces and/or superclasses.
+///
+/// Superclasses are walked in order under the override rules the runtime
+/// applies: the root overrides a loaded ancestor's virtual declaration only when
+/// it is not final and is public, protected, or package-private in the package
+/// of the method overriding it (overriding is transitive, so a same-package
+/// intermediate override carries a cross-package child through). A declaration
+/// the root cannot override, and the non-declaring superclasses passed since
+/// the last override, are not aliases: an invoke on any of them resolves to that
+/// declaration. A final or foreign package-private declaration also ends the
+/// walk, since it holds the vtable slot of everything above it. A private or
+/// static declaration is a direct method outside the vtable: an invoke that
+/// resolves to it fails, and the root still overrides declarations above it.
+/// Unloaded superclasses stay aliases: nothing can be proven about them.
+/// Interfaces are collected from every loaded class in the ancestry, since
+/// interface selection starts at the receiver class and reaches the root method
+/// before any non-overriding ancestor.
 fn dispatch_aliases_for(
     catalog: &Catalog<'_>,
     root: &str,
@@ -543,6 +569,7 @@ fn dispatch_aliases_for(
         Ok(Dispatch {
             aliases: HashSet::new(),
             status,
+            stopped_at: None,
         })
     };
     let Some((owner_name, class)) = owner(root).and_then(|name| Some((name, catalog.class(name)?)))
@@ -560,35 +587,84 @@ fn dispatch_aliases_for(
     if class.access_flags & 0x200 != 0 || method.access_flags & 0x400 != 0 {
         return none("skipped_interface_or_abstract_root");
     }
-    let mut queue: VecDeque<(std::sync::Arc<str>, bool)> = VecDeque::new();
-    queue.extend(class.interfaces.iter().cloned().map(|d| (d, true)));
-    queue.extend(class.superclass.iter().cloned().map(|d| (d, false)));
-    let mut seen = HashSet::from([class.descriptor.clone()]);
+    const BUDGET: &str = "Dispatch ancestry exceeds budget; query ancestor methods explicitly";
     let mut aliases = HashSet::new();
-    while let Some((descriptor, via_interface)) = queue.pop_front() {
+    let mut seen = HashSet::from([class.descriptor.clone()]);
+    let mut interface_queue: VecDeque<std::sync::Arc<str>> =
+        class.interfaces.iter().cloned().collect();
+    // Superclass chain: `pending` holds loaded ancestors that do not declare the
+    // member, committed once the next declaration proves overridable.
+    let mut pending = Vec::new();
+    let mut overrider_package = package(owner_name).to_owned();
+    let mut stopped_at: Option<String> = None;
+    let mut ended = false;
+    let mut next = class.superclass.clone();
+    while let Some(descriptor) = next.take() {
+        check_cancel(cancel)?;
+        if !seen.insert(descriptor.clone()) {
+            break;
+        }
+        ensure!(seen.len() <= 256, BUDGET);
+        let name = crate::native_engine::disassembly::type_name(&descriptor);
+        let id = format!("{name}.{member}");
+        let Some(ancestor) = catalog.class(&name) else {
+            if superclasses && !ended {
+                aliases.extend(pending.drain(..));
+                aliases.insert(id);
+            }
+            break;
+        };
+        interface_queue.extend(ancestor.interfaces.iter().cloned());
+        next = ancestor.superclass.clone();
+        if ended {
+            continue;
+        }
+        let Some(position) = catalog.method_position(&id) else {
+            pending.push(id);
+            continue;
+        };
+        let flags = ancestor.methods[position].access_flags;
+        let direct = flags & 0xa != 0;
+        let overridable = !direct
+            && flags & 0x10 == 0
+            && (flags & 0x5 != 0 || package(&name) == overrider_package);
+        if !overridable {
+            pending.clear();
+            stopped_at.get_or_insert(id);
+            ended = !direct;
+            continue;
+        }
+        overrider_package = package(&name).to_owned();
+        if superclasses {
+            aliases.extend(pending.drain(..));
+            aliases.insert(id);
+        } else {
+            pending.clear();
+        }
+    }
+    // A chain that ends in a loaded class proves nothing against the ancestors
+    // still pending: an interface may declare the member they inherit.
+    if superclasses {
+        aliases.extend(pending);
+    }
+    while let Some(descriptor) = interface_queue.pop_front() {
         check_cancel(cancel)?;
         if !seen.insert(descriptor.clone()) {
             continue;
         }
-        ensure!(
-            seen.len() <= 256 && queue.len() <= 4096,
-            "Dispatch ancestry exceeds budget; query ancestor methods explicitly"
-        );
+        ensure!(seen.len() <= 256 && interface_queue.len() <= 4096, BUDGET);
         let name = crate::native_engine::disassembly::type_name(&descriptor);
-        let ancestor = catalog.class(&name);
-        let interface = ancestor.map_or(via_interface, |c| c.access_flags & 0x200 != 0);
-        let wanted = if interface { interfaces } else { superclasses };
-        if wanted {
+        if interfaces {
             aliases.insert(format!("{name}.{member}"));
         }
-        if let Some(ancestor) = ancestor {
-            queue.extend(ancestor.interfaces.iter().cloned().map(|d| (d, true)));
-            queue.extend(ancestor.superclass.iter().cloned().map(|d| (d, false)));
+        if let Some(interface) = catalog.class(&name) {
+            interface_queue.extend(interface.interfaces.iter().cloned());
         }
     }
     Ok(Dispatch {
         aliases,
         status: "applied",
+        stopped_at,
     })
 }
 
@@ -741,7 +817,7 @@ impl SemanticReport {
         }
         json!({"enabled":true,"kinds":Self::KINDS,"complete":self.skipped == 0,"methods_expanded":self.expanded,
             "methods_skipped":self.skipped,"skipped_samples":self.samples,"sample_limit":ScanFailures::SAMPLE_LIMIT,"method_budget":Self::METHOD_LIMIT,
-            "semantics":"Opt-in labelled edges that no DEX invoke states directly, produced for every traversed method of a caller query and never replacing declared calls. lambda_creation: a new-instance of a callback class (synthetic, anonymous $N, Lambda-named, or extending a Kotlin lambda/continuation base) links the allocating method to each concrete instance method of that class; the allocation is exact, the callback relationship is inferred. possible_interface_dispatch and possible_virtual_dispatch: invoke-interface or invoke-virtual sites whose raw target names the traversed member on any known or unknown supertype of its class. Not covered: invoke-custom (indy) lambdas, named listener classes without those markers, reflection, LiveData/Flow/RxJava value delivery, dependency-injection factories, Intent, Handler or executor delivery. complete=false when the method budget or an ancestry budget skipped a method; skipped_samples lists them."})
+            "semantics":"Opt-in labelled edges that no DEX invoke states directly, produced for every traversed method of a caller query and never replacing declared calls. lambda_creation: a new-instance of a callback class (synthetic, anonymous $N, Lambda-named, or extending a Kotlin lambda/continuation base) links the allocating method to each concrete instance method of that class; the allocation is exact, the callback relationship is inferred. possible_interface_dispatch and possible_virtual_dispatch: invoke-interface or invoke-virtual sites whose raw target names the traversed member on an interface or unloaded supertype of its class, or on a loaded superclass whose declaration the traversed method overrides under runtime access rules (a final or foreign-package package-private declaration ends the superclass walk; a private or static one excludes only the classes resolving to it). Not covered: invoke-custom (indy) lambdas, named listener classes without those markers, reflection, LiveData/Flow/RxJava value delivery, dependency-injection factories, Intent, Handler or executor delivery. complete=false when the method budget or an ancestry budget skipped a method; skipped_samples lists them."})
     }
 }
 
@@ -1170,8 +1246,9 @@ fn query_catalog_with_sites(
         result["dispatch_through_interfaces"] = json!(options.interface_dispatch);
         result["dispatch_through_superclasses"] = json!(options.superclass_dispatch);
         result["dispatch_expansion"] = json!(dispatch.status);
+        result["dispatch_superclass_stop"] = json!(dispatch.stopped_at);
         result["dispatch_expansion_semantics"] = json!(
-            "applied: invoke-virtual/invoke-interface sites whose raw target names the root member on any known or unknown supertype of the root class (declaring or not) are added as possible dispatch; invoke-super, direct and static calls and sibling or unrelated receiver types are never added. skipped_*: no inference because the root is not a concrete instance method declared by its own loaded class."
+            "applied: invoke-virtual/invoke-interface sites whose raw target names the root member on a supertype of the root class (declaring or not) are added as possible dispatch. Superclasses count only while the root overrides their declarations under runtime rules. The first loaded superclass declaration the root does not override is named in dispatch_superclass_stop: neither it nor the non-declaring superclasses below it are inferred, because an invoke on any of them resolves to that declaration. A final or foreign-package package-private declaration also excludes every superclass above it (it holds their vtable slot); a private or static declaration is a direct method, so superclasses above it stay possible. Unloaded superclasses and interfaces anywhere in the ancestry remain possible. invoke-super, direct and static calls and sibling or unrelated receiver types are never added. skipped_*: no inference because the root is not a concrete instance method declared by its own loaded class."
         );
         let mut hash = Sha256::new();
         for (&i, &depth) in &selected_sites {
@@ -1470,6 +1547,98 @@ mod tests {
             result["call_sites"][0]["relationship"],
             "possible_virtual_dispatch"
         );
+    }
+
+    #[test]
+    fn superclass_dispatch_respects_override_rules_across_packages() {
+        let cancel = AtomicBool::new(false);
+        // Chain q.Child -> p.Mid -> p.Base -> r.Top -> x.Unknown (unloaded).
+        // p.Base.run() is package-private and q.Child.run() lives in another
+        // package, so it does not override it: a call through any superclass
+        // stays on p.Base at runtime, which also holds r.Top's vtable slot.
+        let base = |flags: u32| {
+            let mut base = class("p.Base", Some("r.Top"), vec![("run", vec![], vec![])]);
+            base.methods[0].access_flags = flags;
+            base
+        };
+        let mid = |declares_run: bool| {
+            let member = if declares_run { "run" } else { "other" };
+            let mut mid = class("p.Mid", Some("p.Base"), vec![(member, vec![], vec![])]);
+            mid.methods[0].access_flags = 1;
+            mid
+        };
+        let mut top = class("r.Top", Some("x.Unknown"), vec![("run", vec![], vec![])]);
+        top.methods[0].access_flags = 1;
+        let mut child = class("q.Child", Some("p.Mid"), vec![("run", vec![], vec![])]);
+        child.methods[0].access_flags = 1;
+        let targets = [
+            "p.Base.run()V",
+            "p.Mid.run()V",
+            "r.Top.run()V",
+            "x.Unknown.run()V",
+        ];
+        let mut caller = class("p.Caller", None, vec![("call", vec![], targets.to_vec())]);
+        let body = caller.methods[0].code.as_mut().unwrap();
+        for k in 0..targets.len() {
+            body.instructions[1 + 4 * k] = 0x106e;
+        }
+        body.outs = 1;
+        let query = |base: &DexClass, mid: &DexClass, args: &Value| {
+            let catalog = Catalog::new([base, mid, &top, &child, &caller], &cancel).unwrap();
+            query_cached_catalog(catalog, "q.Child.run()V", args, &cancel, &Cache::default())
+                .unwrap()
+        };
+        let receivers = |result: &Value| -> Vec<String> {
+            let mut names: Vec<String> = result["call_sites"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|site| site["raw_callee_method_id"].as_str().unwrap().to_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let explicit = json!({"direction":"callers","projection":"call_sites","dispatch_through_superclasses":true});
+        let semantic = json!({"direction":"callers","projection":"call_sites","depth":2,"semantic_edges":true});
+
+        let result = query(&base(0), &mid(false), &explicit);
+        assert_eq!(result["matching_total"], 0, "{result}");
+        assert_eq!(result["dispatch_expansion"], "applied");
+        assert_eq!(result["dispatch_superclass_stop"], "p.Base.run()V");
+        let result = query(&base(0), &mid(false), &semantic);
+        assert_eq!(result["matching_total"], 0, "{result}");
+
+        // A protected declaration is overridable from any package: every
+        // superclass receiver type is a possible target.
+        let result = query(&base(4), &mid(false), &explicit);
+        assert_eq!(receivers(&result), targets, "{result}");
+        assert_eq!(result["possible_dispatch_total"], 4);
+        assert_eq!(result["dispatch_superclass_stop"], Value::Null);
+        let result = query(&base(4), &mid(false), &semantic);
+        assert_eq!(
+            result["semantic_edge_kinds"],
+            json!({"possible_virtual_dispatch":4}),
+            "{result}"
+        );
+
+        // Overriding is transitive: a same-package override in p.Mid of the
+        // package-private method carries the cross-package child through.
+        let result = query(&base(0), &mid(true), &explicit);
+        assert_eq!(receivers(&result), targets, "{result}");
+        assert_eq!(result["dispatch_superclass_stop"], Value::Null);
+
+        // A final declaration ends the walk the same way as a foreign one.
+        let result = query(&base(0x11), &mid(false), &explicit);
+        assert_eq!(result["matching_total"], 0, "{result}");
+        assert_eq!(result["dispatch_superclass_stop"], "p.Base.run()V");
+
+        // A private or static declaration is a direct method: invokes resolving
+        // to it fail, while the child still overrides r.Top.run() above it.
+        for flags in [2, 8] {
+            let result = query(&base(flags), &mid(false), &explicit);
+            assert_eq!(receivers(&result), &targets[2..], "{result}");
+            assert_eq!(result["dispatch_superclass_stop"], "p.Base.run()V");
+        }
     }
 
     fn annotate(

@@ -1296,10 +1296,21 @@ Use `get_call_graph(method_id, direction="callers", projection="call_sites", dep
 
 Superclass dispatch uses `dispatch_through_superclasses=true` with the same
 direct caller projection. It includes `invoke-virtual` sites whose raw target
-names the root member on any superclass of the root class (declaring or not,
+names the root member on a superclass of the root class (declaring or not,
 abstract or concrete, loaded or framework) and labels them
-`possible_virtual_dispatch`. `invoke-super`, static and direct calls, and sites
-on sibling or unrelated receiver types are never inferred. Both options can be
+`possible_virtual_dispatch`. Superclasses count only while the root method
+overrides their declarations under the runtime's rules. The first loaded
+superclass declaration the root does not override is named in
+`dispatch_superclass_stop`; neither it nor the non-declaring superclasses below
+it are inferred, because an invoke on any of them resolves to that declaration.
+A final declaration, or a package-private one in another package, also
+excludes every superclass above it, since it holds their vtable slot; a private
+or static declaration is a direct method, so superclasses above it stay
+possible. Overriding is transitive, so a same-package intermediate override
+carries a cross-package subclass through. Unloaded superclasses and interfaces
+anywhere in the ancestry remain possible targets. `invoke-super`, static and
+direct calls, and sites on sibling or unrelated receiver types are never
+inferred. Both options can be
 combined. `dispatch_expansion` reports what happened: `applied`,
 `not_requested`, or a `skipped_*` reason when the root is not a concrete
 instance method declared by its own loaded class (constructors, static and

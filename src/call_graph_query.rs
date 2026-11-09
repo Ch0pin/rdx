@@ -1200,9 +1200,11 @@ fn query_catalog_with_sites(
         let total = selected_sites.len();
         result["direct_matching_total"] =
             json!(selected_sites.values().filter(|&&depth| depth == 1).count());
-        result["call_site_semantics"] = json!(
+        result["call_site_semantics"] = json!(if options.semantic_edges {
+            "Records mix two kinds of evidence, told apart by relationship. exact_declared_call and possible_*_dispatch records are one raw DEX invoke each to callee_method_id. semantic_edge records carry kind: possible_interface_dispatch and possible_virtual_dispatch are also one invoke each, while lambda_creation is one new-instance allocation (opcode new-instance, callee_method_id null, allocated_class_id set) that links the allocating method to semantic_target_method_id. depth is traversal distance from the query root; only depth=1 records are direct root neighbors. call_sites defaults to depth=1; explicit depth includes transitive sites."
+        } else {
             "Each record is one raw DEX invoke to callee_method_id. depth is traversal distance from the query root; only depth=1 records are direct root neighbors. call_sites defaults to depth=1; explicit depth includes transitive sites."
-        );
+        });
         let record_for = |i: usize, depth: usize| {
             if i >= declared {
                 return semantic_record(&semantic[i - declared], depth, &catalog);
@@ -2639,6 +2641,12 @@ mod tests {
                 .unwrap()
                 .contains("lambda_creation")
         );
+        let semantics = result["call_site_semantics"].as_str().unwrap();
+        assert!(
+            semantics.contains("lambda_creation is one new-instance allocation"),
+            "{semantics}"
+        );
+        assert!(semantics.contains("callee_method_id null"), "{semantics}");
         let rows = result["call_sites"].as_array().unwrap();
         let exact: Vec<_> = rows
             .iter()
@@ -2701,6 +2709,12 @@ mod tests {
         assert_eq!(plain["matching_total"], 1);
         assert_eq!(plain["semantic_edge_total"], 0);
         assert_eq!(plain["semantic_edges"], json!({"enabled":false}));
+        assert!(
+            plain["call_site_semantics"]
+                .as_str()
+                .unwrap()
+                .starts_with("Each record is one raw DEX invoke")
+        );
 
         let shallow = json!({"direction":"callers","projection":"call_sites","depth":2,"semantic_edges":true});
         let result = run(&classes, root, shallow.clone());

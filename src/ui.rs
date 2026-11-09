@@ -1024,16 +1024,25 @@ impl App {
         self.call_graph.status = "Building call graph…".into();
         let cancel = Arc::new(AtomicBool::new(false));
         self.call_graph.cancel = Some(cancel.clone());
-        let (tx, generation, ctx, depth, direction) = (
+        let (tx, generation, ctx, depth, direction, lambda_creators) = (
             self.tx.clone(),
             self.generation,
             ctx.clone(),
             self.call_graph.depth,
             self.call_graph.direction,
+            self.call_graph.lambda_creators_requested(),
         );
         thread::spawn(move || {
             let result = engine
-                .call_graph_at(&class, offset, &hash, depth, direction, &cancel)
+                .call_graph_at(
+                    &class,
+                    offset,
+                    &hash,
+                    depth,
+                    direction,
+                    lambda_creators,
+                    &cancel,
+                )
                 .map_err(|e| format!("{e:#}"))
                 .map(|graph| (graph, engine.component_exposure().ok()));
             let _ = tx.send(Event::CallGraph(generation, engine, result));
@@ -2781,10 +2790,18 @@ impl App {
                     self.call_graph.cancel = None;
                     match result {
                         Ok((graph, exposure)) => {
+                            let inferred = graph.edges.iter().filter(|e| e.inferred_only()).count();
                             self.call_graph.status = format!(
-                                "{} methods · {} edges · click a method to open it{}",
+                                "{} methods · {} edges{} · click a method to open it{}",
                                 graph.nodes.len(),
                                 graph.edges.len(),
+                                if inferred > 0 {
+                                    format!(
+                                        " ({inferred} dashed, inferred from callback allocation)"
+                                    )
+                                } else {
+                                    String::new()
+                                },
                                 if exposure.is_none() {
                                     " · manifest unavailable, exported state unknown"
                                 } else {

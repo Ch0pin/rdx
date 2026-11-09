@@ -235,6 +235,21 @@ arrow flows into it. **Callees** walks the methods the selected method invokes, 
 the selected method at the left edge. **Both** combines the two around the selected
 method. Changing the selector rebuilds the graph at once.
 
+Declared calls stop where the app hands a callback to the framework: a
+`Runnable` lambda's `run()` has no caller in the DEX code, because a thread,
+executor or handler invokes it through the interface. The **Lambda creators**
+checkbox, available for Callers graphs, follows such callbacks back to the code
+that creates them. A method declared by a synthetic, anonymous or `Lambda`-named
+class, or by a class extending a Kotlin lambda or continuation base, gains an
+edge from every method that allocates that class, and the walk continues from
+those creators. These edges are drawn dashed and the status line counts them:
+the allocation is exact, the callback relationship is inferred. Declared calls
+keep their solid edges. The producer is the `lambda_creation` kind of the MCP
+`semantic_edges` option, applied to the first 2,048 traversed methods; the
+dispatch producers stay off in the window, and invoke-custom lambdas, reflection,
+and framework or Intent delivery remain out of reach. Toggling the checkbox
+rebuilds the graph at once.
+
 Callers and Both graphs read the project's invoke index, the same index MCP
 caller queries use. The first such graph after opening an APK builds the index
 by scanning every class once; later rebuilds at any depth or direction reuse it

@@ -33,6 +33,10 @@ struct Options<'a> {
     /// Expand at most this many methods; later discoveries stay leaves. Never set
     /// from request arguments: MCP queries traverse fully and report totals.
     visit_limit: Option<usize>,
+    /// Run only the `lambda_creation` producer when `semantic_edges` is on, so a
+    /// Callers graph reaches callback creators without dispatch guesses. Never set
+    /// from request arguments: MCP queries report every producer.
+    lambda_creators_only: bool,
 }
 
 fn string_option<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
@@ -161,6 +165,7 @@ impl<'a> Options<'a> {
             offset,
             limit,
             visit_limit: None,
+            lambda_creators_only: false,
         })
     }
 }
@@ -433,20 +438,49 @@ fn query_cached_catalog(
 /// bidirectional graphs read the index; callee graphs scan reachable bodies only.
 /// Expansion stops after `NODE_LIMIT` methods, like the legacy builder, so a
 /// popular root or a deep bidirectional walk cannot visit the whole app before
-/// the projection discards everything past the limit anyway.
+/// the projection discards everything past the limit anyway. With
+/// `lambda_creators`, a Callers graph also follows `lambda_creation` edges from
+/// the methods allocating a callback class to its instance methods; each edge
+/// reports them in `inferred`, apart from its declared `sites`.
 pub(crate) fn graph_cached(
     engine: &NativeDexEngine,
     root: &str,
     depth: usize,
     direction: Direction,
+    lambda_creators: bool,
     cancel: &AtomicBool,
     cache: &Cache,
 ) -> Result<CallGraph> {
     check_cancel(cancel)?;
+    let catalog = Catalog::new(engine.graph_classes(), cancel)?;
+    graph_cached_catalog(
+        catalog,
+        root,
+        depth,
+        direction,
+        lambda_creators,
+        cancel,
+        cache,
+    )
+}
+fn graph_cached_catalog(
+    catalog: Catalog<'_>,
+    root: &str,
+    depth: usize,
+    direction: Direction,
+    lambda_creators: bool,
+    cancel: &AtomicBool,
+    cache: &Cache,
+) -> Result<CallGraph> {
+    ensure!(
+        !lambda_creators || direction == Direction::Callers,
+        "Lambda creators apply to Callers graphs"
+    );
     let args = json!({"direction":direction.as_str(),"depth":depth,"projection":"graph"});
     let mut options = Options::parse(&args)?;
     options.visit_limit = Some(NODE_LIMIT);
-    let catalog = Catalog::new(engine.graph_classes(), cancel)?;
+    options.semantic_edges = lambda_creators;
+    options.lambda_creators_only = lambda_creators;
     let normalized = crate::method_lookup::graph_selector(root, |name| catalog.class(name))?;
     let provided = match direction {
         Direction::Callees => None,
@@ -904,10 +938,11 @@ fn callback_class(class: &DexClass) -> Option<&'static str> {
 
 /// Semantic producers for one traversed method: ancestor-typed invokes that may
 /// run it as an override, and allocations of its class when that class is a
-/// callback carrier.
+/// callback carrier. `lambda_creators_only` keeps the allocation producer alone.
 fn semantic_into(
     catalog: &Catalog<'_>,
     method: &str,
+    options: &Options<'_>,
     lookup: &dyn Lookup,
     cancel: &AtomicBool,
     report: &mut SemanticReport,
@@ -918,8 +953,14 @@ fn semantic_into(
         return Ok(edges);
     }
     report.expanded += 1;
-    match dispatch_aliases_for(catalog, method, true, true, cancel) {
-        Ok(dispatch) => {
+    let dispatch = if options.lambda_creators_only {
+        Ok(None)
+    } else {
+        dispatch_aliases_for(catalog, method, true, true, cancel).map(Some)
+    };
+    match dispatch {
+        Ok(None) => {}
+        Ok(Some(dispatch)) => {
             let keys: BTreeSet<String> = dispatch
                 .aliases
                 .iter()
@@ -1023,7 +1064,7 @@ fn collect(
             }
         }
         if options.semantic_edges {
-            for edge in semantic_into(catalog, &current, lookup, cancel, report)? {
+            for edge in semantic_into(catalog, &current, options, lookup, cancel, report)? {
                 if visited.insert(edge.from.clone()) {
                     queue.push_back((edge.from.clone(), depth + 1));
                 }
@@ -1258,8 +1299,6 @@ fn traverse(
 /// Retained nodes and edges, with the totals the limits were applied to.
 struct GraphProjection {
     graph: CallGraph,
-    /// Semantic edges folded into each graph edge, in edge order.
-    semantic_counts: Vec<usize>,
     matching_nodes: usize,
     matching_edges: usize,
 }
@@ -1322,8 +1361,7 @@ fn project_graph(
             depth,
         });
     }
-    let mut semantic_counts = Vec::new();
-    for ((from, to), (count, inferred)) in counts {
+    for ((from, to), (sites, inferred)) in counts {
         if let (Some(&from), Some(&to)) = (indices.get(&from), indices.get(&to)) {
             if graph.edges.len() == EDGE_LIMIT {
                 break;
@@ -1331,15 +1369,14 @@ fn project_graph(
             graph.edges.push(Edge {
                 from,
                 to,
-                sites: count,
+                sites,
+                inferred,
             });
-            semantic_counts.push(inferred);
         }
     }
     graph.truncated = matching_nodes > graph.nodes.len() || matching_edges > graph.edges.len();
     Ok(GraphProjection {
         graph,
-        semantic_counts,
         matching_nodes,
         matching_edges,
     })
@@ -1480,7 +1517,6 @@ fn query_catalog_with_sites(
     }
     let GraphProjection {
         graph,
-        semantic_counts,
         matching_nodes,
         matching_edges,
     } = project_graph(&catalog, &t, root, &options, cancel)?;
@@ -1493,10 +1529,10 @@ fn query_catalog_with_sites(
             .collect::<Vec<_>>()
     };
     result["nodes"] = json!(graph.nodes.iter().enumerate().map(|(i,n)| json!({"id":i,"method_id":n.method,"depth":n.depth,"component":n.component.map(|c| c.label()),"available":n.available,"reachable_components":kinds(masks[i])})).collect::<Vec<_>>());
-    result["edges"] = json!(graph.edges.iter().zip(&semantic_counts).map(|(e, &inferred)| {
+    result["edges"] = json!(graph.edges.iter().map(|e| {
         let mut edge = json!({"from":e.from,"to":e.to,"call_sites":e.sites,"highlighted":masks[e.to] != 0,"reachable_components":kinds(masks[e.to])});
         if options.semantic_edges {
-            edge["semantic_edges"] = json!(inferred);
+            edge["semantic_edges"] = json!(e.inferred);
         }
         edge
     }).collect::<Vec<_>>());
@@ -2744,8 +2780,10 @@ mod tests {
         code.instructions.splice(end..end, [0x0022, index]);
     }
 
-    #[test]
-    fn semantic_edges_follow_lambda_creation_and_transitive_dispatch_in_both_paths() {
+    /// `app.Outer.start` allocates the anonymous listener `app.Outer$1`, whose
+    /// `onEvent` calls `app.Sink.handle`; `app.Bus.fire` invokes the listener
+    /// interface, `app.Scheduler.go` calls `fire`, and `app.Outer.other` calls `start`.
+    fn listener_fixture() -> Vec<DexClass> {
         let mut outer = class(
             "app.Outer",
             None,
@@ -2778,7 +2816,140 @@ mod tests {
             None,
             vec![("go", vec![], vec!["app.Bus.fire()V"])],
         );
-        let classes = vec![outer, callback, listener, sink, bus, scheduler];
+        vec![outer, callback, listener, sink, bus, scheduler]
+    }
+
+    #[test]
+    fn gui_lambda_creators_follow_allocations_and_skip_dispatch_guesses() {
+        let classes = listener_fixture();
+        let cancel = AtomicBool::new(false);
+        let cache = Cache::default();
+        let graph = |root: &str, direction: Direction, creators: bool| {
+            graph_cached_catalog(
+                Catalog::new(&classes, &cancel).unwrap(),
+                root,
+                5,
+                direction,
+                creators,
+                &cancel,
+                &cache,
+            )
+        };
+        let shape = |graph: &CallGraph| {
+            let nodes: Vec<(String, usize)> = graph
+                .nodes
+                .iter()
+                .map(|n| (n.method.clone(), n.depth))
+                .collect();
+            let edges: Vec<(String, String, usize, usize)> = graph
+                .edges
+                .iter()
+                .map(|e| {
+                    (
+                        graph.nodes[e.from].method.clone(),
+                        graph.nodes[e.to].method.clone(),
+                        e.sites,
+                        e.inferred,
+                    )
+                })
+                .collect();
+            (nodes, edges)
+        };
+        let root = "app.Outer$1.onEvent()V";
+        // Declared calls alone never reach the callback method.
+        let plain = graph(root, Direction::Callers, false).unwrap();
+        assert_eq!(shape(&plain), (vec![(root.to_owned(), 0)], vec![]));
+        // The creator joins through its allocation and the walk continues from it,
+        // while the interface dispatch from app.Bus.fire stays out of the graph.
+        let creators = graph(root, Direction::Callers, true).unwrap();
+        assert_eq!(creators.direction, Direction::Callers);
+        assert!(!creators.truncated);
+        assert_eq!(
+            shape(&creators),
+            (
+                vec![
+                    (root.to_owned(), 0),
+                    ("app.Outer.start()V".to_owned(), 1),
+                    ("app.Outer.other()V".to_owned(), 2),
+                ],
+                vec![
+                    (
+                        "app.Outer.other()V".to_owned(),
+                        "app.Outer.start()V".to_owned(),
+                        1,
+                        0,
+                    ),
+                    ("app.Outer.start()V".to_owned(), root.to_owned(), 0, 1),
+                ],
+            )
+        );
+        assert_eq!(
+            creators
+                .edges
+                .iter()
+                .map(Edge::inferred_only)
+                .collect::<Vec<_>>(),
+            [false, true]
+        );
+        assert!(creators.nodes.iter().all(|n| n.available));
+        // Other directions refuse the option before touching the index.
+        for direction in [Direction::Callees, Direction::Both] {
+            let error = graph(root, direction, true).unwrap_err();
+            assert!(error.to_string().contains("Callers graphs"), "{error:#}");
+        }
+        // The MCP graph projection keeps every producer and its edge fields.
+        let full = query_cached_catalog(
+            Catalog::new(&classes, &cancel).unwrap(),
+            root,
+            &json!({"direction":"callers","projection":"graph","depth":5,"semantic_edges":true}),
+            &cancel,
+            &cache,
+        )
+        .unwrap();
+        let methods: BTreeSet<&str> = full["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["method_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            methods,
+            BTreeSet::from([
+                root,
+                "app.Outer.start()V",
+                "app.Outer.other()V",
+                "app.Bus.fire()V",
+                "app.Scheduler.go()V",
+            ])
+        );
+        let edges = full["edges"].as_array().unwrap();
+        let inferred: Vec<_> = edges.iter().filter(|e| e["call_sites"] == 0).collect();
+        assert_eq!(inferred.len(), 2, "{edges:?}");
+        for edge in &inferred {
+            assert_eq!(edge["semantic_edges"], 1);
+            let keys: BTreeSet<&str> = edge
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                keys,
+                BTreeSet::from([
+                    "from",
+                    "to",
+                    "call_sites",
+                    "highlighted",
+                    "reachable_components",
+                    "semantic_edges",
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_edges_follow_lambda_creation_and_transitive_dispatch_in_both_paths() {
+        let classes = listener_fixture();
         let cancel = AtomicBool::new(false);
         let cache = Cache::default();
         let cached = |root: &str, args: &Value| {

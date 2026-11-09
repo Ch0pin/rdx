@@ -25,6 +25,7 @@ fn graph_from_dex_and_exact_navigation() {
             &source.source_hash,
             3,
             Direction::Callees,
+            false,
             &cancel,
         )
         .unwrap();
@@ -54,6 +55,7 @@ fn graph_from_dex_and_exact_navigation() {
                 "stale",
                 3,
                 Direction::Callees,
+                false,
                 &cancel
             )
             .is_err()
@@ -66,6 +68,7 @@ fn graph_from_dex_and_exact_navigation() {
                 &source.source_hash,
                 0,
                 Direction::Callees,
+                false,
                 &cancel
             )
             .is_err()
@@ -78,6 +81,7 @@ fn graph_from_dex_and_exact_navigation() {
                 &source.source_hash,
                 3,
                 Direction::Callees,
+                false,
                 &AtomicBool::new(true)
             )
             .is_err()
@@ -98,6 +102,7 @@ fn graph_from_dex_and_exact_navigation() {
             &target.source_hash,
             3,
             Direction::Callers,
+            false,
             &cancel,
         )
         .unwrap();

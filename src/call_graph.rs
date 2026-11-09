@@ -38,7 +38,17 @@ pub struct Node {
 pub struct Edge {
     pub from: usize,
     pub to: usize,
+    /// Declared invoke sites folded into this edge.
     pub sites: usize,
+    /// Inferred links folded into this edge, such as the allocation of a callback
+    /// class by the caller; they never stand in for a declared call.
+    pub inferred: usize,
+}
+impl Edge {
+    /// No declared invoke supports this edge; it exists through inference alone.
+    pub fn inferred_only(&self) -> bool {
+        self.sites == 0 && self.inferred > 0
+    }
 }
 /// Which call edges a graph follows from its root method.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -392,7 +402,12 @@ pub fn build_direction(
                     return Ok(graph);
                 }
                 edge_indices.insert((from, to), graph.edges.len());
-                graph.edges.push(Edge { from, to, sites: 1 });
+                graph.edges.push(Edge {
+                    from,
+                    to,
+                    sites: 1,
+                    inferred: 0,
+                });
             }
         }
     }
@@ -680,26 +695,31 @@ mod tests {
                     from: 0,
                     to: 1,
                     sites: 1,
+                    inferred: 0,
                 },
                 Edge {
                     from: 1,
                     to: 2,
                     sites: 1,
+                    inferred: 0,
                 },
                 Edge {
                     from: 2,
                     to: 3,
                     sites: 1,
+                    inferred: 0,
                 },
                 Edge {
                     from: 1,
                     to: 4,
                     sites: 1,
+                    inferred: 0,
                 },
                 Edge {
                     from: 2,
                     to: 1,
                     sites: 1,
+                    inferred: 0,
                 },
             ],
             truncated: false,
@@ -720,7 +740,12 @@ mod tests {
             component,
             available: true,
         };
-        let edge = |from, to| Edge { from, to, sites: 1 };
+        let edge = |from, to| Edge {
+            from,
+            to,
+            sites: 1,
+            inferred: 0,
+        };
         // Discovery order of a bidirectional build: node 1 calls the root, the root calls
         // node 2, node 3 also calls node 2, node 4 calls node 1, node 5 was cut off before
         // its edge was recorded.

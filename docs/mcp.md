@@ -1349,7 +1349,8 @@ guessed: invoke-custom lambdas, named listener classes without those markers,
 reflection, LiveData, Flow or RxJava value delivery, dependency-injection
 factories, and Intent, Handler or executor delivery. `semantic_edges` requires
 `direction="callers"` and conflicts with `dispatch_through_*`, which it
-subsumes. Source locations, forwarders and constant arguments mark allocation
+subsumes. The GUI call graph window offers the `lambda_creation` producer alone
+as its **Lambda creators** checkbox and draws those edges dashed. Source locations, forwarders and constant arguments mark allocation
 rows `not_applicable`.
 
 ### Asset contents

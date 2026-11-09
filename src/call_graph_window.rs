@@ -24,6 +24,9 @@ const LANE: f32 = 70.0;
 const ARC_RISE: f32 = 80.0;
 /// Largest control offset of a same-column bow; it stays within the card width.
 const SIDE_BOW: f32 = 56.0;
+/// Dash length of an inferred edge in unscaled units; the gap is six tenths of it.
+const DASH: f32 = 9.0;
+const LAMBDA_CREATORS_HINT: &str = "Callers graphs only. A method of a synthetic, anonymous or Lambda-named callback class, or of a class extending a Kotlin lambda or continuation base, gains an edge from every method that allocates that class, and the walk continues from those creators. A Runnable handed to a thread, executor or handler shows the method that built it this way. Dashed edges mark these links: the allocation is exact, the callback relationship is inferred. Invoke-custom lambdas, reflection and framework delivery stay out.";
 
 pub struct CallGraphWindow {
     pub visible: bool,
@@ -35,6 +38,9 @@ pub struct CallGraphWindow {
     pub depth: usize,
     /// Direction requested for the next build; a change rebuilds the graph at once.
     pub direction: Direction,
+    /// Follow callback methods back to the methods allocating their class in the next
+    /// Callers build; a change rebuilds the graph at once.
+    pub lambda_creators: bool,
     zoom: f32,
     /// Displacement of each node from its column/row slot, in unscaled units.
     offsets: Vec<Vec2>,
@@ -50,6 +56,7 @@ impl Default for CallGraphWindow {
             cancel: None,
             depth: 20,
             direction: Direction::Callers,
+            lambda_creators: false,
             zoom: 0.8,
             offsets: Vec::new(),
         }
@@ -204,23 +211,34 @@ fn arrowhead(painter: &egui::Painter, tip: Pos2, direction: Vec2, length: f32, t
 /// An edge within one column bows out beside the cards, a leftward edge arcs over the
 /// cards it spans, and a recursive call loops above its own sphere. Arcs and loops rise
 /// less than `LANE` above the card, the space the layout reserves over the top row.
+/// A dashed edge follows the same route; it marks an inferred link.
 fn draw_edge(
     painter: &egui::Painter,
     [start, end]: [Pos2; 2],
     radius: f32,
     highlighted: bool,
+    dashed: bool,
     tint: Color32,
     zoom: f32,
 ) {
     let stroke = Stroke::new(if highlighted { 2.5 } else { 0.9 }, tint);
     let head = (16.0 * zoom).clamp(7.0, 18.0) * if highlighted { 1.15 } else { 1.0 };
+    let dash = (DASH * zoom).clamp(4.0, 10.0);
+    let dashes = |points: &[Pos2]| {
+        painter.extend(egui::Shape::dashed_line(points, stroke, dash, dash * 0.6));
+    };
     let curve = |points: [Pos2; 4]| {
-        painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+        let shape = egui::epaint::CubicBezierShape::from_points_stroke(
             points,
             false,
             Color32::TRANSPARENT,
             stroke,
-        ));
+        );
+        if dashed {
+            dashes(&shape.flatten(Some(0.25)));
+        } else {
+            painter.add(shape);
+        }
         let into = (points[3] - points[2]).normalized();
         arrowhead(painter, points[3], into, head, tint);
     };
@@ -250,13 +268,22 @@ fn draw_edge(
         let direction = delta.normalized();
         let a = start + direction * radius;
         let b = end - direction * radius;
-        painter.line_segment([a, b], stroke);
+        if dashed {
+            dashes(&[a, b]);
+        } else {
+            painter.line_segment([a, b], stroke);
+        }
         arrowhead(painter, b, direction, head, tint);
     }
 }
 impl CallGraphWindow {
     pub fn viewport_id() -> egui::ViewportId {
         egui::ViewportId::from_hash_of("rdx_call_graph")
+    }
+    /// Whether the next build follows lambda creators: the option applies to Callers
+    /// graphs, so another direction builds declared calls alone.
+    pub fn lambda_creators_requested(&self) -> bool {
+        self.lambda_creators && self.direction == Direction::Callers
     }
     /// Replaces the graph and its manifest context, dropping any manual node placement.
     pub fn set_graph(&mut self, graph: Option<CallGraph>, exposure: Option<ExposureMap>) {
@@ -299,6 +326,7 @@ impl CallGraphWindow {
             zoom,
             depth,
             direction,
+            lambda_creators,
             cancel,
             status,
             ..
@@ -323,6 +351,18 @@ impl CallGraphWindow {
                         }
                     }
                 });
+                ui.add_enabled_ui(
+                    cancel.is_none() && *direction == Direction::Callers,
+                    |ui| {
+                        if ui
+                            .checkbox(lambda_creators, "Lambda creators")
+                            .on_hover_text(LAMBDA_CREATORS_HINT)
+                            .changed()
+                        {
+                            rebuild = true;
+                        }
+                    },
+                );
                 ui.separator();
                 ui.add(
                     egui::Slider::new(zoom, 0.01..=2.0)
@@ -370,6 +410,10 @@ impl CallGraphWindow {
             });
             ui.label(status.as_str());
             let Some(graph) = graph else { return };
+            if graph.edges.iter().any(Edge::inferred_only) {
+                ui.label("Dashed edges: the caller allocates the callback class declaring the callee · the allocation is exact, the callback relationship is inferred")
+                    .on_hover_text(LAMBDA_CREATORS_HINT);
+            }
             if graph.truncated {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
@@ -469,6 +513,7 @@ impl CallGraphWindow {
                         [centers[edge.from], centers[edge.to]],
                         RADIUS * z,
                         mask != 0,
+                        edge.inferred_only(),
                         tint,
                         z,
                     );
@@ -588,11 +633,13 @@ mod tests {
                     from: 0,
                     to: 1,
                     sites: 2,
+                    inferred: 0,
                 },
                 Edge {
                     from: 1,
                     to: 1,
                     sites: 1,
+                    inferred: 0,
                 },
             ],
             truncated: false,
@@ -808,6 +855,7 @@ mod tests {
             from: 1,
             to: 0,
             sites: 3,
+            inferred: 0,
         }];
         window.set_graph(Some(graph), Some(exported_main()));
         let output = ctx.run(egui::RawInput::default(), |ctx| {
@@ -867,7 +915,12 @@ mod tests {
             component: None,
             available: true,
         };
-        let edge = |from, to| Edge { from, to, sites: 1 };
+        let edge = |from, to| Edge {
+            from,
+            to,
+            sites: 1,
+            inferred: 0,
+        };
         // Root in column 0; Up, Peer and Third call it from rows 0..2 of column -1; Down
         // is its callee in column +1 and also calls it back and itself.
         let graph = CallGraph {
@@ -958,6 +1011,127 @@ mod tests {
                 "the arc rises over its spheres: {points:?}"
             );
         }
+    }
+    #[test]
+    fn lambda_creators_dash_inferred_edges_and_rebuild_callers_graphs() {
+        assert!(!CallGraphWindow::default().lambda_creators);
+        let node = |method: &str, depth| Node {
+            method: method.into(),
+            depth,
+            component: None,
+            available: true,
+        };
+        // The root is a lambda's callback: app.Main.start allocates the lambda class and
+        // app.Other.call invokes the callback directly.
+        let graph = CallGraph {
+            nodes: vec![
+                node("app.Main$$ExternalSyntheticLambda0.run()V", 0),
+                node("app.Main.start()V", 1),
+                node("app.Other.call()V", 1),
+            ],
+            edges: vec![
+                Edge {
+                    from: 1,
+                    to: 0,
+                    sites: 0,
+                    inferred: 1,
+                },
+                Edge {
+                    from: 2,
+                    to: 0,
+                    sites: 1,
+                    inferred: 0,
+                },
+            ],
+            truncated: false,
+            dispatch_targets: vec![],
+            dispatch_targets_truncated: false,
+            direction: Direction::Callers,
+        };
+        let ctx = egui::Context::default();
+        let mut window = CallGraphWindow {
+            visible: true,
+            ..Default::default()
+        };
+        window.set_graph(Some(graph), None);
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1100.0, 750.0))),
+            ..Default::default()
+        };
+        let output = ctx.run(input(), |ctx| {
+            window.show_contents(ctx);
+        });
+        assert_eq!(spheres(&output).len(), 3);
+        let canvas = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Circle(circle) if circle.radius > 40.0 => Some(clipped.clip_rect),
+                _ => None,
+            })
+            .expect("sphere clip rect");
+        let segments: Vec<[Pos2; 2]> = output
+            .shapes
+            .iter()
+            .filter(|clipped| clipped.clip_rect == canvas)
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::LineSegment { points, .. } => Some(*points),
+                _ => None,
+            })
+            .collect();
+        // The declared call is one solid segment; the inferred link breaks into dashes
+        // shorter than a scaled dash length, and both edges keep their arrowheads.
+        let solid = segments
+            .iter()
+            .filter(|[a, b]| (*b - *a).length() > 100.0)
+            .count();
+        let dashes = segments
+            .iter()
+            .filter(|[a, b]| (*b - *a).length() <= DASH)
+            .count();
+        assert_eq!(solid, 1, "{segments:?}");
+        assert!(dashes >= 8, "{segments:?}");
+        assert_eq!(solid + dashes, segments.len(), "{segments:?}");
+        assert_eq!(arrowheads(&output), 2);
+        assert!(output.shapes.iter().any(|clipped| matches!(
+            &clipped.shape,
+            egui::Shape::Text(shape) if shape.galley.text().starts_with("Dashed edges")
+        )));
+        // The checkbox records the choice and asks for a rebuild.
+        let (selected, rebuild) = click(
+            &ctx,
+            &mut window,
+            text_rect(&output, "Lambda creators").center(),
+        );
+        assert_eq!((selected, rebuild), (None, true));
+        assert!(window.lambda_creators);
+        assert!(window.lambda_creators_requested());
+        // Other directions build declared calls alone and keep the box disabled.
+        window.direction = Direction::Callees;
+        assert!(!window.lambda_creators_requested());
+        let output = ctx.run(input(), |ctx| {
+            window.show_contents(ctx);
+        });
+        let (_, rebuild) = click(
+            &ctx,
+            &mut window,
+            text_rect(&output, "Lambda creators").center(),
+        );
+        assert!(!rebuild);
+        assert!(window.lambda_creators);
+        // A running build disables it as well.
+        window.direction = Direction::Callers;
+        window.cancel = Some(Arc::new(AtomicBool::new(false)));
+        let output = ctx.run(input(), |ctx| {
+            window.show_contents(ctx);
+        });
+        let (_, rebuild) = click(
+            &ctx,
+            &mut window,
+            text_rect(&output, "Lambda creators").center(),
+        );
+        assert!(!rebuild);
+        assert!(window.lambda_creators);
     }
     #[test]
     fn nodes_follow_pointer_drags_and_reset_with_a_new_graph() {

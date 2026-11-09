@@ -935,6 +935,10 @@ impl NativeEngine {
         crate::call_graph::query_cached(&self.native, method, args, cancel, &self.invoke_index)
     }
 
+    /// Graph for the GUI window. `lambda_creators` adds inferred edges from the
+    /// methods that allocate a callback class to its instance methods; it applies
+    /// to Callers graphs alone.
+    #[allow(clippy::too_many_arguments)]
     pub fn call_graph_at(
         &mut self,
         class: &str,
@@ -942,8 +946,13 @@ impl NativeEngine {
         hash: &str,
         depth: usize,
         direction: crate::call_graph::Direction,
+        lambda_creators: bool,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<crate::call_graph::CallGraph> {
+        anyhow::ensure!(
+            !lambda_creators || direction == crate::call_graph::Direction::Callers,
+            "Lambda creators apply to Callers graphs"
+        );
         let target = self.resolve_method_xref_target(class, offset, hash, false)?;
         match direction {
             // Callee graphs scan only the bodies they reach, which is cheap.
@@ -962,6 +971,7 @@ impl NativeEngine {
                     &target.id,
                     depth,
                     direction,
+                    lambda_creators,
                     cancel,
                     &self.invoke_index,
                 )
@@ -1781,6 +1791,7 @@ mod navigation_cache_tests {
                         root,
                         depth,
                         crate::call_graph::Direction::parse(direction).unwrap(),
+                        false,
                         &cancel,
                         &engine.invoke_index,
                     )
@@ -1861,10 +1872,20 @@ mod navigation_cache_tests {
                 &hash,
                 3,
                 Direction::Callees,
+                false,
                 &cancel,
             )
             .unwrap();
         assert_eq!(callees.direction, Direction::Callees);
+        assert_eq!(engine.invoke_index.status()["state"], "not_built");
+        // Lambda creators are a Callers option; other directions refuse the flag
+        // before any work starts.
+        for direction in [Direction::Callees, Direction::Both] {
+            let error = engine
+                .call_graph_at("sample.Target", offset, &hash, 3, direction, true, &cancel)
+                .unwrap_err();
+            assert!(error.to_string().contains("Callers graphs"), "{error:#}");
+        }
         assert_eq!(engine.invoke_index.status()["state"], "not_built");
         let shape = |graph: &CallGraph| {
             let nodes: BTreeSet<_> = graph
@@ -1899,7 +1920,7 @@ mod navigation_cache_tests {
         };
         for direction in [Direction::Callers, Direction::Both] {
             let graph = engine
-                .call_graph_at("sample.Target", offset, &hash, 3, direction, &cancel)
+                .call_graph_at("sample.Target", offset, &hash, 3, direction, false, &cancel)
                 .unwrap();
             assert_eq!(engine.invoke_index.status()["state"], "ready");
             assert_eq!(graph.direction, direction);
@@ -1920,6 +1941,37 @@ mod navigation_cache_tests {
             .unwrap();
             assert_eq!(shape(&graph), shape(&legacy));
         }
+        // The fixture allocates no callback class, so the lambda-creators graph is
+        // the declared Callers graph with every edge declared.
+        let creators = engine
+            .call_graph_at(
+                "sample.Target",
+                offset,
+                &hash,
+                3,
+                Direction::Callers,
+                true,
+                &cancel,
+            )
+            .unwrap();
+        let plain = engine
+            .call_graph_at(
+                "sample.Target",
+                offset,
+                &hash,
+                3,
+                Direction::Callers,
+                false,
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(shape(&creators), shape(&plain));
+        assert!(
+            creators
+                .edges
+                .iter()
+                .all(|e| e.inferred == 0 && !e.inferred_only())
+        );
         // The index the window built is the one MCP queries reuse.
         let args = serde_json::json!({"direction":"callers","projection":"graph"});
         let query = engine

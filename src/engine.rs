@@ -330,10 +330,12 @@ impl NativeEngine {
                         total_bytes <= 256 * 1024 * 1024,
                         "Combined resource tables exceed 256 MiB"
                     );
-                    let bytes = container.read_member(entry.index, 64 * 1024 * 1024)?;
-                    let table = crate::resource_table::ResourceTable::parse(&bytes)?;
+                    let bytes =
+                        container.read_member(entry.index, limits.resource_table_bytes())?;
+                    let table =
+                        crate::resource_table::ResourceTable::parse_with_limits(&bytes, limits)?;
                     let prefix = entry.path.strip_suffix("resources.arsc").unwrap_or("");
-                    merged.merge_split(table, prefix)?;
+                    merged.merge_split_with_limits(table, prefix, limits)?;
                     Ok(())
                 })();
                 if let Err(error) = loaded {

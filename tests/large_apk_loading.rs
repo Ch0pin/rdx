@@ -66,6 +66,20 @@ fn oversized_apk_retries_with_bounded_large_profile() {
         .take(3)
         .cloned()
         .collect();
+    assert!(
+        !samples.is_empty(),
+        "expected source samples from the supplied APK"
+    );
+    let icon = engine
+        .prepared_container()
+        .and_then(|container| rdx::app_icon::load(&container, engine.resource_table()));
+    if std::env::var_os("RDX_REQUIRE_ICON").is_some() {
+        assert!(
+            icon.is_some(),
+            "launcher icon failed to decode: {:?}",
+            engine.resource_error()
+        );
+    }
     let mut reports = Vec::new();
     for name in samples {
         let (code, coverage) = engine
@@ -76,6 +90,6 @@ fn oversized_apk_retries_with_bounded_large_profile() {
     }
     eprintln!(
         "LARGE_APK_RESULT {}",
-        serde_json::json!({"classes":project.classes.len(),"standard_failure":format!("{error:#}"),"standard_seconds":standard_seconds,"large_seconds":large_seconds,"sample_sources":reports})
+        serde_json::json!({"classes":project.classes.len(),"icon_decoded":icon.is_some(),"standard_failure":format!("{error:#}"),"standard_seconds":standard_seconds,"large_seconds":large_seconds,"sample_sources":reports})
     );
 }

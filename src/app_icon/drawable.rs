@@ -694,10 +694,15 @@ mod tests {
     fn app_icon_local_apk() {
         let path = std::env::var("RDX_ICON_APK").expect("RDX_ICON_APK");
         let container = PackageContainer::open(std::path::Path::new(&path)).unwrap();
+        let limits = if std::env::var_os("RDX_ICON_LARGE").is_some() {
+            crate::load_limits::LoadLimits::Large
+        } else {
+            crate::load_limits::LoadLimits::Standard
+        };
         let bytes = container
-            .read_path("resources.arsc", 64 * 1024 * 1024)
+            .read_path("resources.arsc", limits.resource_table_bytes())
             .unwrap();
-        let table = ResourceTable::parse(&bytes).unwrap();
+        let table = ResourceTable::parse_with_limits(&bytes, limits).unwrap();
         let icon = super::super::load(&container, &table).expect("launcher icon");
         assert_eq!(icon.dimensions(), (48, 48));
         assert!(icon.pixels().any(|p| p.0[3] > 200));

@@ -70,7 +70,15 @@ fn config(b: &[u8]) -> String {
 }
 impl ResourceTable {
     /// Merge one split table while retaining the origin of file-backed values.
-    pub fn merge_split(&mut self, mut other: Self, prefix: &str) -> Result<()> {
+    pub fn merge_split(&mut self, other: Self, prefix: &str) -> Result<()> {
+        self.merge_split_with_limits(other, prefix, crate::load_limits::LoadLimits::Standard)
+    }
+    pub(crate) fn merge_split_with_limits(
+        &mut self,
+        mut other: Self,
+        prefix: &str,
+        limits: crate::load_limits::LoadLimits,
+    ) -> Result<()> {
         let variant_count = self
             .variant_count
             .checked_add(other.variant_count)
@@ -80,7 +88,7 @@ impl ResourceTable {
             .checked_add(other.retained_bytes)
             .context("Resource index byte count overflow")?;
         ensure!(
-            variant_count <= MAX_VALUES && retained_bytes <= 256 * 1024 * 1024,
+            variant_count <= MAX_VALUES && retained_bytes <= limits.resource_index_bytes(),
             "Combined resource index exceeds native budget"
         );
         for (id, resource) in &other.entries {
@@ -117,9 +125,16 @@ impl ResourceTable {
         Ok(())
     }
     pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::parse_with_limits(bytes, crate::load_limits::LoadLimits::Standard)
+    }
+    pub(crate) fn parse_with_limits(
+        bytes: &[u8],
+        limits: crate::load_limits::LoadLimits,
+    ) -> Result<Self> {
         ensure!(
-            bytes.len() <= 64 * 1024 * 1024,
-            "Resource table exceeds 64 MiB"
+            bytes.len() as u64 <= limits.resource_table_bytes(),
+            "Resource table exceeds {} MiB",
+            limits.resource_table_bytes() / (1024 * 1024)
         );
         let (kind, header, b) = chunk(bytes, 0)?;
         ensure!(
@@ -277,7 +292,7 @@ impl ResourceTable {
                         + kind.len()
                         + 128;
                     ensure!(
-                        retained <= 256 * 1024 * 1024,
+                        retained <= limits.resource_index_bytes(),
                         "Decoded resource index exceeds budget"
                     );
                     let resource = table.entries.entry(id).or_insert_with(|| Resource {
@@ -824,5 +839,64 @@ impl ResourceTable {
         code.links.sort_by_key(|l| l.start);
         code.source = source;
         code.source_hash = source_identity(&code.source);
+    }
+}
+
+#[cfg(test)]
+mod loading_limit_tests {
+    use super::*;
+    use crate::load_limits::LoadLimits;
+
+    #[test]
+    fn merged_resource_index_keeps_profile_budget() {
+        let over_standard = || ResourceTable {
+            retained_bytes: LoadLimits::Standard.resource_index_bytes() + 1,
+            ..Default::default()
+        };
+        let mut merged = ResourceTable::default();
+        assert!(merged.merge_split(over_standard(), "").is_err());
+        assert_eq!(merged.retained_bytes, 0);
+        merged
+            .merge_split_with_limits(over_standard(), "", LoadLimits::Large)
+            .unwrap();
+        assert!(
+            merged
+                .merge_split_with_limits(over_standard(), "", LoadLimits::Large)
+                .is_err()
+        );
+        assert_eq!(
+            merged.retained_bytes,
+            LoadLimits::Standard.resource_index_bytes() + 1
+        );
+    }
+
+    #[test]
+    fn large_table_input_requires_opt_in_and_still_checks_chunk_bounds() {
+        // A valid table envelope containing one unknown extension chunk. Its
+        // payload exercises the input limit without allocating a decoded index.
+        let size = 64 * 1024 * 1024 + 20;
+        let mut bytes = vec![0; size];
+        bytes[..2].copy_from_slice(&2u16.to_le_bytes());
+        bytes[2..4].copy_from_slice(&12u16.to_le_bytes());
+        bytes[4..8].copy_from_slice(&(size as u32).to_le_bytes());
+        bytes[12..14].copy_from_slice(&0xfffeu16.to_le_bytes());
+        bytes[14..16].copy_from_slice(&8u16.to_le_bytes());
+        bytes[16..20].copy_from_slice(&((size - 12) as u32).to_le_bytes());
+        assert!(
+            ResourceTable::parse(&bytes)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("64 MiB")
+        );
+        assert!(ResourceTable::parse_with_limits(&bytes, LoadLimits::Large).is_ok());
+        bytes[16..20].copy_from_slice(&(size as u32).to_le_bytes());
+        assert!(
+            ResourceTable::parse_with_limits(&bytes, LoadLimits::Large)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Truncated resource chunk")
+        );
     }
 }

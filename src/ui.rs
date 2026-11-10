@@ -772,7 +772,13 @@ impl App {
             } else {
                 ui.label("Status: Stopped");
                 if ui.add_enabled(self.project.is_some() && !self.loading_project, egui::Button::new("Start server")).clicked() { self.start_mcp(); }
-                if self.project.is_none() { ui.label("Open an APK, XAPK, APKS, or DEX to enable this instance."); }
+                if self.loading_project {
+                    ui.label("Project loading is in progress. MCP becomes available when it finishes.");
+                } else if self.project.is_none() && self.path.is_some() {
+                    ui.label("Project loading did not complete. Resolve the loading error in Diagnostics, then reload before starting MCP.");
+                } else if self.project.is_none() {
+                    ui.label("Open an APK, XAPK, APKS, or DEX to enable this instance.");
+                }
             }
             if ui.button("Copy MCP client configuration").clicked() {
                 match rdx::mcp::client_config() { Ok(config) => ui.ctx().copy_text(config), Err(e) => self.mcp_error=e.to_string() }
@@ -3055,8 +3061,10 @@ impl App {
                 if can_retry {
                     ui.label("Retry with the large-APK profile:");
                     ui.label("• 2 GiB retained parsed-DEX budget
-• 400,000 classes
-• 512 MiB combined DEX input");
+• 600,000 classes
+• 512 MiB combined DEX input
+• 128 MiB per resource table
+• 512 MiB decoded resource index");
                     ui.label("Total application RAM can be higher than the parsing budget. These limits apply to this project for this session.");
                 } else {
                     ui.label("This input also exceeds the available large-APK profile. Loading remains stopped; diagnostics show the limit reached.");
@@ -4618,6 +4626,7 @@ mod settings_tests {
     fn mcp_panel_exposes_controls_without_starting_a_service() {
         let mut app = navigation_test_app();
         app.show_mcp = true;
+        app.path = Some(PathBuf::from("/tmp/failed.apk"));
         let ctx = egui::Context::default();
         let mut labels = String::new();
         for _ in 0..2 {
@@ -4641,6 +4650,10 @@ mod settings_tests {
         assert!(labels.contains("MCP Server"), "{labels}");
         assert!(labels.contains("Start server"), "{labels}");
         assert!(labels.contains("Copy MCP client configuration"), "{labels}");
+        assert!(
+            labels.contains("Project loading did not complete"),
+            "{labels}"
+        );
         assert!(app.mcp_server.is_none());
     }
 

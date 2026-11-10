@@ -21,6 +21,33 @@ pub fn method_id(method: &DexMethod) -> String {
         method.return_type
     )
 }
+
+/// Smali p aliases refer to physical input words; register reuse does not retain argument identity.
+pub(crate) fn input_registers(method: &DexMethod) -> serde_json::Value {
+    use serde_json::json;
+    let Some(code) = method.code.as_ref() else {
+        return json!({"status":"no_code","aliases":[]});
+    };
+    let Some(first) = code.registers.checked_sub(code.ins) else {
+        return json!({"status":"invalid_input_count","aliases":[]});
+    };
+    let mut roles = Vec::new();
+    if method.access_flags & 8 == 0 {
+        roles.push((None, method.declaring_type.as_ref(), 0));
+    }
+    for (index, ty) in method.parameters.iter().enumerate() {
+        roles.push((Some(index), ty.as_ref(), 0));
+        if matches!(ty.as_ref(), "J" | "D") {
+            roles.push((Some(index), ty.as_ref(), 1));
+        }
+    }
+    if roles.len() != code.ins as usize {
+        return json!({"status":"declaration_input_mismatch","aliases":[]});
+    }
+    json!({"status":"mapped","input_words":code.ins,"truncated":roles.len()>256,
+        "aliases":roles.iter().take(256).enumerate().map(|(word,(parameter,ty,part))|json!({"alias":format!("p{word}"),"register":usize::from(first)+word,"parameter_index":parameter,"descriptor":ty,"word":part,"receiver":parameter.is_none()})).collect::<Vec<_>>(),
+        "semantics":"pN aliases input register words, including this and both words of long/double arguments. Registers can be overwritten; this is not value provenance."})
+}
 pub(crate) fn symbol(s: &DexSymbols, kind: char, index: usize) -> Option<String> {
     match kind {
         's' => s.strings.get(index).map(|v| format!("{v:?}")),
@@ -824,6 +851,26 @@ fn append_method(
             "    .registers {} // inputs={}, outputs={}, try_blocks={}\n",
             code.registers, code.ins, code.outs, code.tries
         ));
+        let aliases = input_registers(method);
+        if let Some(rows) = aliases["aliases"].as_array()
+            && !rows.is_empty()
+        {
+            out.push("    // Input aliases (registers may be reused): ");
+            for (index, row) in rows.iter().enumerate() {
+                if index > 0 {
+                    out.push(", ");
+                }
+                out.push(&format!(
+                    "{}=v{}",
+                    row["alias"].as_str().unwrap(),
+                    row["register"]
+                ));
+            }
+            if aliases["truncated"] == true {
+                out.push(" … (first 256 input words)");
+            }
+            out.push("\n");
+        }
         let words = &code.instructions;
         let mut pc = 0;
         while pc < words.len() {

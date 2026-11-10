@@ -124,6 +124,80 @@ impl Transport {
         }
     }
 
+    /// Protocol v2: bounded, cancellable analysis with host query callbacks.
+    pub fn project_request(
+        &mut self,
+        mut request: Value,
+        cancel: &std::sync::atomic::AtomicBool,
+        mut query: impl FnMut(&str, &Value) -> Result<Value>,
+    ) -> Result<Value> {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+        self.next_id += 1;
+        let id = self.next_id;
+        request["protocol"] = json!(2);
+        request["id"] = json!(id);
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let outcome = (|| -> Result<Value> {
+            let send = |value: &Value| -> Result<()> {
+                let mut bytes = serde_json::to_vec(value)?;
+                anyhow::ensure!(bytes.len() <= 8 * 1024 * 1024, "Plugin frame exceeds 8 MiB");
+                bytes.push(b'\n');
+                self.requests
+                    .try_send(bytes)
+                    .context("Plugin input queue unavailable")?;
+                Ok(())
+            };
+            send(&request)?;
+            let mut queries = 0;
+            let mut query_ids = std::collections::HashSet::new();
+            loop {
+                anyhow::ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "Plugin analysis exceeded 300 seconds"
+                );
+                let response = match self.replies.recv_timeout(Duration::from_millis(50)) {
+                    Ok(value) => value.map_err(anyhow::Error::msg)?,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                anyhow::ensure!(
+                    response["protocol"] == 2 && response["id"] == id,
+                    "Plugin protocol or analysis ID mismatch"
+                );
+                if response["method"] == "host.query" {
+                    queries += 1;
+                    anyhow::ensure!(queries <= 512, "Plugin exceeded 512 host queries");
+                    let qid = response["query_id"]
+                        .as_u64()
+                        .context("Missing numeric query_id")?;
+                    anyhow::ensure!(query_ids.insert(qid), "Duplicate plugin query_id");
+                    let name = response["tool"].as_str().context("Missing query tool")?;
+                    let result = query(name, &response["arguments"]);
+                    let reply = match result {
+                        Ok(value) => json!({"protocol":2,"id":id,"query_id":qid,"result":value}),
+                        Err(error) => {
+                            json!({"protocol":2,"id":id,"query_id":qid,"error":format!("{error:#}")})
+                        }
+                    };
+                    send(&reply)?;
+                } else {
+                    if let Some(error) = response.get("error") {
+                        bail!("Plugin: {error}");
+                    }
+                    return response
+                        .get("result")
+                        .cloned()
+                        .context("Missing plugin result");
+                }
+            }
+        })();
+        // Analysis workers are single-use, even after application errors.
+        self.terminate();
+        outcome
+    }
+
     pub fn request(&mut self, mut request: Value) -> Result<Value> {
         if self.failed {
             bail!("Worker transport is closed; reopen the project to retry");

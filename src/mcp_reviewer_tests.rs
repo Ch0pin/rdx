@@ -860,6 +860,28 @@ fn assets_are_readable_searchable_and_binary_skips_are_explicit() {
     assert_eq!(first["total"], 2);
     assert_eq!(first["complete"], false);
     assert_eq!(first["coverage"]["files_skipped"], 1);
+    assert!(first["coverage"]["skipped_files"].is_null());
+    assert_eq!(first["coverage"]["skipped_details_included"], false);
+    let detailed = dispatch(
+        &mut engine,
+        &project,
+        "search_resources",
+        &json!({"query":"different","scope":"assets","include_skipped_details":true}),
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(
+        detailed["coverage"]["skipped_files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        detailed["coverage"]["diagnostics_id"],
+        first["coverage"]["diagnostics_id"]
+    );
+
     let mut next = args.clone();
     next["offset"] = json!(1);
     let second = dispatch(&mut engine, &project, "search_resources", &next, &cancel).unwrap();

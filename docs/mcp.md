@@ -125,8 +125,9 @@ arrays beyond 64 items and nesting beyond 8 levels are cut with an explicit
 List responses contain `next_offset`; text responses use Unicode character
 `offset` and `next_offset`. Continue until `next_offset` is null. Text paging
 only limits tool responses: it does not truncate the GUI viewer. Lists default
-to 100 items (maximum 500); text defaults to 32,000 characters (maximum 128,000),
-except `get_method_source`, which returns the complete selected method by default.
+to 100 items (maximum 500); all text, including `get_method_source`, defaults to
+32,000 characters (maximum 128,000). Long methods return `next_offset`, a source
+hash and an `export_source` hint instead of an oversized complete response.
 The same filters and project identity must be retained across pages.
 Responses exceeding the 8 MiB transport frame limit return `RESPONSE_TOO_LARGE`
 while keeping the connection available. Retry with a smaller page or narrower
@@ -1564,3 +1565,35 @@ an invoke does not establish absence of caller guards. Without source enrichment
 the status is `not_attempted`. `include_source_locations:true` supplies bounded
 reconstruction status, reasons and source/DEX locations as already documented.
 This feedback adds no source rendering to default call-graph queries.
+
+
+### Bounded reviewer output
+
+`get_call_graph` and `get_call_graph_batch` accept `max_output_bytes` (default
+65,536; range 16,384–1,048,576 for a single query, minimum 32,768 for a batch), measured over serialized result data before the
+MCP text/structured wrapper. Call-site responses are bounded after optional
+constant/source enrichment and filtering. `result_offset` is the absolute record
+position; `next_offset` resumes at the first record withheld by the byte budget.
+Filtered matched, excluded and unresolved arrays share that position sequence.
+A single record larger than the requested budget fails explicitly with guidance.
+
+Graph output remains a bounded node/edge overview. If clipped by size or graph
+limits, `continuation` supplies a complete call-site query starting at offset 0;
+follow that query's `next_offset` to enumerate relationships. This is a switch
+to call-site projection, not pagination of graph node IDs. Batch results retain
+both `next_method_offset` and each query's individual continuation.
+
+Asset searches return skipped counts and `diagnostics_id` by default. The ID
+hashes the ordered skipped-path/reason records; identical diagnostics share an
+ID across queries. Set `include_skipped_details=true` with `scope="assets"` to
+include up to 100 details. Withheld details are null, not an empty assertion of
+no skipped files. The existing `complete=false` boundary remains unchanged.
+
+DEX method headers identify physical input aliases (`p0=vN`, etc.). These names
+include the receiver and both words of wide parameters; registers may be reused
+later in the method. `get_method_source(include_dex_summary=true)` also reports
+parameter roles and up to 32 Bundle/BaseBundle `getString`/`getBoolean` reads.
+Keys require agreement across the supported constant-flow analysis; result
+registers identify the immediate `move-result`, not subsequent taint flow.
+Unsupported or over-budget proofs remain explicit. This optional summary does
+not trigger Java reconstruction beyond the requested source format.

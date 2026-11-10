@@ -61,6 +61,7 @@ enum Event {
         >,
     ),
     Archive(u64, Arc<Archive>),
+    IndexingStage(u64, &'static str),
     AppIcon(u64, image::RgbaImage),
     PackageName(u64, String),
     Opened(u64, Result<ProjectSnapshot, String>),
@@ -541,7 +542,8 @@ pub struct App {
     initial: Option<PathBuf>,
     busy: bool,
     loading_project: bool,
-    loading_progress: f32,
+    loading_started: Option<std::time::Instant>,
+    loading_stage: &'static str,
     asset_busy: bool,
     export_busy: bool,
     pending_dialog: Option<u64>,
@@ -575,6 +577,11 @@ pub struct App {
     show_plugins: bool,
     plugin_busy: bool,
     plugin_output: String,
+    project_plugins: Arc<rdx::plugin_analysis::Controller>,
+    plugin_analysis_id: Option<String>,
+    plugin_page: usize,
+    plugin_arguments: String,
+    plugin_results: crate::plugin_window::ResultsWindow,
     diagnostics: Vec<String>,
     screenshot: crate::screenshot::RegionCapture,
     /// Pairs a remapped Ctrl/Cmd+primary press with its release (see `raw_input_hook`).
@@ -681,7 +688,8 @@ impl App {
             initial,
             busy: false,
             loading_project: false,
-            loading_progress: 0.0,
+            loading_started: None,
+            loading_stage: "Opening package…",
             asset_busy: false,
             export_busy: false,
             pending_dialog: None,
@@ -716,6 +724,11 @@ impl App {
             show_plugins: false,
             plugin_busy: false,
             plugin_output: String::new(),
+            project_plugins: Arc::default(),
+            plugin_analysis_id: None,
+            plugin_page: 0,
+            plugin_arguments: "{}".into(),
+            plugin_results: Default::default(),
             diagnostics: settings_error.into_iter().collect(),
             screenshot: crate::screenshot::RegionCapture::Idle,
             screenshot_remapped_primary: false,
@@ -723,7 +736,7 @@ impl App {
     }
     fn start_mcp(&mut self) {
         if let Some(snapshot) = self.shared_project.clone() {
-            match rdx::mcp::Server::start_shared(snapshot) {
+            match rdx::mcp::Server::start_shared_plugins(snapshot, self.project_plugins.clone()) {
                 Ok(server) => {
                     self.mcp_server = Some(server);
                     self.mcp_error.clear();
@@ -814,6 +827,14 @@ impl App {
         );
     }
     fn stop(&mut self) {
+        self.project_plugins.cancel_all();
+        self.project_plugins = Arc::default();
+        for (plugin, enabled) in &self.plugins {
+            self.project_plugins.set_enabled(plugin, *enabled);
+        }
+        self.plugin_analysis_id = None;
+        self.plugin_page = 0;
+        self.plugin_results = Default::default();
         self.mcp_server = None;
         if let Some(cancel) = self.analysis_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
@@ -851,7 +872,8 @@ impl App {
         self.shared_project = None;
         self.busy = false;
         self.loading_project = false;
-        self.loading_progress = 0.0;
+        self.loading_started = None;
+        self.loading_stage = "Opening package…";
         self.asset_busy = false;
         self.export_busy = false;
     }
@@ -879,7 +901,8 @@ impl App {
         self.path = Some(path.clone());
         self.busy = true;
         self.loading_project = true;
-        self.loading_progress = 0.05;
+        self.loading_started = Some(std::time::Instant::now());
+        self.loading_stage = "Opening package…";
         self.status = "Indexing Android package or DEX with native Rust…".into();
         let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
         thread::spawn(move || {
@@ -889,6 +912,11 @@ impl App {
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("dex"))
                 {
+                    let _ = tx.send(Event::IndexingStage(
+                        generation,
+                        "Reading classes and resources…",
+                    ));
+                    ctx.request_repaint();
                     engine.open(&path)?
                 } else {
                     let source = rdx::package_container::PackageContainer::open(&path)?;
@@ -897,6 +925,11 @@ impl App {
                     ctx.request_repaint();
                     engine.open_prepared(source)?
                 };
+                let _ = tx.send(Event::IndexingStage(
+                    generation,
+                    "Preparing manifest and app icon…",
+                ));
+                ctx.request_repaint();
                 if let Ok(xml) = engine.read_resource("AndroidManifest.xml")
                     && let Ok(package) = rdx::manifest_summary::package_name(&xml)
                     && !package.trim().is_empty()
@@ -909,6 +942,11 @@ impl App {
                 {
                     let _ = tx.send(Event::AppIcon(generation, icon));
                 }
+                let _ = tx.send(Event::IndexingStage(
+                    generation,
+                    "Verifying loaded project…",
+                ));
+                ctx.request_repaint();
                 Ok(project)
             })
             .map_err(|e: anyhow::Error| format!("{e:#}"));
@@ -2470,15 +2508,20 @@ impl App {
                         egui::TextureOptions::LINEAR,
                     ));
                 }
+                Event::IndexingStage(generation, stage)
+                    if generation == self.generation && self.loading_project =>
+                {
+                    self.loading_stage = stage;
+                }
                 Event::Archive(generation, archive) if generation == self.generation => {
                     self.archive = Some(archive);
-                    self.loading_progress = self.loading_progress.max(0.25);
+                    self.loading_stage = "Reading classes and resources…";
                     self.rebuild_tree();
                 }
                 Event::Opened(generation, result) if generation == self.generation => {
                     self.busy = false;
                     self.loading_project = false;
-                    self.loading_progress = 1.0;
+                    self.loading_started = None;
                     match result {
                         Ok(snapshot) => {
                             let engine = snapshot.engine().clone();
@@ -2949,82 +2992,246 @@ impl App {
             self.decode_resource_mode(index, ctx, true);
         }
     }
+    fn indexing_banner(&self, ctx: &egui::Context) {
+        // Independent of navigation/status text and toolbar auto-hide.
+        if !self.loading_project {
+            return;
+        }
+        let name = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Project".into());
+        let seconds = self
+            .loading_started
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        egui::TopBottomPanel::top("project_indexing_banner")
+            .frame(egui::Frame::default().fill(ctx.style().visuals.selection.bg_fill).inner_margin(10.0))
+            .show(ctx,|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spinner();
+                    ui.strong(format!("Indexing project · {name}"));
+                    ui.label(format!("{seconds}s elapsed"));
+                });
+                ui.label(self.loading_stage);
+                ui.label(if self.archive.is_some() {
+                    "You can browse archive files now. Class navigation, code search and analysis become available when indexing finishes."
+                } else {
+                    "Preparing project contents. Class navigation, code search and analysis become available when indexing finishes."
+                });
+            });
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+
     fn plugins_window(&mut self, ctx: &egui::Context) {
-        let mut visible = self.show_plugins;
-        egui::Window::new("Plugins")
-            .open(&mut visible)
-            .default_width(600.0)
-            .show(ctx, |ui| {
-                ui.label("Local executable plugins · protocol v1");
+        if self.show_plugins {
+            ctx.show_viewport_immediate(
+                crate::plugin_window::manager_id(),
+                egui::ViewportBuilder::default()
+                    .with_title("RDX — Plugins")
+                    .with_inner_size([720.0, 440.0])
+                    .with_min_inner_size([500.0, 300.0]),
+                |ctx, _| self.plugin_manager_contents(ctx),
+            );
+        }
+        if self.plugin_results.visible {
+            let page = if let (Some(id), Some(snapshot)) =
+                (&self.plugin_analysis_id, &self.shared_project)
+            {
+                self.project_plugins
+                    .get(id, snapshot.apk_sha256(), self.plugin_page, 25, false)
+                    .unwrap_or_else(|e| serde_json::json!({"error":format!("{e:#}")}))
+            } else {
+                serde_json::json!({})
+            };
+            let actions = self.plugin_results.show(ctx, &page);
+            if actions.cancel
+                && let (Some(id), Some(snapshot)) = (&self.plugin_analysis_id, &self.shared_project)
+            {
+                let _ = self
+                    .project_plugins
+                    .get(id, snapshot.apk_sha256(), 0, 25, true);
+            }
+            if actions.previous {
+                self.plugin_page = self.plugin_results.previous_offsets.pop().unwrap_or(0);
+            }
+            if let Some(next) = actions.next {
+                self.plugin_results.previous_offsets.push(self.plugin_page);
+                self.plugin_page = next;
+            }
+            if let Some(method) = actions.method {
+                self.navigate_analysis_owner(method, true, ctx);
+            }
+        }
+    }
+    fn plugin_manager_contents(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.show_plugins = false;
+            return;
+        }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Plugins");
+            ui.label("Add an analysis plugin, enable it, then run it on your loaded project.");
+            ui.weak("Enabled plugins run with your user permissions. Enable code you trust.");
+            if ui.button("Add plugin…").clicked()
+                && let Some(id) = self.begin_dialog()
+            {
+                let future = rfd::AsyncFileDialog::new()
+                    .add_filter("Plugin manifest", &["json"])
+                    .pick_file();
+                let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
+                thread::spawn(move || {
+                    let path = pollster::block_on(future).map(|h| h.path().to_owned());
+                    let _ = tx.send(Event::Dialog(generation, id, DialogResult::Plugin(path)));
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    ctx.request_repaint_of(crate::plugin_window::manager_id());
+                });
+            }
+            ui.add_space(8.0);
+            ui.collapsing("Advanced analysis options", |ui| {
                 ui.label(
-                    "Enabled plugins run with your user permissions. Only enable code you trust.",
+                    "Optional JSON arguments supplied to the plugin. Leave {} for its defaults.",
                 );
-                if ui.button("Load plugin manifest…").clicked()
-                    && let Some(id) = self.begin_dialog()
-                {
-                    let future = rfd::AsyncFileDialog::new()
-                        .add_filter("Plugin manifest", &["json"])
-                        .pick_file();
-                    let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
-                    thread::spawn(move || {
-                        let path =
-                            pollster::block_on(future).map(|handle| handle.path().to_owned());
-                        let _ = tx.send(Event::Dialog(generation, id, DialogResult::Plugin(path)));
-                        ctx.request_repaint();
-                    });
-                }
-                ui.separator();
-                let active_class = self
-                    .tabs
-                    .get(self.selected)
-                    .filter(|t| matches!(t.target, Target::Class(_)));
-                for (plugin, enabled) in &mut self.plugins {
-                    ui.horizontal(|ui| {
-                        ui.checkbox(enabled, &plugin.name);
-                        ui.small(&plugin.id);
-                        if ui
-                            .add_enabled(
-                                *enabled && !self.plugin_busy && active_class.is_some(),
-                                egui::Button::new("Run on active class"),
-                            )
-                            .clicked()
-                        {
-                            let tab = active_class.unwrap();
-                            let (plugin, name, source, tx, generation, ctx) = (
-                                plugin.clone(),
-                                tab.name.clone(),
-                                tab.text().unwrap().to_owned(),
-                                self.tx.clone(),
-                                self.generation,
-                                ctx.clone(),
-                            );
-                            self.plugin_busy = true;
-                            thread::spawn(move || {
-                                let result = plugin
-                                    .analyze(&name, &source)
-                                    .and_then(|v| Ok(serde_json::to_string_pretty(&v)?))
-                                    .map_err(|e| format!("Plugin failed: {e:#}"));
-                                let _ = tx.send(Event::Plugin(generation, result));
-                                ctx.request_repaint();
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.plugin_arguments)
+                        .desired_width(f32::INFINITY),
+                );
+            });
+            ui.separator();
+            let available = self.project_plugins.list();
+            let running = available["analyses"]
+                .as_array()
+                .is_some_and(|jobs| jobs.iter().any(|j| j["status"] == "running"));
+            if running {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                ctx.request_repaint_after_for(
+                    std::time::Duration::from_millis(200),
+                    egui::ViewportId::ROOT,
+                );
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("plugin_manager_entries")
+                .show(ui, |ui| {
+                    let active_class = self
+                        .tabs
+                        .get(self.selected)
+                        .filter(|t| matches!(t.target, Target::Class(_)));
+                    for (plugin, enabled) in &mut self.plugins {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.checkbox(enabled, &plugin.name).changed() {
+                                self.project_plugins.set_enabled(plugin, *enabled);
+                            }
+                            if plugin.protocol == 2 {
+                                if ui
+                                    .add_enabled(
+                                        *enabled && self.shared_project.is_some() && !running,
+                                        egui::Button::new("Run analysis"),
+                                    )
+                                    .clicked()
+                                {
+                                    let arguments = serde_json::from_str(&self.plugin_arguments)
+                                        .map_err(anyhow::Error::from);
+                                    match arguments.and_then(|args| {
+                                        self.project_plugins.start(
+                                            self.shared_project.clone().unwrap(),
+                                            &plugin.id,
+                                            args,
+                                        )
+                                    }) {
+                                        Ok(job) => {
+                                            self.plugin_analysis_id =
+                                                job["analysis_id"].as_str().map(str::to_owned);
+                                            self.plugin_page = 0;
+                                            self.plugin_results.open();
+                                            ctx.send_viewport_cmd_to(
+                                                crate::plugin_window::results_id(),
+                                                egui::ViewportCommand::Focus,
+                                            );
+                                        }
+                                        Err(error) => self.plugin_output = format!("{error:#}"),
+                                    }
+                                }
+                            } else if ui
+                                .add_enabled(
+                                    *enabled
+                                        && !self.plugin_busy
+                                        && active_class.is_some_and(|t| t.text().is_some()),
+                                    egui::Button::new("Run on active class"),
+                                )
+                                .clicked()
+                            {
+                                let tab = active_class.unwrap();
+                                let (plugin, name, source, tx, generation, ctx) = (
+                                    plugin.clone(),
+                                    tab.name.clone(),
+                                    tab.text().unwrap().to_owned(),
+                                    self.tx.clone(),
+                                    self.generation,
+                                    ctx.clone(),
+                                );
+                                self.plugin_busy = true;
+                                thread::spawn(move || {
+                                    let result = plugin
+                                        .analyze(&name, &source)
+                                        .and_then(|v| Ok(serde_json::to_string_pretty(&v)?))
+                                        .map_err(|e| format!("Plugin failed: {e:#}"));
+                                    let _ = tx.send(Event::Plugin(generation, result));
+                                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                                    ctx.request_repaint_of(crate::plugin_window::manager_id());
+                                });
+                            }
+                        });
+                    }
+                    if self.plugins.is_empty() {
+                        ui.label("Choose the plugin.json file from your plugin folder.");
+                    }
+                    if let Some(jobs) = available["analyses"].as_array()
+                        && !jobs.is_empty()
+                    {
+                        ui.separator();
+                        ui.strong("Recent analyses");
+                        for (index, job) in jobs.iter().enumerate() {
+                            let id = job["analysis_id"].as_str().unwrap_or("");
+                            let name = self
+                                .plugins
+                                .iter()
+                                .find(|(p, _)| Some(p.id.as_str()) == job["plugin_id"].as_str())
+                                .map(|(p, _)| p.name.as_str())
+                                .unwrap_or("Analysis");
+                            let state = match job["status"].as_str() {
+                                Some("complete") => "Ready",
+                                Some("running") => "Running",
+                                Some("cancelled") => "Cancelled",
+                                _ => "Failed",
+                            };
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(format!("Run {} · {} · {}", index + 1, name, state));
+                                if ui.button("View results").clicked() {
+                                    if self.plugin_analysis_id.as_deref() != Some(id) {
+                                        self.plugin_page = 0;
+                                        self.plugin_results.previous_offsets.clear();
+                                    }
+                                    self.plugin_analysis_id = Some(id.into());
+                                    self.plugin_results.visible = true;
+                                    ctx.send_viewport_cmd_to(
+                                        crate::plugin_window::results_id(),
+                                        egui::ViewportCommand::Focus,
+                                    );
+                                }
                             });
                         }
-                    });
-                }
-                if self.plugins.is_empty() {
-                    ui.weak("Example: plugins/source-stats/plugin.json");
-                }
-                if self.plugin_busy {
-                    ui.spinner();
-                }
-                egui::ScrollArea::vertical()
-                    .max_height(260.0)
-                    .show(ui, |ui| {
-                        ui.monospace(&self.plugin_output);
-                    });
-                ui.separator();
-                ui.weak("JADX Java/GUI plugin compatibility is not implemented in this preview.");
-            });
-        self.show_plugins = visible;
+                    }
+                    if self.plugin_busy {
+                        ui.spinner();
+                    }
+                    if !self.plugin_output.is_empty() {
+                        ui.separator();
+                        ui.label(&self.plugin_output);
+                    }
+                });
+        });
     }
 }
 
@@ -3508,6 +3715,10 @@ impl eframe::App for App {
                             }
                             if ui.button("Plugins…").clicked() {
                                 self.show_plugins = true;
+                                ctx.send_viewport_cmd_to(
+                                    crate::plugin_window::manager_id(),
+                                    egui::ViewportCommand::Focus,
+                                );
                                 ui.close_menu();
                             }
                         });
@@ -3574,6 +3785,10 @@ impl eframe::App for App {
                     }
                     if icons::button(ui, Icon::Plugin, "Manage plugins", true).clicked() {
                         self.show_plugins = true;
+                        ctx.send_viewport_cmd_to(
+                            crate::plugin_window::manager_id(),
+                            egui::ViewportCommand::Focus,
+                        );
                     }
                     if icons::button(ui, Icon::Search, "Code search (Cmd/Ctrl+Shift+F)", true)
                         .clicked()
@@ -3649,15 +3864,10 @@ impl eframe::App for App {
                 ctx.request_repaint();
             });
         }
+        self.indexing_banner(ctx);
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if self.busy && self.loading_project {
-                    let percent = (self.loading_progress * 100.0).round() as u8;
-                    ui.add(egui::ProgressBar::new(self.loading_progress)
-                        .animate(false).desired_width(160.0)
-                        .text(format!("Loading / indexing… {percent}%")))
-                        .on_hover_text("Completed native loading stages; the current indexing stage is still running.");
-                } else if self.busy {
+                if self.busy && !self.loading_project {
                     ui.spinner();
                 }
                 if self.asset_busy {
@@ -3718,7 +3928,9 @@ impl eframe::App for App {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if self.tree.count == 0 {
-                            ui.weak(if self.filter.is_empty() {
+                            ui.weak(if self.loading_project {
+                                "Preparing project contents…"
+                            } else if self.filter.is_empty() {
                                 "No contents loaded"
                             } else {
                                 "No matching classes or files"
@@ -4159,6 +4371,76 @@ fn searching_status(workers: usize) -> String {
 #[cfg(test)]
 mod settings_tests {
     #[test]
+    fn indexing_banner_survives_navigation_status_and_has_no_guessed_percentage() {
+        let mut app = navigation_test_app();
+        app.loading_project = true;
+        app.busy = false; // Other UI work must not hide project loading.
+        app.status = "Asset ready".into();
+        app.menu_auto_hide = true;
+        app.path = Some(PathBuf::from("/tmp/example.apk"));
+        app.loading_started = Some(std::time::Instant::now());
+        app.loading_stage = "Reading classes and resources…";
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.indexing_banner(ctx));
+        fn labels(shape: &egui::epaint::Shape, out: &mut String) {
+            match shape {
+                egui::epaint::Shape::Text(t) => out.push_str(t.galley.text()),
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        labels(s, out)
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut text = String::new();
+        for shape in output.shapes {
+            labels(&shape.shape, &mut text);
+        }
+        assert!(text.contains("Indexing project · example.apk"), "{text}");
+        assert!(text.contains("Reading classes and resources"), "{text}");
+        assert!(text.contains("elapsed"), "{text}");
+        assert!(!text.contains('%'), "{text}");
+        app.loading_project = false;
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.indexing_banner(ctx));
+        let mut text = String::new();
+        for shape in output.shapes {
+            labels(&shape.shape, &mut text);
+        }
+        assert!(!text.contains("Indexing project"), "{text}");
+    }
+
+    #[test]
+    fn indexing_stage_updates_ignore_old_projects_and_completed_loads() {
+        let mut app = navigation_test_app();
+        let ctx = egui::Context::default();
+        app.loading_project = true;
+        app.loading_stage = "Opening package…";
+        app.tx
+            .send(Event::IndexingStage(
+                app.generation.wrapping_add(1),
+                "stale",
+            ))
+            .unwrap();
+        app.events(&ctx);
+        assert_eq!(app.loading_stage, "Opening package…");
+        app.tx
+            .send(Event::IndexingStage(
+                app.generation,
+                "Reading classes and resources…",
+            ))
+            .unwrap();
+        app.events(&ctx);
+        assert_eq!(app.loading_stage, "Reading classes and resources…");
+        app.loading_project = false;
+        app.tx
+            .send(Event::IndexingStage(app.generation, "late"))
+            .unwrap();
+        app.events(&ctx);
+        assert_eq!(app.loading_stage, "Reading classes and resources…");
+    }
+
+    #[test]
     fn mcp_panel_exposes_controls_without_starting_a_service() {
         let mut app = navigation_test_app();
         app.show_mcp = true;
@@ -4499,7 +4781,8 @@ mod settings_tests {
             initial: None,
             busy: false,
             loading_project: false,
-            loading_progress: 0.0,
+            loading_started: None,
+            loading_stage: "Opening package…",
             asset_busy: false,
             export_busy: false,
             pending_dialog: None,
@@ -4529,6 +4812,11 @@ mod settings_tests {
             show_plugins: false,
             plugin_busy: false,
             plugin_output: String::new(),
+            project_plugins: Arc::default(),
+            plugin_analysis_id: None,
+            plugin_page: 0,
+            plugin_arguments: "{}".into(),
+            plugin_results: Default::default(),
             diagnostics: Vec::new(),
             screenshot: crate::screenshot::RegionCapture::Idle,
             screenshot_remapped_primary: false,

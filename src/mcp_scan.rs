@@ -273,6 +273,8 @@ pub(super) fn assets(
     let mut scanned = 0;
     let mut skipped = 0;
     let mut diagnostics = Vec::new();
+    let include_details = args["include_skipped_details"].as_bool().unwrap_or(false);
+    let mut diagnostics_hash = Sha256::new();
     for path in files {
         ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
         let content = reader
@@ -298,8 +300,11 @@ pub(super) fn assets(
             }
             Err(e) => {
                 skipped += 1;
-                if diagnostics.len() < 100 {
-                    diagnostics.push(json!({"resource_path":path,"reason":e.to_string()}));
+                let diagnostic = json!({"resource_path":path,"reason":e.to_string()});
+                diagnostics_hash.update(serde_json::to_vec(&diagnostic)?);
+                diagnostics_hash.update(b"\n");
+                if include_details && diagnostics.len() < 100 {
+                    diagnostics.push(diagnostic);
                 }
             }
         }
@@ -307,6 +312,6 @@ pub(super) fn assets(
     let mut result = page.finish()?;
     result["scope"] = json!("assets");
     result["complete"] = json!(skipped == 0);
-    result["coverage"] = json!({"files_total":total_files,"text_files_scanned":scanned,"files_skipped":skipped,"skipped_files":diagnostics,"diagnostics_truncated":skipped>100,"per_file_byte_limit":8*1024*1024});
+    result["coverage"] = json!({"files_total":total_files,"text_files_scanned":scanned,"files_skipped":skipped,"skipped_files":if include_details {json!(diagnostics)} else {Value::Null},"skipped_details_included":include_details,"diagnostics_id":format!("{:x}",diagnostics_hash.finalize()),"diagnostics_truncated":include_details && skipped>100,"skipped_details_hint":if !include_details && skipped>0 {Some("Repeat with include_skipped_details=true to read skipped-file reasons (up to 100)")}else{None},"per_file_byte_limit":8*1024*1024});
     Ok(result)
 }

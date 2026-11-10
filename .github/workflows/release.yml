@@ -61,6 +61,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev
       - name: Check formatting
         run: cargo fmt --check
+      - name: Test bundled Python plugins
+        run: python -m unittest discover -s plugins/logical-webview-inventory/tests -v
       - name: Lint
         run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
       - name: Test

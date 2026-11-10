@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import tomllib
@@ -29,7 +30,7 @@ def main():
     stage.mkdir()
     binary_dir = args.binary_dir.resolve()
     if args.platform.startswith('macos-'):
-        subprocess.run(['python3', str(ROOT / 'scripts/package_macos.py'), '--binary-dir', str(binary_dir)], check=True)
+        subprocess.run([sys.executable, str(ROOT / 'scripts/package_macos.py'), '--binary-dir', str(binary_dir)], check=True)
         app = stage / 'RDX.app'
         shutil.copytree(ROOT / 'target/RDX.app', app)
         subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(app)], check=True)
@@ -44,6 +45,7 @@ def main():
         shutil.copy2(ROOT / notice, stage / notice)
     shutil.copy2(ROOT / 'docs/install.md', stage / 'START-HERE.md')
     shutil.copytree(ROOT / 'docs', stage / 'docs', ignore=shutil.ignore_patterns('images'))
+    shutil.copytree(ROOT / 'plugins', stage / 'plugins', ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '.DS_Store', 'tests'))
     (stage / 'VERSION').write_text(version + '\n')
     (stage / 'BUILD.txt').write_text('Version: ' + version + '\nPlatform: ' + args.platform + '\nCommit: ' + os.environ.get('GITHUB_SHA', 'local') + '\n')
     dist = ROOT / 'dist'
@@ -57,7 +59,8 @@ def main():
         subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(stage), str(archive)], check=True)
     else:
         archive = dist / (name + '.zip')
-        with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as output:
+        # Some bundled upstream notices retain pre-1980 archive timestamps.
+        with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED, strict_timestamps=False) as output:
             for file in sorted(stage.rglob('*')):
                 if file.is_file():
                     output.write(file, arcname=file.relative_to(stage.parent))

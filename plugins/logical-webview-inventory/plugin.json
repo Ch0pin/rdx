@@ -1,0 +1,8 @@
+{
+  "protocol": 2,
+  "id": "logical-webview-inventory",
+  "name": "Logical WebView inventory (preview)",
+  "executable": "python3",
+  "args": ["analyzer.py"],
+  "capability": "project.analyze"
+}

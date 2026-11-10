@@ -6,6 +6,7 @@ __pycache__/
 *.dex
 !tests/fixtures/*.apk
 !tests/fixtures/*.dex
+!plugins/logical-webview-inventory/demo/classes.dex
 .env
 .env.*
 *.pem

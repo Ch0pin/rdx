@@ -1,6 +1,8 @@
 # Local plugin protocol
 
-Protocol 1 supports `source.analyze`: a plugin receives the selected class's native source representation (Java or explicitly labelled DEX) and returns JSON. This branch also previews protocol 2 `project.analyze`, with bounded host queries against the already-loaded project. Plugins cannot replace an engine or inject decompilation passes. Project results use the host's generic evidence-group viewer.
+Protocol 1 supports `source.analyze`: a plugin receives the selected class's native source representation (Java or explicitly labelled DEX) and returns JSON. Protocol 2 `project.analyze` is available as a preview, with bounded host queries against the already-loaded project. Plugins cannot replace an engine or inject decompilation passes. Project results use the host's generic evidence-group viewer.
+
+Bundled plugins live in the repository's dedicated [plugins directory](https://github.com/Ch0pin/rdx/tree/main/plugins). The [Logical WebView inventory](https://github.com/Ch0pin/rdx/tree/main/plugins/logical-webview-inventory) is the first project-analysis plugin. It requires Python 3.9+; the native application and source-statistics plugin do not. Release archives include plugin manifests, implementations and demos; plugins remain disabled until explicitly enabled.
 
 ## Manifest
 

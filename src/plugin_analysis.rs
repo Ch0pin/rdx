@@ -302,6 +302,38 @@ print(json.dumps(dict(protocol=2,id=r['id'],result={'items':[{'value':1},{'value
         }
     }
     #[test]
+    fn bundled_webview_plugin_runs_against_its_demo() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/logical-webview-inventory");
+        let plugin = Plugin::load(&root.join("plugin.json")).unwrap();
+        let snapshot = ProjectSnapshot::open(&root.join("demo/classes.dex")).unwrap();
+        let hash = snapshot.apk_sha256().to_owned();
+        let controller = Controller::default();
+        controller.set_enabled(&plugin, true);
+        let job = controller.start(snapshot, &plugin.id, json!({})).unwrap();
+        let id = job["analysis_id"].as_str().unwrap();
+        let status = done(&controller, id, &hash);
+        assert_eq!(status["status"], "complete", "{status}");
+        let page = controller.get(id, &hash, 0, 100, false).unwrap();
+        assert_eq!(page["total"], 4, "{page}");
+        let items = page["result"]["items"].as_array().unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| i["sinks"].as_array().unwrap().len())
+                .sum::<usize>(),
+            5
+        );
+        let help = items
+            .iter()
+            .find(|i| {
+                i["receiver_origin"]["field_id"] == "demo.Screen.help:Landroid/webkit/WebView;"
+            })
+            .unwrap();
+        assert_eq!(help["sinks"].as_array().unwrap().len(), 2);
+        assert_eq!(help["human"]["title"], "demo.Screen.help");
+        assert_eq!(page["result"]["coverage"]["sink_scan_complete"], true);
+    }
+    #[test]
     fn project_plugin_rejects_wrong_protocol() {
         let dir = tempfile::tempdir().unwrap();
         let p = plugin(

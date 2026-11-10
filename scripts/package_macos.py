@@ -34,6 +34,8 @@ def main():
     for notice in ('LICENSE', 'NOTICE'):
         shutil.copy2(ROOT / notice, resources / notice)
     shutil.copytree(ROOT / 'third_party', resources / 'third_party', dirs_exist_ok=True)
+    shutil.copytree(ROOT / 'plugins', resources / 'plugins', dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '.DS_Store', 'tests'))
     info = {
         'CFBundleExecutable': 'rdx',
         'CFBundleIdentifier': 'dev.rdx.desktop',

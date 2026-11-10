@@ -9,6 +9,7 @@ mod manifest_view;
 use rdx::manifest_summary;
 mod native_coverage;
 mod navigation;
+mod plugin_window;
 mod render_recovery;
 mod screenshot;
 mod search;

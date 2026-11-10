@@ -39,9 +39,13 @@ impl Plugin {
             "Plugin manifest exceeds 64 KiB"
         );
         let mut plugin: Self = serde_json::from_slice(&std::fs::read(&path)?)?;
-        ensure!(plugin.protocol == 1, "Unsupported plugin protocol");
         ensure!(
-            plugin.capability == "source.analyze",
+            matches!(plugin.protocol, 1 | 2),
+            "Unsupported plugin protocol"
+        );
+        ensure!(
+            (plugin.protocol == 1 && plugin.capability == "source.analyze")
+                || (plugin.protocol == 2 && plugin.capability == "project.analyze"),
             "Unsupported plugin capability"
         );
         ensure!(
@@ -51,7 +55,7 @@ impl Plugin {
         plugin.directory = path.parent().unwrap().into();
         Ok(plugin)
     }
-    fn resolve_executable(&self) -> Result<PathBuf> {
+    pub(crate) fn resolve_executable(&self) -> Result<PathBuf> {
         if self.executable_base == ExecutableBase::Application {
             ensure!(
                 Path::new(&self.executable).components().count() == 1
@@ -92,6 +96,7 @@ impl Plugin {
     }
 
     pub fn analyze(&self, class: &str, source: &str) -> Result<Value> {
+        ensure!(self.protocol == 1, "Use project analysis for protocol v2");
         let executable = self.resolve_executable()?;
         let mut command = Command::new(executable);
         command.args(&self.args).current_dir(&self.directory);

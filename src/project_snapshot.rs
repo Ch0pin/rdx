@@ -55,6 +55,10 @@ impl ProjectSnapshot {
         Ok(snapshot)
     }
 
+    pub fn apk_sha256(&self) -> &str {
+        &self.identity.hash
+    }
+
     pub fn engine(&self) -> &NativeEngine {
         &self.engine
     }

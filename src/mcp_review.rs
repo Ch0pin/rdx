@@ -388,7 +388,7 @@ pub(super) fn argument_filter(result: &mut Value, args: &Value) -> Result<()> {
     for site in sites.drain(..) {
         let compact = |reason: Value, proven: Option<&Value>| {
             let mut record = json!({"caller_method_id":site["caller_method_id"],"call_site_offset":site["call_site_offset"],
-                "invoke_instruction":site["invoke_instruction"],"depth":site["depth"],"reason":reason});
+                "invoke_instruction":site["invoke_instruction"],"depth":site["depth"],"result_offset":site["result_offset"],"reason":reason});
             if let Some(argument) = proven {
                 record["argument"] = argument.clone();
             }

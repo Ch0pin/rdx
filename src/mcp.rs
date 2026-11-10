@@ -24,6 +24,10 @@ mod discovery;
 #[path = "mcp_exports.rs"]
 mod exports;
 pub use exports::export_directory;
+#[path = "mcp_budget.rs"]
+mod budget;
+#[path = "mcp_dex_summary.rs"]
+mod dex_summary;
 #[path = "mcp_feedback.rs"]
 mod feedback;
 #[path = "mcp_registry.rs"]
@@ -139,6 +143,7 @@ struct LoadedProject {
     package_selection: String,
     literals: literals::Controller,
     exports: exports::Controller,
+    plugins: Arc<crate::plugin_analysis::Controller>,
 }
 impl LoadedProject {
     fn from_snapshot(snapshot: ProjectSnapshot, stop: Arc<AtomicBool>) -> Result<Self> {
@@ -170,6 +175,7 @@ impl LoadedProject {
             package_selection,
             literals,
             exports: exports::Controller::default(),
+            plugins: Arc::default(),
         })
     }
 }
@@ -196,6 +202,7 @@ impl Drop for WorkSlot {
     }
 }
 pub struct Server {
+    pub plugins: Arc<crate::plugin_analysis::Controller>,
     pub instance_id: String,
     stop: Arc<AtomicBool>,
     requests: Arc<Mutex<Vec<RequestWatch>>>,
@@ -219,6 +226,18 @@ impl Server {
             .unwrap_or(random_id()?);
         Self::start_shared_in(snapshot, registry()?, instance_id)
     }
+    pub fn start_shared_plugins(
+        snapshot: ProjectSnapshot,
+        plugins: Arc<crate::plugin_analysis::Controller>,
+    ) -> Result<Self> {
+        Self::start_source(
+            snapshot.identity.path.clone(),
+            registry()?,
+            random_id()?,
+            Some(snapshot),
+            plugins,
+        )
+    }
     fn start_shared_in(
         snapshot: ProjectSnapshot,
         directory: PathBuf,
@@ -229,16 +248,18 @@ impl Server {
             directory,
             instance_id,
             Some(snapshot),
+            Arc::default(),
         )
     }
     fn start_in(path: PathBuf, directory: PathBuf, instance_id: String) -> Result<Self> {
-        Self::start_source(path, directory, instance_id, None)
+        Self::start_source(path, directory, instance_id, None, Arc::default())
     }
     fn start_source(
         path: PathBuf,
         directory: PathBuf,
         instance_id: String,
         snapshot: Option<ProjectSnapshot>,
+        plugins: Arc<crate::plugin_analysis::Controller>,
     ) -> Result<Self> {
         let path = path.canonicalize().context("Cannot resolve APK path")?;
         let build = build_identity();
@@ -267,6 +288,7 @@ impl Server {
             requests.clone(),
             index.clone(),
         );
+        let loaded_plugins = plugins.clone();
         thread::spawn(move || {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let loading_path = path.clone();
@@ -280,10 +302,9 @@ impl Server {
                         }
                         None => ProjectSnapshot::open(&loading_path)?,
                     };
-                    Ok(Arc::new(LoadedProject::from_snapshot(
-                        snapshot,
-                        loading_stop,
-                    )?))
+                    let mut loaded = LoadedProject::from_snapshot(snapshot, loading_stop)?;
+                    loaded.plugins = loaded_plugins;
+                    Ok(Arc::new(loaded))
                 })();
                 let _ = tx.send(loaded);
             });
@@ -467,6 +488,7 @@ impl Server {
             }
         });
         Ok(Self {
+            plugins,
             instance_id,
             stop,
             requests,
@@ -545,6 +567,35 @@ fn project_request(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
+    if name == "list_analysis_plugins" {
+        return Ok(project.plugins.list());
+    }
+    if name == "run_plugin_analysis" {
+        check_project_file(project)?;
+        return project.plugins.start(
+            ProjectSnapshot {
+                engine: project.analysis_snapshot.as_ref().clone(),
+                project: project.project.clone(),
+                identity: Arc::new(crate::project_snapshot::InputIdentity {
+                    path: project.path.clone(),
+                    hash: project.hash.clone(),
+                    metadata: project.metadata.clone(),
+                }),
+            },
+            required(args, "plugin_id")?,
+            args.get("arguments").cloned().unwrap_or_else(|| json!({})),
+        );
+    }
+    if matches!(name, "get_plugin_analysis" | "cancel_plugin_analysis") {
+        check_project_file(project)?;
+        return project.plugins.get(
+            required(args, "analysis_id")?,
+            &project.hash,
+            args["offset"].as_u64().unwrap_or(0) as usize,
+            args["limit"].as_u64().unwrap_or(25) as usize,
+            name == "cancel_plugin_analysis",
+        );
+    }
     let normalized = feedback::aliases(name, args)?;
     let args = &normalized;
     if name == "get_export_status" || name == "cancel_export" {
@@ -1226,6 +1277,14 @@ fn dispatch(
         normalized["class_id"] = json!(resolved);
     }
     let mut result = dispatch_resolved(engine, project, name, &normalized, cancel)?;
+    if name == "get_call_graph"
+        && let Some(rows) = result["call_sites"].as_array_mut()
+    {
+        let offset = args["offset"].as_u64().unwrap_or(0);
+        for (i, row) in rows.iter_mut().enumerate() {
+            row["result_offset"] = json!(offset + i as u64);
+        }
+    }
     let argument_filter = name == "get_call_graph" && args.get("argument_literal").is_some();
     if name == "get_call_graph" && (args["include_const_args"] == true || argument_filter) {
         review::call_arguments(engine, &mut result, cancel)?;
@@ -1255,6 +1314,9 @@ fn dispatch(
         result["method_selection"] = json!({"parameter":key,"requested_method_id":requested,"method_id":chosen.method_id,
             "status":if chosen.exact {"exact"} else {"unique_candidate"},"owner_qualified":chosen.owner_qualified,
             "scope":crate::method_lookup::SELECTION_SCOPE});
+    }
+    if name == "get_call_graph" {
+        budget::call_graph(&mut result, args)?;
     }
     Ok(result)
 }
@@ -1326,21 +1388,13 @@ fn class_scoped(name: &str) -> bool {
     )
 }
 fn method_source_page(text: String, args: &Value, format: &str) -> Result<Value> {
-    if args.get("limit").is_some() {
-        return text_page(text, args, format);
-    }
-    let total = text.chars().count();
-    let start = args["offset"].as_u64().unwrap_or(0) as usize;
-    ensure!(start <= total, "Invalid method-local offset");
-    let hash = crate::engine::source_identity(&text);
-    check_source_hash(args, &hash)?;
-    let result = json!({"text":text.chars().skip(start).collect::<String>(),"format":format,"source_hash":hash,"offset":start,"total_chars":total,"next_offset":Value::Null});
-    ensure!(
-        serde_json::to_vec(&result)?.len() < MAX_FRAME as usize - 65536,
-        "METHOD_SOURCE_TOO_LARGE: use explicit limit and offset pagination"
+    let mut result = text_page(text, args, format)?;
+    result["export_hint"] = json!(
+        "Use export_source with the same method selector and a new absolute out_path directory for the full method and coverage metadata"
     );
     Ok(result)
 }
+
 fn dispatch_resolved(
     engine: &mut NativeEngine,
     project: &Project,
@@ -1435,6 +1489,15 @@ fn dispatch_resolved(
             result["requested_format"] = json!(requested_format.as_str());
             result["reconstruction_attempted"] = json!(report.reconstruction_attempted);
             result["fallback_reason"] = json!(report.fallback_reason);
+            if args["include_dex_summary"] == true {
+                result["dex_summary"] = match dex_summary::summarize(engine,&id,cancel) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+                        json!({"status":"unavailable","complete":false,"reason":format!("{error:#}")})
+                    }
+                };
+            }
             result["scope"] = json!("Selected method; enclosing imports and generated class helpers are available from get_class_source");
             Ok(result)
         },
@@ -1632,6 +1695,30 @@ pub fn client_config() -> Result<String> {
 }
 fn tools_list() -> Value {
     let definitions = [
+        (
+            "list_analysis_plugins",
+            "List project-analysis plugins explicitly enabled in this GUI session.",
+            vec![],
+            true,
+        ),
+        (
+            "run_plugin_analysis",
+            "Start an enabled plugin against the pinned loaded project. Returns analysis_id; poll get_plugin_analysis. Executes trusted local plugin code.",
+            vec!["plugin_id"],
+            true,
+        ),
+        (
+            "get_plugin_analysis",
+            "Read plugin status, evidence, coverage and paginated result items. Retains the last four session analyses.",
+            vec!["analysis_id"],
+            true,
+        ),
+        (
+            "cancel_plugin_analysis",
+            "Cancel a project plugin analysis; poll get_plugin_analysis for terminal status.",
+            vec!["analysis_id"],
+            true,
+        ),
         (
             "find_type_references",
             "Paged original DEX type operands, declaration types, and explicit class/field/method/parameter annotation type usages with decoded values. Annotation references follow identifier references in hit pagination. XML references use find_layout_references.",
@@ -1923,6 +2010,8 @@ fn tools_list() -> Value {
             required.retain(|key| *key != "class_id");
             properties.insert("class_name".into(),json!({"type":"string","minLength":1,"description":"Alias for class_id: exact FQCN, DEX descriptor or unique short name"}));
         }
+        if name=="run_plugin_analysis" { properties.insert("arguments".into(),json!({"type":"object"})); }
+        if matches!(name,"get_plugin_analysis"|"cancel_plugin_analysis") { properties.insert("limit".into(),json!({"type":"integer","minimum":1,"maximum":100})); }
         if name=="export_package_source" {
             properties.insert("background".into(),json!({"type":"boolean","default":true}));
             properties.insert("resume".into(),json!({"type":"boolean","default":false}));
@@ -1948,6 +2037,7 @@ fn tools_list() -> Value {
                 "description":"exact_descriptor compares the complete descriptor; simple_name compares the class name after the last package separator, so GET matches retrofit2.http.GET and relocated copies; prefix matches a literal FQCN or package prefix such as retrofit2.http on the internal name"}));
         }
         if name=="search_resources" {
+            properties.insert("include_skipped_details".into(),json!({"type":"boolean","default":false,"description":"For scope=assets, include up to 100 skipped-file reasons. Counts and diagnostics_id are always returned."}));
             properties.insert("scope".into(),json!({"type":"string","enum":["resource_table","assets"],"default":"resource_table","description":"assets searches UTF-8 asset contents and paths, one paginated record per matching file; skipped binary/oversized files are explicit"}));
             properties.insert("asset_prefix".into(),json!({"type":"string"}));
             properties.insert("case_sensitive".into(),json!({"type":"boolean","default":true}));
@@ -1960,6 +2050,7 @@ fn tools_list() -> Value {
             properties.insert("format".into(),json!({"type":"string","enum":["auto","dex"],"default":"auto","description":"auto attempts Java with explicit DEX fallback; dex requests native RDX DEX disassembly directly"}));
         }
         if name=="get_method_source" {
+            properties.insert("include_dex_summary".into(),json!({"type":"boolean","default":false,"description":"Add physical p-register aliases and up to 32 Bundle getString/getBoolean key/result-register records with bounded constant proof"}));
             properties.insert("include_call_sites".into(),json!({"type":"boolean","default":false,"description":"Add call_sites: every invoke of this method with its DEX offset, callee, argument registers with proven constants, and the position in this text when the callee is referenced once (rdx-dex text maps every offset)"}));
         }
         if name=="find_field_references" {
@@ -2052,6 +2143,9 @@ fn tools_list() -> Value {
             properties.insert("depth".into(),json!({"type":"integer","minimum":1,"maximum":100,"description":"Defaults to 1 for call_sites and 20 for graph; explicit values include transitive sites"}));
             properties.insert("direction".into(),json!({"type":"string","enum":["callers","callees","both"],"default":"callees"}));
         }
+        if matches!(name,"get_call_graph"|"get_call_graph_batch") {
+            properties.insert("max_output_bytes".into(),json!({"type":"integer","minimum":if name=="get_call_graph_batch" {32768} else {16384},"maximum":1048576,"default":65536,"description":"Serialized result-data budget. Call-site pages continue with next_offset; clipped graphs return a continuation query for complete paged call sites."}));
+        }
         if name=="get_call_graph_batch" {
             properties.insert("method_ids".into(),json!({"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1}}));
             properties.insert("method_offset".into(),json!({"type":"integer","minimum":0,"maximum":16}));
@@ -2076,6 +2170,7 @@ fn tools_list() -> Value {
                 properties.insert((*alias).into(),property);
             }
         }
+        if matches!(name,"get_plugin_analysis"|"cancel_plugin_analysis") { properties["limit"]["maximum"] = json!(100); }
         let mut schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
         if class_scoped(name) { schema["anyOf"] = json!([{"required":["class_id"]},{"required":["class_name"]}]); }
         if name=="find_instantiations" { schema["anyOf"]=json!([{"required":["class_id"]},{"required":["class_name"]},{"required":["allocating_class"]},{"required":["allocating_method_id"]}]); }
@@ -2101,7 +2196,7 @@ fn tools_list() -> Value {
                 } }
             }
         }
-        json!({"name":name,"description":description,"inputSchema":schema,"annotations":{"readOnlyHint":!["open_apk","forget_instance","export_source","export_package_source","cancel_export"].contains(&name),"destructiveHint":name=="forget_instance","openWorldHint":false}})
+        json!({"name":name,"description":description,"inputSchema":schema,"annotations":{"readOnlyHint":!["open_apk","forget_instance","export_source","export_package_source","cancel_export","run_plugin_analysis","cancel_plugin_analysis"].contains(&name),"destructiveHint":name=="forget_instance","openWorldHint":false}})
     }).collect::<Vec<_>>()})
 }
 #[derive(Debug)]
@@ -2222,6 +2317,8 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
                     "{key} must not be empty"
                 );
             }
+        } else if property["type"] == "object" {
+            ensure!(value.is_object(), "{key} must be an object");
         } else if property["type"] == "boolean" {
             ensure!(value.is_boolean(), "{key} must be a boolean");
         } else {
@@ -3330,6 +3427,7 @@ mod tests {
         let analysis_snapshot = Arc::new(engine.clone());
         let loaded = Arc::new(LoadedProject {
             exports: exports::Controller::default(),
+            plugins: Arc::default(),
             engine: Mutex::new(engine),
             analysis_snapshot: analysis_snapshot.clone(),
             project: project.clone(),
@@ -4307,3 +4405,44 @@ mod reviewer_tests;
 
 #[path = "mcp_hotwire.rs"]
 mod hotwire;
+
+/// Query bridge for enabled project plugins. No socket credentials or APK reopening.
+pub(crate) fn plugin_query(
+    snapshot: &ProjectSnapshot,
+    name: &str,
+    args: &Value,
+    cancel: &AtomicBool,
+) -> Result<Value> {
+    ensure!(
+        matches!(
+            name,
+            "get_call_graph"
+                | "get_method_source"
+                | "get_methods_of_class"
+                | "get_class_hierarchy"
+                | "find_implementations"
+                | "find_instantiations"
+        ),
+        "PLUGIN_QUERY_DENIED: unsupported read-only tool {name}"
+    );
+    ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+    let mut args = args.clone();
+    ensure!(args.is_object(), "Query arguments must be an object");
+    args["instance_id"] = json!("plugin-host");
+    args["project_id"] = json!(snapshot.identity.hash);
+    if name == "get_call_graph" {
+        args["projection"] = json!("call_sites");
+        args["depth"] = json!(1);
+    }
+    if name == "get_method_source" {
+        args["format"] = json!("dex");
+    }
+    validate(name, &args)?;
+    let mut engine = snapshot.engine.clone();
+    let result = dispatch(&mut engine, &snapshot.project, name, &args, cancel)?;
+    ensure!(
+        serde_json::to_vec(&result)?.len() <= 2 * 1024 * 1024,
+        "PLUGIN_QUERY_TOO_LARGE: use a smaller page"
+    );
+    Ok(result)
+}

@@ -727,11 +727,18 @@ fn short_class_selection_requires_unique_exact_simple_name() {
 }
 
 #[test]
-fn method_source_is_complete_by_default_and_unicode_pages_reassemble() {
+fn method_source_is_paged_by_default_and_unicode_pages_reassemble() {
     let source = "𐐀switch λ\n".repeat(20000);
     let all = method_source_page(source.clone(), &json!({}), "java").unwrap();
-    assert_eq!(all["text"], source);
-    assert!(all["next_offset"].is_null());
+    assert_eq!(all["text"].as_str().unwrap().chars().count(), 32000);
+    assert_eq!(all["next_offset"], 32000);
+    assert_eq!(all["full_text_in_response"], false);
+    assert!(
+        all["export_hint"]
+            .as_str()
+            .unwrap()
+            .contains("export_source")
+    );
     let mut got = String::new();
     let mut offset = 0;
     loop {

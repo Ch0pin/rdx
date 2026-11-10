@@ -19,6 +19,7 @@ pub mod native_resources;
 pub mod native_ssa;
 pub mod native_types;
 pub mod plugin;
+pub mod plugin_analysis;
 pub mod transport;
 
 pub mod native_method;

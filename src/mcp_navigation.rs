@@ -522,7 +522,12 @@ pub(super) fn batch(
         cache: engine.invoke_index.clone(),
     };
     let mut results = vec![];
-    let mut bytes = 0;
+    let mut bytes = 4096;
+    let output_budget = super::budget::requested(args)?;
+    ensure!(
+        output_budget >= 32768,
+        "Batch max_output_bytes must be at least 32768"
+    );
     let mut next = offset;
     for (i, method) in methods.iter().enumerate().skip(offset) {
         check(cancel)?;
@@ -532,6 +537,10 @@ pub(super) fn batch(
         object.remove("method_ids");
         object.remove("method_offset");
         object.insert("method_id".into(), method.clone());
+        object.insert(
+            "max_output_bytes".into(),
+            json!((output_budget / 2).max(16384)),
+        );
         object.entry("projection").or_insert(json!("call_sites"));
         object.entry("direction").or_insert(json!("callers"));
         let item = match super::dispatch(engine, project, "get_call_graph", &query, cancel) {
@@ -543,7 +552,7 @@ pub(super) fn batch(
         };
         let size = serde_json::to_vec(&item)?.len();
         // MCP carries both structured JSON and its escaped text representation.
-        if bytes + size > 2 * 1024 * 1024 {
+        if bytes + size > output_budget {
             break;
         }
         bytes += size;
@@ -557,9 +566,12 @@ pub(super) fn batch(
     let batch_id = progress.id.clone();
     drop(progress);
     let failed = results.iter().filter(|r| r.get("error").is_some()).count();
-    Ok(
-        json!({"batch_id":batch_id,"results":results,"failed_queries":failed,"method_offset":offset,"next_method_offset":(next<methods.len()).then_some(next),"complete":next==methods.len(),"pagination_note":"complete means all input methods were processed, including explicit per-query errors. Each result retains its own next_offset for call-site paging; next_method_offset pages the input methods","invoke_index":engine.invoke_index.status()}),
-    )
+    let result = json!({"batch_id":batch_id,"results":results,"failed_queries":failed,"method_offset":offset,"next_method_offset":(next<methods.len()).then_some(next),"complete":next==methods.len(),"response_byte_budget":output_budget,"pagination_note":"complete means all input methods were processed, including explicit per-query errors. Each result retains its own next_offset for call-site paging; next_method_offset pages the input methods","invoke_index":engine.invoke_index.status()});
+    ensure!(
+        serde_json::to_vec(&result)?.len() <= output_budget,
+        "Batch metadata exceeds max_output_bytes; increase the explicit budget"
+    );
+    Ok(result)
 }
 
 #[cfg(test)]

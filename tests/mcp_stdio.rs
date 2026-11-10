@@ -40,13 +40,52 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     assert_eq!(replies[0]["error"]["code"], -32600);
     assert_eq!(replies[1]["result"]["protocolVersion"], "2025-06-18");
     let tools = replies[2]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 47);
+    assert_eq!(tools.len(), 51);
     let schema = |name: &str| {
         &tools
             .iter()
             .find(|tool| tool["name"] == name)
             .unwrap_or_else(|| panic!("{name} must be advertised over stdio"))["inputSchema"]
     };
+    for name in [
+        "list_analysis_plugins",
+        "run_plugin_analysis",
+        "get_plugin_analysis",
+        "cancel_plugin_analysis",
+    ] {
+        for key in ["instance_id", "project_id"] {
+            assert!(
+                schema(name)["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(key))
+            );
+        }
+    }
+    assert_eq!(
+        schema("run_plugin_analysis")["properties"]["arguments"]["type"],
+        "object"
+    );
+    assert_eq!(
+        schema("get_plugin_analysis")["properties"]["limit"]["maximum"],
+        100
+    );
+    assert_eq!(
+        schema("get_call_graph")["properties"]["max_output_bytes"]["default"],
+        65536
+    );
+    assert_eq!(
+        schema("get_call_graph_batch")["properties"]["max_output_bytes"]["minimum"],
+        32768
+    );
+    assert_eq!(
+        schema("search_resources")["properties"]["include_skipped_details"]["default"],
+        false
+    );
+    assert_eq!(
+        schema("get_method_source")["properties"]["include_dex_summary"]["default"],
+        false
+    );
     for name in ["get_export_status", "cancel_export"] {
         assert!(
             schema(name)["required"]

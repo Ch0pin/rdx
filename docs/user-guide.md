@@ -4,6 +4,8 @@ A native Rust desktop application for APK, XAPK, APKS, and DEX inspection. The G
 
 RDX is alpha software. Unsupported methods remain explicitly labelled DEX disassembly. See [native engine scope](native-engine.md) for reconstruction details.
 
+While a project opens, a persistent indexing banner shows its filename, current loading stage, and elapsed time. Archive files can be browsed as soon as they are available; class navigation, code search, and analysis wait for the project index. The banner remains visible while navigating or auto-hiding the toolbar and clears when loading completes or fails. Stages are reported directly; no estimated percentage is displayed.
+
 ## Run from source
 
 Requirements: stable Rust and Cargo. Python 3 is needed only for transport test fixtures. Initial builds download Rust dependencies.

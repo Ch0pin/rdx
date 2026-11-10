@@ -560,6 +560,12 @@ pub(super) fn plan_at(class: &DexClass, method: &DexMethod, start: usize) -> Opt
         .strings
         .get(usize::try_from(reference.index).ok()?)?
         .clone();
+    // Empty builder results may reuse the platform's empty String singleton.
+    // Keep the original builder calls unless the prefix guarantees a nonempty
+    // result, whose fresh identity the emitted String constructor preserves.
+    if prefix.is_empty() {
+        return None;
+    }
 
     // Appended operands are defined values, and values written between appends
     // feed later appends of this chain only.

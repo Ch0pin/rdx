@@ -15139,12 +15139,30 @@ fn render(
                             append.pc,
                         )?
                     };
+                    // append(Object) performs string conversion at this exact
+                    // instruction. A later field read can observe its effects
+                    // (or throw), so do not postpone conversion to the final +.
+                    let text = if descriptor == "Ljava/lang/Object;" {
+                        out.local(
+                            "Ljava/lang/String;",
+                            &format!(
+                                "java.lang.String.valueOf((java.lang.Object) {})",
+                                concat::operand(&text)
+                            ),
+                            &[],
+                        )?
+                        .text
+                    } else {
+                        text
+                    };
                     progress.parts.push(concat::operand(&text));
                     progress.appended += 1;
                     pc = append.next;
                     continue;
                 }
-                let expression = progress.parts.join(" + ");
+                // toString() returns a fresh String even when every operand is
+                // constant. Java would otherwise intern a constant + expression.
+                let expression = format!("new java.lang.String({})", progress.parts.join(" + "));
                 let (result, end) = (progress.plan.result, progress.plan.end);
                 concat_fold = None;
                 let text = out.local("Ljava/lang/String;", &expression, &[])?;

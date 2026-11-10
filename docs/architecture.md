@@ -66,12 +66,13 @@ Code search over disassembly is not equivalent to searching reconstructed Java.
 Cold source search uses up to twelve workers (available CPUs minus one), with a
 rolling admission window of sixteen renders per worker. Workers render source and
 prepare trigram filters and compressed records; the coordinator owns cache
-admission and disk writes. Indexed classes resolve at admission, so only classes
-that need rendering occupy the window. Rendered results are consumed as workers
-finish them and reported in input order: a slow class delays only its own report
-while the other workers keep rendering the classes behind it. A 128 MiB byte
-budget covers queued results, including prepared records. The oldest render in flight
-may exceed that budget to ensure progress, and each worker may hold one
+admission and disk writes. Finished renders enter the index in completion order;
+matching and reporting happen in input order. Later indexed classes retain only
+compact markers, so a slow class cannot accumulate a hit list for every later
+class. Reorder metadata is limited to 4,096 classes. A 128 MiB byte budget covers
+queued results, prepared records, and pending source that could not enter the
+disk index. Only the next reportable class may exceed that budget to ensure
+progress, and each worker may hold one
 additional rendered result while waiting. Rendering and compression have
 transient allocations, so this is not a process memory ceiling. Cancellation and
 interactive requests are serviced during admission, result waits, and shutdown.
@@ -102,13 +103,14 @@ The render pool defaults to one fewer than the cores (at most 12) and can be set
 from Search → Scan → Workers; the preference persists with the other settings.
 Scans stop at a configurable result limit (`ScanOptions::limit`, set from the Max results preference, 2,000 by default). A stopped scan returns a `SearchResume`: the classes still to scan in their order, how many matches of the first one were already reported, and where the resource pass continues. Raising the limit in the search window reruns with that resume point, so nothing already covered is scanned again; a changed query, scope or project drops it.
 Hits do not retain source: each carries its target, offsets and the source hash
-the scan recorded, so result memory stays small however broad the query. Opening
+the scan recorded. Result memory grows with the configured limit; pending
+classes do not allocate additional hit lists. Opening
 a hit reloads the source from the session index on the engine thread (the search
 thread services the request between classes while a scan runs) and renders the
 class again only when the index holds no record. A render whose hash differs
 from the recorded one opens on the match line rather than trusting stale
 offsets. Every user navigation (opening a hit, choosing a tree node or tab,
-history, go-to-definition) advances a navigation serial; a hit reload carries
+history, go-to-definition, graph and analysis navigation) advances a navigation serial; a hit reload carries
 the serial it was issued under and its result is dropped if a newer navigation
 happened meanwhile, so a late reload never steals focus from the view the user
 chose since. Find-usages hits keep their source because their documents never enter

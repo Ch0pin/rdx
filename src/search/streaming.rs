@@ -11,6 +11,14 @@ enum Outcome {
     Rejected,
     Skipped,
     Failed(String),
+    /// Reload only when this class reaches the reporting head.
+    Cached,
+    /// Disk admission failed (or this is the head). Keep the render under
+    /// its original byte reservation until it is consumed.
+    Source {
+        value: CachedValue,
+        reserved: usize,
+    },
     Resolved {
         hits: Vec<SearchHit>,
         note: Option<String>,
@@ -18,8 +26,8 @@ enum Outcome {
 }
 
 /// Outcomes resolve in completion order and report in class order, so hit
-/// order and counters match a serial scan while a slow class never idles the
-/// other workers. Documents leave memory at resolution unless they have hits.
+/// order and counters match a serial scan. Future classes hold cache markers,
+/// or byte-budgeted source when disk admission fails, never computed hit lists.
 /// Reporting stops at the result limit; a class cut off part-way stays
 /// unreported so a continuation can report the rest of its matches.
 struct Reporter {
@@ -90,6 +98,10 @@ impl Reporter {
                 break;
             };
             match outcome {
+                pending @ (Outcome::Cached | Outcome::Source { .. }) => {
+                    self.completed.insert(self.next, pending);
+                    return;
+                }
                 Outcome::Rejected => cache.index_rejections += 1,
                 Outcome::Skipped => summary.skipped += 1,
                 Outcome::Failed(error) => {
@@ -152,6 +164,100 @@ impl Reporter {
             self.last_progress = Instant::now();
         }
     }
+}
+
+// Bound reorder metadata as well as rendered bytes. This leaves substantially
+// more lookahead than the worker window without accumulating project-wide maps.
+const MAX_PENDING_CLASSES: usize = 4096;
+
+/// Match only the next reportable class. A slow head therefore cannot cause
+/// every later class to allocate its own limit-sized hit vector.
+#[allow(clippy::too_many_arguments)]
+fn drain_ready(
+    reporter: &mut Reporter,
+    summary: &mut SearchSummary,
+    engine: &mut NativeEngine,
+    cache: &mut SearchCache,
+    classes: &[&String],
+    query: &CompiledQuery,
+    budget: &ResultBudget,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(SearchUpdate),
+    interactive: &mut impl FnMut(&mut NativeEngine, &mut SearchCache),
+) {
+    loop {
+        interactive(engine, cache);
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        reporter.drain(summary, cache, emit);
+        reporter.progress(summary, emit, false);
+        // Only the reportable head may exceed the render budget. Advancing to
+        // the oldest in-flight job while retaining earlier sources would let
+        // successive future jobs bypass the same limit.
+        budget.head(reporter.next);
+        if !reporter.wants_more(summary) || cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let index = reporter.next;
+        let Some(pending) = reporter.completed.remove(&index) else {
+            return;
+        };
+        let name = classes[index];
+        let (value, reserved) = match pending {
+            Outcome::Source { value, reserved } => (Ok(value), reserved),
+            Outcome::Cached => {
+                let key = SearchTarget::Class(name.clone());
+                let loaded = if let Some(value) = cache.lookup(&key) {
+                    Ok(value)
+                } else {
+                    // A failed/evicted cache record must not queue the required
+                    // head behind workers blocked on the byte budget.
+                    cache.source_fetches += 1;
+                    repair_cached_head(engine, cache, name, cancel, interactive).map(
+                        |(value, prepared)| {
+                            cache.insert_prepared(key, value.clone(), prepared);
+                            value
+                        },
+                    )
+                };
+                (loaded, 0)
+            }
+            other => {
+                reporter.completed.insert(index, other);
+                return;
+            }
+        };
+        let outcome = reporter.resolve(index, name, value, query);
+        budget.release(reserved);
+        reporter.buffer(index, outcome);
+    }
+}
+
+/// A missing cache record is the required head, so use one temporary worker
+/// rather than enqueueing behind render workers waiting on the byte budget.
+/// Continue serving navigation while that exceptional render completes.
+fn repair_cached_head(
+    engine: &mut NativeEngine,
+    cache: &mut SearchCache,
+    name: &str,
+    cancel: &AtomicBool,
+    interactive: &mut impl FnMut(&mut NativeEngine, &mut SearchCache),
+) -> Rendered {
+    let mut worker = engine.clone();
+    let legacy = cache.legacy;
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(move || {
+            render_job(&mut worker, name, legacy, || cancel.load(Ordering::Relaxed))
+        });
+        while !handle.is_finished() {
+            interactive(engine, cache);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        handle
+            .join()
+            .unwrap_or_else(|_| Err("Cache repair worker panicked".into()))
+    })
 }
 
 // Reservations cover estimated in-progress work, the result channel and the
@@ -256,22 +362,19 @@ fn render_job(
     }))
     .unwrap_or_else(|_| Err("Native source renderer panicked".into()))
 }
-/// Account for a finished render: free its budget, move the required head and
-/// buffer its outcome for reporting in class order.
+/// Index finished renders immediately, deferring matching until class order
+/// reaches them. Uncached renders retain their reservation while buffered.
 #[allow(clippy::too_many_arguments)]
 fn collect(
     (index, result, bytes): (usize, Rendered, usize),
     classes: &[&String],
-    query: &CompiledQuery,
     budget: &ResultBudget,
     in_flight: &mut BTreeSet<usize>,
-    next: usize,
     cache: &mut SearchCache,
     reporter: &mut Reporter,
 ) {
-    budget.release(bytes);
     in_flight.remove(&index);
-    budget.head(in_flight.first().copied().unwrap_or(next));
+    budget.head(reporter.next);
     let name = classes[index];
     let outcome = match result {
         Ok((value, prepared)) => {
@@ -280,9 +383,20 @@ fn collect(
                 value.clone(),
                 prepared,
             );
-            reporter.resolve(index, name, Ok(value), query)
+            if index != reporter.next && cache.disk.contains(&SearchTarget::Class(name.clone())) {
+                budget.release(bytes);
+                Outcome::Cached
+            } else {
+                Outcome::Source {
+                    value,
+                    reserved: bytes,
+                }
+            }
         }
-        Err(error) => reporter.resolve(index, name, Err(error), query),
+        Err(error) => {
+            budget.release(bytes);
+            Outcome::Failed(format!("{name}: {error}"))
+        }
     };
     reporter.buffer(index, outcome);
 }
@@ -407,7 +521,7 @@ pub(super) fn run_with_workers(
             ..Default::default()
         };
         let mut reporter = Reporter::new(limit, skip);
-        // Renders in flight, in class order; the oldest is the budget's required head.
+        // Renders in flight. Only reporter.next may bypass the byte budget.
         let mut in_flight = BTreeSet::new();
         let mut next = 0;
         'scan: loop {
@@ -418,7 +532,10 @@ pub(super) fn run_with_workers(
             }
             // Admission resolves indexed classes inline and bounds only renders
             // in flight, so a slow render never starves the workers behind it.
-            while next < classes.len() && in_flight.len() < window && reporter.wants_more(&summary)
+            while next < classes.len()
+                && in_flight.len() < window
+                && next.saturating_sub(reporter.next) < MAX_PENDING_CLASSES
+                && reporter.wants_more(&summary)
             {
                 interactive(engine, cache);
                 if cancel.load(Ordering::Relaxed) {
@@ -435,21 +552,15 @@ pub(super) fn run_with_workers(
                     false,
                 ) {
                     reporter.buffer(next, Outcome::Rejected);
-                } else if let Some(value) = cache.get(&key).or_else(|| {
-                    let value = cache.disk.load(&key);
-                    if value.is_some() {
-                        cache.disk_hits += 1;
-                    }
-                    value
-                }) {
-                    reporter.buffer(next, reporter.resolve(next, name, Ok(value), query));
+                } else if cache.contains(&key) {
+                    reporter.buffer(next, Outcome::Cached);
                 } else {
                     if jobs_tx.send(next).is_err() {
                         record_error(&mut summary, "Source workers stopped".into());
                         break 'scan;
                     }
                     in_flight.insert(next);
-                    budget.head(*in_flight.first().unwrap());
+                    budget.head(reporter.next);
                 }
                 next += 1;
                 // Finished renders are collected during admission too, so a run
@@ -458,15 +569,24 @@ pub(super) fn run_with_workers(
                     collect(
                         received,
                         classes,
-                        query,
                         &budget,
                         &mut in_flight,
-                        next,
                         cache,
                         &mut reporter,
                     );
                 }
-                reporter.drain(&mut summary, cache, emit);
+                drain_ready(
+                    &mut reporter,
+                    &mut summary,
+                    engine,
+                    cache,
+                    classes,
+                    query,
+                    &budget,
+                    cancel,
+                    emit,
+                    interactive,
+                );
                 reporter.progress(&summary, emit, false);
             }
             if !reporter.wants_more(&summary) {
@@ -482,14 +602,23 @@ pub(super) fn run_with_workers(
                     collect(
                         received,
                         classes,
-                        query,
                         &budget,
                         &mut in_flight,
-                        next,
                         cache,
                         &mut reporter,
                     );
-                    reporter.drain(&mut summary, cache, emit);
+                    drain_ready(
+                        &mut reporter,
+                        &mut summary,
+                        engine,
+                        cache,
+                        classes,
+                        query,
+                        &budget,
+                        cancel,
+                        emit,
+                        interactive,
+                    );
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -499,7 +628,18 @@ pub(super) fn run_with_workers(
                             Outcome::Failed(format!("{}: Source workers stopped", classes[index])),
                         );
                     }
-                    reporter.drain(&mut summary, cache, emit);
+                    drain_ready(
+                        &mut reporter,
+                        &mut summary,
+                        engine,
+                        cache,
+                        classes,
+                        query,
+                        &budget,
+                        cancel,
+                        emit,
+                        interactive,
+                    );
                     break;
                 }
             }
@@ -539,6 +679,159 @@ pub(super) fn run_with_workers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_head_defers_matching_and_uncached_sources_keep_their_byte_reservations() {
+        for disk in [true, false] {
+            let names: Vec<_> = (0..33).map(|i| format!("Cached{i}")).collect();
+            let classes: Vec<_> = names.iter().collect();
+            let cancel = AtomicBool::new(false);
+            let budget = ResultBudget::new(128 * 1024 * 1024);
+            let mut cache = SearchCache {
+                budget: 0,
+                legacy: !disk,
+                ..Default::default()
+            };
+            let query = CompiledQuery::new(SearchQuery {
+                text: "needle".into(),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut reporter = Reporter::new(2000, 0);
+            let mut in_flight = BTreeSet::from([0]);
+            let mut charged = 0;
+            for (index, name) in names.iter().enumerate().skip(1) {
+                let document = Arc::new(SearchDocument {
+                    target: SearchTarget::Class(name.clone()),
+                    name: name.clone(),
+                    source: "needle\n".repeat(2001),
+                    syntax: "java".into(),
+                    links: vec![],
+                    source_hash: None,
+                    metadata_complete: true,
+                });
+                let weak = Arc::downgrade(&document);
+                let value = Some((document, Arc::new(vec![]), None));
+                let prepared =
+                    disk.then(|| crate::search_index::PreparedEntry::prepare(&value).unwrap());
+                let rendered = Ok((value, prepared));
+                let bytes = rendered_bytes(&rendered);
+                assert!(budget.reserve(index, bytes, &cancel));
+                charged += bytes;
+                in_flight.insert(index);
+                collect(
+                    (index, rendered, bytes),
+                    &classes,
+                    &budget,
+                    &mut in_flight,
+                    &mut cache,
+                    &mut reporter,
+                );
+                assert_eq!(
+                    weak.upgrade().is_none(),
+                    disk,
+                    "only unindexed source may remain in the reorder map"
+                );
+            }
+            // Previously these 32 classes retained 64,032 fully built hits.
+            assert_eq!(reporter.completed.len(), 32);
+            assert!(reporter.completed.values().all(|outcome| {
+                if disk {
+                    matches!(outcome, Outcome::Cached)
+                } else {
+                    matches!(outcome, Outcome::Source { .. })
+                }
+            }));
+            assert_eq!(
+                budget.state.lock().unwrap().0,
+                if disk { 0 } else { charged }
+            );
+            reporter.buffer(0, Outcome::Rejected);
+            let mut summary = SearchSummary {
+                total: 33,
+                ..Default::default()
+            };
+            let mut engine = NativeEngine::default();
+            let mut emitted = 0;
+            let mut callbacks = 0;
+            drain_ready(
+                &mut reporter,
+                &mut summary,
+                &mut engine,
+                &mut cache,
+                &classes,
+                &query,
+                &budget,
+                &cancel,
+                &mut |update| {
+                    if let SearchUpdate::Batch(hits) = update {
+                        emitted += hits.len();
+                    }
+                },
+                &mut |_, _| callbacks += 1,
+            );
+            assert_eq!(emitted, 2000);
+            assert!(
+                callbacks >= 2,
+                "draining cached outcomes must service interactive requests"
+            );
+            assert_eq!(reporter.remaining(&classes).unwrap().skip, 2000);
+            // Every remaining class is still a compact marker or a reserved source.
+            assert!(
+                !reporter
+                    .completed
+                    .values()
+                    .any(|outcome| matches!(outcome, Outcome::Resolved { .. }))
+            );
+            if disk {
+                assert_eq!(budget.state.lock().unwrap().0, 0);
+            } else {
+                assert!(budget.state.lock().unwrap().0 < charged);
+            }
+        }
+    }
+
+    #[test]
+    fn buffered_head_keeps_the_only_budget_bypass_until_consumed() {
+        let names = ["Head".to_owned(), "Future".to_owned()];
+        let classes: Vec<_> = names.iter().collect();
+        let budget = ResultBudget::new(1);
+        let cancel = AtomicBool::new(false);
+        assert!(budget.reserve(0, 1, &cancel));
+        let mut in_flight = BTreeSet::from([0, 1]);
+        let mut reporter = Reporter::new(2000, 0);
+        let mut cache = SearchCache::default();
+        collect(
+            (0, Ok((None, None)), 1),
+            &classes,
+            &budget,
+            &mut in_flight,
+            &mut cache,
+            &mut reporter,
+        );
+        assert_eq!(*budget.state.lock().unwrap(), (1, 0, false));
+        let query = CompiledQuery::new(SearchQuery {
+            text: "needle".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut engine = NativeEngine::default();
+        let mut summary = SearchSummary::default();
+        drain_ready(
+            &mut reporter,
+            &mut summary,
+            &mut engine,
+            &mut cache,
+            &classes,
+            &query,
+            &budget,
+            &cancel,
+            &mut |_| {},
+            &mut |_, _| {},
+        );
+        assert_eq!(*budget.state.lock().unwrap(), (0, 1, false));
+        assert_eq!(summary.scanned, 1);
+    }
 
     #[test]
     fn memory_admission_blocks_work_before_render_and_reconciles_finished_bytes() {

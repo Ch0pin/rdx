@@ -1056,6 +1056,7 @@ impl App {
                 "Wait for the current engine operation, then click the method again.".into();
             return;
         };
+        self.navigation_serial += 1;
         self.busy = true;
         let origin = self.current_location().unwrap_or(JumpLocation {
             target: Target::Class(rdx::call_graph::owner(&method).unwrap_or_default().into()),
@@ -1075,6 +1076,7 @@ impl App {
         let Some(snapshot) = self.shared_project.clone() else {
             return;
         };
+        self.navigation_serial += 1;
         let origin = self.current_location().unwrap_or(JumpLocation {
             target: Target::Class(if method {
                 rdx::call_graph::owner(&owner).unwrap_or_default().into()
@@ -2018,6 +2020,7 @@ impl App {
         self.decode_resource_mode(index, ctx, false);
     }
     fn open_manifest_summary(&mut self, index: usize, ctx: &egui::Context) {
+        self.navigation_serial += 1;
         if let Some(existing) = self
             .tabs
             .iter()
@@ -6481,5 +6484,54 @@ mod settings_tests {
             Target::Class(target.into())
         );
         assert!(app.diagnostics.is_empty(), "{:?}", app.diagnostics);
+    }
+    #[test]
+    fn analysis_and_graph_navigation_supersede_pending_hits() {
+        for graph in [false, true] {
+            let mut app = navigation_test_app();
+            let ctx = egui::Context::default();
+            let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/navigation.dex");
+            app.shared_project = Some(ProjectSnapshot::open(&fixture).unwrap());
+            app.engine = Some(app.shared_project.as_ref().unwrap().engine().clone());
+            let hit = sample_hit("sample.Caller", Some("older"), 0);
+            app.open_search_hit(hit.clone(), &ctx);
+            let request = app.interactive_requests.lock().unwrap().pop().unwrap();
+            let InteractiveRequest::OpenHit(_, serial) = request else {
+                panic!("expected queued open")
+            };
+            if graph {
+                app.navigate_graph_method("sample.Target.doubleValue(I)I".into(), &ctx);
+            } else {
+                app.navigate_analysis_owner("sample.Target".into(), false, &ctx);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                app.events(&ctx);
+                if !app.tabs.is_empty() {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(app.tabs[app.selected].name, "sample.Target");
+            let doc = Arc::new(SearchDocument {
+                target: SearchTarget::Class("sample.Caller".into()),
+                name: "sample.Caller".into(),
+                source: "target".into(),
+                syntax: "java".into(),
+                links: vec![],
+                source_hash: Some("older".into()),
+                metadata_complete: true,
+            });
+            app.tx
+                .send(Event::HitSource(app.generation, serial, hit, Ok(doc)))
+                .unwrap();
+            app.events(&ctx);
+            assert_eq!(
+                app.tabs[app.selected].name, "sample.Target",
+                "late hit stole focus after analysis navigation"
+            );
+        }
     }
 }

@@ -70,15 +70,156 @@ fn fixture() -> DexClass {
     class
 }
 
+fn conversion_order_fixture(constant_only: bool) -> DexClass {
+    let mut class = fixture_without_hierarchy();
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols.types.push("Ljava/lang/String;".into());
+    symbols.strings.extend(["state".into(), "tail".into()]);
+    symbols.fields.push((1, 2, 6));
+    symbols.protos.push((
+        "Ljava/lang/StringBuilder;".into(),
+        vec!["Ljava/lang/String;".into()],
+    ));
+    symbols.methods.push((0, 5, 2));
+    class.methods[0].name = if constant_only {
+        "constant"
+    } else {
+        "converted"
+    }
+    .into();
+    class.methods[0].code.as_mut().unwrap().instructions = if constant_only {
+        vec![
+            0x0022, 0, 0x011a, 0, 0x2070, 0, 0x0010, 0x011a, 7, 0x206e, 5, 0x0010, 0x106e, 2, 0,
+            0x020c, 0x0211,
+        ]
+    } else {
+        // append(Object p0); read Hook.state; append(String state); toString.
+        vec![
+            0x0022, 0, 0x011a, 0, 0x2070, 0, 0x0010, 0x206e, 1, 0x0030, 0x0262, 0, 0x206e, 5,
+            0x0020, 0x106e, 2, 0, 0x020c, 0x0211,
+        ]
+    };
+    let hierarchy = rdx::native_hierarchy::TypeHierarchy::from_classes([&class]).unwrap();
+    class.symbols.hierarchy.set(Arc::new(hierarchy)).unwrap();
+    class
+}
+
+fn empty_result_fixture() -> DexClass {
+    let mut class = conversion_order_fixture(true);
+    class.methods[0].name = "empty".into();
+    let symbols = Arc::get_mut(&mut class.symbols).unwrap();
+    symbols.strings[0].clear();
+    symbols.strings[7].clear();
+    class
+}
+
+#[test]
+fn folded_conversion_is_staged_before_field_reads_and_result_is_fresh() {
+    let class = conversion_order_fixture(false);
+    let source = native_java::render_method("sample.Test", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    let conversion = source
+        .find("String.valueOf((java.lang.Object) p0)")
+        .unwrap();
+    let field = source.find("sample.Hook.state").unwrap();
+    let result = source.find("new java.lang.String(").unwrap();
+    assert!(conversion < field && field < result, "{source}");
+    let class = conversion_order_fixture(true);
+    let source = native_java::render_method("sample.Test", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    assert!(
+        source.contains("new java.lang.String(\"tag:\" + \"tail\")"),
+        "{source}"
+    );
+    let class = empty_result_fixture();
+    let source = native_java::render_method("sample.Test", &class, &class.methods[0])
+        .unwrap()
+        .source;
+    assert!(
+        source.contains("StringBuilder") && source.contains(".toString()"),
+        "{source}"
+    );
+}
+
+#[test]
+#[ignore = "requires javac and java"]
+fn jvm_interleaved_conversion_and_constant_results_preserve_semantics() {
+    use std::{fs, process::Command};
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("sample")).unwrap();
+    let mut methods: String = [false, true]
+        .into_iter()
+        .map(|constant| {
+            let class = conversion_order_fixture(constant);
+            native_java::render_method("sample.Test", &class, &class.methods[0])
+                .unwrap()
+                .source
+        })
+        .collect();
+    let empty = empty_result_fixture();
+    methods.push_str(
+        &native_java::render_method("sample.Test", &empty, &empty.methods[0])
+            .unwrap()
+            .source,
+    );
+    let source = format!(
+        r#"package sample;
+public class Test {{
+{methods}
+ static String original(Object value) {{
+   StringBuilder b = new StringBuilder("tag:"); b.append(value);
+   String state = Hook.state; b.append(state); return b.toString();
+ }}
+ static String originalConstant() {{ return new StringBuilder("tag:").append("tail").toString(); }}
+ public static void main(String[] args) {{
+   Object token = new Object() {{ public String toString() {{ Hook.state="new"; return "value"; }} }};
+   Hook.state="old"; String expected=original(token);
+   Hook.state="old"; String actual=converted(token);
+   if (!expected.equals(actual) || !actual.equals("tag:valuenew")) throw new AssertionError(actual);
+   if (originalConstant()==originalConstant() || constant(null)==constant(null)) throw new AssertionError("identity");
+   if (!originalConstant().equals(constant(null))) throw new AssertionError("content");
+   boolean originalEmptyIdentity = new StringBuilder("").append("").toString() == new StringBuilder("").append("").toString();
+   if ((empty(null)==empty(null)) != originalEmptyIdentity) throw new AssertionError("empty identity");
+   final RuntimeException sentinel = new RuntimeException();
+   Object throwing = new Object() {{ public String toString() {{ throw sentinel; }} }};
+   try {{ converted(throwing); throw new AssertionError("missing throw"); }}
+   catch (RuntimeException e) {{ if (e != sentinel) throw new AssertionError("exception identity"); }}
+ }}
+}}
+class Hook {{ static String state="old"; }}
+"#
+    );
+    fs::write(dir.path().join("sample/Test.java"), &source).unwrap();
+    for (program, argument) in [("javac", "sample/Test.java"), ("java", "sample.Test")] {
+        let output = Command::new(program)
+            .arg(argument)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{program}: {}\n{source}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[test]
 fn exact_single_use_builder_becomes_ordered_concat_with_valid_links() {
     let class = fixture();
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
-    assert!(code.source.contains("\"tag:\" + p0"), "{}", code.source);
+    assert!(
+        code.source
+            .contains("String.valueOf((java.lang.Object) p0)"),
+        "{}",
+        code.source
+    );
     assert!(!code.source.contains("StringBuilder"), "{}", code.source);
     assert!(!code.source.contains(".append("), "{}", code.source);
     assert!(!code.source.contains(".toString()"), "{}", code.source);
-    let concat = code.source.find("\"tag:\" + p0").unwrap();
+    let concat = code.source.find("new java.lang.String(\"tag:\" +").unwrap();
     let receiver = code.source.find("Hook.readLogger()").unwrap();
     let after = code.source.find("Hook.after(").unwrap();
     assert!(concat < receiver && receiver < after, "{}", code.source);
@@ -151,7 +292,12 @@ fn implicit_this_argument_folds_like_any_reference() {
     class.methods[0].access_flags = 1; // instance method; v3 is implicit this
     class.methods[0].parameters.clear();
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
-    assert!(code.source.contains("\"tag:\" + this"), "{}", code.source);
+    assert!(
+        code.source
+            .contains("String.valueOf((java.lang.Object) this)"),
+        "{}",
+        code.source
+    );
     assert!(!code.source.contains(".append("), "{}", code.source);
 }
 
@@ -183,7 +329,7 @@ fn statement_form_appends_with_interleaved_field_read_and_constant_fold_in_order
     let field = code.source.find("java.lang.String v1 = this.a;").unwrap();
     let concat = code
         .source
-        .find("java.lang.String v2 = \"tag:\" + v1 + \"')\";")
+        .find("java.lang.String v2 = new java.lang.String(\"tag:\" + v1 + \"')\");")
         .unwrap();
     let load = code.source.find("sample.Hook.load(v2);").unwrap();
     let read = code.source.find("sample.Hook.read();").unwrap();
@@ -214,8 +360,9 @@ fn chained_appends_with_int_and_char_operands_fold_with_exact_conversions() {
     let class = multi_fixture_class(words);
     let code = native_java::render_method("sample.Test", &class, &class.methods[0]).unwrap();
     assert!(
-        code.source
-            .contains("java.lang.String v1 = \"tag:\" + 7 + v0 + ((char) 65);"),
+        code.source.contains(
+            "java.lang.String v1 = new java.lang.String(\"tag:\" + 7 + v0 + ((char) 65));"
+        ),
         "{}",
         code.source
     );

@@ -260,12 +260,32 @@ impl NativeEngine {
         container: std::sync::Arc<crate::package_container::PackageContainer>,
     ) -> Result<Project> {
         let path = container.source_path().to_path_buf();
-        self.open_internal(&path, Some(container))
+        self.open_internal(
+            &path,
+            Some(container),
+            crate::load_limits::LoadLimits::Standard,
+        )
+    }
+    pub fn open_with_limits(
+        &mut self,
+        path: &Path,
+        limits: crate::load_limits::LoadLimits,
+    ) -> Result<Project> {
+        self.open_internal(path, None, limits)
+    }
+    pub fn open_prepared_with_limits(
+        &mut self,
+        container: std::sync::Arc<crate::package_container::PackageContainer>,
+        limits: crate::load_limits::LoadLimits,
+    ) -> Result<Project> {
+        let path = container.source_path().to_path_buf();
+        self.open_internal(&path, Some(container), limits)
     }
     fn open_internal(
         &mut self,
         path: &Path,
         supplied: Option<std::sync::Arc<crate::package_container::PackageContainer>>,
+        limits: crate::load_limits::LoadLimits,
     ) -> Result<Project> {
         self.input = None;
         self.prepared = None;
@@ -293,11 +313,7 @@ impl NativeEngine {
             }
             None => Some(crate::package_container::PackageContainer::open(&path)?),
         };
-        let project = if let Some(container) = &prepared {
-            self.native.open_prepared(container.clone())?
-        } else {
-            self.native.open(&path)?
-        };
+        let project = self.native.open_input(&path, prepared.clone(), limits)?;
         if let Some(container) = &prepared {
             let mut merged = crate::resource_table::ResourceTable::default();
             let mut total_bytes = 0u64;
@@ -1247,7 +1263,7 @@ impl NativeEngine {
 }
 impl DecompilerEngine for NativeEngine {
     fn open(&mut self, path: &Path) -> Result<Project> {
-        self.open_internal(path, None)
+        self.open_internal(path, None, crate::load_limits::LoadLimits::Standard)
     }
     fn decompile(&mut self, class: &str) -> Result<String> {
         Ok(self.decompile_with_metadata(class)?.source)

@@ -6,6 +6,10 @@ RDX is alpha software. Unsupported methods remain explicitly labelled DEX disass
 
 While a project opens, a persistent indexing banner shows its filename, current loading stage, and elapsed time. Archive files can be browsed as soon as they are available; class navigation, code search, and analysis wait for the project index. The banner remains visible while navigating or auto-hiding the toolbar and clears when loading completes or fails. Stages are reported directly; no estimated percentage is displayed.
 
+If a recognized project-loading limit is reached, the GUI offers **Retry with higher limits** or **Cancel**. The standard profile allows 1 GiB of retained parsed-DEX allocations, 250,000 classes and 256 MiB of combined DEX input. The large-APK profile allows 2 GiB, 400,000 classes and 512 MiB respectively. Total process RAM can exceed the parser allocation budget. Per-DEX input and temporary-parser limits remain unchanged.
+
+Higher limits require an explicit retry and apply only to the current APK during this session, including reloads of the same path. Opening a different file restores standard limits. If the larger profile also fails, RDX reports the remaining limit; it never raises limits repeatedly or publishes a partial class inventory. Malformed-input and unsupported-format errors use the normal diagnostics. CLI loading keeps standard limits; agents can use the GUI's accepted, shared project through MCP.
+
 ## Run from source
 
 Requirements: stable Rust and Cargo. Python 3 is needed only for transport test fixtures. Initial builds download Rust dependencies.

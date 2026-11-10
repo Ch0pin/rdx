@@ -62,6 +62,7 @@ enum Event {
     ),
     Archive(u64, Arc<Archive>),
     IndexingStage(u64, &'static str),
+    LoadLimit(u64, rdx::load_limits::LoadLimitExceeded),
     AppIcon(u64, image::RgbaImage),
     PackageName(u64, String),
     Opened(u64, Result<ProjectSnapshot, String>),
@@ -544,6 +545,8 @@ pub struct App {
     loading_project: bool,
     loading_started: Option<std::time::Instant>,
     loading_stage: &'static str,
+    loading_limits: rdx::load_limits::LoadLimits,
+    load_retry: Option<rdx::load_limits::LoadLimitExceeded>,
     asset_busy: bool,
     export_busy: bool,
     pending_dialog: Option<u64>,
@@ -690,6 +693,8 @@ impl App {
             loading_project: false,
             loading_started: None,
             loading_stage: "Opening package…",
+            loading_limits: Default::default(),
+            load_retry: None,
             asset_busy: false,
             export_busy: false,
             pending_dialog: None,
@@ -874,11 +879,29 @@ impl App {
         self.loading_project = false;
         self.loading_started = None;
         self.loading_stage = "Opening package…";
+        self.load_retry = None;
         self.asset_busy = false;
         self.export_busy = false;
     }
+    fn limits_for_path(&self, path: &std::path::Path) -> rdx::load_limits::LoadLimits {
+        if self.path.as_deref() == Some(path) {
+            self.loading_limits
+        } else {
+            Default::default()
+        }
+    }
     fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let limits = self.limits_for_path(&path);
+        self.open_with_limits(path, ctx, limits);
+    }
+    fn open_with_limits(
+        &mut self,
+        path: PathBuf,
+        ctx: &egui::Context,
+        limits: rdx::load_limits::LoadLimits,
+    ) {
         self.stop();
+        self.loading_limits = limits;
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(WINDOW_TITLE.into()));
         self.project = None;
         self.archive = None;
@@ -917,13 +940,13 @@ impl App {
                         "Reading classes and resources…",
                     ));
                     ctx.request_repaint();
-                    engine.open(&path)?
+                    engine.open_with_limits(&path, limits)?
                 } else {
                     let source = rdx::package_container::PackageContainer::open(&path)?;
                     let archive = Arc::new(Archive::from_prepared(source.clone()));
                     let _ = tx.send(Event::Archive(generation, archive));
                     ctx.request_repaint();
-                    engine.open_prepared(source)?
+                    engine.open_prepared_with_limits(source, limits)?
                 };
                 let _ = tx.send(Event::IndexingStage(
                     generation,
@@ -949,7 +972,14 @@ impl App {
                 ctx.request_repaint();
                 Ok(project)
             })
-            .map_err(|e: anyhow::Error| format!("{e:#}"));
+            .map_err(|e: anyhow::Error| {
+                if limits == rdx::load_limits::LoadLimits::Standard
+                    && let Some(limit) = e.downcast_ref::<rdx::load_limits::LoadLimitExceeded>()
+                {
+                    let _ = tx.send(Event::LoadLimit(generation, limit.clone()));
+                }
+                format!("{e:#}")
+            });
             let _ = tx.send(Event::Opened(generation, result));
             ctx.request_repaint();
         });
@@ -2508,6 +2538,11 @@ impl App {
                         egui::TextureOptions::LINEAR,
                     ));
                 }
+                Event::LoadLimit(generation, limit)
+                    if generation == self.generation && self.loading_project =>
+                {
+                    self.load_retry = Some(limit);
+                }
                 Event::IndexingStage(generation, stage)
                     if generation == self.generation && self.loading_project =>
                 {
@@ -2992,6 +3027,52 @@ impl App {
             self.decode_resource_mode(index, ctx, true);
         }
     }
+    fn load_limit_prompt(&mut self, ctx: &egui::Context) {
+        let Some(failure) = self.load_retry.clone() else {
+            return;
+        };
+        let Some(path) = self.path.clone() else {
+            self.load_retry = None;
+            return;
+        };
+        let higher = rdx::load_limits::LoadLimits::Large;
+        let can_retry = failure.required_at_least <= higher.allowance(failure.resource);
+        let mut visible = true;
+        let mut retry = false;
+        let mut cancel = false;
+        egui::Window::new("Large APK loading")
+            .id(egui::Id::new("large_apk_retry"))
+            .anchor(egui::Align2::CENTER_CENTER,egui::Vec2::ZERO)
+            .collapsible(false).resizable(false).default_width(510.0).open(&mut visible)
+            .show(ctx,|ui| {
+                ui.heading("This file exceeds the standard loading limits");
+                ui.label(path.file_name().unwrap_or_default().to_string_lossy());
+                ui.label(match failure.resource {
+                    rdx::load_limits::LoadResource::Classes => format!("At least {} classes were encountered. The standard limit is {}.",failure.required_at_least,failure.limit),
+                    _ => format!("This loading stage needs at least {} MiB. Its standard allowance is {} MiB.",failure.required_at_least.div_ceil(1024*1024),failure.limit/(1024*1024)),
+                });
+                ui.separator();
+                if can_retry {
+                    ui.label("Retry with the large-APK profile:");
+                    ui.label("• 2 GiB retained parsed-DEX budget
+• 400,000 classes
+• 512 MiB combined DEX input");
+                    ui.label("Total application RAM can be higher than the parsing budget. These limits apply to this project for this session.");
+                } else {
+                    ui.label("This input also exceeds the available large-APK profile. Loading remains stopped; diagnostics show the limit reached.");
+                }
+                ui.horizontal(|ui| {
+                    retry=ui.add_enabled(can_retry,egui::Button::new("Retry with higher limits")).clicked();
+                    cancel=ui.button("Cancel").clicked();
+                });
+            });
+        if retry {
+            self.open_with_limits(path, ctx, higher);
+        } else if cancel || !visible {
+            self.load_retry = None;
+        }
+    }
+
     fn indexing_banner(&self, ctx: &egui::Context) {
         // Independent of navigation/status text and toolbar auto-hide.
         if !self.loading_project {
@@ -3016,6 +3097,7 @@ impl App {
                     ui.label(format!("{seconds}s elapsed"));
                 });
                 ui.label(self.loading_stage);
+                if self.loading_limits==rdx::load_limits::LoadLimits::Large {ui.weak("Large-APK limits enabled for this project");}
                 ui.label(if self.archive.is_some() {
                     "You can browse archive files now. Class navigation, code search and analysis become available when indexing finishes."
                 } else {
@@ -4214,6 +4296,7 @@ impl eframe::App for App {
         }
         self.trim_tab_layouts(64 * 1024 * 1024);
         self.trim_tab_sources(128 * 1024 * 1024);
+        self.load_limit_prompt(ctx);
         self.plugins_window(ctx);
         let actions = self.search.show(
             ctx,
@@ -4370,6 +4453,97 @@ fn searching_status(workers: usize) -> String {
 
 #[cfg(test)]
 mod settings_tests {
+    #[test]
+    fn large_apk_choice_is_scoped_to_current_path_and_requires_explicit_retry() {
+        use rdx::load_limits::{LoadLimitExceeded, LoadLimits, LoadResource};
+        let mut app = navigation_test_app();
+        let ctx = egui::Context::default();
+        app.path = Some(PathBuf::from("/tmp/large.apk"));
+        app.loading_project = true;
+        app.tx
+            .send(Event::LoadLimit(
+                app.generation,
+                LoadLimitExceeded {
+                    resource: LoadResource::Classes,
+                    limit: 250000,
+                    required_at_least: 250001,
+                },
+            ))
+            .unwrap();
+        app.tx
+            .send(Event::Opened(
+                app.generation,
+                Err("Class limit exceeded".into()),
+            ))
+            .unwrap();
+        app.events(&ctx);
+        assert!(app.load_retry.is_some());
+        assert_eq!(app.loading_limits, LoadLimits::Standard);
+        assert!(!app.loading_project);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 820.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), |ctx| app.load_limit_prompt(ctx));
+        let output = ctx.run(input(), |ctx| app.load_limit_prompt(ctx));
+        fn labels(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => out.push_str(t.galley.text()),
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        labels(s, out)
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut text = String::new();
+        for s in output.shapes {
+            labels(&s.shape, &mut text);
+        }
+        assert!(text.contains("Retry with higher limits"), "{text}");
+        assert!(text.contains("2 GiB"), "{text}");
+        assert_eq!(
+            app.loading_limits,
+            LoadLimits::Standard,
+            "rendering the prompt never opts in"
+        );
+        app.loading_limits = LoadLimits::Large;
+        assert_eq!(
+            app.limits_for_path(std::path::Path::new("/tmp/large.apk")),
+            LoadLimits::Large
+        );
+        assert_eq!(
+            app.limits_for_path(std::path::Path::new("/tmp/different.apk")),
+            LoadLimits::Standard
+        );
+        app.stop();
+        assert!(app.load_retry.is_none());
+    }
+    #[test]
+    fn stale_limit_errors_and_malformed_inputs_do_not_offer_retry() {
+        let mut app = navigation_test_app();
+        let ctx = egui::Context::default();
+        app.loading_project = true;
+        app.tx
+            .send(Event::LoadLimit(
+                app.generation + 1,
+                rdx::load_limits::LoadLimitExceeded {
+                    resource: rdx::load_limits::LoadResource::Classes,
+                    limit: 250000,
+                    required_at_least: 250001,
+                },
+            ))
+            .unwrap();
+        app.tx
+            .send(Event::Opened(app.generation, Err("Malformed DEX".into())))
+            .unwrap();
+        app.events(&ctx);
+        assert!(app.load_retry.is_none());
+    }
     #[test]
     fn indexing_banner_survives_navigation_status_and_has_no_guessed_percentage() {
         let mut app = navigation_test_app();
@@ -4783,6 +4957,8 @@ mod settings_tests {
             loading_project: false,
             loading_started: None,
             loading_stage: "Opening package…",
+            loading_limits: Default::default(),
+            load_retry: None,
             asset_busy: false,
             export_busy: false,
             pending_dialog: None,

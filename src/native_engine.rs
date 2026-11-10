@@ -20,9 +20,8 @@ use std::{
 const MAX_DEX_BYTES: u64 = 256 * 1024 * 1024;
 // Parsed code and symbol tables are wider than their packed DEX representation.
 // Keep this separate from the input-byte limit and bounded for hostile archives.
-const MAX_RETAINED_DEX_BYTES: usize = 1024 * 1024 * 1024;
+use crate::load_limits::{LoadLimitExceeded, LoadLimits, LoadResource};
 const MAX_ZIP_ENTRIES: usize = 100_000;
-const MAX_CLASSES: usize = 250_000;
 const MAX_ARCHIVE_METADATA: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -285,7 +284,7 @@ pub(crate) fn check_zip_directory(file: &mut File) -> Result<()> {
 }
 impl DecompilerEngine for NativeDexEngine {
     fn open(&mut self, path: &Path) -> Result<Project> {
-        self.open_input(path, None)
+        self.open_input(path, None, LoadLimits::Standard)
     }
     fn decompile(&mut self, name: &str) -> Result<String> {
         ensure!(self.opened, "Open an APK or DEX first");
@@ -301,16 +300,11 @@ impl DecompilerEngine for NativeDexEngine {
     }
 }
 impl NativeDexEngine {
-    pub(crate) fn open_prepared(
-        &mut self,
-        container: Arc<crate::package_container::PackageContainer>,
-    ) -> Result<Project> {
-        self.open_input(container.source_path(), Some(container.clone()))
-    }
-    fn open_input(
+    pub(crate) fn open_input(
         &mut self,
         path: &Path,
         prepared: Option<Arc<crate::package_container::PackageContainer>>,
+        limits: LoadLimits,
     ) -> Result<Project> {
         // Clear stale state even if the replacement input fails.
         self.classes = Arc::default();
@@ -320,10 +314,20 @@ impl NativeDexEngine {
         let mut classes = BTreeMap::new();
         let mut class_origins = BTreeMap::<String, String>::new();
         let mut resources = Vec::new();
-        let mut parse_budget = MAX_RETAINED_DEX_BYTES;
+        let mut parse_budget = limits.retained_bytes();
         let mut add_dex = |bytes: &[u8], origin: &str| -> Result<()> {
             let dex = native_dex::parse_with_budget(bytes, &mut parse_budget).map_err(|error| {
-                if error.downcast_ref::<native_dex::UnsupportedDex>().is_some() {
+                if let Some(limit) = error.downcast_ref::<native_dex::RetainedAllocationLimit>() {
+                    anyhow::Error::new(LoadLimitExceeded {
+                        resource: LoadResource::RetainedDex,
+                        limit: limits.retained_bytes() as u64,
+                        required_at_least: limits
+                            .retained_bytes()
+                            .saturating_sub(limit.available)
+                            .saturating_add(limit.required)
+                            as u64,
+                    })
+                } else if error.downcast_ref::<native_dex::UnsupportedDex>().is_some() {
                     anyhow::Error::new(UnsupportedNative(error.to_string()))
                 } else {
                     error
@@ -338,8 +342,12 @@ impl NativeDexEngine {
                     .context("Invalid class descriptor")?
                     .replace('/', ".");
                 ensure!(
-                    classes.len() < MAX_CLASSES,
-                    "Native class inventory exceeds limit"
+                    classes.len() < limits.classes(),
+                    LoadLimitExceeded {
+                        resource: LoadResource::Classes,
+                        limit: limits.classes() as u64,
+                        required_at_least: classes.len() as u64 + 1
+                    }
                 );
                 if let Some(first) = class_origins.get(&name) {
                     bail!("Duplicate class across DEX inputs: {name} in {first} and {origin}");
@@ -375,7 +383,7 @@ impl NativeDexEngine {
                     container.entries().len() <= MAX_ZIP_ENTRIES,
                     "Package has too many entries"
                 );
-                let mut remaining = MAX_DEX_BYTES;
+                let mut remaining = limits.total_dex_bytes();
                 let mut dex_count = 0;
                 let mut resource_name_bytes = 0;
                 for entry in container.entries() {
@@ -388,8 +396,19 @@ impl NativeDexEngine {
                     if !entry.is_apk_member || !dex_entry(&entry.member_path) {
                         continue;
                     }
-                    ensure!(entry.size <= remaining, "APK DEX data exceeds size limit");
-                    let bytes = container.read_member(entry.index, remaining)?;
+                    ensure!(
+                        entry.size <= MAX_DEX_BYTES,
+                        "Native DEX input exceeds per-file size limit"
+                    );
+                    ensure!(
+                        entry.size <= remaining,
+                        LoadLimitExceeded {
+                            resource: LoadResource::TotalDex,
+                            limit: limits.total_dex_bytes(),
+                            required_at_least: limits.total_dex_bytes() - remaining + entry.size
+                        }
+                    );
+                    let bytes = container.read_member(entry.index, remaining.min(MAX_DEX_BYTES))?;
                     remaining -= bytes.len() as u64;
                     let origin = if entry.source_path.is_empty() {
                         entry.member_path.clone()

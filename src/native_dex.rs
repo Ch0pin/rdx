@@ -380,16 +380,33 @@ pub fn parse(bytes: &[u8]) -> Result<DexFile> {
     parse_with_budget(bytes, &mut remaining)
 }
 
-/// Parse with a shared conservative allocation budget, suitable for APK multidex.
-/// Each parser invocation has an independent 768 MiB temporary allocation budget.
-/// Retained allocations are charged by actual container capacities, with overhead
-/// allowances. Failed parsing exhausts the supplied retained budget. This is a
-/// parser allocation budget, not a process RSS guarantee or an input-byte budget.
+/// A typed aggregate-budget failure, distinct from unsupported or malformed DEX.
+#[derive(Debug)]
+pub struct RetainedAllocationLimit {
+    pub required: usize,
+    pub available: usize,
+}
+impl std::fmt::Display for RetainedAllocationLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "native DEX retained allocation budget exceeded (requires {} bytes, {} bytes remain)",
+            self.required, self.available
+        )
+    }
+}
+impl std::error::Error for RetainedAllocationLimit {}
+
+/// Parse using a shared retained-allocation budget and an independent 768 MiB
+/// temporary budget per DEX. This accounting is not a process RSS ceiling.
 pub fn parse_with_budget(bytes: &[u8], remaining: &mut usize) -> Result<DexFile> {
     let available = *remaining;
     ensure!(
         available > 0,
-        UnsupportedDex("native DEX allocation budget exceeded".into())
+        RetainedAllocationLimit {
+            required: 1,
+            available: 0
+        }
     );
     // Temporary allocations stay bounded per DEX. The caller-provided balance
     // is a separate aggregate retained-data budget and may legitimately exceed
@@ -399,11 +416,12 @@ pub fn parse_with_budget(bytes: &[u8], remaining: &mut usize) -> Result<DexFile>
     *remaining = 0;
     let dex = result?;
     let retained = retained_charge(&dex)?;
-    *remaining = available.checked_sub(retained).ok_or_else(|| {
-        UnsupportedDex(format!(
-            "native DEX retained allocation budget exceeded (requires {retained} bytes, {available} bytes remain)"
-        ))
-    })?;
+    *remaining = available
+        .checked_sub(retained)
+        .ok_or(RetainedAllocationLimit {
+            required: retained,
+            available,
+        })?;
     Ok(dex)
 }
 
@@ -1007,7 +1025,13 @@ mod tests {
     fn budget_limit_is_typed_but_malformed_bytes_are_not() {
         let bytes = include_bytes!("../tests/fixtures/hello.dex");
         let error = parse_with_budget(bytes, &mut 0).unwrap_err();
-        assert!(error.downcast_ref::<UnsupportedDex>().is_some());
+        assert!(error.downcast_ref::<RetainedAllocationLimit>().is_some());
+        assert!(
+            parse(b"not a dex")
+                .unwrap_err()
+                .downcast_ref::<RetainedAllocationLimit>()
+                .is_none()
+        );
         assert!(
             parse(b"not a dex")
                 .unwrap_err()

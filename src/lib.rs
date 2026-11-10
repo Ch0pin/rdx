@@ -5,6 +5,7 @@ pub mod app_icon;
 pub mod engine;
 pub mod engines;
 pub mod export;
+pub mod load_limits;
 pub mod native_call_values;
 pub mod native_calls;
 pub mod native_cfg;

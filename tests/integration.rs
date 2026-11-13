@@ -39,6 +39,37 @@ fn native_opens_dex_and_apk_and_reconstructs_method() {
 
 #[test]
 fn source_stats_runs_over_real_transport() {
+    // Exercise the application-relative resolver in the actual bundle layout.
+    // Cargo's test location is not stable (deps/ on older versions, build/.../
+    // out/ on newer versions), so run this test in a private staged bundle.
+    const STAGED: &str = "RDX_TEST_SOURCE_STATS_BUNDLE";
+    if std::env::var_os(STAGED).is_none() {
+        let bundle = tempfile::tempdir().unwrap();
+        let harness = bundle
+            .path()
+            .join(format!("integration{}", std::env::consts::EXE_SUFFIX));
+        let worker = bundle
+            .path()
+            .join(format!("rdx-source-stats{}", std::env::consts::EXE_SUFFIX));
+        std::fs::copy(std::env::current_exe().unwrap(), &harness).unwrap();
+        std::fs::copy(env!("CARGO_BIN_EXE_rdx-source-stats"), &worker).unwrap();
+        let result = Command::new(harness)
+            .args([
+                "--exact",
+                "source_stats_runs_over_real_transport",
+                "--nocapture",
+            ])
+            .env(STAGED, "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "bundled plugin test failed:\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
     let plugin = Plugin::load(&root().join("plugins/source-stats/plugin.json")).unwrap();
     assert_eq!(plugin.executable, "rdx-source-stats");
     assert!(PathBuf::from(env!("CARGO_BIN_EXE_rdx-source-stats")).is_file());

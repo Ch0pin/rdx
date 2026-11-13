@@ -224,7 +224,10 @@ mod tests {
         Plugin::load(&dir.join("plugin.json")).unwrap()
     }
     fn done(controller: &Controller, id: &str, hash: &str) -> Value {
-        let until = Instant::now() + Duration::from_secs(10);
+        // Cold Python startup competes with the parallel suite on hosted
+        // Windows runners. Keep a bounded wait without changing the worker's
+        // production deadline or weakening any completion/result assertions.
+        let until = Instant::now() + Duration::from_secs(60);
         loop {
             let result = controller.get(id, hash, 0, 1, false).unwrap();
             if result["status"] != "running" {

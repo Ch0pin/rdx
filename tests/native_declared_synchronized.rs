@@ -159,16 +159,17 @@ fn effects_outside_scope_wrong_lock_or_missing_monitor_reject() {
             .to_string()
             .contains("whole-method monitor")
     );
+    // monitor-exit v2; invoke-static effect; move-result v0; return v0
     let mut suffix = fixture(false, false);
     let code = suffix.methods[0].code.as_mut().unwrap();
-    code.instructions[6] = 0x0012;
-    code.instructions.insert(7, 0x000f);
+    code.instructions[6] = 0x2071;
+    code.instructions.splice(7..7, [0, 0x0032, 0x000a, 0x000f]);
     for region in &mut code.try_regions {
         if region.start > 6 {
-            region.start += 1;
-            region.end += 1;
+            region.start += 4;
+            region.end += 4;
         }
-        Arc::make_mut(&mut region.catches)[0].1 += 1;
+        Arc::make_mut(&mut region.catches)[0].1 += 4;
     }
     assert!(
         source(&suffix)
@@ -197,6 +198,29 @@ fn effects_outside_scope_wrong_lock_or_missing_monitor_reject() {
     let mut no_release = fixture(false, false);
     no_release.methods[0].code.as_mut().unwrap().instructions[5] = 0x000f;
     assert!(source(&no_release).is_err());
+}
+
+#[test]
+fn constant_materialized_after_declared_release_renders_without_block() {
+    let mut class = fixture(false, false);
+    let code = class.methods[0].code.as_mut().unwrap();
+    // monitor-exit v2; const/4 v0, 1; return v0
+    code.instructions.insert(6, 0x1012);
+    for region in &mut code.try_regions {
+        if region.start > 6 {
+            region.start += 1;
+            region.end += 1;
+        }
+        Arc::make_mut(&mut region.catches)[0].1 += 1;
+    }
+    let source = source(&class).unwrap();
+    assert!(
+        source.contains("synchronized int test(boolean p0)"),
+        "{source}"
+    );
+    assert_eq!(source.matches("synchronized (").count(), 0, "{source}");
+    assert!(source.contains("return 1;"), "{source}");
+    assert_eq!(source.matches("Effect.effect(").count(), 1, "{source}");
 }
 
 #[test]

@@ -373,7 +373,13 @@ pub(super) fn analyze(code: &DexCode, graph: &Graph) -> Result<Vec<Region>> {
                 tail.push(next);
                 match instruction.opcode {
                     0x0e..=0x11 => break Some(next),
-                    0x00 => next += instruction.width,
+                    // d8 materializes the returned constant or copies the
+                    // result after the release. Register-only writes perform
+                    // no effect between the explicit release and Java's
+                    // implicit release at return.
+                    0x00..=0x09 | 0x12..=0x19 if !instruction.may_throw => {
+                        next += instruction.width
+                    }
                     0x28..=0x2a => next = graph.targets[next].context("monitor return jump")?,
                     _ => break None,
                 }
@@ -869,7 +875,7 @@ pub(super) fn declared_method_lock(
             let instruction = at.get(&pc).context("declared monitor return boundary")?;
             match instruction.opcode {
                 0x0e..=0x11 => break,
-                0x00 => pc += instruction.width,
+                0x00..=0x09 | 0x12..=0x19 if !instruction.may_throw => pc += instruction.width,
                 0x28..=0x2a => pc = graph.targets[pc].context("declared monitor return jump")?,
                 _ => bail!("effects follow declared method monitor release"),
             }

@@ -433,6 +433,60 @@ fn multiple_releases_with_immediate_returns_reconstruct() {
     assert!(render(&wrong_lock).is_err());
 }
 
+// d8 materializes a returned constant after the release:
+// `monitor-exit; const/4 vX, N; return vX`. The second release overwrites
+// the released lock register itself, which is harmless once the lock is gone.
+fn constant_releases() -> DexClass {
+    fixture(
+        vec![
+            0x021d, 0x0071, 0, 0, 0x000a, 0x0038, 5, 0x021e, 0x1012, 0x000f, 0x0071, 0, 0, 0x000a,
+            0x021e, 0x0212, 0x020f, 0x010d, 0x021e, 0x0127,
+        ],
+        &[(1, 7, 17), (10, 14, 17), (18, 19, 17)],
+    )
+}
+
+#[test]
+fn constants_materialized_after_release_stay_pure_return_tails() {
+    let class = constant_releases();
+    let source = render(&class).unwrap().source;
+    assert_eq!(source.matches("synchronized (").count(), 1, "{source}");
+    assert_eq!(source.matches(".effect()").count(), 2, "{source}");
+    assert!(source.contains("return 1;"), "{source}");
+    assert!(source.contains("return 0;"), "{source}");
+    // A single release followed by a constant keeps the block closed before
+    // the return and performs no effect in between.
+    let single = fixture(
+        vec![
+            0x021d, 0x0071, 0, 0, 0x000a, 0x021e, 0x1012, 0x000f, 0x010d, 0x021e, 0x0127,
+        ],
+        &[(1, 6, 8), (9, 10, 8)],
+    );
+    let source = render(&single).unwrap().source;
+    assert_eq!(source.matches("synchronized (").count(), 1, "{source}");
+    assert!(source.contains("return 1;"), "{source}");
+    // A post-release call is an effect and must stay outside the block.
+    let mut multi = constant_releases();
+    multi.methods[0].code.as_mut().unwrap().instructions[8] = 0x0071;
+    multi.methods[0]
+        .code
+        .as_mut()
+        .unwrap()
+        .instructions
+        .splice(9..9, [0, 0]);
+    for region in &mut multi.methods[0].code.as_mut().unwrap().try_regions {
+        if region.start > 8 {
+            region.start += 2;
+            region.end += 2;
+        }
+        Arc::make_mut(&mut region.catches)[0].1 += 2;
+    }
+    assert!(
+        render(&multi).is_err(),
+        "post-release call must not move inside monitor"
+    );
+}
+
 #[test]
 #[ignore = "requires javac and java"]
 fn multiple_return_monitor_executes_with_real_jvm_release_semantics() {

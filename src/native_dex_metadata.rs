@@ -511,8 +511,8 @@ impl AnnotationCache {
                             .context("Parameter annotation allocation overflow")?,
                     )?;
                     directory.parameters[position] = vec![None; count];
-                    for i in 0..count {
-                        directory.parameters[position][i] = self
+                    for (i, parameter) in directory.parameters[position].iter_mut().enumerate() {
+                        *parameter = self
                             .set(&input, reader.u32(list + 4 + i * 4)?, budget)?
                             .map(|summary| summary.annotations);
                     }

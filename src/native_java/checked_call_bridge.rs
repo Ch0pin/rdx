@@ -96,14 +96,27 @@ fn discover(class: &DexClass, preserve_header: bool) -> Option<Vec<Bridge>> {
                 continue;
             };
             let (result, parameters) = class.symbols.protos.get(*prototype_index as usize)?;
-            let Some(declaration) = hierarchy.exact_platform_source_declaration(
-                &class.descriptor,
-                owner,
-                name,
-                parameters,
-                result,
-                true,
-            ) else {
+            // A header-preserving retry also forwards exact loaded static
+            // declarations; the baseline infers or refuses those instead.
+            let Some(declaration) = hierarchy
+                .exact_platform_source_declaration(
+                    &class.descriptor,
+                    owner,
+                    name,
+                    parameters,
+                    result,
+                    true,
+                )
+                .or_else(|| {
+                    preserve_header
+                        .then(|| {
+                            hierarchy.exact_loaded_static_source_declaration(
+                                class, owner, name, parameters, result,
+                            )
+                        })
+                        .flatten()
+                })
+            else {
                 continue;
             };
             let checked: Vec<_> = declaration
@@ -195,14 +208,17 @@ pub(super) fn for_site(
     let name = class.symbols.strings.get(name as usize)?;
     let (result, parameters) = class.symbols.protos.get(proto as usize)?;
     let hierarchy = class.symbols.hierarchy.get()?;
-    let declaration = hierarchy.exact_platform_source_declaration(
-        &class.descriptor,
-        owner,
-        name,
-        parameters,
-        result,
-        true,
-    )?;
+    let declaration = hierarchy
+        .exact_platform_source_declaration(&class.descriptor, owner, name, parameters, result, true)
+        .or_else(|| {
+            preserve_header
+                .then(|| {
+                    hierarchy.exact_loaded_static_source_declaration(
+                        class, owner, name, parameters, result,
+                    )
+                })
+                .flatten()
+        })?;
     let needs_bridge = declaration.thrown_types.iter().any(|ty| {
         hierarchy.assignable(ty, "Ljava/lang/RuntimeException;") != Relation::Proven
             && hierarchy.assignable(ty, "Ljava/lang/Error;") != Relation::Proven

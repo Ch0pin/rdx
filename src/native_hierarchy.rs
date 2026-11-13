@@ -2551,6 +2551,64 @@ impl TypeHierarchy {
             })
     }
 
+    /// Proof-only exact declaration of a loaded public static method that
+    /// declares checked exceptions. The source forwarder calls it by its
+    /// rendered header, so the owner and member must render exactly as
+    /// declared and be accessible from the caller's package.
+    pub(crate) fn exact_loaded_static_source_declaration(
+        &self,
+        class: &DexClass,
+        owner: &str,
+        name: &str,
+        args: &[Arc<str>],
+        ret: &str,
+    ) -> Option<ExactSourceDeclaration> {
+        if !self.loaded_owners.contains(owner)
+            || owner.contains('$')
+            || !self.header_static_shape_known(class, owner, name, args, ret)
+        {
+            return None;
+        }
+        let key = format!(
+            "{owner}->{name}({}){ret}",
+            args.iter().map(AsRef::as_ref).collect::<String>()
+        );
+        let (true, thrown_types) = self.static_throws.get(&key)? else {
+            return None;
+        };
+        if thrown_types.is_empty()
+            || thrown_types
+                .iter()
+                .any(|ty| !valid_reference_descriptor(ty))
+        {
+            return None;
+        }
+        let summary = self.loaded_call_families.get(owner)?;
+        let candidate = summary
+            .methods
+            .get(name)
+            .and_then(|family| family.get(&args.len()))
+            .and_then(Option::as_ref)?;
+        (summary.access_flags & !0x7631 == 0
+            && candidate.parameters == args
+            && candidate.return_type.as_ref() == ret
+            && candidate.access_flags & 8 != 0
+            && !candidate.declared_throws_empty
+            && !candidate.generic_method
+            && candidate.legal_source_declaration
+            && platform_source_accessible(
+                &class.descriptor,
+                owner,
+                summary.access_flags,
+                candidate.access_flags,
+            ))
+        .then(|| ExactSourceDeclaration {
+            owner_access_flags: summary.access_flags,
+            member_access_flags: candidate.access_flags,
+            thrown_types: thrown_types.to_vec(),
+        })
+    }
+
     // Shared with the exact post-render declaration writer. This does not
     // summarize the runtime effects or recursively generated callee headers.
     pub(crate) fn source_static_declaration<'a>(

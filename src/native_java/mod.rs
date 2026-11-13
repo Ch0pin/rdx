@@ -369,7 +369,13 @@ fn render_method_inner(
                                     failure.site.throw_pc,
                                 ) {
                                     Ok(body) => body,
-                                    Err(_) => {
+                                    Err(source_error) => {
+                                        if std::env::var_os("RDX_RETHROW_DIAG").is_some() {
+                                            eprintln!(
+                                                "RDX_RETHROW_DIAG {name}.{} caught_source={source_error:#}",
+                                                method.name
+                                            );
+                                        }
                                         return Err(baseline_error);
                                     }
                                 }

@@ -59,6 +59,8 @@ mod parent_continue;
 mod parent_prefix_fusion;
 #[path = "protected_pure_exits.rs"]
 mod protected_pure_exits;
+#[path = "protected_terminal_writes.rs"]
+mod protected_terminal_writes;
 #[path = "pure_loop_exit_span.rs"]
 mod pure_loop_exit_span;
 #[path = "receiver_cleanup.rs"]
@@ -11429,6 +11431,41 @@ fn protected_normal_exit(
         }
     }
     if exits.len() > 1 {
+        // R8 can use the same null/default assignment for a failed type test
+        // and a catch. Join the protected exits before inspecting any later
+        // loop-continue edge or effectful per-item work. Only a bounded chain
+        // of nonthrowing copies/constants/forward gotos may cross the DEX end.
+        let candidate = *exits.last().unwrap();
+        let mut common_pure_join = candidate < words.len();
+        for &entry in &exits {
+            let mut pc = entry;
+            let mut hops = 0;
+            while common_pure_join && pc != candidate {
+                graph.tick()?;
+                if hops >= 32 || pc >= candidate || graph.widths[pc] == 0 || graph.payloads[pc] {
+                    common_pure_join = false;
+                    break;
+                }
+                hops += 1;
+                match words[pc] as u8 {
+                    0x00 if words[pc] == 0 => pc += graph.widths[pc],
+                    0x01..=0x09 | 0x12..=0x19 => pc += graph.widths[pc],
+                    0x28..=0x2a => {
+                        if let Some(target) =
+                            graph.targets[pc].filter(|&target| target > pc && target <= candidate)
+                        {
+                            pc = target;
+                        } else {
+                            common_pure_join = false;
+                        }
+                    }
+                    _ => common_pure_join = false,
+                }
+            }
+        }
+        if common_pure_join {
+            return Ok(candidate);
+        }
         // Pure forward branches/moves ending in returns can be included in the
         // Java try: none introduces a newly caught exception. Effectful tails
         // must retain their original exception boundary.
@@ -11628,17 +11665,61 @@ fn protected_loop_suffix_end(
         .filter(|l| start <= l.start && l.start < end && end < l.exit)
         .map(|l| l.exit)
         .max()?;
+    // A detached catch entry can be laid out between the loop's latch and
+    // normal exit. It does not belong to the normal loop, but its nonthrowing
+    // move-exception/jump prefix may lie inside the extended address span.
+    // Keep it separate from the Java try body and reject any normal entry.
+    let detached_handlers = if region
+        .catches
+        .iter()
+        .any(|(_, handler)| (end..extension).contains(&(*handler as usize)))
+    {
+        if code.instructions.len() > 32768 {
+            return None;
+        }
+        let cfg = crate::native_cfg::ControlFlowGraph::build(code).ok()?;
+        let normal_targets: std::collections::HashSet<_> = cfg
+            .blocks
+            .iter()
+            .flat_map(|block| &block.successors)
+            .filter(|edge| edge.kind == crate::native_cfg::EdgeKind::Normal)
+            .map(|edge| edge.target)
+            .collect();
+        region
+            .catches
+            .iter()
+            .filter_map(|(_, handler)| {
+                let pc = *handler as usize;
+                let block = *cfg.block_at.get(&pc)?;
+                (cfg.blocks[block].start == pc && !normal_targets.contains(&block)).then_some(pc)
+            })
+            .collect::<std::collections::HashSet<_>>()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let detached_catch_entry = |pc: usize| {
+        region
+            .catches
+            .iter()
+            .any(|(_, handler)| *handler as usize == pc)
+            && detached_handlers.contains(&pc)
+            && code
+                .instructions
+                .get(pc)
+                .is_some_and(|word| *word as u8 == 0x0d)
+    };
     if extension - end > 64
         || code.try_regions.iter().any(|other| {
             other.catches.iter().any(|(_, pc)| {
                 let handler = *pc as usize;
                 (end..extension).contains(&handler)
                     && (other != region
-                        || !shared_nonthrowing_exit::pure_protected_tail(
-                            code,
-                            end..extension,
-                            handler,
-                        ))
+                        || (!detached_catch_entry(handler)
+                            && !shared_nonthrowing_exit::pure_protected_tail(
+                                code,
+                                end..extension,
+                                handler,
+                            )))
             }) || (other != region
                 && (other.start as usize) < extension
                 && end < other.end as usize)
@@ -11659,8 +11740,9 @@ fn protected_loop_suffix_end(
             || graph.targets.get(instruction.pc) != Some(&instruction.branch_target)
             || graph.payloads[instruction.pc]
             || instruction.opcode == 0 && code.instructions[instruction.pc] != 0
-            || !matches!(instruction.opcode,
+            || !(matches!(instruction.opcode,
                 0x00..=0x09 | 0x0e..=0x19 | 0x28..=0x2a | 0x2d..=0x3d | 0xd8)
+                || (instruction.opcode == 0x0d && detached_catch_entry(instruction.pc)))
         {
             return None;
         }
@@ -12579,11 +12661,13 @@ fn render_try(
     // continuation). Unused entry registers may freely change type in the try.
     // Wide operations are safe without snapshots; an immutable wide entry must
     // have neither word overwritten. Tail text remains ownership metadata.
-    let written = super::liveness::written_in(
-        method.code.as_ref().context("missing try code")?,
-        start,
-        end,
-    );
+    let written = graph
+        .loops
+        .iter()
+        .any(|region| start <= region.start && region.exit <= end)
+        .then(|| protected_terminal_writes::written_in(method.code.as_ref().unwrap(), start, end))
+        .flatten()
+        .or_else(|| super::liveness::written_in(method.code.as_ref().unwrap(), start, end));
     // A materialized exception snapshot may outlive the protected body and
     // meet a normal reference result. Type literal-zero storage from the
     // handler's complete first-read SSA domains, preserving the original

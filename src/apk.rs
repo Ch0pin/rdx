@@ -9,7 +9,8 @@ use std::{
     time::SystemTime,
 };
 
-const MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum decompressed entry bytes examined by a generic archive preview.
+pub(crate) const MAX_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TEXT: usize = 2 * 1024 * 1024;
 const HEX_BYTES: usize = 4096;
 
@@ -149,7 +150,7 @@ impl Archive {
             .find(|e| e.index == index)
             .context("Unknown package entry index")?;
         if let Some(source) = &self.prepared {
-            if expected.size > MAX_BYTES {
+            if expected.size > MAX_PREVIEW_BYTES {
                 let prefix = source.read_prefix(index, HEX_BYTES)?;
                 return Ok(binary(
                     &prefix,
@@ -160,7 +161,7 @@ impl Archive {
                     ),
                 ));
             }
-            let bytes = source.read_member(index, MAX_BYTES)?;
+            let bytes = source.read_member(index, MAX_PREVIEW_BYTES)?;
             ensure!(
                 bytes.len() as u64 == expected.size,
                 "Corrupt package entry: decompressed size mismatch"
@@ -182,7 +183,7 @@ impl Archive {
                 && entry.crc32() == self.checksums[index],
             "APK entry changed; reopen the archive"
         );
-        if expected.size > MAX_BYTES {
+        if expected.size > MAX_PREVIEW_BYTES {
             let mut prefix = Vec::new();
             entry
                 .by_ref()
@@ -201,11 +202,11 @@ impl Archive {
         let mut bytes = Vec::new();
         entry
             .by_ref()
-            .take(MAX_BYTES + 1)
+            .take(MAX_PREVIEW_BYTES + 1)
             .read_to_end(&mut bytes)
             .context("Corrupt or unsupported APK entry")?;
         ensure!(
-            bytes.len() as u64 <= MAX_BYTES,
+            bytes.len() as u64 <= MAX_PREVIEW_BYTES,
             "APK entry exceeds decompression preview limit"
         );
         ensure!(
@@ -443,7 +444,10 @@ mod tests {
     }
     #[test]
     fn compressed_oversize_is_bounded() {
-        let f = fixture("assets/large.txt", &vec![b'x'; MAX_BYTES as usize + 1]);
+        let f = fixture(
+            "assets/large.txt",
+            &vec![b'x'; MAX_PREVIEW_BYTES as usize + 1],
+        );
         let archive = Archive::open(&f.0).unwrap();
         assert!(archive.entries[0].compressed_size < 16384);
         match archive.preview(0).unwrap() {
@@ -522,7 +526,7 @@ mod tests {
         let exported = archive.export(entry.index, &directory.0).unwrap();
         assert_eq!(
             fs::read(exported).unwrap(),
-            source.read_member(entry.index, MAX_BYTES).unwrap()
+            source.read_member(entry.index, MAX_PREVIEW_BYTES).unwrap()
         );
     }
     #[test]
@@ -592,7 +596,10 @@ mod tests {
         for (name, bytes) in [
             ("assets/tiny.png", png.into_inner()),
             ("assets/binary.bin", vec![0, 255, 0, 1, 2]),
-            ("../../assets/large.txt", vec![b'x'; MAX_BYTES as usize + 1]),
+            (
+                "../../assets/large.txt",
+                vec![b'x'; MAX_PREVIEW_BYTES as usize + 1],
+            ),
         ] {
             let f = fixture(name, &bytes);
             let archive = Archive::open(&f.0).unwrap();

@@ -656,7 +656,8 @@ fn project_request(
     // Immutable DEX queries bypass the interactive engine mutex entirely.
     if matches!(
         name,
-        "get_call_graph"
+        "search_code"
+            | "get_call_graph"
             | "get_call_graph_batch"
             | "resolve_reference"
             | "find_field_references"
@@ -1071,84 +1072,7 @@ fn search_code(
     if args["mode"] == "identifiers" {
         return engine.search_identifiers(args, cancel);
     }
-    // Hits pagination returns only matching occurrences; the class-window
-    // contract stays available for callers that page by class index.
-    if args["pagination"] != "classes" {
-        return source_search::search_hits(engine, project, args, cancel);
-    }
-    let query = required(args, "query")?;
-    ensure!(
-        !query.is_empty() && query.len() <= 4096,
-        "Query must contain 1..4096 bytes"
-    );
-    let scope = crate::package_scope::PackageScope::from_args(args)?;
-    let classes: Vec<_> = project
-        .classes
-        .iter()
-        .filter(|class| scope.matches(class))
-        .collect();
-    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
-    let limit = args["limit"].as_u64().unwrap_or(25) as usize;
-    let source_offset = args["source_offset"].as_u64().unwrap_or(0) as usize;
-    ensure!(
-        (1..=500).contains(&limit) && offset <= classes.len(),
-        "Invalid search page"
-    );
-    ensure!(
-        offset < classes.len() || source_offset == 0,
-        "Source offset without a class"
-    );
-    let end = offset.saturating_add(limit).min(classes.len());
-    let mut items = Vec::new();
-    let mut errors = Vec::new();
-    let mut scanned = 0;
-    let mut next = (end < classes.len()).then_some(end);
-    let mut next_source = 0;
-    'classes: for (index, class) in classes.iter().enumerate().take(end).skip(offset) {
-        ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-        scanned += 1;
-        let code = match engine.decompile_search_cancellable(class, cancel) {
-            Ok(code) => code,
-            Err(error) => {
-                ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-                errors.push(json!({"class_id":class,"error":format!("{error:#}")}));
-                continue;
-            }
-        };
-        let start_char = if index == offset { source_offset } else { 0 };
-        let start_byte = if start_char == code.source.chars().count() {
-            code.source.len()
-        } else {
-            code.source
-                .char_indices()
-                .nth(start_char)
-                .map(|(i, _)| i)
-                .context("Invalid source_offset")?
-        };
-        for matched in crate::resource_search::literal_ranges(&code.source, &code.links, query)
-            .filter(|range| range.start >= start_byte)
-        {
-            ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-            let byte = matched.start;
-            let start = code.source[..byte].chars().count();
-            let end = start + code.source[matched].chars().count();
-            let line = code.source[..byte].bytes().filter(|b| *b == b'\n').count() + 1;
-            let snippet: String = code.source[byte..]
-                .chars()
-                .take(200)
-                .take_while(|c| *c != '\n')
-                .collect();
-            items.push(json!({"class_id":class,"source_hash":code.source_hash,"start":start,"end":end,"line":line,"snippet":snippet,"format":"java-or-mixed-dex"}));
-            if items.len() == 100 {
-                next = Some(index);
-                next_source = end;
-                break 'classes;
-            }
-        }
-    }
-    Ok(
-        json!({"items":items,"pagination":"classes","scope":"generated Java and mixed DEX; case-sensitive literal plus exact numeric aliases for resolved resource links; resource files excluded","offset":offset,"limit":limit,"scanned_classes":scanned,"total_classes":classes.len(),"page_status":source_search::page_status(items.is_empty(),next.is_some(),!errors.is_empty()),"errors":errors,"next_offset":next,"next_source_offset":next.map(|_|next_source),"exhausted":next.is_none(),"package_scope":scope.describe(),"hint":source_search::identifier_hint(query,items.is_empty(),next.is_none())}),
-    )
+    source_search::search_hits(engine, project, args, cancel)
 }
 
 fn resolve_class_id<'a>(project: &'a Project, requested: &str) -> Result<&'a str> {
@@ -1889,7 +1813,7 @@ fn tools_list() -> Value {
         ),
         (
             "search_code",
-            "mode=identifiers searches original DEX identifiers without decompilation. Method-reference queries use a direct per-DEX method-table filter without building the global index. search_mode=scan and compact projections return bounded resumable pages: pass next_cursor as resume_cursor with unchanged filters; total is null until coverage_complete. projection=summary returns counts and callers returns unique enclosing methods. Package-scoped queries stream only matching classes; global index overflow automatically uses a complete bounded streaming scan. coverage_complete describes requested-scope coverage independently of index_complete. Offset-based index/streaming pages use next_offset; resumable scan pages use next_cursor and expose progressive counts. query matches class/method/field names or full IDs, with exact/contains, case_sensitive, symbol_kind and occurrence filters. Full projection retains instruction evidence. Excludes generated names, locals, comments, strings and runtime dispatch. mode=source (default) searches generated Java and mixed DEX by case-sensitive literal substring. No resources. Default pagination=hits returns only matching occurrences, scanning across classes until limit matches (default 100, max 500) or a 20-second between-class time budget; follow next_offset AND next_source_offset until exhausted. pagination=classes scans limit classes per page (default 25, max 500) with at most 100 matches per response. package_prefix takes one prefix, an array of prefixes, or the pseudo-prefix obfuscated-root (default-package classes and classes whose package segments are all at most three characters, such as wr.b$a or tk.a). Resume with the same query, package_prefix and pagination; no-match is conclusive only after all pages with no errors. Generated-source text has no precomputed index: prefer mode=identifiers for class/method/field names and find_string_references for DEX string literals.",
+            "mode=identifiers searches original DEX identifiers without decompilation. Method-reference queries use a direct per-DEX method-table filter without building the global index. search_mode=scan and compact projections return bounded resumable pages: pass next_cursor as resume_cursor with unchanged filters; total is null until coverage_complete. projection=summary returns counts and callers returns unique enclosing methods. Package-scoped queries stream only matching classes; global index overflow automatically uses a complete bounded streaming scan. coverage_complete describes requested-scope coverage independently of index_complete. Offset-based index/streaming pages use next_offset; resumable scan pages use next_cursor and expose progressive counts. query matches class/method/field names or full IDs, with exact/contains, case_sensitive, symbol_kind and occurrence filters. Full projection retains instruction evidence. Excludes generated names, locals, comments, strings and runtime dispatch. mode=source (default) searches generated Java and mixed DEX with case-sensitive literal matching, optional regex=true and case_sensitive=false. scope=resources or all opts into resource text and decoded XML; resource_prefix filters archive paths independently of package_prefix. GUI and MCP share bounded session source renders and parallel workers. Cold source searches reconstruct classes; warm queries reuse cached renders. Follow next_cursor as resume_cursor, or both legacy continuation offsets. Default pagination=hits returns only matching occurrences, scanning across classes until limit matches (default 100, max 500) or a 20-second between-class time budget; prefer next_cursor as resume_cursor, with both next_offset AND next_source_offset supported for legacy clients. pagination=classes scans limit classes per page (default 25, max 500) with at most 100 matches per response. package_prefix takes one prefix, an array of prefixes, or the pseudo-prefix obfuscated-root (default-package classes and classes whose package segments are all at most three characters, such as wr.b$a or tk.a). Keep the pinned instance/project and all source filters unchanged across every continuation; completion follows the all-page coverage contract above. Cold generated-source searches require reconstruction; warm searches reuse the session index. Prefer mode=identifiers for class/method/field names and find_string_references for DEX string literals.",
             vec!["query"],
             true,
         ),
@@ -2110,10 +2034,13 @@ fn tools_list() -> Value {
         if name=="search_code" {
             properties.insert("search_mode".into(),json!({"type":"string","enum":["auto","index","scan"],"default":"auto","description":"Identifiers only: auto directly scans method references; scan supports bounded cursor pages for every identifier kind; index explicitly requests the historical index path"}));
             properties.insert("projection".into(),json!({"type":"string","enum":["full","summary","callers"],"default":"full","description":"Identifiers only: summary returns cumulative counts; callers pages unique enclosing methods; full retains instruction evidence"}));
-            properties.insert("resume_cursor".into(),json!({"type":"string","description":"Opaque next_cursor from a previous identifier scan. Keep query filters and projection unchanged; omit offset."}));
+            properties.insert("resume_cursor".into(),json!({"type":"string","description":"Opaque next_cursor from a previous scan. Keep pinned instance_id/project_id and query filters unchanged; omit offset and source_offset. Follow every source page through exhausted=true with no continuation, accumulating coverage diagnostics across every page."}));
             properties.insert("mode".into(),json!({"type":"string","enum":["source","identifiers"],"default":"source"}));
             properties.insert("match_mode".into(),json!({"type":"string","enum":["exact","contains"],"default":"contains","description":"Identifier mode only"}));
-            properties.insert("case_sensitive".into(),json!({"type":"boolean","default":true,"description":"Identifier mode only"}));
+            properties.insert("case_sensitive".into(),json!({"type":"boolean","default":true,"description":"Literal/regex source and identifier matching; defaults true"}));
+            properties.insert("regex".into(),json!({"type":"boolean","default":false,"description":"Source only: regular expression instead of literal text"}));
+            properties.insert("scope".into(),json!({"type":"string","enum":["code","resources","all"],"default":"code","description":"Source only: include resource text and decoded XML explicitly"}));
+            properties.insert("resource_prefix".into(),json!({"type":"string","maxLength":4096,"description":"Source only: independent archive path prefix for resource scope"}));
             properties.insert("symbol_kind".into(),json!({"type":"string","enum":["all","class","method","field"],"default":"all","description":"Identifier mode only"}));
             properties.insert("occurrence".into(),json!({"type":"string","enum":["all","declaration","reference"],"default":"all","description":"Identifier mode only"}));
 
@@ -2196,6 +2123,9 @@ fn tools_list() -> Value {
                 } }
             }
         }
+        let description = if name == "search_code" {
+            format!("{} {description}", source_search::COMPLETION_GUIDANCE)
+        } else { description.to_owned() };
         json!({"name":name,"description":description,"inputSchema":schema,"annotations":{"readOnlyHint":!["open_apk","forget_instance","export_source","export_package_source","cancel_export","run_plugin_analysis","cancel_plugin_analysis"].contains(&name),"destructiveHint":name=="forget_instance","openWorldHint":false}})
     }).collect::<Vec<_>>()})
 }
@@ -2410,17 +2340,21 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
     }
     if name == "search_code" {
         if args["mode"] == "identifiers" {
+            ensure!(
+                ["regex", "scope", "resource_prefix"]
+                    .iter()
+                    .all(|key| args.get(key).is_none()),
+                "Source options require mode=source"
+            );
             crate::identifier_search::validate(args)?;
         } else {
             ensure!(
                 [
                     "match_mode",
-                    "case_sensitive",
                     "symbol_kind",
                     "occurrence",
                     "projection",
-                    "search_mode",
-                    "resume_cursor"
+                    "search_mode"
                 ]
                 .iter()
                 .all(|key| args.get(key).is_none()),
@@ -3479,6 +3413,10 @@ mod tests {
                         indexed["index_complete"] == true,
                         "Expected complete identifier index"
                     );
+                    let source=project_request(&worker_project,"search_code",&json!({"query":"(?s)^.","regex":true,"limit":500}),&cancel)?;
+                    ensure!(!source["items"].as_array().unwrap().is_empty(),"Expected source hits while interactive mutex is held");
+                    let resources=project_request(&worker_project,"search_code",&json!({"query":"sample","scope":"resources","resource_prefix":"AndroidManifest.xml"}),&cancel)?;
+                    ensure!(!resources["items"].as_array().unwrap().is_empty(),"Expected resource hits while interactive mutex is held");
                     project_request(&worker_project, "get_call_graph_batch", &json!({"method_ids":["sample.Target.doubleValue(I)I"]}), &cancel)?;
                     let graph = project_request(&worker_project, "get_call_graph", &json!({"method_id":"sample.Target.doubleValue(I)I", "direction":"callers", "projection":"call_sites"}), &cancel)?;
                     ensure!(graph["invoke_index_cached"] == true, "Expected shared invoke index");

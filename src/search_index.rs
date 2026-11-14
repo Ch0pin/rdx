@@ -1,6 +1,6 @@
 //! Private, bounded, disposable project-session source index.
+use crate::engine::{CodeDefinition, CodeLink};
 use crate::search::{CachedValue, SearchDocument, SearchTarget};
-use rdx::engine::{CodeDefinition, CodeLink};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -35,6 +35,164 @@ const RECORD_HEADER: usize = 12;
 const COMPRESSED_MAGIC: &[u8; 4] = b"RDXZ";
 const COMPRESSED_HEADER: usize = 8;
 static NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// One bounded disk index per parsed project, shared by GUI and MCP workers.
+/// Only index I/O holds this mutex; rendering and matching happen outside it.
+#[derive(Clone, Default)]
+pub struct SharedIndex(Arc<SharedState>);
+struct SharedState {
+    identity: Mutex<Option<[u8; 32]>>,
+    disk: Mutex<DiskIndex>,
+    active: Mutex<HashSet<SearchTarget>>,
+    wake: std::sync::Condvar,
+    renders: AtomicU64,
+    source_page_active: Mutex<bool>,
+    source_page_wake: std::sync::Condvar,
+}
+impl Default for SharedState {
+    fn default() -> Self {
+        Self {
+            identity: Mutex::new(None),
+            disk: Mutex::new(DiskIndex::default()),
+            active: Mutex::new(HashSet::new()),
+            wake: std::sync::Condvar::new(),
+            renders: AtomicU64::new(0),
+            source_page_active: Mutex::new(false),
+            source_page_wake: std::sync::Condvar::new(),
+        }
+    }
+}
+pub(crate) struct RenderClaim {
+    index: SharedIndex,
+    key: SearchTarget,
+}
+impl Drop for RenderClaim {
+    fn drop(&mut self) {
+        self.index.0.active.lock().unwrap().remove(&self.key);
+        self.index.0.wake.notify_all();
+    }
+}
+/// One MCP page may render per project at a time; GUI navigation/search remains independent.
+pub(crate) struct SourcePagePermit {
+    index: SharedIndex,
+}
+impl Drop for SourcePagePermit {
+    fn drop(&mut self) {
+        *self.index.0.source_page_active.lock().unwrap() = false;
+        self.index.0.source_page_wake.notify_all();
+    }
+}
+impl SharedIndex {
+    pub(crate) fn source_page(&self, cancelled: impl Fn() -> bool) -> Option<SourcePagePermit> {
+        let mut active = self.0.source_page_active.lock().unwrap();
+        loop {
+            if cancelled() {
+                return None;
+            }
+            if !*active {
+                *active = true;
+                return Some(SourcePagePermit {
+                    index: self.clone(),
+                });
+            }
+            active = self
+                .0
+                .source_page_wake
+                .wait_timeout(active, std::time::Duration::from_millis(20))
+                .unwrap()
+                .0;
+        }
+    }
+    pub fn for_project(classes: usize) -> Self {
+        Self(Arc::new(SharedState {
+            disk: Mutex::new(DiskIndex::for_project(classes)),
+            ..Default::default()
+        }))
+    }
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    pub(crate) fn identity(&self) -> Result<[u8; 32], String> {
+        let mut identity = self.0.identity.lock().unwrap();
+        if let Some(identity) = *identity {
+            return Ok(identity);
+        }
+        let mut nonce = [0; 32];
+        getrandom::fill(&mut nonce)
+            .map_err(|error| format!("Source cursor random identity: {error}"))?;
+        *identity = Some(nonce);
+        Ok(nonce)
+    }
+    pub fn renders(&self) -> u64 {
+        self.0.renders.load(Ordering::Relaxed)
+    }
+    pub(crate) fn rendered(&self) {
+        self.0.renders.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn claim(
+        &self,
+        key: SearchTarget,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<RenderClaim> {
+        let mut active = self.0.active.lock().unwrap();
+        loop {
+            if cancelled() {
+                return None;
+            }
+            if active.insert(key.clone()) {
+                return Some(RenderClaim {
+                    index: self.clone(),
+                    key,
+                });
+            }
+            active = self
+                .0
+                .wake
+                .wait_timeout(active, std::time::Duration::from_millis(20))
+                .unwrap()
+                .0;
+        }
+    }
+    pub fn contains(&self, key: &SearchTarget) -> bool {
+        self.0.disk.lock().unwrap().contains(key)
+    }
+    pub(crate) fn load(&self, key: &SearchTarget) -> Option<CachedValue> {
+        self.0.disk.lock().unwrap().load(key)
+    }
+    pub(crate) fn insert(&self, key: SearchTarget, value: &CachedValue) {
+        // Prepare filters/compression outside the index lock.
+        if let Some(prepared) = PreparedEntry::prepare(value) {
+            self.insert_prepared(key, prepared);
+        }
+    }
+    pub(crate) fn insert_prepared(&self, key: SearchTarget, entry: PreparedEntry) {
+        self.0.disk.lock().unwrap().insert_prepared(key, entry);
+    }
+    pub fn rejects(
+        &self,
+        key: &SearchTarget,
+        text: &str,
+        sensitive: bool,
+        regex: bool,
+        definitions: bool,
+    ) -> bool {
+        self.0
+            .disk
+            .lock()
+            .unwrap()
+            .rejects(key, text, sensitive, regex, definitions)
+    }
+    pub fn remove(&self, key: &SearchTarget) {
+        self.0.disk.lock().unwrap().remove(key);
+    }
+    pub fn stats(&self) -> (usize, usize, usize, usize) {
+        self.0.disk.lock().unwrap().stats()
+    }
+    #[cfg(test)]
+    pub(crate) fn truncate_payload_for_test(&self) {
+        self.0.disk.lock().unwrap().truncate_payload_for_test();
+    }
+}
 #[derive(Default)]
 struct OwnedDirectories {
     paths: HashSet<PathBuf>,
@@ -50,6 +208,11 @@ fn registry() -> Arc<Mutex<OwnedDirectories>> {
 /// Forced termination/crashes can leave private temporary files for OS cleanup.
 pub struct SessionCleanup {
     registry: Arc<Mutex<OwnedDirectories>>,
+}
+impl Default for SessionCleanup {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl SessionCleanup {
     pub fn new() -> Self {
@@ -335,7 +498,7 @@ impl PreparedEntry {
         let numeric_aliases: Vec<_> = doc
             .links
             .iter()
-            .filter_map(rdx::resource_search::link_id)
+            .filter_map(crate::resource_search::link_id)
             .flat_map(|id| [id.to_string(), format!("0x{id:08x}"), format!("0x{id:x}")])
             .collect();
         let filter = Filter::new(
@@ -518,7 +681,7 @@ impl DiskIndex {
                 && (!definitions || entry.complete)
                 && !entry.filter.may_match(text, sensitive, regex)
                 && (regex
-                    || rdx::resource_search::query_id(text)
+                    || crate::resource_search::query_id(text)
                         .is_none_or(|id| !entry.filter.may_match(&id.to_string(), true, false)))
         })
     }
@@ -1258,5 +1421,38 @@ mod tests {
         late.registry = registry;
         assert!(late.directory().is_none());
         drop(live);
+    }
+    #[test]
+    fn source_page_admission_is_shared_cancellable_and_released() {
+        use std::sync::{atomic::AtomicBool, mpsc};
+        let index = SharedIndex::default();
+        let first = index.source_page(|| false).unwrap();
+        let cancel = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let other = index.clone();
+            let cancel = &cancel;
+            let waiter = scope.spawn(move || {
+                other
+                    .source_page(|| {
+                        let _ = tx.send(());
+                        cancel.load(Ordering::Relaxed)
+                    })
+                    .is_none()
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+            cancel.store(true, Ordering::Relaxed);
+            assert!(waiter.join().unwrap());
+        });
+        drop(first);
+        assert!(index.source_page(|| false).is_some());
+    }
+    #[test]
+    fn source_cursor_session_nonces_are_random_and_shared_only_by_clones() {
+        let first = SharedIndex::default();
+        let clone = first.clone();
+        let independent = SharedIndex::default();
+        assert_eq!(first.identity().unwrap(), clone.identity().unwrap());
+        assert_ne!(first.identity().unwrap(), independent.identity().unwrap());
     }
 }

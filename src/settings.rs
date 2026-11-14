@@ -7,24 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
-pub const STANDARD_PACKAGES: &[&str] = &[
-    "android.*",
-    "androidx.*",
-    "com.android.*",
-    "kotlin.*",
-    "kotlinx.*",
-    "java.*",
-    "javax.*",
-    "jdk.*",
-    "sun.*",
-    "com.sun.*",
-    "dalvik.*",
-    "libcore.*",
-];
-
-pub fn default_excluded_packages() -> Vec<String> {
-    STANDARD_PACKAGES.iter().map(|s| (*s).to_owned()).collect()
-}
+pub use rdx::search::default_excluded_packages;
 
 /// Matches a search reports before it stops, until the user changes it.
 pub const DEFAULT_MAX_RESULTS: usize = 2000;

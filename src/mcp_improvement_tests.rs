@@ -1185,6 +1185,12 @@ fn smali_field_alias_normalizes_without_changing_owner_or_type() {
         source_search::page_status(true, true, false)["message"]
             .as_str()
             .unwrap()
+            .contains("next_cursor as resume_cursor")
+    );
+    assert!(
+        source_search::identifier_hint("Target", true, false)
+            .as_str()
+            .unwrap()
             .contains("mode=identifiers")
     );
     assert_eq!(

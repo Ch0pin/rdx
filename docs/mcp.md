@@ -13,8 +13,10 @@ server install is required. Each enabled GUI instance has an authenticated
 loopback service; the gateway discovers it through a private per-user registry.
 The instance backend shares the GUI's parsed DEX, hierarchy, resources, archive
 and project indexes. Starting or restarting MCP does not parse a second project.
-Interactive and service workers keep separate bounded source-cache LRU state and
-request cancellation state; cache clones share immutable document allocations.
+Interactive and service workers keep separate bounded interactive source-cache LRU state and
+request cancellation state; cache clones share immutable document allocations. GUI project
+search and MCP source search additionally share one bounded, query-independent session
+source index, so a completed render in either interface serves subsequent queries in both.
 Source-cache documents, identifier postings and literal postings share a 384 MiB
 retention admission budget per parsed project. When an analysis index cannot be
 retained, its complete streaming scan remains available. This budget covers
@@ -432,21 +434,87 @@ use `get_call_graph` with `direction: "callers"` and `argument_literal`.
 
 ## Bounded code search
 
-Source-mode `search_code` pages by occurrences across the APK by default
-(`pagination: "hits"`). `limit` bounds matches (default 100, maximum 500), not
-classes, so a page is never empty while matches remain. The server scans until
-that limit, the end of the filtered class list, or a 20-second budget checked
-between class renders. One expensive class may exceed that budget; cancellation
-remains cooperative. Resume with **both** `next_offset` and `next_source_offset`,
-using the same query, `package_prefix` and pagination mode. `scan_boundary`
-explains each page boundary; `scanned_classes` and `total_classes` show
-progress. `page_error_count` includes all failed renders even when the bounded
-`errors` detail list is truncated. Generated-source text has no precomputed
-index: uncached search still reconstructs each scanned class. An
-identifier-shaped query on an empty or unfinished page carries a `hint` naming
-`mode: "identifiers"`, which searches DEX class, method and field names from the
-symbol index without decompiling. For DEX string literals use
-`find_string_references`, which indexes literal operands directly.
+Agents must finish source searches using this completion contract:
+
+1. Keep the pinned `instance_id` and `project_id`, query, filters, scopes,
+   pagination mode unchanged across requests. Honor the requested page size;
+   `limit` is a page control and can change between pages.
+2. Inspect **every page** and accumulate `errors`, `page_error_count`,
+   `errors_truncated`, `truncated_resources` and other coverage diagnostics.
+   Carry earlier failures and truncated content into the final assessment.
+3. Prefer every returned `next_cursor` as the next request's `resume_cursor`.
+   Legacy clients use **both** `next_offset` and `next_source_offset`. Continue
+   until `exhausted: true` and no continuation remains. Zero hits on a partial
+   page mean the search is still incomplete.
+4. Report complete coverage or absence within the requested scope only after
+   every continuation is consumed and no unresolved coverage gaps remain across
+   **any page**. Otherwise report the completed scan with its coverage limits.
+
+`page_status.complete` retains its page-local boolean semantics;
+`page_status.completion_scope: "page"` makes that scope explicit. A clean final
+page cannot erase an earlier page's errors or truncation. These instructions
+are exposed through MCP initialize instructions, the `search_code` description
+and page messages. They guide agents; arbitrary clients remain responsible for
+following them. The server continues to return bounded pages at the requested
+limits, with client-driven pagination.
+
+Source-mode `search_code` uses case-sensitive literal text by default. Set
+`regex: true` for a Rust regular expression, or `case_sensitive: false` for
+Unicode-aware case-insensitive matching. Zero-width regex matches are skipped.
+`scope: "code"` is the default; `scope: "resources"` or `"all"` explicitly includes
+archive text and decoded Android XML. `resource_prefix` filters resource paths
+independently of `package_prefix`. Resource hits include `path` and their syntax;
+class hits include `class_id` and `source_hash`. Both use Unicode `start`/`end`,
+one-based `line`, and bounded snippets. Binary previews are skipped and counted;
+truncated text and decode failures carry coverage diagnostics. Text or unknown
+entries beyond the generic 8 MiB archive preview limit report incomplete
+coverage instead of ordinary binary skips; decoded manifest/res XML retains its
+separate 32 MiB decoder bound.
+
+For example, search application source and asset text together:
+
+```json
+{"instance_id":"INSTANCE","project_id":"PROJECT","mode":"source","query":"addJavascriptInterface|loadUrl","regex":true,"case_sensitive":false,"scope":"all","package_prefix":"com.example","resource_prefix":"assets/","limit":100}
+```
+
+Continue the same search by adding `"resume_cursor": "NEXT_CURSOR"`, using the
+returned `next_cursor` and retaining those filters. For decoded XML alone, use
+`"scope": "resources"` and `"resource_prefix": "res/"`.
+
+The default `pagination: "hits"` returns at most `limit` occurrences (default 100,
+maximum 500) across deterministic filtered-class order, followed by resource
+archive order when selected. A page stops at the hit limit, end of scope, or a
+20-second budget checked between reportable documents. One expensive class can
+exceed that budget; cancellation remains cooperative. Empty pages may carry
+remaining work. Follow `next_cursor` as `resume_cursor`, keeping the project,
+query, matching options, scopes and pagination unchanged. Cursors validate those
+bindings and retain only numeric positions. Existing clients may instead pass
+**both** `next_offset` and `next_source_offset`; omit these offsets when using a
+cursor. With resource scope enabled, `offset` counts classes followed by selected
+resources, or selected resources alone for `scope: "resources"`.
+
+`scan_boundary` explains each page boundary. `scanned_classes`, `total_classes`,
+`scanned_resources` and `total_resources` show page coverage; `page_error_count`
+includes all diagnostics even when the bounded `errors` list is truncated.
+Apply the completion contract above: consume every continuation and retain
+coverage diagnostics from every page before interpreting absence. First exhaustive source searches reconstruct uncached
+classes; warm queries reuse shared rendered documents and conservative filters.
+There is no project-wide source rendering at project load or MCP startup.
+Identifier-shaped empty or unfinished searches carry a hint for
+`mode: "identifiers"`; DEX string literals use `find_string_references`.
+
+MCP uses the same completion-order worker collection and bounded reporting
+pipeline as GUI search, with up to four render workers and a 32 MiB estimated
+in-flight target per page. One cancellable MCP source page runs per project;
+additional source requests wait without holding the interactive engine or index
+I/O lock. The existing GUI scan keeps its 128 MiB target and configured worker
+count (automatic maximum twelve, explicit maximum sixteen). A simultaneous GUI
+and MCP scan therefore uses at most sixteen automatic or twenty explicitly
+configured workers, and a combined 160 MiB in-flight estimate. Each scan's
+required class may exceed its target to guarantee progress; these are work
+estimates, not a total-process RAM ceiling. Per-class claims deduplicate
+simultaneous renders; matching and rendering occur outside the index I/O lock.
+MCP adds no persistent source RAM tier. Failed renders remain retryable.
 
 `package_prefix` accepts a single prefix, an array of prefixes, or the
 pseudo-prefix `obfuscated-root` on `search_code` (both modes), `get_all_classes`
@@ -462,11 +530,14 @@ that a single prefix misses. Responses echo the applied scope as
 
 `pagination: "classes"` keeps the class-window contract: `offset` is a class
 index, `limit` counts classes to scan (default 25, maximum 500), and
-`source_offset` is the Unicode character offset inside the first class. Each
-response contains at most 100 matches. Resume with both `next_offset` and
-`next_source_offset`, keeping the query, scope and pagination unchanged. Continue
-until `exhausted` is true, and check every page's `errors` before interpreting an
-empty result as absence. A failed class is reported and does not silently count
+`source_offset` is the Unicode character offset inside the first class. With
+resource scope selected, this window counts the combined document order described
+above. Each response contains at most 100 matches. Prefer `next_cursor` as
+`resume_cursor`; legacy clients use both `next_offset` and `next_source_offset`.
+Keep pinned IDs, query, scopes and pagination unchanged; the page-size `limit`
+can change between requests.
+Accumulate every page's coverage diagnostics through exhaustion before
+interpreting an empty result as absence. A failed class is reported and does not silently count
 as successfully searched.
 
 Hits include `class_id`, `source_hash`, Unicode `start`/`end`, one-based `line`,
@@ -1499,11 +1570,13 @@ call site, in 16-bit DEX code units. Choose an exact listed site; a switch-case
 query uses `resolve_switch_case_callers`. Source lines and byte offsets are
 not interchangeable with instruction offsets.
 
-Source-mode `search_code` includes `page_status.complete` and an explanatory
-message when a zero-hit page still has unscanned classes or occurrences. Resume
-its cursors or choose `mode: "identifiers"` for DEX symbol searches; an
-identifier-shaped query on such a page also carries a `hint` naming that mode.
-Identifier filters require that mode. `format: "dex"` returns RDX's labeled DEX listing;
+Source-mode `search_code` includes a page-local `page_status.complete`,
+`completion_scope: "page"` and continuation guidance. Follow every cursor through
+exhaustion with the same pinned IDs and filters, accumulating coverage errors
+and truncation from every page. A zero-hit partial page remains incomplete, and
+a clean final page preserves earlier coverage failures in the agent's final
+assessment. Identifier-shaped queries also carry a `hint` for a separate
+`mode: "identifiers"` search. Identifier filters require that mode. `format: "dex"` returns RDX's labeled DEX listing;
 it is not advertised as assemblable Smali.
 
 `list_nav_deeplinks` includes `hotwire_annotation` records for exact

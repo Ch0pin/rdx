@@ -39,6 +39,21 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     assert_eq!(replies.len(), 6);
     assert_eq!(replies[0]["error"]["code"], -32600);
     assert_eq!(replies[1]["result"]["protocolVersion"], "2025-06-18");
+    let instructions = replies[1]["result"]["instructions"].as_str().unwrap();
+    for clause in [
+        "EVERY next_cursor as resume_cursor",
+        "pinned instance_id/project_id",
+        "exhausted=true and no continuation remains",
+        "accumulate errors",
+        "this response only",
+        "client-driven",
+        "limit may change between pages",
+    ] {
+        assert!(
+            instructions.contains(clause),
+            "initialize instructions: {clause}"
+        );
+    }
     let tools = replies[2]["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 51);
     let schema = |name: &str| {
@@ -47,6 +62,31 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
             .find(|tool| tool["name"] == name)
             .unwrap_or_else(|| panic!("{name} must be advertised over stdio"))["inputSchema"]
     };
+    let source_description = tools
+        .iter()
+        .find(|tool| tool["name"] == "search_code")
+        .unwrap()["description"]
+        .as_str()
+        .unwrap();
+    assert!(source_description.contains("follow EVERY next_cursor as resume_cursor"));
+    assert!(
+        source_description
+            .contains("a clean final page cannot erase an earlier page's errors or truncation")
+    );
+    let source_properties = &schema("search_code")["properties"];
+    assert_eq!(source_properties["regex"]["default"], false);
+    assert_eq!(source_properties["case_sensitive"]["default"], true);
+    assert_eq!(
+        source_properties["scope"]["enum"],
+        json!(["code", "resources", "all"])
+    );
+    assert!(source_properties.get("resource_prefix").is_some());
+    let resume_description = source_properties["resume_cursor"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(resume_description.contains("pinned instance_id/project_id"));
+    assert!(resume_description.contains("across every page"));
+
     for name in [
         "list_analysis_plugins",
         "run_plugin_analysis",

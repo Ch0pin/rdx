@@ -39,6 +39,11 @@ struct Reporter {
     skip: usize,
     /// Matches reported from the class at `next` before the limit cut it off.
     partial: Option<usize>,
+    source_from: usize,
+    partial_source: usize,
+    deadline: Option<Instant>,
+    timed_out: bool,
+    numeric_page: bool,
 }
 impl Reporter {
     fn new(limit: usize, skip: usize) -> Self {
@@ -49,11 +54,16 @@ impl Reporter {
             limit,
             skip,
             partial: None,
+            source_from: 0,
+            partial_source: 0,
+            deadline: None,
+            timed_out: false,
+            numeric_page: false,
         }
     }
     /// Reporting continues while the limit has room.
     fn wants_more(&self, summary: &SearchSummary) -> bool {
-        self.partial.is_none() && summary.hits < self.limit
+        !self.timed_out && self.partial.is_none() && summary.hits < self.limit
     }
     /// Matches worth collecting from one class: the limit, the ones a
     /// continuation skips in its first class, and one more to tell a class
@@ -63,6 +73,7 @@ impl Reporter {
             .saturating_add(if index == 0 { self.skip } else { 0 })
             .saturating_add(1)
     }
+    #[cfg(test)]
     fn resolve(
         &self,
         index: usize,
@@ -70,13 +81,36 @@ impl Reporter {
         rendered: std::result::Result<CachedValue, String>,
         query: &CompiledQuery,
     ) -> Outcome {
+        self.resolve_until(index, name, rendered, query, &|| false)
+    }
+    fn resolve_until(
+        &self,
+        index: usize,
+        name: &str,
+        rendered: std::result::Result<CachedValue, String>,
+        query: &CompiledQuery,
+        cancelled: &impl Fn() -> bool,
+    ) -> Outcome {
         match rendered {
             Err(error) => Outcome::Failed(format!("{name}: {error}")),
             Ok(None) => Outcome::Skipped,
-            Ok(Some((document, definitions, note))) => Outcome::Resolved {
-                hits: matches(document, &definitions, query, self.room(index)),
-                note,
-            },
+            Ok(Some((document, definitions, note))) => {
+                let from = if index == 0 { self.source_from } else { 0 };
+                if from > 0 && from > document.source.chars().count() {
+                    return Outcome::Failed("Invalid source_offset".into());
+                }
+                Outcome::Resolved {
+                    hits: matches_after_until(
+                        document,
+                        &definitions,
+                        query,
+                        self.room(index),
+                        from,
+                        cancelled,
+                    ),
+                    note,
+                }
+            }
         }
     }
     fn buffer(&mut self, index: usize, outcome: Outcome) {
@@ -94,6 +128,13 @@ impl Reporter {
         emit: &mut impl FnMut(SearchUpdate),
     ) {
         while self.wants_more(summary) {
+            if summary.scanned > 0
+                && self.next < summary.total
+                && self.deadline.is_some_and(|time| Instant::now() >= time)
+            {
+                self.timed_out = true;
+                return;
+            }
             let Some(outcome) = self.completed.remove(&self.next) else {
                 break;
             };
@@ -119,6 +160,7 @@ impl Reporter {
                     if hits.len() > room {
                         hits.truncate(room);
                         summary.hits += room;
+                        self.partial_source = hits.last().map_or(0, |hit| hit.end);
                         emit(SearchUpdate::Batch(hits));
                         self.partial = Some(reported + room);
                         return;
@@ -228,7 +270,9 @@ fn drain_ready(
                 return;
             }
         };
-        let outcome = reporter.resolve(index, name, value, query);
+        let outcome = reporter.resolve_until(index, name, value, query, &|| {
+            cancel.load(Ordering::Relaxed)
+        });
         budget.release(reserved);
         reporter.buffer(index, outcome);
     }
@@ -246,9 +290,12 @@ fn repair_cached_head(
 ) -> Rendered {
     let mut worker = engine.clone();
     let legacy = cache.legacy;
+    let disk = cache.disk.clone();
     std::thread::scope(|scope| {
         let handle = scope.spawn(move || {
-            render_job(&mut worker, name, legacy, || cancel.load(Ordering::Relaxed))
+            render_job(&mut worker, &disk, name, legacy, || {
+                cancel.load(Ordering::Relaxed)
+            })
         });
         while !handle.is_finished() {
             interactive(engine, cache);
@@ -332,11 +379,26 @@ type Rendered =
     std::result::Result<(CachedValue, Option<crate::search_index::PreparedEntry>), String>;
 fn render_job(
     worker: &mut NativeEngine,
+    index: &crate::search_index::SharedIndex,
     name: &str,
     legacy: bool,
     cancelled: impl Fn() -> bool,
 ) -> Rendered {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let key = SearchTarget::Class(name.into());
+        let _claim = if legacy {
+            None
+        } else {
+            Some(
+                index
+                    .claim(key.clone(), &cancelled)
+                    .ok_or("Search cancelled")?,
+            )
+        };
+        if !legacy && let Some(value) = index.load(&key) {
+            return Ok((value, None));
+        }
+        index.rendered();
         let code = worker
             .decompile_search_until(name, &cancelled)
             .map_err(|error| format!("{error:#}"))?;
@@ -358,7 +420,10 @@ fn render_job(
         if cancelled() {
             return Err("Search cancelled".into());
         }
-        Ok((value, prepared))
+        if let Some(prepared) = prepared {
+            index.insert_prepared(key, prepared);
+        }
+        Ok((value, None))
     }))
     .unwrap_or_else(|_| Err("Native source renderer panicked".into()))
 }
@@ -468,11 +533,47 @@ pub(super) fn run_with_workers(
     limit: usize,
     skip: usize,
 ) -> SearchSummary {
+    run_page(
+        engine,
+        cache,
+        classes,
+        query,
+        cancel,
+        emit,
+        interactive,
+        workers,
+        limit,
+        skip,
+        None,
+    )
+}
+
+/// Numeric page controls used by MCP; GUI retains its existing continuation contract.
+#[derive(Clone, Copy)]
+pub(super) struct PageControl {
+    pub source_from: usize,
+    pub deadline: Instant,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_page(
+    engine: &mut NativeEngine,
+    cache: &mut SearchCache,
+    classes: &[&String],
+    query: &CompiledQuery,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(SearchUpdate),
+    interactive: &mut impl FnMut(&mut NativeEngine, &mut SearchCache),
+    workers: usize,
+    limit: usize,
+    skip: usize,
+    page: Option<PageControl>,
+) -> SearchSummary {
     let workers = workers.clamp(1, MAX_WORKERS);
     // `0` is unlimited; `skip` is what a continuation's first class already reported.
     let limit = if limit == 0 { usize::MAX } else { limit };
     let window = workers * 16;
-    let budget = ResultBudget::new(128 * 1024 * 1024);
+    let budget = ResultBudget::new(if page.is_some() { 32 } else { 128 } * 1024 * 1024);
     let legacy = cache.legacy;
     let stop = AtomicBool::new(false);
     let started = std::sync::atomic::AtomicUsize::new(0);
@@ -483,6 +584,7 @@ pub(super) fn run_with_workers(
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
             let mut worker = engine.clone();
+            let disk = cache.disk.clone();
             let jobs_rx = jobs_rx.clone();
             let results_tx = results_tx.clone();
             let stop = &stop;
@@ -501,7 +603,7 @@ pub(super) fn run_with_workers(
                         break;
                     }
                     started.fetch_add(1, Ordering::Relaxed);
-                    let result = render_job(&mut worker, classes[index], legacy, || {
+                    let result = render_job(&mut worker, &disk, classes[index], legacy, || {
                         stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed)
                     });
                     let bytes = rendered_bytes(&result);
@@ -521,6 +623,11 @@ pub(super) fn run_with_workers(
             ..Default::default()
         };
         let mut reporter = Reporter::new(limit, skip);
+        if let Some(page) = page {
+            reporter.source_from = page.source_from;
+            reporter.deadline = Some(page.deadline);
+            reporter.numeric_page = true;
+        }
         // Renders in flight. Only reporter.next may bypass the byte budget.
         let mut in_flight = BTreeSet::new();
         let mut next = 0;
@@ -544,13 +651,15 @@ pub(super) fn run_with_workers(
                 }
                 let name = classes[next];
                 let key = SearchTarget::Class((*name).clone());
-                if cache.disk.rejects(
-                    &key,
-                    &query.query.text,
-                    query.query.case_sensitive,
-                    query.query.regex,
-                    false,
-                ) {
+                if !(next == 0 && page.is_some_and(|page| page.source_from > 0))
+                    && cache.disk.rejects(
+                        &key,
+                        &query.query.text,
+                        query.query.case_sensitive,
+                        query.query.regex,
+                        false,
+                    )
+                {
                     reporter.buffer(next, Outcome::Rejected);
                 } else if cache.contains(&key) {
                     reporter.buffer(next, Outcome::Cached);
@@ -647,8 +756,16 @@ pub(super) fn run_with_workers(
         }
         summary.cancelled |= cancel.load(Ordering::Relaxed);
         if !summary.cancelled && !reporter.wants_more(&summary) {
-            summary.resume = reporter.remaining(classes);
-            summary.limited = summary.resume.is_some();
+            summary.page_position = reporter.next;
+            summary.page_source_offset = reporter.partial_source;
+            summary.time_budget = reporter.timed_out;
+            if !reporter.numeric_page {
+                summary.resume = reporter.remaining(classes);
+            }
+            summary.limited = reporter.next < classes.len();
+        }
+        if !summary.limited {
+            summary.page_position = reporter.next;
         }
         reporter.progress(&summary, emit, true);
         stop.store(true, Ordering::Relaxed);
@@ -973,7 +1090,7 @@ mod tests {
 
     #[test]
     fn deferred_corrupt_cache_load_renders_head_and_preserves_hits() {
-        use rdx::engine::DecompilerEngine;
+        use crate::engine::DecompilerEngine;
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
         let mut engine = NativeEngine::start().unwrap();
@@ -1269,7 +1386,7 @@ mod tests {
 
     #[test]
     fn limited_scan_stops_and_continuations_complete_the_same_results() {
-        use rdx::engine::DecompilerEngine;
+        use crate::engine::DecompilerEngine;
         fn scan(
             engine: &mut NativeEngine,
             cache: &mut SearchCache,
@@ -1371,5 +1488,124 @@ mod tests {
         assert_eq!(resolve_workers(1), 1);
         assert_eq!(resolve_workers(3), 3);
         assert_eq!(resolve_workers(MAX_WORKERS + 50), MAX_WORKERS);
+    }
+    #[test]
+    fn numeric_time_budget_pages_advance_one_document_without_changing_cancellation() {
+        let mut engine = NativeEngine::start().unwrap();
+        let mut cache = SearchCache {
+            budget: 0,
+            ..Default::default()
+        };
+        let names: Vec<String> = ["A", "B", "C"].iter().map(|name| (*name).into()).collect();
+        for name in &names {
+            cache.disk.insert(
+                SearchTarget::Class(name.clone()),
+                &Some((
+                    Arc::new(SearchDocument {
+                        target: SearchTarget::Class(name.clone()),
+                        name: name.clone(),
+                        source: "é api api".into(),
+                        syntax: "java".into(),
+                        links: vec![],
+                        source_hash: None,
+                        metadata_complete: true,
+                    }),
+                    Arc::new(vec![]),
+                    None,
+                )),
+            );
+        }
+        let query = CompiledQuery::new(SearchQuery {
+            text: "api".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut actual = Vec::new();
+        for offset in 0..3 {
+            let classes: Vec<_> = names[offset..].iter().collect();
+            let summary = run_page(
+                &mut engine,
+                &mut cache,
+                &classes,
+                &query,
+                &cancel,
+                &mut |update| {
+                    if let SearchUpdate::Batch(hits) = update {
+                        actual.extend(
+                            hits.into_iter()
+                                .map(|hit| (hit.origin.name.clone(), hit.start)),
+                        );
+                    }
+                },
+                &mut |_, _| {},
+                2,
+                500,
+                0,
+                Some(PageControl {
+                    source_from: 0,
+                    deadline: Instant::now() - Duration::from_secs(1),
+                }),
+            );
+            assert_eq!(summary.page_position, 1);
+            assert_eq!(summary.scanned, 1);
+            assert_eq!(summary.limited, offset < 2);
+            assert_eq!(summary.time_budget, offset < 2);
+            assert!(
+                summary.resume.is_none(),
+                "numeric pages retain no remaining class vector"
+            );
+            assert!(!cancel.load(Ordering::Relaxed));
+        }
+        assert_eq!(
+            actual,
+            [
+                ("A".into(), 2),
+                ("A".into(), 6),
+                ("B".into(), 2),
+                ("B".into(), 6),
+                ("C".into(), 2),
+                ("C".into(), 6)
+            ]
+        );
+    }
+
+    #[test]
+    fn simultaneous_workers_share_one_class_render_and_cancelled_work_is_retryable() {
+        use crate::engine::DecompilerEngine;
+        let mut engine = NativeEngine::start().unwrap();
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        engine.open(&path).unwrap();
+        let index = engine.search_index();
+        let gate = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let mut first = engine.clone();
+            let mut second = engine.clone();
+            let index = &index;
+            let gate = &gate;
+            let one = scope.spawn(move || {
+                gate.wait();
+                render_job(&mut first, index, "sample.Caller", false, || false).unwrap()
+            });
+            let two = scope.spawn(move || {
+                gate.wait();
+                render_job(&mut second, index, "sample.Caller", false, || false).unwrap()
+            });
+            assert_eq!(
+                one.join().unwrap().0.unwrap().0.source,
+                two.join().unwrap().0.unwrap().0.source
+            );
+        });
+        assert_eq!(index.renders(), 1);
+        let key = SearchTarget::Class("sample.Target".into());
+        assert!(render_job(&mut engine, &index, "sample.Target", false, || true).is_err());
+        assert!(!index.contains(&key));
+        assert!(render_job(&mut engine, &index, "sample.Target", false, || false).is_ok());
+        assert!(index.contains(&key));
+        let old = engine.clone();
+        engine.open(&path).unwrap();
+        assert!(!old.search_index().same(&engine.search_index()));
+        assert!(!engine.search_index().contains(&key));
     }
 }

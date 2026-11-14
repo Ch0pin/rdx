@@ -1,5 +1,5 @@
 //! Query-local DEX hints. Ordering only: every class remains searchable.
-use rdx::{
+use crate::{
     engine::NativeEngine,
     native_dex::{DexAnnotationSet, DexClass, DexSymbols, DexValue},
 };
@@ -143,7 +143,7 @@ impl Plan {
                 if cancel.load(Ordering::Relaxed) {
                     return false;
                 }
-                let Ok((width, payload)) = rdx::native_cfg::instruction_width(words, pc) else {
+                let Ok((width, payload)) = crate::native_cfg::instruction_width(words, pc) else {
                     break;
                 };
                 if !payload {
@@ -221,7 +221,7 @@ pub(super) fn prioritize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rdx::native_dex::{DexCode, DexMethod};
+    use crate::native_dex::{DexCode, DexMethod};
     use std::sync::Arc;
 
     fn fixture(instructions: Vec<u16>) -> DexClass {

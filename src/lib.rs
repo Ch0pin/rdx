@@ -59,3 +59,6 @@ mod network_stacks;
 
 mod retained_budget;
 pub mod source_text;
+
+pub mod search;
+pub mod search_index;

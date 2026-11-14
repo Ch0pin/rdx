@@ -1,5 +1,5 @@
 //! Bounded in-process native project search. Offsets are Unicode scalar indices.
-use rdx::{
+use crate::{
     apk::{Archive, Preview},
     engine::{CodeDefinition, CodeLink, DecompilerEngine, DefinitionNameIndex, NativeEngine},
 };
@@ -17,6 +17,25 @@ mod candidates;
 mod latency_tests;
 mod streaming;
 pub use streaming::{MAX_WORKERS, resolve_workers};
+
+pub const STANDARD_PACKAGES: &[&str] = &[
+    "android.*",
+    "androidx.*",
+    "com.android.*",
+    "kotlin.*",
+    "kotlinx.*",
+    "java.*",
+    "javax.*",
+    "jdk.*",
+    "sun.*",
+    "com.sun.*",
+    "dalvik.*",
+    "libcore.*",
+];
+
+pub fn default_excluded_packages() -> Vec<String> {
+    STANDARD_PACKAGES.iter().map(|s| (*s).to_owned()).collect()
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchQuery {
@@ -45,7 +64,7 @@ impl Default for SearchQuery {
             code: true,
             resources: false,
             comments: false,
-            excluded_packages: crate::settings::default_excluded_packages(),
+            excluded_packages: default_excluded_packages(),
         }
     }
 }
@@ -130,7 +149,7 @@ impl CompiledQuery {
 }
 
 fn is_standard_package(name: &str) -> bool {
-    crate::settings::STANDARD_PACKAGES
+    STANDARD_PACKAGES
         .iter()
         .any(|pattern| package_matches(name, pattern))
 }
@@ -170,7 +189,7 @@ pub struct SearchDocument {
     pub source_hash: Option<String>,
     pub metadata_complete: bool,
 }
-impl rdx::source_text::TextOwner for SearchDocument {
+impl crate::source_text::TextOwner for SearchDocument {
     fn text(&self) -> &str {
         &self.source
     }
@@ -255,6 +274,11 @@ pub struct SearchSummary {
     /// Where a limited scan continues; `None` once the scan ran to the end.
     pub resume: Option<SearchResume>,
     pub errors: Vec<String>,
+    pub error_count: usize,
+    /// Numeric source-page position; avoids copying all remaining class names.
+    pub page_position: usize,
+    pub page_source_offset: usize,
+    pub time_budget: bool,
 }
 
 /// Where a scan stopped at the result limit, so a later run continues from
@@ -280,6 +304,87 @@ pub struct ScanOptions {
     pub limit: usize,
     /// Continue a stopped scan instead of starting over.
     pub resume: Option<SearchResume>,
+}
+
+/// Search a deterministic class slice through the same worker/cache pipeline as GUI.
+/// MCP keeps no additional persistent source memory tier.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn source_page(
+    engine: &mut NativeEngine,
+    classes: &[&String],
+    query: &CompiledQuery,
+    cancel: &AtomicBool,
+    limit: usize,
+    source_from: usize,
+    deadline: std::time::Instant,
+    emit: &mut impl FnMut(SearchUpdate),
+) -> SearchSummary {
+    let mut cache = SearchCache::default();
+    cache.attach(engine, false);
+    streaming::run_page(
+        engine,
+        &mut cache,
+        classes,
+        query,
+        cancel,
+        emit,
+        &mut |_, _| {},
+        resolve_workers(0).min(4),
+        limit,
+        0,
+        Some(streaming::PageControl {
+            source_from,
+            deadline,
+        }),
+    )
+}
+
+/// Resource preview/decode rules and query-independent snapshots shared with GUI.
+pub(crate) fn source_resource(
+    engine: &mut NativeEngine,
+    archive: &Archive,
+    entry: &crate::apk::Entry,
+    query: &CompiledQuery,
+    cancel: &AtomicBool,
+    remaining: usize,
+    source_from: usize,
+) -> Result<(Vec<SearchHit>, bool, Option<String>), String> {
+    let index = engine.search_index();
+    let key = SearchTarget::Resource(entry.index);
+    let _claim = index
+        .claim(key.clone(), || cancel.load(Ordering::Relaxed))
+        .ok_or("Search cancelled")?;
+    let value = if let Some(value) = index.load(&key) {
+        value
+    } else {
+        let value = resource_document(engine, archive, entry)?
+            .map(|(document, definitions, note)| (Arc::new(document), Arc::new(definitions), note));
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Search cancelled".into());
+        }
+        index.insert(key, &value);
+        value
+    };
+    match value {
+        None => Ok((Vec::new(), true, None)),
+        Some((document, definitions, note)) => {
+            if source_from > document.source.chars().count() {
+                return Err("Invalid source_offset".into());
+            }
+            Ok((
+                matches_after_until(
+                    document,
+                    &definitions,
+                    query,
+                    remaining,
+                    source_from,
+                    &|| cancel.load(Ordering::Relaxed),
+                ),
+                false,
+                note,
+            ))
+        }
+    }
 }
 
 // Java lexical comments; strings, characters and text blocks shield comment markers.
@@ -451,37 +556,98 @@ fn matches(
     query: &CompiledQuery,
     remaining: usize,
 ) -> Vec<SearchHit> {
+    matches_after(document, definitions, query, remaining, 0)
+}
+
+fn matches_after(
+    document: Arc<SearchDocument>,
+    definitions: &[CodeDefinition],
+    query: &CompiledQuery,
+    remaining: usize,
+    source_from: usize,
+) -> Vec<SearchHit> {
+    matches_after_until(
+        document,
+        definitions,
+        query,
+        remaining,
+        source_from,
+        &|| false,
+    )
+}
+
+fn matches_after_until(
+    document: Arc<SearchDocument>,
+    definitions: &[CodeDefinition],
+    query: &CompiledQuery,
+    remaining: usize,
+    source_from: usize,
+    cancelled: &impl Fn() -> bool,
+) -> Vec<SearchHit> {
+    if remaining == 0 || cancelled() {
+        return Vec::new();
+    }
     let source = &document.source;
-    let char_count = if definitions.is_empty() {
+    let char_count = if definitions.is_empty()
+        && crate::resource_search::query_id(&query.query.text).is_none()
+    {
         0
     } else {
-        source.chars().count()
+        let (mut from, mut count) = (0, 0);
+        while from < source.len() {
+            if cancelled() {
+                return Vec::new();
+            }
+            let mut end = (from + 65536).min(source.len());
+            while !source.is_char_boundary(end) {
+                end -= 1;
+            }
+            count += source[from..end].chars().count();
+            from = end;
+        }
+        count
     };
     let mut found = BTreeMap::<(usize, usize), String>::new();
-    for d in definitions {
+    for (index, d) in definitions.iter().enumerate() {
+        if index % 256 == 0 && cancelled() {
+            return Vec::new();
+        }
         let selected = match d.kind.as_str() {
             "class" => query.query.classes,
             "method" => query.query.methods,
             "field" => query.query.fields,
             _ => false,
         };
-        if selected && d.start < d.end && d.end <= char_count && query.matcher.is_match(&d.name) {
+        if selected
+            && d.start >= source_from
+            && d.start < d.end
+            && d.end <= char_count
+            && query.matcher.is_match(&d.name)
+        {
             found.insert((d.start, d.end), d.kind.clone());
-            if found.len() >= remaining {
-                break;
+            if found.len() > remaining {
+                found.pop_last();
             }
         }
     }
     let is_resource = matches!(document.target, SearchTarget::Resource(_));
     if query.query.code && !query.query.regex && !is_resource {
-        for range in rdx::resource_search::aliases(&document.links, &query.query.text) {
-            if found.len() >= remaining {
-                break;
+        for (index, range) in crate::resource_search::aliases(&document.links, &query.query.text)
+            .filter(|range| {
+                range.start >= source_from && range.start < range.end && range.end <= char_count
+            })
+            .enumerate()
+        {
+            if index % 256 == 0 && cancelled() {
+                return Vec::new();
             }
             found.insert((range.start, range.end), "code".into());
+            if found.len() > remaining {
+                found.pop_last();
+            }
         }
     }
-    if found.len() < remaining && (is_resource || query.query.code || query.query.comments) {
+    if is_resource || query.query.code || query.query.comments {
         // Definition and alias ranges in order. Regex matches arrive ascending
         // and never overlap each other, so one cursor over the earlier ranges
         // finds every overlap in linear time.
@@ -491,7 +657,10 @@ fn matches(
         let all_text = is_resource || (query.query.code && query.query.comments);
         let mut span_index = 0;
         let (mut byte_cursor, mut char_cursor) = (0, 0);
-        for m in query.matcher.find_iter(source) {
+        for (index, m) in query.matcher.find_iter(source).enumerate() {
+            if index % 256 == 0 && cancelled() {
+                return Vec::new();
+            }
             if m.is_empty() {
                 continue;
             }
@@ -522,6 +691,16 @@ fn matches(
             let end = start + m.as_str().chars().count();
             byte_cursor = m.end();
             char_cursor = end;
+            if start < source_from {
+                continue;
+            }
+            if found.len() >= remaining
+                && found
+                    .last_key_value()
+                    .is_some_and(|(&(last, _), _)| start > last)
+            {
+                break;
+            }
             while earlier_index < earlier.len() && earlier[earlier_index].1 <= start {
                 earlier_index += 1;
             }
@@ -542,10 +721,13 @@ fn matches(
                 }
                 .into(),
             );
-            if found.len() >= remaining {
-                break;
+            if found.len() > remaining {
+                found.pop_last();
             }
         }
+    }
+    if cancelled() {
+        return Vec::new();
     }
     let origin = HitOrigin::indexed(&document);
     let nodes = if found.is_empty() {
@@ -619,7 +801,7 @@ pub struct SearchCache {
     pub disk_hits: usize,
     pub index_rejections: usize,
     pub source_fetches: usize,
-    disk: crate::search_index::DiskIndex,
+    disk: crate::search_index::SharedIndex,
     legacy: bool,
 }
 impl Default for SearchCache {
@@ -633,7 +815,7 @@ impl Default for SearchCache {
             disk_hits: 0,
             index_rejections: 0,
             source_fetches: 0,
-            disk: crate::search_index::DiskIndex::default(),
+            disk: crate::search_index::SharedIndex::default(),
             legacy: false,
         }
     }
@@ -650,7 +832,7 @@ impl SearchCache {
     pub fn reset(&mut self, project_id: u64, classes: usize) {
         if self.project_id != Some(project_id) {
             self.entries.clear();
-            self.disk = crate::search_index::DiskIndex::for_project(classes);
+            self.disk = crate::search_index::SharedIndex::for_project(classes);
             self.disk_hits = 0;
             self.index_rejections = 0;
             self.source_fetches = 0;
@@ -659,6 +841,18 @@ impl SearchCache {
             self.project_id = Some(project_id);
         }
     }
+    pub(crate) fn attach(&mut self, engine: &NativeEngine, memory: bool) {
+        let shared = engine.search_index();
+        if !self.disk.same(&shared) {
+            self.entries.clear();
+            self.bytes = 0;
+            self.disk = shared;
+        }
+        if !memory {
+            self.budget = 0;
+        }
+    }
+
     fn get(&mut self, key: &SearchTarget) -> Option<CachedValue> {
         let entry = self.entries.get(key).cloned();
         if entry.is_some() {
@@ -717,7 +911,7 @@ impl SearchCache {
         self.entries.contains_key(key) || self.disk.contains(key)
     }
 
-    pub(super) fn index_stats(&self) -> (usize, usize, usize, usize) {
+    pub fn index_stats(&self) -> (usize, usize, usize, usize) {
         self.disk.stats()
     }
 
@@ -865,7 +1059,7 @@ fn definition_candidates(
 fn resource_document(
     engine: &mut NativeEngine,
     archive: &Archive,
-    entry: &rdx::apk::Entry,
+    entry: &crate::apk::Entry,
 ) -> LoadedDocument {
     let decoded_xml = entry.path == "AndroidManifest.xml"
         || (entry.path.starts_with("res/") && entry.path.ends_with(".xml"));
@@ -886,12 +1080,18 @@ fn resource_document(
             text: String::new(),
             note: String::new(),
         })
+    } else if entry.size > crate::apk::MAX_PREVIEW_BYTES {
+        Err(anyhow::anyhow!(
+            "Resource text coverage incomplete: entry is {} bytes, exceeding the {}-byte archive preview limit",
+            entry.size,
+            crate::apk::MAX_PREVIEW_BYTES
+        ))
     } else {
         archive.preview(entry.index)
     };
     preview
-        .map(|preview| match preview {
-            Preview::Text { text, syntax, note } => Some((
+        .and_then(|preview| match preview {
+            Preview::Text { text, syntax, note } => Ok(Some((
                 SearchDocument {
                     target: SearchTarget::Resource(entry.index),
                     name: entry.path.clone(),
@@ -903,8 +1103,13 @@ fn resource_document(
                 },
                 Vec::new(),
                 note,
-            )),
-            _ => None,
+            ))),
+            Preview::Binary { note, .. }
+                if note.starts_with("Cannot decode compiled Android XML:") =>
+            {
+                Err(anyhow::anyhow!("Resource text coverage incomplete: {note}"))
+            }
+            _ => Ok(None),
         })
         .map_err(|e| format!("{}: {e}", entry.path))
 }
@@ -1003,6 +1208,7 @@ pub fn run_search_interactive(
     options: &ScanOptions,
 ) -> SearchSummary {
     cache.reset(project_id, classes.len());
+    cache.attach(engine, true);
     let q = &query.query;
     let limit = if options.limit == 0 {
         usize::MAX
@@ -1397,6 +1603,7 @@ pub fn run_search_interactive(
     summary
 }
 fn record_error(summary: &mut SearchSummary, error: String) {
+    summary.error_count += 1;
     if summary.errors.len() < 8 {
         summary.errors.push(error.chars().take(400).collect());
     }
@@ -1528,7 +1735,7 @@ mod tests {
             CompiledQuery::new(SearchQuery {
                 text: "x".into(),
                 excluded_packages: if exclude {
-                    crate::settings::default_excluded_packages()
+                    default_excluded_packages()
                 } else {
                     Vec::new()
                 },
@@ -1893,7 +2100,7 @@ mod tests {
     }
     #[test]
     fn definition_page_overflow_retries_individual_owners() {
-        use rdx::engine::DefinitionName;
+        use crate::engine::DefinitionName;
         let names = vec!["small".to_owned(), "huge".to_owned(), "match".to_owned()];
         let query = CompiledQuery::new(SearchQuery {
             text: "wanted".into(),
@@ -2323,5 +2530,27 @@ mod tests {
         let answered = hit_source(&mut engine, &mut empty, None, &retained).unwrap();
         assert!(Arc::ptr_eq(&answered, &document));
         assert_eq!(empty.hits + empty.disk_hits, 0);
+    }
+    #[test]
+    fn matching_observes_cancellation_during_dense_regex_iteration() {
+        let query = CompiledQuery::new(SearchQuery {
+            text: "api".into(),
+            regex: true,
+            comments: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let document = document(&"api ".repeat(100_000));
+        let checks = std::cell::Cell::new(0);
+        let hits = matches_after_until(document, &[], &query, 500, 0, &|| {
+            checks.set(checks.get() + 1);
+            checks.get() >= 3
+        });
+        assert!(hits.is_empty());
+        assert_eq!(
+            checks.get(),
+            3,
+            "cancellation checked after matching has started"
+        );
     }
 }

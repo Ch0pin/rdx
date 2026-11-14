@@ -215,6 +215,7 @@ pub struct NativeEngine {
     native: NativeDexEngine,
     pub(crate) retained_budget: std::sync::Arc<crate::retained_budget::RetainedBudget>,
     source_cache: source_cache::SourceCache,
+    search_index: crate::search_index::SharedIndex,
     input: Option<PathBuf>,
     prepared: Option<std::sync::Arc<crate::package_container::PackageContainer>>,
     classes: std::sync::Arc<Vec<String>>,
@@ -291,6 +292,7 @@ impl NativeEngine {
         self.prepared = None;
         self.native = NativeDexEngine::default();
         self.source_cache = Default::default();
+        self.search_index = Default::default();
         self.retained_budget = Default::default();
         self.identifier_index =
             crate::identifier_search::Cache::with_budget(self.retained_budget.clone());
@@ -362,6 +364,7 @@ impl NativeEngine {
             self.native.shared_classes(),
             self.native.shared_nested_children(),
         ));
+        self.search_index = crate::search_index::SharedIndex::for_project(project.classes.len());
         self.classes = std::sync::Arc::new(project.classes.clone());
         Ok(project)
     }
@@ -549,6 +552,10 @@ impl NativeEngine {
         code.source_hash = source_identity(&code.source);
         Ok(code)
     }
+    pub fn search_index(&self) -> crate::search_index::SharedIndex {
+        self.search_index.clone()
+    }
+
     pub fn search_work_bytes(&self, class: &str) -> usize {
         self.native.search_work_bytes(class)
     }

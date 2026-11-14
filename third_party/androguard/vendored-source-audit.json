@@ -1,0 +1,1280 @@
+[
+  {
+    "component": "dex-decompiler",
+    "revision": "f7fa4a4853d957ebc3c54355d128a3835ef5ae22",
+    "modified_files": [
+      "Cargo.toml",
+      "src/decompile/mod.rs"
+    ],
+    "files": [
+      {
+        "path": "Cargo.toml",
+        "sha256": "4e43f92a42636975355e8b3a7befdea28bb568fcf55e03c98e82efbb595912be",
+        "upstream_unchanged": false
+      },
+      {
+        "path": "src/error.rs",
+        "sha256": "37bf183be5f097fb3ce31e5c446d4d8391434d5b6df1d547c18198018e93d5e0",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/lib.rs",
+        "sha256": "964e370fe6cb0f16176db117ab6cf9fd236d5d7030b3a2fc3856629a7347589c",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/xref.rs",
+        "sha256": "26dfe0107860231a171616935bf6411e5cc9a04012b1a8d5831c4a0f61152429",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/getclass.rs",
+        "sha256": "0303fb8fd0936b48ba041d0b4cd89e6a9c89d2e768fea0f677a6a08892723851",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/input.rs",
+        "sha256": "abd7c9204de0c244c9e5ea248f2b4667abc378a188156fd66b8beedbf0586749",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/ssa.rs",
+        "sha256": "ded875b7123e944f0a1b9616ecb94117d795639d22896be9d6c485ee68a3b7e7",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/read_write.rs",
+        "sha256": "98340d5bad22af44a443074824816b70afb47b32d1db3f59785e367ccd64b457",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/value_flow.rs",
+        "sha256": "38941cd8078cbe04d1f4cfae2a1d4fb08245992a8af866e45a8353e3f19c7535",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/ir.rs",
+        "sha256": "6d25e96bd3c7c0e7ea78fa28091f3ad07524b46ed59ad46b94c69982eda52cdf",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/region.rs",
+        "sha256": "fdf59b65e7b8b3dd40c1b38918e05240504670f21a5ecef8cbdb417184347aff",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/type_infer.rs",
+        "sha256": "bc5307a97e287a91b748ef2ef0f1c2cbcc7a0f779aca860f0ea3a4e7b41a05bf",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/resource_consts.rs",
+        "sha256": "6d998a36f285e9c0bd00b3df843dcfe0387b0de87aa47ef0ec18f51f9ad4fde1",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/graph.rs",
+        "sha256": "8fa4b6fb087e907e886a92ef14d45daaafc1b39827a4dc63c282e89884290295",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/accessors.rs",
+        "sha256": "964951798bdd9925d6afd6fb22dc6e26404783dd6eb201b7b9b4d55d24322afc",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/pass.rs",
+        "sha256": "5a293c45c3c3ab8480601292a29968922f4a30e44b7cd9248c36fe38cdff9bae",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/rename.rs",
+        "sha256": "42734142e1ffec62d9586b50449f8b996aa15add09e3b3e7d503cfaba226baff",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/json_export.rs",
+        "sha256": "3106c6fce53436cce34dcc33b3e0b312ca00be3405f7febaed8887a61f47f81a",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/try_catch.rs",
+        "sha256": "eb1f5dff92828d0e3ac30a17d115300806daced39b3bbaa5e8962aa428a84a32",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/const_fields.rs",
+        "sha256": "9d243b2e165afdc653944c5dbbd40bb66ebb845c5ad5764f2d5c67b5fd0e91f5",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/cfg.rs",
+        "sha256": "20443fa798b24b3a7b8c649a78bcb07163ed0419d00e8a2ca749e394a58545c2",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/mod.rs",
+        "sha256": "920b527a1bb170666259f83afcad201fe7a5d7d9c365432134b32ede3d851231",
+        "upstream_unchanged": false
+      },
+      {
+        "path": "src/decompile/mapping.rs",
+        "sha256": "219c2497152e7623fa4beea8f825855e1f3973c5c9c0b52960c61264470d8034",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/annotations.rs",
+        "sha256": "826be465ea40ca6ffe7b6ae5bf6c9610c763c499b9dd2969c52e705c26a2cc0e",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/kotlin.rs",
+        "sha256": "64d5ccc8902d0dfa08c113691027f1ab7fce5e278df99dc40e445310db9c2c37",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/deobf.rs",
+        "sha256": "ad4ee614ead1c9ae148b56d3eece96eee043399a225d80db34b5f8215996e557",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/bin/dex-decompile.rs",
+        "sha256": "6099f8a63d98bcec3db24a125b01127bbf6ae83ff7412125e11bbe40b016fef6",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/taint/solver.rs",
+        "sha256": "656fd8967176673bf35c80f6eee5c11e1baadf64b556c4b93b9f382728d76f5d",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/taint/config.rs",
+        "sha256": "e092aee3dce31af6e763ea2316bbca66873e73d9cd73ddee267eca07007ced36",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/taint/index.rs",
+        "sha256": "8784a18bbb362d10f5cfc1c5562368663a304ca82bb4f139f8876788af0e13fd",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/taint/models.rs",
+        "sha256": "05e11b3c488fb2d64800486cb64b921c977de27af86d9291034d7674b2c29417",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/taint/report.rs",
+        "sha256": "3feb46dc5dd49e200f09b2199cfb6dd9f39ead28e187a927476cd377e424e685",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/taint/mod.rs",
+        "sha256": "b6a02a490f95fa4d957568432d64222cce1bc3a7d6db375ab89593822724c717",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/taint/mt_compat.rs",
+        "sha256": "850d669733c6004fad172d3075b84dc7c7bc7b52fad8771b30f90968d4869f8f",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/taint/call_graph.rs",
+        "sha256": "7c33663cfb9bdfe64724611d03da5ebf551825af4548b5eb6eba5d63840937ac",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/taint/issue.rs",
+        "sha256": "aa36991412285a4a0ceddc50662217a71b9f3020894dfa34f9d6c6a44107e2c1",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/taint/lifecycle.rs",
+        "sha256": "f093ae817ae5aac4fa469ef7ed4830e04e0e81a8aaef05ff298a448037db9d0f",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/taint/defaults.rs",
+        "sha256": "a55b3562583de3a2ac500351e52ccb52a80f71aa4672192b9a9543b41bc9957a",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/semgrep/mod.rs",
+        "sha256": "bbebe098558b9082576e84938c91118f3ddb221c9bf83550860a5760d322b0a4",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/semgrep/match_java.rs",
+        "sha256": "e0e868cae66243895d4ab3f09b61867321aaf1f10dedc5fe23aed5f2283dd7b5",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/semgrep/scan.rs",
+        "sha256": "7d2b00a9c2c5dbddd92261c196ec5ef2a7620a435047f49104f56f50840e6148",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/semgrep/rule.rs",
+        "sha256": "a31a70153d2de234c4a40f4a34921884ff53a4b0b4b2169aa3b90fdb2e32abea",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/java/mod.rs",
+        "sha256": "7b3f606f8da76ce36b7c7ee21958d0a24c605366364231f15fd6ebad2332caef",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/mas.rs",
+        "sha256": "263ad52289ff2ab4462ae7af042cff5bc4f676eeab6faa2638937564ea993f90",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/ssl_trust_all.rs",
+        "sha256": "b2b47c3b5d07410cf52785c93bb6015a8494702b8d4e0d8aa8a6d6749df6eb3d",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/webresource_response.rs",
+        "sha256": "d0f8eec26ecddba5d427c2e13738dcf29c6e8e18d7b5c018340b9b7eadbac085",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/icc.rs",
+        "sha256": "52d4e4f6c032d41ad85b4772cc0a1fb3d1b8a2f10be38614384d6b5ef829fc08",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/ipc_intent_validation.rs",
+        "sha256": "0608a7598dec207e8a91051bad714e254f7f84a5bac354b8fbf25a260feeeb4e",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/types.rs",
+        "sha256": "267f20dff7d8cb86eb6e1e899dcca24b6e7656ef60363d70c61a33a97d6b19f2",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/biometric.rs",
+        "sha256": "a4627a391a6544ec103bcecc017932493ccef7ddb0d916452fe7c817dd2a9cf9",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/package_context.rs",
+        "sha256": "a6fd78331bd52ff2c2eb4fa1f15aeaea7410ee1e8c03c626da3d0ccd6452f322",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/storage_mode.rs",
+        "sha256": "7822abe929cde70fe1ca9c7be041c104230695d2377597e2536c16f02e497097",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/reflection_rce.rs",
+        "sha256": "00e5f78c793f279fdd9ce9982416a1a7eae348055922233d586e5b291ef17e0b",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/api_misuse.rs",
+        "sha256": "a66fe120736572f068389ad0e49fffd0b85d5204b6b58b8eac938307bd53d977",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/custom_tabs.rs",
+        "sha256": "216b8cd03aa0fb322bd8a7550933196ae1b45b09674cb93883a31a83a2630f90",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/insecure_logging.rs",
+        "sha256": "a712d21a40fb0a288550a448464e53081f1546b22d4a867619dd27d75d2fc545",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/weak_host_check.rs",
+        "sha256": "107202f37b3bc6d53f1699db471d998a32791b3289337a98447d6e4c9eac5436",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/intent_parse_uri.rs",
+        "sha256": "5e9461dd727d8c507e0de1c01875ff6220b86aee8db2bfd18e637d9c9abc4764",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/uri_grant.rs",
+        "sha256": "56ffad45374a4743ee460a6760a99d61f6c524a62468249035da4d4df13ee71d",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/weak_crypto.rs",
+        "sha256": "ce1d494324825d1701ad4b383b22fe0753e2e5523ea46b31c5c9f95f7041ab5f",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/keystore.rs",
+        "sha256": "58cf01d35340f024cf6c06694a9c53ef60e87c90f5c60e8fe82fa140bc46c260",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/rce_dynamic_loading.rs",
+        "sha256": "12324b2d0f9408ac7028935db730aa9ddd7fb1b192e390b2fc98d465ce72ffc3",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/intent_spoofing.rs",
+        "sha256": "10b571ea3ae2aea9c5b32be1cb7ac7b01afc277d567931b0b83e28a778ab087c",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/resilience_static.rs",
+        "sha256": "3f5f0a7cb96bfe7d0129997fbdb5c4fcaf621bea22205afb809ff13ec972d34f",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/mod.rs",
+        "sha256": "55b20ca39a3fb340290da88a5b08210ebc48a7401d0009aeb8075475691ed66a",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/credential_broadcast.rs",
+        "sha256": "920208f14001aa4485c5fe04174cd2b08d9c10bbc1ea37ff9ff5603628e7a4c6",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/pick_file_theft.rs",
+        "sha256": "ddbc3d9b367177ae5319f38adbd5850f1f513de44c11d0f595c6160d35429301",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/sql_injection.rs",
+        "sha256": "526d007d4d8006c532de18d519bbfd97c5fd089e23441b9ed1e0f95d27618b44",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/webview.rs",
+        "sha256": "6d4b0a3f1eb000a28047b8c85281ca556178212e1d60ee870ce39ebcf91505c2",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/pinning_bypass.rs",
+        "sha256": "01301478db1d1b65c633dd12f4ccf1277c57391bdfe6f244b319da70f3539a4c",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/command_receiver.rs",
+        "sha256": "6ea98d0fb6132582c2883a617bd910ae6ef0206971f277d594b8b17dff8be9ff",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/path_traversal.rs",
+        "sha256": "6d8e1a14886d28260180ce481cd7d4bcb2c8cf597365da26d47e65f2680a0172",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/implicit_intent.rs",
+        "sha256": "6baf424da5085e1c49d552576fcd14314eec7f93b0d0ba8731795549c3a7f225",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/logcat_external.rs",
+        "sha256": "13c94b90f62f55ad018d7a219b9723b63cf3ae1f25ba1ee0892336648d30f062",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/sqlcipher_passphrase.rs",
+        "sha256": "523614c454abada8e64d1cca0043a60097a1f5fa5784c4c8e91d0fd1f006b59b",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/unsafe_deserialization.rs",
+        "sha256": "47e2660326235da073fc990c061e2b31b3baf227b8732f7b6ba84ddf8fbe01f6",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/broadcast_abuse.rs",
+        "sha256": "f9c451056b0c247f261ff296f80d670a1d5dbafece6b7de804da7c4b02e2877d",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/pending_intent.rs",
+        "sha256": "7c43df1318e58160312c56bc59858ee5aaf845e50bca53ec8d74754009bd112e",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/next_wave.rs",
+        "sha256": "40f7d02209c4525267008befa2d07f60b52e3d147ac3c82e78df74e6d9d800ed",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/intent_redirect.rs",
+        "sha256": "20139240f9db7af7b5e1a80540b42a8eaacf8b8c6669e6e059b9b64043402e61",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/broadcast_redirect.rs",
+        "sha256": "19358d2985340cc2543e68b55c9066c4d281ec21f9d64460feb4f304240492ab",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/hardcoded_secrets.rs",
+        "sha256": "d79c12a2d36cead09cb289c81d557c2a41b19e6ee06ef3ea1fe33c1746a398f9",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/trackers.rs",
+        "sha256": "52334cea29501249168e0cb8713b5a8ac84fbbe64f372a4a29891a0eb2d893dc",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/zip_slip.rs",
+        "sha256": "7d806b2743346d4cfa83301b55e28d9f17634f067c79aa00a231c9a5d1e5db7a",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/detectors/sensitive_broadcast.rs",
+        "sha256": "ceb3d39ca05dd1a7aa3f5d67e0264ed818ad84fa38fa23912f529b93a1ea6ed4",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/emulator/interpret.rs",
+        "sha256": "92adb438aebad6e1b5d9819c01da7f74078057597063a70aac76f0ef6c448477",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/emulator/mod.rs",
+        "sha256": "6a2e6952e902ed2059e3c136feec0eaedb421c91e75a8e9c286e58fab5ca88c5",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/emulator/state.rs",
+        "sha256": "ddf69e693b1d1ac5d4c6a8e5a840df934d4277f0abe0a182f974605a679a6b01",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/emulator/stubs.rs",
+        "sha256": "7fa621dfcbb12ea14190e80afbb59b499b9108ad6de3e0a00ce74596a76cc9c3",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/simplify/format.rs",
+        "sha256": "8495eefbf6497862dc282c23885e0bb71208af567a97a1515ec7824ae1fc2ad1",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/simplify/cleanup.rs",
+        "sha256": "b47a5666a5a32bce5800b55b19c15cf7966e8bf9cfaf9bb39f0b1e720742f39a",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/simplify/util.rs",
+        "sha256": "d12e61c70c02d17f373a5bcfed031776998c29f9f92c79f7a0bf61e06d100127",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/simplify/repair.rs",
+        "sha256": "74d40ab718235818c845d811b31ab3b59e01e730dec5677baead761d413e5e72",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/simplify/try_catch.rs",
+        "sha256": "65785851a0695971debe874768093b12b0da40f9c579574be871d85702ded444",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/simplify/mod.rs",
+        "sha256": "63313fe947d16deea2224b5673c0afcaf3737c8f2abe34dfe34727025acf2b9d",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/simplify/expr.rs",
+        "sha256": "274baab45fc924d37c87cdc40c1e0bb818570b38cf8f0214e7a835832c5993cf",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/simplify/string_switch.rs",
+        "sha256": "f042a9cffb6a03d64309bea842c22db34ba604ca557095e7c34e08362eaa717c",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/simplify/pipeline.rs",
+        "sha256": "adcf5da52008da277449be5b68d26ef12e004a47215ee41b3e5586febba2dece",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/simplify/loops.rs",
+        "sha256": "a7fc706a1aa87cd92f197ef1b139c9987845d030b13ac8647bba1d7411b7c690",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/simplify/conditions.rs",
+        "sha256": "c3d42a6578f319b4f14ee152b4140a02d653aeb4a4467d1948efc2c663c0f6c3",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/simplify/tests/mod.rs",
+        "sha256": "0b19c044895e50389d78cb8153fe7ec72de30ce52887840ed799fc12dc6c6abe",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decompile/simplify/tests/ternary_probe.rs",
+        "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/general.yml",
+        "sha256": "ec92146eaa9424a4a3d33f91de3157fff120dd35b45bb7aa7c1675be8f572d15",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/all.yml",
+        "sha256": "b166c0c22f8a94c6dd723a179ccf76d60222df553ac53946dc69245675057fc1",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-keyboard-cache-input-types.yml",
+        "sha256": "02897abd7f102bbb6f4d1ede0ea1f4c9be2f2c88566af8fe1fdff5260908e17c",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-asymmetric-key-pair-used-for-multiple-purposes.yml",
+        "sha256": "f7dec88166d70ce0b7a6e02b7de5e7f21eb05351fda503ed5de3b03bd741340e",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-debuggable-flag.yml",
+        "sha256": "16f6cf7b5ed3cadcb86dc2ac651d03c70d3b2fc3ea1387dbb2ed8be5474fc3c5",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-biometric-invalidated-enrollment.yml",
+        "sha256": "4f514d4842232d90993755334afbd98020e3eb07229dd6aacd11c7a8490631f7",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-input-field-usage.yml",
+        "sha256": "751f0fe41a91865058dc9dc17fc3a4af2786d68466ba93561991eb6a186f046f",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-network-insecure-trust-anchors.yml",
+        "sha256": "ad6cef32cedf0e5278b211639ca188bbe1276a976c40fbb1c5974ca3fb97ed58",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-pendingintent-mutable.yml",
+        "sha256": "28c13a8de1132d5155a2117b89a04be8b8fdfd15f5d70e9041d074e62b987054",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-network-hostname-verification.yml",
+        "sha256": "15f80d4f91412e7596d2a060e6a9e85f63e9435b8e3b9d715607440de51559d3",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-webview-bridges.yml",
+        "sha256": "be720f3ce22ad9e7076b41821ec1923fc09c3ef68bc62b0e1ae9bca1ffe4be6a",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-device-passcode-present.yml",
+        "sha256": "a3b82c26c0f4917b9ec888aa441c9f122abc42c96122f2109dc9229b2a4b2df8",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-biometric-device-credential-fallback.yml",
+        "sha256": "5f9b7b4939da6cb9c4030fbfd1024575931ee3a4f32aaa3d2d5d99bbf33ca1a5",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-deeplink-autoverify-missing.yml",
+        "sha256": "422a7bbf8d8a0d9a6258b27ccc3cfd4ee9d171fa5e9fb02e4c2f80b6f75c58a5",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-overlay-protection.yml",
+        "sha256": "a368a837cf4f730f9b354b0b2bb6e9111c5bd90d03723b66c5f0d111ad323913",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-biometric-validity-duration.yml",
+        "sha256": "80585f0c55887389538c2cafc2529897b3553b90b902d3913c753d9717f97a54",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-native-debugger-checks.yml",
+        "sha256": "a36c62b701c1832bc2db071582f119fa458038d2c1184c1c3fc0efcc92d2a3b2",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-fileprovider-broad-scope.yml",
+        "sha256": "6e551f68ecd400786f55715b0f07504095a6edc7e4095ba72ba9260afbe16ef6",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-backup-manifest.yml",
+        "sha256": "2926db783cc3615d21f2f007bb8fcd1c09e4b1ff19aec55110462ae95c693eee",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-biometric-no-confirmation-required.yml",
+        "sha256": "14bcff56cc1528021e3a218e9cc37e7593c6960c68d327b28ccc4aaa2f4ae99d",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-deeplink-unvalidated-parameter.yml",
+        "sha256": "9b99499160490088becd9adef40444d23caa439ce40ac3353491be2b9d90fc83",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-sql-injection-contentprovider.yml",
+        "sha256": "2cb55c78a63699d934f7908b8797f27425dc767d974b582e3f307bd5a95539a2",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-data-unencrypted-shared-storage-no-user-interaction-apis.yml",
+        "sha256": "76089b6050f9b5ee4d02b4ab84236dd61b436de87abbcbae71711b3a53781245",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-webview-url-handlers.yml",
+        "sha256": "51d5cadecab47d174a05092cffe3a20887071374a5bb5cc742643e988f382279",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-network-onreceivedsslerror.yml",
+        "sha256": "84ca94dd18e22f87a81cd618a3f82e08fdb7e3cddf2015fe7dc00dce7cd1f79b",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-data-unencrypted-shared-storage-no-user-interaction-manifest.yml",
+        "sha256": "4aee09ae244603e97b4ef1eae60fa4a72f86c99c582205aa42f5f22d3e30b91c",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-implicit-intent-internal-communication.yml",
+        "sha256": "c8b99d0922f32d5e3b95c2136fdd43007266c9dd34eaf78a589ae5a1905920e3",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-debugger-checks.yml",
+        "sha256": "68bc215fa2c44b7a905d07ba72aa0ec707236c4b5413bb569d0caf209809305e",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-sensitive-data-in-screenshot.yml",
+        "sha256": "99b5c3b68adc0dca1314317a51e0ab57ee2f8d80f3393340a0355fd198ac753c",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-custom-deeplink-scheme.yml",
+        "sha256": "d5b86a0e689a538b0d40374f3ab9f214c3967a1152cddc29b3003323701832a8",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-key-generation-with-insufficient-key-length.yml",
+        "sha256": "7a58d85c14e1c46db0be030d961ff62b7a579138006dc6f31c1f5140f9d83d62",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-webview-allow-local-access.yml",
+        "sha256": "876357aeb69f7f332ff43ec7d1323544b0910e42f5fd7f50866174957eb39234",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-content-provider-exported.yml",
+        "sha256": "b69953ee0ee73e3ee76a3f46569b4679295e393371038a14802f0924a8fcb3ac",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-sdk-version.yml",
+        "sha256": "412acbd3fb5d70ff08619fc7b8333b5732e7264a55166b1d10e363763ce121cd",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-biometric-event-bound.yml",
+        "sha256": "4e2cf64d224b13bf7a8a105f4d6091baa2df62087628c2d698ec3b8cb38913bb",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-implicit-intent-leaking-extras.yml",
+        "sha256": "e26456f80a942a842a9da4c099b230afdd5f17f5c72f51cc8f704e4dda95aff7",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-sensitive-data-in-notifications.yml",
+        "sha256": "68316f9a9601f31d5448e80c743256f8db0878b2c04424a979e31ca737c8cd2b",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-non-random-use.yml",
+        "sha256": "06fa9f790c8a06b81b80bea2b7731b5daf9234caceadba2079a1c5c6af467b8b",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-random-apis-insufficient-entropy.yml",
+        "sha256": "9e143071dcfa65988ce8e1f6743615979bf848e1a3cd4a08f647530abca21a44",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-webview-safebrowsing.yml",
+        "sha256": "9040acaab34bc5c5ac5a34c710112eee1002b46c1b0739ad248ff4a48faa323d",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-system-alert-window.yml",
+        "sha256": "e71f4a254b33972babc7c340365ba1eaafc4f5c2327c48f609096e955e7ba534",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-strictmode.yml",
+        "sha256": "ddb1cf2c21dfd080c415fb643c1a64cf62c0c2fc57252a72f7e3a07613f93937",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-hardcoded-crypto-keys-usage.yml",
+        "sha256": "4409b29926a2344f822a10da3f50474374d210f76755f5f62f5edb2424851c97",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-local-storage-input-validation.yml",
+        "sha256": "da5cdad2811e0a011bd2c3829c8fec977fde4017b0ce65f266182cc86bceeb2d",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-network-checkservertrusted.yml",
+        "sha256": "3651af239bdc106e4689a67249c24a76f120b6fe33a4fc1c8fd3f55ae7120142",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-object-deserialization.yml",
+        "sha256": "fb4508e106e7fe6afaeefd00bba8b5fb96d72dde64218762c0cdaa455ffc2b2c",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-sensitive-data-in-notifications-manifest.yml",
+        "sha256": "5bd5954849c3c6d9703315deb2dde4c587d941812e6efac9aed4a7062982eb3a",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "rules/semgrep/android/mastg/mastg-android-ssl-socket-hostnameverifier.yml",
+        "sha256": "203c8ec1e70a8b9a753fcfc042837cb8538ee4ab6a4cbb1137c5ca229bab802d",
+        "upstream_unchanged": true
+      }
+    ]
+  },
+  {
+    "component": "dex-parser",
+    "revision": "30bde726dd30a0d8c442ea7006666da2ef72b9bd",
+    "modified_files": [
+      "Cargo.toml"
+    ],
+    "files": [
+      {
+        "path": "Cargo.toml",
+        "sha256": "15e12ccdb2065bbbd5af59286403be2a728596b7efc7edf1bac1230d510d3d2e",
+        "upstream_unchanged": false
+      },
+      {
+        "path": "src/leb128.rs",
+        "sha256": "033829e481185501b8127fd14a8735fb19135bc6c7b6c923197489f1d2997927",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/error.rs",
+        "sha256": "926d8ff76e221015157357ecfe7d90d9553b0497b2255ed6dbca2498ceb11adf",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/lib.rs",
+        "sha256": "a1f438538df2900628254d8bbba32a2c25ec117259b2df198db5be5bb645c1ec",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/bounds.rs",
+        "sha256": "2805f556c88087020290846916a61d7848ec21f23eafd68c05cad7ecddb077a7",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/bin/dexparser.rs",
+        "sha256": "63447821da21a62d347cf1104cbcee60bb3ee2ac7be51baae36c87ca8c8e6469",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/bin/dexparse_dir.rs",
+        "sha256": "cb1e573fdee8b6defbb6304ea321c05c3d96baaa7f1514cd05c805a565d910b6",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/debug_info.rs",
+        "sha256": "81a63b0ec63d46f6f597e9c0b81ac1180cb3eff161f72ec1c6dd0613fe45085e",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/code_item.rs",
+        "sha256": "9d989858ee925781e062945a80bf0d83e025ebaf839cc84e53dabbd8fcb670f8",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/types.rs",
+        "sha256": "16c3a349acdf73c363b97c27954f1c0f765106f038f14df1951aed99bafc45f5",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/methods.rs",
+        "sha256": "921cb0e5ae5a1f2d82f23773ec9ce7aed6b7bc2fef3093f4091463ff131a17ec",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/raw.rs",
+        "sha256": "236ae59f3d9d460c62b0868db3daf4399479df13e0823ffd34a5464b0a198478",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/class_def.rs",
+        "sha256": "e525685f4ad38d6630ecb0bea50dcb54b2fa85032905cb9f8768a24c6d71e883",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/write.rs",
+        "sha256": "c4952a405d70dff8758e1b3389e871da445cc827211985de286c04b4c7c11ccf",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/header.rs",
+        "sha256": "61df9ea3c2ddee20cb3e56566b3ab83f257ce6af24698785a84185834467388f",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/call_sites.rs",
+        "sha256": "935fdd1ca4422a32f743ead86cb638394a58f8d96fddfa07747e36eba1b7c751",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/slice.rs",
+        "sha256": "04439a554d2cf06cf36dbc90ea47b49b024985064f6d6e0c8c575d1926c92541",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/fields.rs",
+        "sha256": "45d2215ccd00fcfce63b84731fdeb1073ba90daaa11156e06d1f88e3e34babd0",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/build.rs",
+        "sha256": "ed0c1de22941d8d5e7aaf749adf53e94a36369e94b13a6c747198040e61b920f",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/strings.rs",
+        "sha256": "f05384ed2ba6825ac79f0c41ab292f71bcecc531bde4b59799eae8ae6470efb1",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/protos.rs",
+        "sha256": "50c8c40874b61aab1943f996af2147f40bc9b5a1bb5164f0ecac44e6a82bc390",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/mod.rs",
+        "sha256": "33944994510689bac2fc4ee23b02abe3f6ad556aaab6d8d2cd7776bcd39a9a9f",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/annotations.rs",
+        "sha256": "5aa82d3ff6e875f4a109e0a9d13d7d10a5036e808897d29beb532cfaee777cc1",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/class_data.rs",
+        "sha256": "95ea542408f1b23e90e87ee7f84f87581c3e7389389da80c614c01d5885119e2",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/encoded_value.rs",
+        "sha256": "7d922bd679d91809884e5d4b48e064a000993e15348f0eefc1660b3b1828b6d9",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/fastref/mod.rs",
+        "sha256": "4ecab717a8214688f25faecdfb22959a3103878eb6197007428fe22d1977a76b",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/fastref/scan.rs",
+        "sha256": "7749eed3f48d8f0a82c5f17379b28a8c15d88cc893e47c7cdddabeb4a005e866",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/fastref/locator/field.rs",
+        "sha256": "50631ace26b01bc466d36ab5d3dfb266a5d608452d076346f551b52ac28e4a92",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/fastref/locator/mod.rs",
+        "sha256": "066d03f25cf1ab12bc9e394951f5713f6d6a65d0491a9dc51b60b58d60e866bf",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/fastref/locator/insn.rs",
+        "sha256": "679dd744c1bbf93a6d8a9dc9771b05aac98dd0e8bcd61f339bf2b946208a69a8",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/fastref/locator/string.rs",
+        "sha256": "f3df3c82f614e981aede8f1805557445e93afe5b3432ea7399e5ac757d8cdb64",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/fastref/locator/type_.rs",
+        "sha256": "47d5766fecdccfec301bf229e32682ef003f0e161c800b511f5e5187c331ad11",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex/fastref/locator/method.rs",
+        "sha256": "a4eb8230abb456ce135c128ad7470fabf4297fb3c7d7947c8606b3433ed473c6",
+        "upstream_unchanged": true
+      }
+    ]
+  },
+  {
+    "component": "apkparser",
+    "revision": "95ec9b00b4e2e30d16ac98c09868e5d6b58d3fdb",
+    "modified_files": [],
+    "files": [
+      {
+        "path": "Cargo.toml",
+        "sha256": "e68754ecfa671c09beafae1f4fa66f451c1ba696c5967f1a747177a8761b9964",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/zip64.rs",
+        "sha256": "a5cfa13ad77052218e581413d29abe23fa5fb0524992550291d18bbe56db41e2",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/zip_write.rs",
+        "sha256": "5cb5cc0cb9f3b6d9038f26f11c9ce182ec40f5a9b6cc10abcb9e64c9247d0bff",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/apkm.rs",
+        "sha256": "1d3f812e51c53d08ee930cafaf3230947003c658ddc62ed52d4d99ef41634b17",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/apk.rs",
+        "sha256": "70139627986369904e7176edd47d6dc287c180beaaba4d8e6b6edec312677ab3",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/error.rs",
+        "sha256": "27e6ebab2f98b330dea0093328b437d85fee8e673f35624d54363f3b687da386",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/dex_entries.rs",
+        "sha256": "a9a1398074b32bac9335cbef6ac60af2b69809fc9ba0451b605719e8b0f79ecc",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/lib.rs",
+        "sha256": "fa34de065e3c04e5a41ceca04be92fece66eee317ed49ab04e504cc1623d9467",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/manifest.rs",
+        "sha256": "e7458d6455085847380c8ca8f448a05d41cafd907fa1d9a190b8e34b2f87b6f6",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/main.rs",
+        "sha256": "3a5fed6c7e3f8cb1b71c0a23932400ce9221920a267239a7277a94fefb1c1ea3",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/permissions.rs",
+        "sha256": "4651af72cf32a8693018814fb82f6bd22fac3127242d3112c97bd6f9420f9946",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/zip.rs",
+        "sha256": "da0e3f7f80a388ebb55bd4029590d88deec2190324a86a240327ee47d14df278",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/utils.rs",
+        "sha256": "5fb445bfd021166b14e6c5b3da98980078b61e69f40800999c6372821169da11",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/signature/apk_sig_block.rs",
+        "sha256": "b53b27aa686b1beb9c4680ad107deaa7d2a0a918bff4b031449c07285402a3a7",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/signature/v1.rs",
+        "sha256": "3c12dbb31c50c6a56a0d67b15e5f9bd548aab79560b89ccb7fdb24e3256043cb",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/signature/v3.rs",
+        "sha256": "a0f42cf6c7c8e8c61bbda27cd56dd02a3679c6af162501b031335586a47b733f",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/signature/mod.rs",
+        "sha256": "fc4f2e8e7af8e500c34fa820859a1cb79075a1ca56c8c4439b27f5241ceb0a07",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/signature/v2.rs",
+        "sha256": "27a7509d8fd39c030e4a6b8a6287e451926622818a364a7a645fae2cd6fef309",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/signature/utils.rs",
+        "sha256": "ea6fa47cfe3eb982c771f3afc82d9a2c059aceaa2cfc12bcc5c94bd4be963f98",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/sign/v1_write.rs",
+        "sha256": "aa384ce3cb300b983ddbab9f51320d22f50607b86b1b843471b92f6f2c8d155f",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/sign/zipalign.rs",
+        "sha256": "c437a6949f29806b27cca55dcaf5e0a25ae92213bef810437c2b3015feac5ccb",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/sign/mod.rs",
+        "sha256": "9ae6c7533a5336267841ffab74215c4e41f006c0953229d3958effb398aae612",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/sign/debug_keystore.rs",
+        "sha256": "2ca5215fe0373aa5dba1e74a960dc2aeb0d2252012db32c5a04052839b1e1456",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/sign/v2_write.rs",
+        "sha256": "30e210d977f906a6935c6fa12a5e0882b4ecd7d8997a952297723262eaff3cde",
+        "upstream_unchanged": true
+      }
+    ]
+  },
+  {
+    "component": "dex-bytecode",
+    "revision": "7d40b753480131bff4d5c1786b5f698b630f2bac",
+    "modified_files": [],
+    "files": [
+      {
+        "path": "Cargo.toml",
+        "sha256": "b458bfd0e3de063c3adad36ceaf3eabc25f12a7bf72e4b0b518eb748a99789c5",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "bin/dis.rs",
+        "sha256": "7c15d9c2e727aea88b9ca9c642a85016b5d5c79ff628e843e84b8fb1459be854",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/control_flow.rs",
+        "sha256": "9eb8d8d45e1affb5d18fd5575dcfda5811494bdeb4526816dbef0b5902f7836c",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/error.rs",
+        "sha256": "98d8b86425d4ab3aa76a0d533f917d76354fd87b3cf224802d7a5c4bf9d2c80f",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/resolve.rs",
+        "sha256": "bc39f897ff817e58e1cef7651f93b0564afe103420528524adede73a094ad4ed",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/encode.rs",
+        "sha256": "b65aad8350169fc1ddceb4c866faea02640db1810bd73ed68ab786178266769a",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/opcodes.rs",
+        "sha256": "983464916c771f47ffd3283c5137cc2bae193ab7719538603993d1ec88c74beb",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/lib.rs",
+        "sha256": "ec9984552796ca2d1eb9b59149ea2cb013877b18b8986765bfeb7ebb21550fde",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/raw.rs",
+        "sha256": "e34168f585c81d41a719458c235ad9f01e25b780a4122345a4224635b9fdfab4",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/decoder.rs",
+        "sha256": "0720f013647b62a69ddac56d843edef907440ae3c75ce71d8f4fcb7aafa024e1",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/patch.rs",
+        "sha256": "7fccde22bd8bb05a09bb1967cc46943799d8264f59d401b2d7415329f8cde6f6",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/instruction.rs",
+        "sha256": "bbb652fcc781350a0c66abeb68ca3961707868b543a0ccca844e7a2b7f327460",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/mod.rs",
+        "sha256": "a65dbf80afe81a447269fd31cddf39f2388b15da1bd8370864dbaca44b8fe81c",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/encode_roundtrip.rs",
+        "sha256": "ca3600e5a8f18f485b716f8cbefc50db6a8c0bb31bdca80a9ee025f8f65354de",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f22x.rs",
+        "sha256": "29eaa64b1651f664357cf8a1f6a6bbb40b00c6af1e84b48b8a3a33a9a6e068fa",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f23x.rs",
+        "sha256": "d41f0f8506a8ecab0c96a1a8397719640beac7bbabcfef3f1cb0939a7bc93f0e",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f32x.rs",
+        "sha256": "0c6ba200ff932938f8173fd3feff1e5cfd8ac54b17bf80e073759825a917782a",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f4rcc.rs",
+        "sha256": "e226d63ed6ce1daa79a7b2cc4eb4027a52c572b44f7e6b00e9b7ce2a960efd84",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f22s.rs",
+        "sha256": "74e97f711d0fa34f890edf60613b0a6160201f05596f2accb005430507647205",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f21s.rs",
+        "sha256": "758aa5d73d140bd45c6af075198621b57d2867f77b4cc9261bd07fcd44e18ef3",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f10t.rs",
+        "sha256": "96628237e5ecbdb79c763b88b103d41cb8f325e62e3d5c7f1476fa418a0ba642",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f45cc.rs",
+        "sha256": "ceec9673577e3d6bafb9dee72e233bd5054c66d48618463c797155daa6d33ca4",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f21t.rs",
+        "sha256": "3f74c8be5cc9fec56316b258f9b351cceeb04690d63feff863fb96bc98d152da",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f20t.rs",
+        "sha256": "b5a5af1c69831a83ff09e68fa348cde946d6e04479a1517a1366056c757885ad",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/mod.rs",
+        "sha256": "7b5df33eb261942520f64f795b5155de9876b8b906037bba5f9f969c3da42800",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f31i.rs",
+        "sha256": "c3b57ea56041d26527ce6050f2fc6470b80999ad4f132b1c47074e254c583c1e",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f22t.rs",
+        "sha256": "f9434860afa9c2f7c2141e7b9c695288d5d24e5f0a0dc1790c6d2b5a555391eb",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f21h.rs",
+        "sha256": "ab3b20f70e4c40d0b9002d4944015a621203b5c3d6b3b9b3bbb3c6c8680b34cc",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f11n.rs",
+        "sha256": "3b985b888d614a4a56850bc0585ba0dfa3ebcb3322a865e60b859cd62edc094c",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f30t.rs",
+        "sha256": "7d6d06fb3a4cc37f5160294a588a853496201f0dbe4dbb01b3a30cde62bf7006",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f31t.rs",
+        "sha256": "827495fa85be100928384917ac675024e4d7f22edcf8305bcdd5249dd855dc6c",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/payloads.rs",
+        "sha256": "7556d2092d1abcb9404798e8c90867b6f1e5a4812c90f8f33a3f5bcce098f05e",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f22b.rs",
+        "sha256": "d35658b848ad67fceedf03303f353016e404f35ef0772cf0c863fe2bb28be6f0",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f3rc.rs",
+        "sha256": "ec2526e20e4d9c007a2e3f348ba48d56ee439c816f3109a890591059718a6047",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f31c.rs",
+        "sha256": "45d41f136009f5dca01f3be31b3d422c0bf867a56cf363efb4632bcfee754046",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f51l.rs",
+        "sha256": "f42813eabba52e29705aec03712b64c7aab37b5d58573826806823cb5e60afc7",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f12x.rs",
+        "sha256": "bdeab00590d66f10d089b591ab8fd0113f88a7611b27b50900f5348c09fac66a",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f35c.rs",
+        "sha256": "6b99c2d8e10fe9ad71caaa36ce30a1c56953f00730888cbfde9063adf7405eab",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f21c.rs",
+        "sha256": "23e3ed960f4b95af0928c31c29675e6ca983c1daf61e3eed78951eb6eb68dfd3",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f11x.rs",
+        "sha256": "5a6a4fc25373b932ef68970c75a12f4316a4b99f028fb683949e64d36be1d65d",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f22c.rs",
+        "sha256": "0ea2c686b29ede052de081f5d9b72a10acaa3f93054c34055461b408a7314e41",
+        "upstream_unchanged": true
+      },
+      {
+        "path": "src/test/instructions/format_f10x.rs",
+        "sha256": "d1d385339a8ea5e7d8e314f6aae059fa07e7a276a4ae4c7afa1cdf5579cfc122",
+        "upstream_unchanged": true
+      }
+    ]
+  }
+]

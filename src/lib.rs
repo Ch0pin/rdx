@@ -1,3 +1,4 @@
+pub mod alternate_source;
 mod annotation_usage;
 mod annotation_values;
 pub mod apk;

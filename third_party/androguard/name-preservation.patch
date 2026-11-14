@@ -1,0 +1,39 @@
+--- upstream/src/decompile/mod.rs
++++ rdx/src/decompile/mod.rs
+@@ -1,3 +1,5 @@
++//! RDX modification (2026-11-14): preserve fully qualified Java names in
++//! shorten_java_names so per-method output does not depend on merged imports.
+ //! DEX to Java decompilation: decode bytecode with dex-bytecode, map to Java source.
+ //! Supports structured control flow: if/else, while loops (via CFG).
+ //! Simplification pass: collapse invoke + move-result + return into single return.
+@@ -7506,27 +7508,9 @@
+ 
+ /// Shorten fully-qualified Java names in a line.
+ fn shorten_java_names(line: &str) -> String {
+-    let mut s = line.to_string();
+-    for prefix in &[
+-        "java.lang.",
+-        "java.util.",
+-        "java.io.",
+-        "android.content.",
+-        "android.os.",
+-        "android.app.",
+-        "android.view.",
+-        "android.widget.",
+-    ] {
+-        while let Some(pos) = s.find(prefix) {
+-            // Only shorten if the previous char is a word boundary
+-            let before = if pos > 0 { s.as_bytes()[pos - 1] } else { b' ' };
+-            if before.is_ascii_alphanumeric() || before == b'_' {
+-                break;
+-            }
+-            s = format!("{}{}", &s[..pos], &s[pos + prefix.len()..]);
+-        }
+-    }
+-    s
++    // RDX modification: per-method output must preserve qualified type names.
++    // No class-level imports are merged into the native RDX document.
++    line.to_owned()
+ }
+ 
+ /// Negate a condition properly: `a != b` → `a == b`, `a >= 0` → `a < 0`, etc.

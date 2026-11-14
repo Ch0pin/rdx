@@ -264,6 +264,7 @@ pub struct CodeDocument {
     /// Rendered document body, below the find bar.
     document_body_rect: Option<egui::Rect>,
     highlight: Option<Range<usize>>,
+    original_search_match: Option<Range<usize>>,
     export_requested: bool,
     usages_requested: Option<usize>,
     subclasses_requested: Option<usize>,
@@ -327,6 +328,7 @@ impl CodeDocument {
             last_navigation_cursor: None,
             document_body_rect: None,
             highlight: None,
+            original_search_match: None,
             export_requested: false,
             usages_requested: None,
             subclasses_requested: None,
@@ -640,6 +642,7 @@ impl CodeDocument {
             .chars()
             .nth(position)
             .ok_or_else(|| "Declaration position is outside the source".to_owned())?;
+        self.original_search_match = None;
         self.navigation_position = position;
         self.jump = Some(position);
         self.highlight = Some(self.symbol_range(position));
@@ -654,6 +657,77 @@ impl CodeDocument {
         self.highlight = Some(start..end);
         self.expand_for_range(start..end);
         Ok(())
+    }
+    /// Keep an original-DEX search match exact but folded until the user expands it.
+    pub fn jump_to_search_range(&mut self, start: usize, end: usize) -> Result<bool, String> {
+        if start >= end || end > self.source.chars().count() {
+            return Err("Search match is outside the source".into());
+        }
+        let original = self.metadata_fold.as_mut().and_then(|group| {
+            group.folds.iter_mut().find(|fold| {
+                matches!(fold.kind, metadata_fold::FoldKind::OriginalDex)
+                    && fold.overlaps(&(start..end))
+            })
+        });
+        if let Some(fold) = original {
+            fold.expanded = false;
+            let warning = format!("// {}\n", rdx::alternate_source::UNVERIFIED_WARNING);
+            let anchor = self.source[..fold.bytes.start]
+                .rfind(&warning)
+                .unwrap_or(fold.bytes.start);
+            let position = self.source[..anchor].chars().count();
+            self.original_search_match = Some(start..end);
+            self.navigation_position = position;
+            self.jump = Some(position);
+            self.highlight = None;
+            self.cache = None;
+            return Ok(true);
+        }
+        self.jump_to_range(start, end)?;
+        Ok(false)
+    }
+    #[cfg(test)]
+    pub fn original_search_match(&self) -> Option<Range<usize>> {
+        self.original_search_match.clone()
+    }
+    #[cfg(test)]
+    pub fn original_search_is_collapsed(&self) -> bool {
+        self.original_search_match.as_ref().is_some_and(|range| {
+            self.metadata_fold.as_ref().is_some_and(|group| {
+                group.folds.iter().any(|fold| {
+                    matches!(fold.kind, metadata_fold::FoldKind::OriginalDex)
+                        && fold.collapsed()
+                        && fold.overlaps(range)
+                })
+            })
+        })
+    }
+    pub fn clipboard_source(&self) -> String {
+        self.copy_source_range(0..self.source.chars().count())
+    }
+    fn copy_display_range(&self, range: Range<usize>) -> String {
+        self.metadata_fold.as_ref().map_or_else(
+            || {
+                self.source
+                    .chars()
+                    .skip(range.start)
+                    .take(range.len())
+                    .collect()
+            },
+            |group| group.copy_display_range(&self.source, range.clone()),
+        )
+    }
+    fn copy_source_range(&self, range: Range<usize>) -> String {
+        self.metadata_fold.as_ref().map_or_else(
+            || {
+                self.source
+                    .chars()
+                    .skip(range.start)
+                    .take(range.len())
+                    .collect()
+            },
+            |group| group.copy_source_range(&self.source, range.clone()),
+        )
     }
     fn expand_for_range(&mut self, range: Range<usize>) {
         if let Some(group) = &mut self.metadata_fold {
@@ -676,9 +750,9 @@ impl CodeDocument {
             .as_ref()
             .map_or(Some(position), |fold| fold.display_to_source(position))
     }
-    fn display_text(&self) -> std::borrow::Cow<'_, str> {
+    pub(crate) fn display_text(&self) -> std::borrow::Cow<'_, str> {
         match &self.metadata_fold {
-            Some(fold) if fold.collapsed() => std::borrow::Cow::Owned(fold.display(&self.source)),
+            Some(fold) if fold.projected() => std::borrow::Cow::Owned(fold.display(&self.source)),
             _ => std::borrow::Cow::Borrowed(&self.source),
         }
     }
@@ -805,7 +879,19 @@ impl CodeDocument {
         if let Some(syntax) = syntax {
             let mut highlighter = HighlightLines::new(syntax, palette);
             for line in LinesWithEndings::from(text) {
-                match highlighter.highlight_line(line, set) {
+                let highlighted = highlighter.highlight_line(line, set);
+                if line.trim().strip_prefix("// ")
+                    == Some(rdx::alternate_source::UNVERIFIED_WARNING)
+                {
+                    let red = if theme.is_light() {
+                        Color32::from_rgb(180, 25, 35)
+                    } else {
+                        Color32::from_rgb(255, 110, 110)
+                    };
+                    job.append(line, 0.0, format(red));
+                    continue;
+                }
+                match highlighted {
                     Ok(parts) => {
                         for (style, part) in parts {
                             job.append(part, 0.0, format(color(style.foreground)));
@@ -1030,10 +1116,7 @@ impl CodeDocument {
                                     let [start, end] = range.sorted();
                                     start.index..end.index
                                 })
-                                .filter(|range| !range.is_empty())
-                                .map(|range| {
-                                    self.metadata_fold.as_ref().map_or(range.start, |group| group.source_boundary(range.start, false))..self.metadata_fold.as_ref().map_or(range.end, |group| group.source_boundary(range.end, true))
-                                });
+                                .filter(|range| !range.is_empty());
                         }
                         if !screenshot_gesture { output.response.context_menu(|ui| {
                             // Popup text follows the interface theme, independently of code colors.
@@ -1160,11 +1243,7 @@ impl CodeDocument {
                             if selection.clicked() {
                                 if let Some(range) = &self.menu_selection {
                                     ui.ctx().copy_text(
-                                        self.source
-                                            .chars()
-                                            .skip(range.start)
-                                            .take(range.len())
-                                            .collect(),
+                                        self.copy_display_range(range.clone()),
                                     );
                                 }
                                 ui.close_menu();
@@ -1185,7 +1264,7 @@ impl CodeDocument {
                                 source.enabled(),
                             ));
                             if source.clicked() {
-                                ui.ctx().copy_text(self.source.to_string());
+                                ui.ctx().copy_text(self.clipboard_source());
                                 ui.close_menu();
                             }
                         }); }
@@ -1216,14 +1295,8 @@ impl CodeDocument {
                             && ui.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::Copy)))
                             && let Some(range) = &selected
                             && let Some(group) = &self.metadata_fold
-                            && group.folds.iter().any(|fold| fold.collapsed() && {
-                                let summary = group.display_range(fold);
-                                range.start < summary.end && summary.start < range.end
-                            })
                         {
-                            let start = group.source_boundary(range.start, false);
-                            let end = group.source_boundary(range.end, true);
-                            ui.ctx().copy_text(self.source.chars().skip(start).take(end - start).collect());
+                            ui.ctx().copy_text(group.copy_display_range(&self.source, range.clone()));
                         }
                         let caret = output
                             .state
@@ -1496,6 +1569,11 @@ impl CodeDocument {
                             self.selection_key = None;
                             if self.highlight.as_ref().is_some_and(|range| fold.folds[index].overlaps(range)) && fold.folds[index].collapsed() {
                                 self.highlight = None;
+                            }
+                            if fold.folds[index].expanded && let Some(range) = self.original_search_match.clone().filter(|range| fold.folds[index].overlaps(range)) {
+                                self.navigation_position = range.start;
+                                self.jump = Some(range.start);
+                                self.highlight = Some(range);
                             }
                             self.cache = None;
                         }
@@ -3255,6 +3333,158 @@ mod tests {
             });
         });
     }
+    #[test]
+    fn androguard_warning_is_red_in_every_theme() {
+        let warning = format!("// {}\n", rdx::alternate_source::UNVERIFIED_WARNING);
+        let source = format!("{warning}public int value() {{ return 1; }}\n");
+        let doc = CodeDocument::new(source.clone(), "java");
+        for theme in CodeTheme::ALL {
+            let job = doc.job(theme, 14.0);
+            assert_eq!(job.text, source);
+            let section = &job.sections[0];
+            assert_eq!(section.byte_range, 0..warning.len());
+            let color = section.format.color;
+            assert!(color.r() > color.g() * 2 && color.r() > color.b() * 2);
+        }
+    }
+
+    #[test]
+    fn androguard_original_dex_folds_between_warning_and_method() {
+        use rdx::alternate_source::{ORIGINAL_DEX_BEGIN, ORIGINAL_DEX_END, UNVERIFIED_WARNING};
+        let dex = ".method sample.C.run()V\n    0000: return-void\n.end method\n";
+        let source = format!(
+            "// {UNVERIFIED_WARNING}\n{ORIGINAL_DEX_BEGIN}{}\n{dex}{ORIGINAL_DEX_END}\npublic void run() {{}}\n",
+            dex.len()
+        );
+        let mut doc = CodeDocument::new(source.clone(), "java");
+        let collapsed = doc.job(CodeTheme::Ocean, 14.0);
+        assert!(
+            collapsed
+                .text
+                .starts_with(&format!("// {UNVERIFIED_WARNING}\nOriginal DEX"))
+        );
+        assert!(!collapsed.text.contains("return-void"));
+        assert!(
+            collapsed.text.find("Original DEX").unwrap()
+                < collapsed.text.find("public void run").unwrap()
+        );
+        doc.metadata_fold.as_mut().unwrap().folds[0].expanded = true;
+        let expanded = doc.job(CodeTheme::Ocean, 14.0).text;
+        assert!(expanded.contains(&format!("Original DEX\n{dex}")));
+        assert!(!expanded.contains("RDX_ORIGINAL_DEX_"));
+        assert!(!doc.clipboard_source().contains("RDX_ORIGINAL_DEX_"));
+    }
+
+    #[test]
+    fn original_dex_projection_maps_unicode_and_copies_clean_text_in_both_states() {
+        use rdx::alternate_source::{ORIGINAL_DEX_BEGIN, ORIGINAL_DEX_END, UNVERIFIED_WARNING};
+        let dex = ".method sample.C.λ()V\n    const-string \"α😀\"\n.end method\n";
+        let details = "// method_id=sample.C.λ()V; native_failure=native α; original DEX: dex://sample.C\n// Androguard diagnostic: incomplete output\n";
+        let payload = format!("{details}{dex}");
+        let source = format!(
+            "import java.util.List;\nimport java.util.Map;\n// {UNVERIFIED_WARNING}\n{ORIGINAL_DEX_BEGIN}{}\n{payload}{ORIGINAL_DEX_END}\nvoid after() {{}}\n",
+            payload.len()
+        );
+        let context = egui::Context::default();
+        let mut doc = CodeDocument::new(source.clone(), "java");
+        let hit = source[..source.find("α😀").unwrap()].chars().count();
+        assert!(doc.jump_to_search_range(hit, hit + 2).unwrap());
+        assert!(doc.original_search_is_collapsed());
+        assert_eq!(doc.original_search_match(), Some(hit..hit + 2));
+        assert!(doc.highlight.is_none());
+        let render = |doc: &mut CodeDocument, time, events| {
+            context.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        doc.show(ui, CodeTheme::Ocean, 14.0);
+                    });
+                },
+            )
+        };
+        for expanded in [false, true] {
+            let fold = doc
+                .metadata_fold
+                .as_mut()
+                .unwrap()
+                .folds
+                .iter_mut()
+                .find(|fold| matches!(fold.kind, metadata_fold::FoldKind::OriginalDex))
+                .unwrap();
+            fold.expanded = expanded;
+            doc.cache = None;
+            render(&mut doc, 0.0, vec![]);
+            let displayed = doc.cache.as_ref().unwrap().galley.job.text.clone();
+            assert!(!displayed.contains("RDX_ORIGINAL_DEX_"));
+            assert_eq!(displayed.contains("const-string"), expanded);
+            assert_eq!(displayed.contains("native_failure="), expanded);
+            assert_eq!(displayed.contains("Androguard diagnostic:"), expanded);
+            if expanded {
+                assert!(
+                    displayed.find("native_failure=").unwrap()
+                        < displayed.find(".method sample.C").unwrap()
+                );
+            }
+            assert!(displayed.contains(&format!("// {UNVERIFIED_WARNING}\nOriginal DEX")));
+            let after = source[..source.find("void after").unwrap()].chars().count();
+            let mapped = doc.source_to_display(after);
+            assert_eq!(doc.display_to_source(mapped), Some(after));
+            if expanded {
+                let mapped = doc.source_to_display(hit);
+                assert_eq!(doc.display_to_source(mapped), Some(hit));
+                assert_eq!(doc.copy_display_range(mapped..mapped + 2), "α😀");
+                assert_eq!(
+                    doc.copy_display_range(
+                        doc.source_to_display(
+                            source[..source.find(ORIGINAL_DEX_BEGIN).unwrap()]
+                                .chars()
+                                .count()
+                        )
+                            ..doc.source_to_display(
+                                source[..source.find(ORIGINAL_DEX_BEGIN).unwrap()]
+                                    .chars()
+                                    .count()
+                            ) + 8
+                    ),
+                    "Original"
+                );
+            }
+            let id = doc.last_editor_id.unwrap();
+            context.memory_mut(|memory| memory.request_focus(id));
+            let mut state = egui::text_edit::TextEditState::load(&context, id).unwrap();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(displayed.chars().count()),
+                )));
+            state.store(&context, id);
+            let copied = render(&mut doc, 0.1, vec![egui::Event::Copy]);
+            let text = copied
+                .platform_output
+                .commands
+                .iter()
+                .filter_map(|command| {
+                    if let egui::OutputCommand::CopyText(text) = command {
+                        Some(text)
+                    } else {
+                        None
+                    }
+                })
+                .next_back()
+                .unwrap();
+            assert!(!text.contains("RDX_ORIGINAL_DEX_"));
+            assert!(text.contains(&payload));
+            assert!(text.contains("import java.util.List;\nimport java.util.Map;"));
+            assert!(text.contains("void after()"));
+            assert!(!doc.clipboard_source().contains("RDX_ORIGINAL_DEX_"));
+        }
+    }
+
     #[test]
     fn embedded_palettes_are_complete_readable_and_highlight_sources() {
         use syntect::highlighting::Color;

@@ -53,6 +53,9 @@ jobs:
         with:
           prefix-key: release-no-debug-v1
           key: release-${{ matrix.target }}
+          workspaces: |
+            . -> target
+            tools/androguard-helper -> target
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -61,6 +64,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev
       - name: Check formatting
         run: cargo fmt --check
+      - name: Test release packaging in isolated temporary roots
+        run: python -m unittest discover -s scripts/tests -v
       - name: Test bundled Python plugins
         run: python -m unittest discover -s plugins/logical-webview-inventory/tests -v
       - name: Lint
@@ -69,6 +74,18 @@ jobs:
         run: cargo test --locked --target ${{ matrix.target }}
       - name: Build
         run: cargo build --locked --release --bins --target ${{ matrix.target }}
+      - name: Build pinned native Androguard helper
+        if: runner.os != 'Windows'
+        run: cargo build --locked --release --manifest-path tools/androguard-helper/Cargo.toml --target-dir tools/androguard-helper/target --target ${{ matrix.target }}
+      - name: Smoke test pinned helper
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          helper="$PWD/tools/androguard-helper/target/${{ matrix.target }}/release/rdx-androguard-helper"
+          "$helper" --version
+          "$helper" tests/fixtures/hello.dex sample.Hello > helper-smoke.json
+          python -c "import json; d=json.load(open('helper-smoke.json')); assert d['class']=='sample.Hello'; assert d['methods'][0]['id']=='sample.Hello.answer()I'; assert 'return 42;' in d['methods'][0]['java']"
+          RDX_ANDROGUARD_HELPER="$helper" cargo test --locked --target ${{ matrix.target }} --test androguard_real -- --ignored
       - name: Smoke test release executable
         shell: bash
         run: |
@@ -78,7 +95,11 @@ jobs:
           "$binary" --engines
           "$binary" --list tests/fixtures/hello.apk
           "$binary" --decompile tests/fixtures/hello.dex sample.Hello
-      - name: Package
+      - name: Package macOS/Linux with matching-target helper
+        if: runner.os != 'Windows'
+        run: python scripts/package_release.py --platform ${{ matrix.platform }} --binary-dir target/${{ matrix.target }}/release --helper tools/androguard-helper/target/${{ matrix.target }}/release/rdx-androguard-helper --tag ${{ github.ref_name }}
+      - name: Package Windows (fallback disabled)
+        if: runner.os == 'Windows'
         run: python scripts/package_release.py --platform ${{ matrix.platform }} --binary-dir target/${{ matrix.target }}/release --tag ${{ github.ref_name }}
       - uses: actions/upload-artifact@v4
         with:

@@ -36,6 +36,10 @@ services. See [performance measurements](docs/search-performance.md) for the tes
 **Status: alpha.** Java reconstruction is still expanding. Unsupported methods
 remain visible as labelled DEX disassembly. See [engine coverage and limitations](docs/native-engine.md).
 
+macOS and Linux packages include optional **Androguard fallback** for browsing
+native-failed methods. Its output is explicitly unverified, with the original
+DEX and diagnostics available in a collapsible section.
+
 ## Screenshots
 
 Click an image to view it at full size.
@@ -96,3 +100,4 @@ for attribution. Third-party material retains its respective licenses.
 RDX includes adaptations of JADX algorithms. See [JADX attribution](third_party/jadx/README.md),
 [Android notices](third_party/android/README.md), [font licenses](third_party/fonts/README.md),
 [theme licenses](third_party/themes/README.md), and [icon rendering licenses](third_party/icon-rendering/README.md).
+The optional helper has its own [Androguard attribution and dependency notices](https://github.com/Ch0pin/rdx/blob/main/third_party/androguard/README.md).

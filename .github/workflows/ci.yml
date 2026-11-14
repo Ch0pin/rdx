@@ -17,16 +17,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: ci-no-debug-v1
+          workspaces: |
+            . -> target
+            tools/androguard-helper -> target
       - name: Install Linux GUI build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev
@@ -34,10 +44,24 @@ jobs:
         with:
           python-version: '3.12'
       - run: cargo fmt --check
+      - name: Test release packaging in isolated temporary roots
+        run: python -m unittest discover -s scripts/tests -v
       - name: Test bundled Python plugins
         run: python -m unittest discover -s plugins/logical-webview-inventory/tests -v
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --no-fail-fast
         env:
           RUST_BACKTRACE: '1'
+      - name: Build pinned native Androguard helper
+        if: runner.os != 'Windows'
+        run: cargo build --locked --release --manifest-path tools/androguard-helper/Cargo.toml --target-dir tools/androguard-helper/target --target ${{ matrix.target }}
+      - name: Smoke test pinned helper and real adapter
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          helper="$PWD/tools/androguard-helper/target/${{ matrix.target }}/release/rdx-androguard-helper"
+          "$helper" --version
+          "$helper" tests/fixtures/hello.dex sample.Hello > helper-smoke.json
+          python -c "import json; d=json.load(open('helper-smoke.json')); assert d['class']=='sample.Hello'; assert d['methods'][0]['id']=='sample.Hello.answer()I'; assert 'return 42;' in d['methods'][0]['java']"
+          RDX_ANDROGUARD_HELPER="$helper" cargo test --locked --test androguard_real -- --ignored
       # Ignored corpus tests require locally supplied APKs; never publish those inputs.

@@ -5,11 +5,12 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tarfile
 import tempfile
 import tomllib
 import zipfile
+
+from package_macos import HELPER, package_app, resolve_helper
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -18,10 +19,14 @@ def main():
     parser.add_argument('--platform', required=True, choices=['macos-arm64', 'macos-x86_64', 'windows-x86_64', 'linux-x86_64'])
     parser.add_argument('--binary-dir', type=Path, required=True)
     parser.add_argument('--tag', required=True)
+    parser.add_argument('--helper', type=Path, help='Matching release helper (required for macOS/Linux)')
     args = parser.parse_args()
     version = tomllib.loads((ROOT / 'Cargo.toml').read_text())['package']['version']
     if args.tag != 'v' + version:
         raise SystemExit(f'Tag {args.tag} does not match Cargo version {version}')
+    if args.platform.startswith('windows-') and args.helper is not None:
+        raise SystemExit('Windows fallback is disabled; do not supply --helper.')
+    helper = None if args.platform.startswith('windows-') else resolve_helper(ROOT, args.helper)
     name = f'rdx-{args.tag}-{args.platform}'
     staging_root = ROOT / 'target/release-packages'
     staging_root.mkdir(parents=True, exist_ok=True)
@@ -30,15 +35,13 @@ def main():
     stage.mkdir()
     binary_dir = args.binary_dir.resolve()
     if args.platform.startswith('macos-'):
-        subprocess.run([sys.executable, str(ROOT / 'scripts/package_macos.py'), '--binary-dir', str(binary_dir)], check=True)
-        app = stage / 'RDX.app'
-        shutil.copytree(ROOT / 'target/RDX.app', app)
-        subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(app)], check=True)
-        subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
+        package_app(binary_dir, stage / 'RDX.app', helper, root=ROOT)
     else:
         suffix = '.exe' if args.platform.startswith('windows-') else ''
         for executable in ['rdx', 'rdx-source-stats']:
             shutil.copy2(binary_dir / (executable + suffix), stage / (executable + suffix))
+        if helper is not None:
+            shutil.copy2(helper, stage / HELPER)
         shutil.copytree(ROOT / 'third_party', stage / 'third_party')
         shutil.copytree(ROOT / 'assets/icons', stage / 'icons')
     for notice in ('LICENSE', 'NOTICE'):

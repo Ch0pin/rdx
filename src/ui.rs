@@ -99,6 +99,12 @@ enum Event {
     /// the navigation serial the open was issued under: a later navigation
     /// makes the result stale, and the UI drops it instead of stealing focus.
     HitSource(u64, u64, SearchHit, Result<Arc<SearchDocument>, String>),
+    BrowseHitSource(
+        u64,
+        u64,
+        SearchHit,
+        Result<(Arc<SharedCode>, Option<std::ops::Range<usize>>), String>,
+    ),
     UsagesUpdate(u64, u64, UsageUpdate),
     UsagesDone(u64, u64, NativeEngine, UsageSummary),
     AnalysisDone(u64, u64, Result<serde_json::Value, String>),
@@ -149,11 +155,37 @@ impl InteractiveRequest {
     ) {
         let event = match self {
             Self::OpenHit(hit, serial) => {
-                let result = search::hit_source(engine, cache, archive, &hit.origin);
-                Event::HitSource(generation, serial, hit, result)
+                let native = search::hit_source(engine, cache, archive, &hit.origin);
+                if engine.alternate_source_enabled()
+                    && matches!(hit.origin.target, SearchTarget::Class(_))
+                {
+                    let result = native.and_then(|native| {
+                        let SearchTarget::Class(class) = &native.target else {
+                            unreachable!()
+                        };
+                        engine
+                            .browse_search_range(
+                                class,
+                                &native.source,
+                                hit.origin.source_hash.as_deref().unwrap_or(""),
+                                hit.start..hit.end,
+                            )
+                            .map_err(|error| format!("{error:#}"))
+                    });
+                    Event::BrowseHitSource(generation, serial, hit, result)
+                } else {
+                    Event::HitSource(generation, serial, hit, native)
+                }
             }
             Self::Metadata(name, hash) => {
-                let result = engine.decompile_shared(&name).map_err(|e| format!("{e:#}"));
+                // A metadata-only response attaches to the native search hash;
+                // actual class/hit opens above always use the browsing policy.
+                let result = if engine.alternate_source_enabled() {
+                    engine.native_source_view().decompile_shared(&name)
+                } else {
+                    engine.decompile_shared(&name)
+                }
+                .map_err(|e| format!("{e:#}"));
                 Event::SearchMetadata(generation, name, hash, None, result)
             }
             Self::Navigate(class, position, hash) => {
@@ -503,6 +535,8 @@ impl Tab {
 }
 
 pub struct App {
+    source_policies: std::collections::BTreeMap<String, bool>,
+    androguard_fallback: bool,
     render_recovery: crate::render_recovery::RenderRecovery,
     toolbar_icon: Option<egui::TextureHandle>,
     application_icon: Option<egui::TextureHandle>,
@@ -513,6 +547,7 @@ pub struct App {
     search: SearchWindow,
     analysis: AnalysisWindow,
     analysis_cancel: Option<Arc<AtomicBool>>,
+    source_cancel: Option<Arc<AtomicBool>>,
     analysis_id: u64,
     usages: UsagesWindow,
     call_graph: crate::call_graph_window::CallGraphWindow,
@@ -650,9 +685,12 @@ impl App {
         last_preferences.tabs_auto_hide = preferences.tabs_auto_hide;
         last_preferences.menu_auto_hide = preferences.menu_auto_hide;
         last_preferences.search_workers = preferences.search_workers;
+        last_preferences.androguard_fallback = preferences.androguard_fallback;
         crate::ui_style::install(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
         Self {
+            source_policies: Default::default(),
+            androguard_fallback: preferences.androguard_fallback,
             render_recovery: Default::default(),
             toolbar_icon: None,
             application_icon: None,
@@ -663,6 +701,7 @@ impl App {
             search,
             analysis: AnalysisWindow::default(),
             analysis_cancel: None,
+            source_cancel: None,
             analysis_id: 0,
             usages,
             call_graph: crate::call_graph_window::CallGraphWindow::default(),
@@ -812,6 +851,7 @@ impl App {
         preferences.tabs_auto_hide = self.tabs_auto_hide;
         preferences.menu_auto_hide = self.menu_auto_hide;
         preferences.search_workers = self.search_workers;
+        preferences.androguard_fallback = self.androguard_fallback;
         if preferences == self.last_preferences {
             return;
         }
@@ -847,6 +887,10 @@ impl App {
         self.plugin_page = 0;
         self.plugin_results = Default::default();
         self.mcp_server = None;
+        self.source_policies.clear();
+        if let Some(cancel) = self.source_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
         if let Some(cancel) = self.analysis_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -992,6 +1036,19 @@ impl App {
     }
     fn choose_target(&mut self, target: Target, ctx: &egui::Context) {
         self.navigation_serial += 1;
+        if self.busy
+            && let Some(cancel) = &self.source_cancel
+        {
+            cancel.store(true, Ordering::Relaxed);
+            self.pending_history = None;
+            self.cancelled_history = None;
+            self.deferred_target = Some(target.clone());
+            if let Some(index) = self.tabs.iter().position(|tab| tab.target == target) {
+                self.selected = index;
+            }
+            self.status = "Cancelling previous source request…".into();
+            return;
+        }
         if let Some(pending) = self.pending_history.take() {
             if pending.destination.target == target {
                 self.pending_history = Some(pending);
@@ -1010,6 +1067,15 @@ impl App {
         }
         if let Some(index) = self.tabs.iter().position(|tab| tab.target == target) {
             self.selected = index;
+            if let Target::Class(name) = &target
+                && !name.starts_with("dex://")
+                && !name.starts_with(rdx::resource_table::PREFIX)
+                && (self.androguard_fallback
+                    || self.source_policies.get(name).copied().unwrap_or(false)
+                        != self.androguard_fallback)
+            {
+                self.decompile(name.clone(), None, ctx);
+            }
             return;
         }
         match target {
@@ -1024,12 +1090,33 @@ impl App {
         };
         self.busy = true;
         self.status = format!("Decompiling {name}…");
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.source_cancel = Some(cancel.clone());
         let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
         thread::spawn(move || {
-            let result = engine.decompile_shared(&name).map_err(|e| format!("{e:#}"));
+            let result = engine
+                .decompile_shared_cancellable(&name, &cancel)
+                .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Event::Source(generation, name, position, engine, result));
             ctx.request_repaint();
         });
+    }
+    fn refresh_selected_source_policy(&mut self, ctx: &egui::Context) {
+        if self.busy || self.engine.is_none() {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.selected) else {
+            return;
+        };
+        let Target::Class(name) = &tab.target else {
+            return;
+        };
+        if !name.starts_with("dex://")
+            && !name.starts_with(rdx::resource_table::PREFIX)
+            && self.source_policies.get(name).copied().unwrap_or(false) != self.androguard_fallback
+        {
+            self.decompile(name.clone(), None, ctx);
+        }
     }
     fn display_code(
         &mut self,
@@ -1038,6 +1125,8 @@ impl App {
         position: Option<usize>,
     ) -> Result<(), String> {
         let code = code.into();
+        self.source_policies
+            .insert(name.clone(), self.androguard_fallback);
         let target = Target::Class(name.clone());
         if let Some(index) = self.tabs.iter().position(|tab| {
             tab.target == target
@@ -1262,10 +1351,12 @@ impl App {
         };
         self.busy = true;
         self.status = "Resolving declaration…".into();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.source_cancel = Some(cancel.clone());
         let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
         thread::spawn(move || {
             let result = engine
-                .navigate_shared(&class, position, &hash)
+                .navigate_shared_cancellable(&class, position, &hash, &cancel)
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Event::Navigated(
                 generation,
@@ -1299,10 +1390,12 @@ impl App {
         };
         self.busy = true;
         self.status = format!("Opening {class}…");
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.source_cancel = Some(cancel.clone());
         let (tx, generation, ctx) = (self.tx.clone(), self.generation, ctx.clone());
         thread::spawn(move || {
             let result = engine
-                .navigate_class_shared(&class)
+                .navigate_class_shared_cancellable(&class, &cancel)
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Event::Navigated(generation, origin, Some(engine), result));
             ctx.request_repaint();
@@ -1901,10 +1994,12 @@ impl App {
             self.cancelled_history = Some(pending.destination.target);
         }
         self.deferred_target = None;
-        if self.select_hit_in_open_view(&hit) {
+        let policy_open =
+            self.androguard_fallback && matches!(hit.origin.target, SearchTarget::Class(_));
+        if !policy_open && self.select_hit_in_open_view(&hit) {
             return;
         }
-        if let Some(document) = hit.origin.retained.clone() {
+        if !policy_open && let Some(document) = hit.origin.retained.clone() {
             self.open_hit_document(hit, document);
             return;
         }
@@ -1972,6 +2067,11 @@ impl App {
     /// Show the source behind a hit. Offsets are trusted only while the source
     /// carries the hash recorded by the scan; a changed render opens on the line.
     fn open_hit_document(&mut self, hit: SearchHit, snapshot: Arc<SearchDocument>) {
+        if let SearchTarget::Class(name) = &snapshot.target {
+            // This callback receives native search snapshots, even if the user
+            // changed the setting while the request was in flight.
+            self.source_policies.insert(name.clone(), false);
+        }
         if self.select_hit_in_open_view(&hit) {
             return;
         }
@@ -2566,6 +2666,7 @@ impl App {
                     match result {
                         Ok(snapshot) => {
                             let engine = snapshot.engine().clone();
+                            engine.set_alternate_source_enabled(self.androguard_fallback);
                             let project = snapshot.project().clone();
                             self.shared_project = Some(snapshot);
                             self.usage_index = engine.usage_index_handle();
@@ -2594,6 +2695,11 @@ impl App {
                 {
                     self.busy = false;
                     self.engine = Some(engine);
+                    self.source_cancel = None;
+                    if let Some(target) = self.deferred_target.take() {
+                        self.choose_target(target, ctx);
+                        continue;
+                    }
                     if self.discard_cancelled_history(&Target::Class(name.clone()), ctx) {
                         continue;
                     }
@@ -2633,6 +2739,11 @@ impl App {
                     if let Some(engine) = engine {
                         self.busy = false;
                         self.engine = Some(engine);
+                        self.source_cancel = None;
+                        if let Some(target) = self.deferred_target.take() {
+                            self.choose_target(target, ctx);
+                            continue;
+                        }
                     }
                     match result {
                         Ok(target) => match self.display_code(
@@ -2641,6 +2752,14 @@ impl App {
                             Some(target.position),
                         ) {
                             Ok(()) => {
+                                if target.position == 0
+                                    && let Some(tab) = self.tabs.get_mut(self.selected)
+                                    && tab.text().is_some_and(|source| {
+                                        source.contains(rdx::alternate_source::UNVERIFIED_WARNING)
+                                    })
+                                {
+                                    tab.note = Some("Opened updated class at its start; an exact declaration position was unavailable.".into());
+                                }
                                 self.future.clear();
                                 self.history.push(origin);
                                 if self.history.len() > 100 {
@@ -2976,6 +3095,51 @@ impl App {
                 Event::InteractiveReady(generation, engine) if generation == self.generation => {
                     self.busy = false;
                     self.engine = Some(engine);
+                }
+                Event::BrowseHitSource(generation, serial, hit, result)
+                    if generation == self.generation =>
+                {
+                    if serial != self.navigation_serial {
+                        continue;
+                    }
+                    match result {
+                        Ok((code, mapped)) => {
+                            let name = hit.origin.name.clone();
+                            let range = mapped.clone().unwrap_or(0..0);
+                            if let Err(error) = self.display_code(name, code, None) {
+                                self.error(error);
+                                continue;
+                            }
+                            if let Some(tab) = self.tabs.get_mut(self.selected) {
+                                let mut original_dex = false;
+                                if let Content::Text(document) = &mut tab.content {
+                                    if range.start < range.end {
+                                        match document.jump_to_search_range(range.start, range.end)
+                                        {
+                                            Ok(original) => original_dex = original,
+                                            Err(error) => {
+                                                self.error(error);
+                                                continue;
+                                            }
+                                        }
+                                    } else if let Err(error) = document.jump_to(0) {
+                                        self.error(error);
+                                        continue;
+                                    }
+                                }
+                                tab.note = if mapped.is_none() {
+                                    Some("Source updated automatically. The native search range could not be mapped exactly; opened at class start.".into())
+                                } else if original_dex {
+                                    Some("Match is in original DEX; expand to inspect.".into())
+                                } else {
+                                    None
+                                };
+                            }
+                            self.future.clear();
+                            self.status = format!("Search match · {}", hit.origin.name);
+                        }
+                        Err(error) => self.error(error),
+                    }
                 }
                 Event::HitSource(generation, serial, hit, result)
                     if generation == self.generation =>
@@ -3618,6 +3782,7 @@ impl eframe::App for App {
             || ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| reveal.contains(p)))
             || ctx.memory(|m| m.any_popup_open());
         self.menu_hovered = show_menu;
+        let mut refresh_source = None;
         if show_menu {
             egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
                 ui.add_space(3.0);
@@ -3688,6 +3853,37 @@ impl eframe::App for App {
                                     icons::small(ui, Icon::Settings);
                                     ui.strong("Preferences");
                                 });
+                                ui.separator();
+                                if ui
+                                    .add_enabled(
+                                        !self.busy,
+                                        egui::Checkbox::new(&mut self.androguard_fallback, "Androguard fallback"),
+                                    )
+                                    .on_hover_ui(|ui| {
+                                        ui.set_max_width(400.0);
+                                        ui.label(rdx::alternate_source::availability());
+                                        ui.label("Automatically tries Androguard for failed methods. Changing this setting refreshes the current class.");
+                                        ui.label("Runs when browsing classes; each attempt stops after 30 seconds.");
+                                        if let Some(path) = rdx::alternate_source::helper_path() {
+                                            ui.small(format!("Decompiler executable: {}", path.display()));
+                                        }
+                                    })
+                                    .changed()
+                                {
+                                    if let Some(engine) = &self.engine {
+                                        engine
+                                            .set_alternate_source_enabled(self.androguard_fallback);
+                                    }
+                                    if let Some(snapshot) = &self.shared_project {
+                                        snapshot
+                                            .engine()
+                                            .set_alternate_source_enabled(self.androguard_fallback);
+                                    }
+                                    refresh_source = self.tabs.get(self.selected).and_then(|tab| match &tab.target {
+                                        Target::Class(name) if !name.starts_with("dex://") && !name.starts_with(rdx::resource_table::PREFIX) => Some(name.clone()),
+                                        _ => None,
+                                    });
+                                }
                                 ui.separator();
                                 ui.menu_button("Interface theme", |ui| {
                                     let mut appearance =
@@ -3940,6 +4136,9 @@ impl eframe::App for App {
                     );
                 });
         }
+        if let Some(class) = refresh_source {
+            self.decompile(class, None, ctx);
+        }
         if choose_file && let Some(id) = self.begin_dialog() {
             let future = rfd::AsyncFileDialog::new()
                 .add_filter(
@@ -4032,7 +4231,11 @@ impl eframe::App for App {
                                 &self.tree,
                                 "",
                                 self.tabs.get(self.selected).map(|t| &t.target),
-                                (self.engine.is_some() && !self.busy, !self.asset_busy),
+                                (
+                                    (self.engine.is_some() && !self.busy)
+                                        || self.source_cancel.is_some(),
+                                    !self.asset_busy,
+                                ),
                                 self.asset_grouping,
                                 &mut tree_actions,
                             );
@@ -4367,6 +4570,7 @@ impl eframe::App for App {
         if let Some(target) = export {
             self.export_target(target, ctx);
         }
+        self.refresh_selected_source_policy(ctx);
         self.load_pending_search_metadata(ctx);
     }
 }
@@ -4396,6 +4600,7 @@ fn snapshot_preferences(
     usages_keep_open: bool,
 ) -> Settings {
     Settings {
+        androguard_fallback: false,
         interface_theme: match ctx.options(|options| options.theme_preference) {
             egui::ThemePreference::System => "system",
             egui::ThemePreference::Light => "light",
@@ -4929,6 +5134,8 @@ mod settings_tests {
     fn navigation_test_app() -> App {
         let (tx, rx) = mpsc::channel();
         App {
+            source_policies: Default::default(),
+            androguard_fallback: false,
             render_recovery: Default::default(),
             toolbar_icon: None,
             application_icon: None,
@@ -4939,6 +5146,7 @@ mod settings_tests {
             search: SearchWindow::default(),
             analysis: AnalysisWindow::default(),
             analysis_cancel: None,
+            source_cancel: None,
             analysis_id: 0,
             usages: UsagesWindow::default(),
             call_graph: crate::call_graph_window::CallGraphWindow::default(),
@@ -5995,6 +6203,281 @@ mod settings_tests {
         (app, index, fixture)
     }
     #[test]
+    fn changing_class_cancels_source_and_discards_stale_completion() {
+        let ctx = egui::Context::default();
+        let (mut app, _, _) = history_fixture();
+        let mut worker = app.engine.take().unwrap();
+        let stale = worker.decompile_shared("sample.Caller").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.busy = true;
+        app.source_cancel = Some(cancel.clone());
+        app.choose_target(Target::Class("sample.Target".into()), &ctx);
+        assert!(cancel.load(Ordering::Relaxed));
+        app.tx
+            .send(Event::Source(
+                app.generation,
+                "sample.Caller".into(),
+                None,
+                worker,
+                Ok(stale),
+            ))
+            .unwrap();
+        app.events(&ctx);
+        assert_eq!(
+            app.current_location().unwrap().target,
+            Target::Class("sample.Target".into())
+        );
+        assert!(!app.tabs.iter().any(|tab| tab.name == "sample.Caller"));
+        assert!(!app.busy && app.source_cancel.is_none());
+    }
+
+    #[test]
+    fn stopping_project_cancels_source_worker() {
+        let mut app = navigation_test_app();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.source_cancel = Some(cancel.clone());
+        let generation = app.generation;
+        app.stop();
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.generation > generation);
+        assert!(app.source_cancel.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires RDX_ANDROGUARD_TEST_APK and the release helper"]
+    fn real_g_search_open_upgrades_retained_reused_and_queued_native_views() {
+        fn check_details(shown: &CodeDocument) {
+            let collapsed = shown.display_text();
+            assert!(!collapsed.contains("// method_id="));
+            assert!(!collapsed.contains("// Androguard diagnostic:"));
+            assert!(!collapsed.contains("original DEX: dex://"));
+            let hit = shown.original_search_match().unwrap();
+            let mut expanded = CodeDocument::new(shown.text().to_owned(), "java");
+            expanded.jump_to_range(hit.start, hit.end).unwrap();
+            let projected = expanded.display_text();
+            let details = projected
+                .find("// method_id=")
+                .expect("expanded method details");
+            let native = projected[details..].find(".method ").unwrap() + details;
+            assert!(details < native);
+            assert!(projected[details..native].contains("native_failure="));
+            assert!(projected[details..native].contains("original DEX: dex://"));
+            assert!(!projected.contains("RDX_ORIGINAL_DEX_"));
+            assert!(!expanded.clipboard_source().contains("RDX_ORIGINAL_DEX_"));
+        }
+        const CLASS: &str = "com.facebook.appevents.codeless.internal.g";
+        const NEEDLE: &str = "com.facebook.react.ReactRootView";
+        let apk = PathBuf::from(
+            std::env::var_os("RDX_ANDROGUARD_TEST_APK").expect("set RDX_ANDROGUARD_TEST_APK"),
+        );
+        let mut engine = NativeEngine::default();
+        let project = engine
+            .open_with_limits(&apk, rdx::load_limits::LoadLimits::Large)
+            .unwrap();
+        let native = engine.decompile_for_search(CLASS).unwrap();
+        let method = native
+            .source
+            .find(&format!(".method {CLASS}.a("))
+            .expect("failed native method a");
+        let needle = method
+            + native.source[method..]
+                .find(NEEDLE)
+                .expect("ReactRootView in failed a");
+        let start = native.source[..needle].chars().count();
+        let document = Arc::new(SearchDocument {
+            target: SearchTarget::Class(CLASS.into()),
+            name: CLASS.into(),
+            source: native.source.clone(),
+            syntax: "java".into(),
+            links: native.links.clone(),
+            source_hash: Some(native.source_hash.clone()),
+            metadata_complete: true,
+        });
+        let (mut app, ctx) = (navigation_test_app(), egui::Context::default());
+        app.project = Some(Arc::new(project));
+        app.engine = Some(engine);
+        app.androguard_fallback = true;
+        app.engine
+            .as_ref()
+            .unwrap()
+            .set_alternate_source_enabled(true);
+        let original_methods = regex::Regex::new(r"(?m)^\.method ").unwrap();
+        for route in ["retained", "reused", "queued"] {
+            if route == "reused" {
+                app.androguard_fallback = false;
+                app.display_code(CLASS.into(), native.clone(), None)
+                    .unwrap();
+                app.androguard_fallback = true;
+            } else {
+                app.tabs.clear();
+            }
+            let origin = if route == "retained" {
+                search::HitOrigin::retaining(document.clone())
+            } else {
+                search::HitOrigin::indexed(&document)
+            };
+            let hit = SearchHit {
+                origin,
+                start,
+                end: start + NEEDLE.chars().count(),
+                line: 1,
+                kind: "Code".into(),
+                node: format!("{CLASS}.a"),
+                preview: NEEDLE.into(),
+                preview_match: 0..NEEDLE.len(),
+            };
+            app.open_search_hit(hit, &ctx);
+            assert!(
+                !app.interactive_requests.lock().unwrap().is_empty(),
+                "{route} must use policy-aware open"
+            );
+            app.load_pending_search_metadata(&ctx);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+            while app.busy || app.engine.is_none() {
+                app.events(&ctx);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{route}: {}",
+                    app.status
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let tab = &app.tabs[app.selected];
+            let source = tab.text().unwrap();
+            assert_eq!(
+                source
+                    .matches(rdx::alternate_source::UNVERIFIED_WARNING)
+                    .count(),
+                3,
+                "{route}"
+            );
+            assert!(
+                source.contains(&format!(".method {CLASS}.a(")),
+                "full original DEX remains present"
+            );
+            for declaration in original_methods.find_iter(&native.source) {
+                let end = declaration.start()
+                    + native.source[declaration.start()..]
+                        .find("\n.end method\n")
+                        .unwrap()
+                    + "\n.end method\n".len();
+                assert!(
+                    source.contains(&native.source[declaration.start()..end]),
+                    "{route}: every original method is byte-for-byte present"
+                );
+            }
+            let Content::Text(shown) = &tab.content else {
+                panic!("text source")
+            };
+            let position = shown
+                .original_search_match()
+                .expect("exact native search match retained")
+                .start;
+            assert_eq!(
+                source
+                    .chars()
+                    .skip(position)
+                    .take(NEEDLE.chars().count())
+                    .collect::<String>(),
+                NEEDLE,
+                "{route}: exact hit relocation"
+            );
+            assert!(
+                shown.original_search_is_collapsed(),
+                "{route}: initial search open keeps DEX collapsed"
+            );
+            assert!(!shown.display_text().contains("RDX_ORIGINAL_DEX_"));
+            assert!(!shown.clipboard_source().contains("RDX_ORIGINAL_DEX_"));
+            check_details(shown);
+            assert_eq!(app.source_policies.get(CLASS), Some(&true));
+            assert!(
+                tab.note
+                    .as_deref()
+                    .is_some_and(|note| note.contains("original DEX"))
+            );
+        }
+        // Same loaded APK, the latest user-reported class initializer.
+        const ADJUST: &str = "com.adjust.sdk.sig.m";
+        const ADJUST_NEEDLE: &str = "com.adjust.sdk.sig.t0";
+        let native = app
+            .engine
+            .as_mut()
+            .unwrap()
+            .decompile_for_search(ADJUST)
+            .unwrap();
+        let method = native
+            .source
+            .find(&format!(".method {ADJUST}.<clinit>("))
+            .expect("failed adjust class initializer");
+        let byte = method
+            + native.source[method..]
+                .find(ADJUST_NEEDLE)
+                .expect("adjust t0 reference");
+        let start = native.source[..byte].chars().count();
+        let document = Arc::new(SearchDocument {
+            target: SearchTarget::Class(ADJUST.into()),
+            name: ADJUST.into(),
+            source: native.source,
+            syntax: "java".into(),
+            links: native.links,
+            source_hash: Some(native.source_hash),
+            metadata_complete: true,
+        });
+        app.open_search_hit(
+            SearchHit {
+                origin: search::HitOrigin::retaining(document),
+                start,
+                end: start + ADJUST_NEEDLE.chars().count(),
+                line: 1,
+                kind: "Code".into(),
+                node: format!("{ADJUST}.<clinit>"),
+                preview: ADJUST_NEEDLE.into(),
+                preview_match: 0..ADJUST_NEEDLE.len(),
+            },
+            &ctx,
+        );
+        app.load_pending_search_metadata(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while app.busy || app.engine.is_none() {
+            app.events(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "adjust search open: {}",
+                app.status
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let tab = &app.tabs[app.selected];
+        let Content::Text(shown) = &tab.content else {
+            panic!("adjust text source")
+        };
+        assert!(shown.original_search_is_collapsed());
+        let hit = shown.original_search_match().unwrap();
+        assert_eq!(
+            shown
+                .text()
+                .chars()
+                .skip(hit.start)
+                .take(hit.len())
+                .collect::<String>(),
+            ADJUST_NEEDLE
+        );
+        assert!(
+            shown
+                .display_text()
+                .contains(rdx::alternate_source::UNVERIFIED_WARNING)
+        );
+        assert!(!shown.display_text().contains("RDX_ORIGINAL_DEX_"));
+        assert!(!shown.clipboard_source().contains("RDX_ORIGINAL_DEX_"));
+        check_details(shown);
+        assert!(
+            tab.note
+                .as_deref()
+                .is_some_and(|note| note == "Match is in original DEX; expand to inspect.")
+        );
+    }
+
+    #[test]
     fn usages_worker_keeps_interactive_engine_available() {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
@@ -6233,6 +6716,24 @@ mod settings_tests {
             preview: "target".into(),
             preview_match: 0..6,
         }
+    }
+
+    #[test]
+    fn late_native_search_result_is_not_marked_as_an_alternate_view() {
+        let mut app = navigation_test_app();
+        app.androguard_fallback = true;
+        let document = Arc::new(SearchDocument {
+            target: SearchTarget::Class("sample.Hello".into()),
+            name: "sample.Hello".into(),
+            source: "target".into(),
+            syntax: "java".into(),
+            links: vec![],
+            source_hash: Some("native".into()),
+            metadata_complete: true,
+        });
+        app.open_hit_document(sample_hit("sample.Hello", Some("native"), 0), document);
+        assert_eq!(app.source_policies.get("sample.Hello"), Some(&false));
+        assert!(app.androguard_fallback);
     }
 
     #[test]

@@ -1,0 +1,4 @@
+# Preserve the exact audited upstream bytes and lockfile across checkouts.
+tools/androguard-helper/vendor/** -text
+tools/androguard-helper/Cargo.lock -text
+third_party/androguard/** -text

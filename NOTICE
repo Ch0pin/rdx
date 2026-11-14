@@ -11,3 +11,7 @@ third_party/jadx/ and third_party/android/.
 Bundled fonts, themes, icon-rendering components, and other third-party
 material retain their respective licenses and notices under third_party/.
 In macOS application bundles, these files are in Contents/Resources/.
+
+The optional native Androguard helper includes separately licensed components.
+Pinned source revisions, modifications, ASC fast-path acknowledgements,
+dependency notices, and corresponding MPL source are in third_party/androguard/.

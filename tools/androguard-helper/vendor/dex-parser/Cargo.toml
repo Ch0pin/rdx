@@ -1,0 +1,32 @@
+# RDX modification (2026-11-14): resolve dex-bytecode from the exact vendored sibling source.
+[package]
+name = "dex-parser"
+version = "0.1.0"
+edition = "2021"
+description = "DEX file format parser for Android (pure Rust)"
+license = "Apache-2.0"
+readme = "../README.md"
+keywords = ["android", "dex", "parser", "androguard"]
+authors = ["anthony <ping@42.bzh>"]
+
+[dependencies]
+dex-bytecode = { path = "../dex-bytecode" }
+thiserror = "1.0"
+clap = { version = "4", features = ["derive"] }
+sha1 = "0.10"
+memchr = "2"
+
+[[bin]]
+name = "dexparser"
+path = "src/bin/dexparser.rs"
+
+[[bin]]
+name = "dexparse-dir"
+path = "src/bin/dexparse_dir.rs"
+
+[features]
+default = []
+disasm = []
+[dev-dependencies]
+# optional: for tests with minimal DEX bytes
+# none required for now

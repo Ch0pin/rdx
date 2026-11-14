@@ -314,7 +314,7 @@ impl Session {
             ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
             verify()?;
             let path = self.out.join(format!("class-{index:08}.txt"));
-            let record = match engine.decompile_class_source_report(name, cancel) {
+            let record = match engine.decompile_native_class_source_report(name, cancel) {
                 Ok((code, coverage)) => {
                     ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
                     let hash = format!("{:x}", Sha256::digest(code.source.as_bytes()));

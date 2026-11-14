@@ -15,6 +15,14 @@ connected device. APK analysis runs locally.
 Keep the accompanying notices and documentation when redistributing an archive.
 `rdx-source-stats` is an optional sample plugin, not required to launch RDX.
 
+macOS and Linux packages also include the native `rdx-androguard-helper` beside
+RDX, with its license notices and corresponding MPL source. Normal launch needs
+no environment variable or additional runtime. **View → Settings → Androguard
+fallback** enables optional unverified reconstruction for native-failed methods;
+the warning and collapsed Original DEX remain available for inspection. Windows
+packages use the native RDX engine and keep Androguard fallback unavailable.
+Keep the helper and accompanying notices with the rest of the extracted package.
+
 ## First launch
 
 **macOS:** this first release is ad-hoc signed, not Developer ID signed or

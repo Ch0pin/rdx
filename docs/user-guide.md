@@ -1,6 +1,6 @@
 # RDX user guide
 
-A native Rust desktop application for APK, XAPK, APKS, and DEX inspection. The GUI and CLI both use the RDX Native DEX engine. There is no Java worker, JVM dependency, or Java fallback.
+A native Rust desktop application for APK, XAPK, APKS, and DEX inspection.
 
 RDX is alpha software. Unsupported methods remain explicitly labelled DEX disassembly. See [native engine scope](native-engine.md) for reconstruction details.
 
@@ -12,7 +12,7 @@ Higher limits require an explicit retry and apply only to the current APK during
 
 ## Run from source
 
-Requirements: stable Rust and Cargo. Python 3 is needed only for transport test fixtures. Initial builds download Rust dependencies.
+Requirements: stable Rust and Cargo. Python is used for packaging and transport test fixtures. Initial builds download Rust dependencies.
 
 ```sh
 cargo build --release --bins
@@ -25,9 +25,17 @@ On Linux, install your distribution's C compiler, `pkg-config`, OpenGL, Wayland,
 To package the macOS app after building (Python 3.11 or newer):
 
 ```sh
+cargo build --release --locked --manifest-path "$PWD/tools/androguard-helper/Cargo.toml"
 python3 scripts/package_macos.py
 open target/RDX.app
 ```
+
+The macOS package includes the Androguard helper and its notices. Enable
+**View → Settings → Androguard fallback** to inspect unverified alternate output
+for methods the native engine could not reconstruct. Expand **Original DEX**
+above a reconstructed method to see its diagnostics and original instructions.
+Linux release archives include the same optional helper; Windows fallback is
+currently unavailable.
 
 ## Headless commands
 

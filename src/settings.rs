@@ -54,6 +54,8 @@ impl Default for SearchPreferences {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Experimental isolated class fallback, used only while browsing source.
+    pub androguard_fallback: bool,
     pub interface_theme: String,
     pub code_theme: String,
     pub font_size: f32,
@@ -71,6 +73,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            androguard_fallback: false,
             interface_theme: "system".into(),
             code_theme: "ocean".into(),
             font_size: 15.0,
@@ -286,6 +289,7 @@ mod tests {
         let store = TemporaryStore::new();
         assert_eq!(store.0.load().unwrap(), Settings::default());
         let settings = Settings {
+            androguard_fallback: false,
             interface_theme: "light".into(),
             code_theme: "solarized_light".into(),
             font_size: 22.0,

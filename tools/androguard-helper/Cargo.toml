@@ -1,0 +1,19 @@
+[package]
+name = "rdx-androguard-helper"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+# Separate manifest: ordinary RDX builds do not download or link this backend.
+[workspace]
+exclude = ["vendor/dex-decompiler", "vendor/dex-parser", "vendor/dex-bytecode", "vendor/apkparser"]
+
+[dependencies]
+dex-decompiler = { path = "vendor/dex-decompiler" }
+serde_json = "1"
+anyhow = "1"
+
+[profile.release]
+strip = true
+debug = 0

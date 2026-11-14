@@ -209,10 +209,11 @@ pub trait DecompilerEngine: Send {
     fn read_resource(&mut self, path: &str) -> Result<String>;
 }
 
-/// Native-only application boundary. No subprocess, JVM or fallback engine.
+/// Native application boundary with an optional isolated, on-demand class helper.
 #[derive(Clone, Default)]
 pub struct NativeEngine {
     native: NativeDexEngine,
+    alternate_source: crate::alternate_source::Session,
     pub(crate) retained_budget: std::sync::Arc<crate::retained_budget::RetainedBudget>,
     source_cache: source_cache::SourceCache,
     search_index: crate::search_index::SharedIndex,
@@ -231,6 +232,116 @@ pub fn source_identity(source: &str) -> String {
     let mut hash = DefaultHasher::new();
     source.hash(&mut hash);
     format!("native-v1-{:016x}-{}", hash.finish(), source.len())
+}
+
+/// Validate every unchanged span and every exact original method before mapping
+/// a native Unicode range into the browsing document. Repeated snippets are not
+/// searched: retained DEX uses full method identity and unchanged spans use their
+/// deterministic position immediately before the next edit (or document end).
+pub fn relocate_copied_source_range(
+    original: &str,
+    displayed: &str,
+    range: std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    use crate::alternate_source::{ORIGINAL_DEX_BEGIN, ORIGINAL_DEX_END};
+    let byte_at = |text: &str, offset: usize| {
+        text.char_indices()
+            .map(|(byte, _)| byte)
+            .chain(std::iter::once(text.len()))
+            .nth(offset)
+    };
+    let begin = byte_at(original, range.start)?;
+    let end = byte_at(original, range.end)?;
+    if begin > end {
+        return None;
+    }
+    let mut edits = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = displayed[cursor..].find(ORIGINAL_DEX_BEGIN) {
+        let marker = cursor + relative;
+        if marker > 0 && displayed.as_bytes()[marker - 1] != b'\n' {
+            return None;
+        }
+        let header = marker + ORIGINAL_DEX_BEGIN.len();
+        let newline = displayed[header..].find('\n')? + header;
+        let length: usize = displayed[header..newline].parse().ok()?;
+        let body = newline + 1;
+        let finish = body.checked_add(length)?;
+        let payload = displayed.get(body..finish)?;
+        let method_offset = crate::alternate_source::original_dex_method_offset(payload)?;
+        let raw = &payload[method_offset..];
+        if !displayed.get(finish..)?.starts_with(ORIGINAL_DEX_END) {
+            return None;
+        }
+        let footer_end = finish + ORIGINAL_DEX_END.len();
+        if displayed
+            .as_bytes()
+            .get(footer_end)
+            .is_some_and(|byte| *byte != b'\n')
+        {
+            return None;
+        }
+        let id = raw
+            .lines()
+            .next()?
+            .strip_prefix(".method ")?
+            .split_once(" // access=")?
+            .0;
+        let wrapper = format!("// method_id={};", serde_json::to_string(id).ok()?);
+        let replacement = if method_offset == 0 {
+            // Previous emitted shape: detail comments preceded the warning.
+            displayed[..marker].rfind(&wrapper)?
+        } else {
+            let warning = format!("// {}\n", crate::alternate_source::UNVERIFIED_WARNING);
+            displayed[..marker].strip_suffix(&warning)?.len()
+        };
+        if replacement > 0 && displayed.as_bytes()[replacement - 1] != b'\n' {
+            return None;
+        }
+        let mut matches = original.match_indices(raw);
+        let source = matches.next()?.0;
+        if matches.next().is_some() {
+            return None;
+        }
+        edits.push((
+            source,
+            source + raw.len(),
+            replacement,
+            body + method_offset,
+        ));
+        cursor = finish + ORIGINAL_DEX_END.len();
+    }
+    edits.sort_by_key(|edit| edit.0);
+    let mut spans = Vec::new();
+    let mut old_end = 0;
+    for (start, finish, replacement, body) in edits {
+        if start < old_end {
+            return None;
+        }
+        let unchanged = original.get(old_end..start)?;
+        let target = replacement.checked_sub(unchanged.len())?;
+        if displayed.get(target..replacement)? != unchanged {
+            return None;
+        }
+        spans.push((old_end, start, target));
+        spans.push((start, finish, body));
+        old_end = finish;
+    }
+    let suffix = original.get(old_end..)?;
+    let target = displayed.len().checked_sub(suffix.len())?;
+    if displayed.get(target..)? != suffix {
+        return None;
+    }
+    spans.push((old_end, original.len(), target));
+    let (start, _, target) = spans
+        .into_iter()
+        .find(|(start, finish, _)| *start <= begin && end <= *finish)?;
+    let new_begin = target + begin - start;
+    let new_end = target + end - start;
+    if displayed.get(new_begin..new_end)? != original.get(begin..end)? {
+        return None;
+    }
+    Some(displayed[..new_begin].chars().count()..displayed[..new_end].chars().count())
 }
 
 impl NativeEngine {
@@ -288,6 +399,9 @@ impl NativeEngine {
         supplied: Option<std::sync::Arc<crate::package_container::PackageContainer>>,
         limits: crate::load_limits::LoadLimits,
     ) -> Result<Project> {
+        let alternate_enabled = self.alternate_source.enabled();
+        self.alternate_source = Default::default();
+        self.alternate_source.set_enabled(alternate_enabled);
         self.input = None;
         self.prepared = None;
         self.native = NativeDexEngine::default();
@@ -315,6 +429,7 @@ impl NativeEngine {
             }
             None => Some(crate::package_container::PackageContainer::open(&path)?),
         };
+        let before_load = std::fs::metadata(&path)?;
         let project = self.native.open_input(&path, prepared.clone(), limits)?;
         if let Some(container) = &prepared {
             let mut merged = crate::resource_table::ResourceTable::default();
@@ -358,6 +473,13 @@ impl NativeEngine {
             }
             self.resources = std::sync::Arc::new(merged);
         }
+        let after_load = std::fs::metadata(&path)?;
+        ensure!(
+            before_load.len() == after_load.len()
+                && before_load.modified().ok() == after_load.modified().ok(),
+            "PROJECT_CHANGED while loading input"
+        );
+        self.alternate_source.bind_input(&path)?;
         self.input = Some(path);
         self.prepared = prepared;
         self.usage_index = Some(crate::usage_index::UsageIndexHandle::start(
@@ -521,18 +643,52 @@ impl NativeEngine {
         self.source_cache.bytes()
     }
     pub fn decompile_shared(&mut self, class: &str) -> Result<std::sync::Arc<SharedCode>> {
-        if let Some(code) = self.source_cache.get(class) {
+        self.decompile_shared_cancellable(class, &std::sync::atomic::AtomicBool::new(false))
+    }
+    pub fn decompile_shared_cancellable(
+        &mut self,
+        class: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<std::sync::Arc<SharedCode>> {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "CANCELLED"
+        );
+        let key = if self.alternate_source.enabled() {
+            format!("{class}\0alternate=true")
+        } else {
+            class.to_owned()
+        };
+        if let Some(code) = self.source_cache.get(&key) {
             return Ok(code);
         }
-        let mut code = SharedCode::from(self.render_with_metadata(class)?);
+        let mut cacheable = true;
+        let mut code = SharedCode::from(
+            if !self.alternate_source.enabled()
+                || class.starts_with("dex://")
+                || class.starts_with(crate::resource_table::PREFIX)
+            {
+                self.render_with_metadata(class)?
+            } else {
+                let (code, coverage) = self.decompile_class_source_report(class, cancel)?;
+                cacheable = coverage["alternate"]["status"]
+                    .as_str()
+                    .is_none_or(|status| {
+                        status == "substituted"
+                            && coverage["counts"]["dex-fallback"].as_u64().unwrap_or(0) == 0
+                            && coverage["counts"]["omitted"].as_u64().unwrap_or(0) == 0
+                    });
+                code
+            },
+        );
         code.retention = self.retained_budget.reserve(code.retained_bytes());
         if code.retention.is_none() {
             self.source_cache.trim(0);
             code.retention = self.retained_budget.reserve(code.retained_bytes());
         }
         let code = std::sync::Arc::new(code);
-        if code.retention.is_some() {
-            self.source_cache.insert(class, code.clone());
+        if cacheable && code.retention.is_some() {
+            self.source_cache.insert(&key, code.clone());
         }
         Ok(code)
     }
@@ -554,6 +710,39 @@ impl NativeEngine {
     }
     pub fn search_index(&self) -> crate::search_index::SharedIndex {
         self.search_index.clone()
+    }
+    /// Shared with service/interactive clones; disabled by default.
+    pub fn set_alternate_source_enabled(&self, enabled: bool) {
+        self.alternate_source.set_enabled(enabled);
+    }
+    pub fn alternate_source_enabled(&self) -> bool {
+        self.alternate_source.enabled()
+    }
+    /// Search-hit metadata keeps the native document's hash and offsets. The UI
+    /// exposes an explicit rebuild action to request alternate browsing source.
+    pub fn native_source_view(&self) -> Self {
+        let mut view = self.clone();
+        view.alternate_source = Default::default();
+        view
+    }
+
+    /// Open a native search result under the current browsing policy. Relocation
+    /// uses complete, byte-identical copied spans, never a Java line estimate.
+    pub fn browse_search_range(
+        &mut self,
+        class: &str,
+        original: &str,
+        native_hash: &str,
+        range: std::ops::Range<usize>,
+    ) -> Result<(std::sync::Arc<SharedCode>, Option<std::ops::Range<usize>>)> {
+        let code = self.decompile_shared(class)?;
+        let native = self.render_with_metadata(class)?;
+        let mapped = if native.source_hash == native_hash && native.source == original {
+            relocate_copied_source_range(original, &code.source, range)
+        } else {
+            None
+        };
+        Ok((code, mapped))
     }
 
     pub fn search_work_bytes(&self, class: &str) -> usize {
@@ -588,11 +777,43 @@ impl NativeEngine {
         class: &str,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(DecompiledCode, serde_json::Value)> {
+        self.class_source_report(class, cancel, true)
+    }
+    /// Bulk export/index path: never starts the optional helper.
+    pub fn decompile_native_class_source_report(
+        &mut self,
+        class: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(DecompiledCode, serde_json::Value)> {
+        self.class_source_report(class, cancel, false)
+    }
+    fn class_source_report(
+        &mut self,
+        class: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+        allow_alternate: bool,
+    ) -> Result<(DecompiledCode, serde_json::Value)> {
         let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
         let (mut code, mut coverage) = self.native.render_reported(class, &cancelled)?;
         ensure!(!cancelled(), "CANCELLED");
         self.resources
             .decorate_java(&mut code, &self.native.shared_classes());
+        crate::source_coverage::refresh_offsets(&mut coverage, &code);
+        if allow_alternate
+            && let (Some(input), Some(metadata)) = (self.input.as_deref(), self.native.class(class))
+        {
+            self.alternate_source.apply(
+                crate::alternate_source::ClassInput {
+                    input,
+                    container: self.prepared.as_deref(),
+                    owner: class,
+                    metadata,
+                },
+                &mut code,
+                &mut coverage,
+                &cancelled,
+            )?;
+        }
         crate::source_coverage::refresh_offsets(&mut coverage, &code);
         code.source_hash = source_identity(&code.source);
         Ok((code, coverage))
@@ -643,17 +864,42 @@ impl NativeEngine {
                 ),
             }
         };
+        if format == MethodSourceFormat::Auto {
+            self.resources
+                .decorate_java(&mut code, &self.native.shared_classes());
+        }
+        let mut alternate = false;
         if let Some(reason) = &fallback {
-            crate::source_coverage::prepend_method_fallback_header(&mut code, id, reason);
+            if let Some(input) = self.input.as_deref() {
+                let declaration = code
+                    .definitions
+                    .iter()
+                    .find(|definition| definition.kind == "method");
+                let mut coverage = serde_json::json!({"counts":{"dex-fallback":1},"methods":[{"method_id":id,"status":"dex-fallback","reason":reason,"declaration_offset":declaration.map(|d| serde_json::json!({"start":d.start,"end":d.end}))}]});
+                self.alternate_source.apply(
+                    crate::alternate_source::ClassInput {
+                        input,
+                        container: self.prepared.as_deref(),
+                        owner,
+                        metadata: class,
+                    },
+                    &mut code,
+                    &mut coverage,
+                    &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
+                )?;
+                alternate = coverage["counts"]["alternate-decompiled"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    > 0;
+            }
+            if !alternate {
+                crate::source_coverage::prepend_method_fallback_header(&mut code, id, reason);
+            }
         }
         ensure!(
             !cancel.load(std::sync::atomic::Ordering::Relaxed),
             "CANCELLED"
         );
-        if format == MethodSourceFormat::Auto {
-            self.resources
-                .decorate_java(&mut code, &self.native.shared_classes());
-        }
         code.source_hash = source_identity(&code.source);
         ensure!(
             !cancel.load(std::sync::atomic::Ordering::Relaxed),
@@ -661,7 +907,9 @@ impl NativeEngine {
         );
         Ok(MethodSource {
             code,
-            format: if format == MethodSourceFormat::Dex || fallback.is_some() {
+            format: if alternate {
+                "androguard-java"
+            } else if format == MethodSourceFormat::Dex || fallback.is_some() {
                 "rdx-dex"
             } else {
                 "java"
@@ -671,7 +919,7 @@ impl NativeEngine {
         })
     }
     pub fn decompile_source(&mut self, class: &str) -> Result<DecompiledSource> {
-        let code = self.decompile_with_metadata(class)?;
+        let code = self.render_with_metadata(class)?;
         Ok(DecompiledSource {
             source: code.source,
             source_hash: code.source_hash,
@@ -702,7 +950,14 @@ impl NativeEngine {
             .map(SharedNavigationResult::into_owned)
     }
     pub fn navigate_class_shared(&mut self, class: &str) -> Result<SharedNavigationResult> {
-        let code = self.decompile_shared(class)?;
+        self.navigate_class_shared_cancellable(class, &std::sync::atomic::AtomicBool::new(false))
+    }
+    pub fn navigate_class_shared_cancellable(
+        &mut self,
+        class: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<SharedNavigationResult> {
+        let code = self.decompile_shared_cancellable(class, cancel)?;
         let position = code
             .definitions
             .iter()
@@ -779,7 +1034,24 @@ impl NativeEngine {
             .map(|f| format!("{class}.{}:{}", f.name, f.field_type))
     }
     fn symbol(&mut self, class: &str, offset: usize, hash: &str) -> Result<String> {
-        let code = self.decompile_shared(class)?;
+        self.symbol_cancellable(
+            class,
+            offset,
+            hash,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+    fn symbol_cancellable(
+        &mut self,
+        class: &str,
+        offset: usize,
+        hash: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<String> {
+        let mut code = self.decompile_shared_cancellable(class, cancel)?;
+        if code.source_hash != hash {
+            code = std::sync::Arc::new(SharedCode::from(self.render_with_metadata(class)?));
+        }
         ensure!(
             code.source_hash == hash,
             "Source changed; reopen this class"
@@ -817,7 +1089,21 @@ impl NativeEngine {
         offset: usize,
         hash: &str,
     ) -> Result<SharedNavigationResult> {
-        let symbol = self.symbol(class, offset, hash)?;
+        self.navigate_shared_cancellable(
+            class,
+            offset,
+            hash,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+    pub fn navigate_shared_cancellable(
+        &mut self,
+        class: &str,
+        offset: usize,
+        hash: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<SharedNavigationResult> {
+        let symbol = self.symbol_cancellable(class, offset, hash, cancel)?;
         if symbol.starts_with(crate::resource_table::PREFIX) {
             let target = symbol.split(" | ").next().unwrap().to_owned();
             let code = std::sync::Arc::new(SharedCode::from(self.resource_document(&target)?));
@@ -839,7 +1125,7 @@ impl NativeEngine {
             declaration_symbol = format!("{declaring_owner}.{member}");
             owner = declaring_owner;
         }
-        let code = self.decompile_shared(&owner)?;
+        let code = self.decompile_shared_cancellable(&owner, cancel)?;
         let position = code
             .definitions
             .iter()
@@ -848,8 +1134,34 @@ impl NativeEngine {
                     .as_deref()
                     == Some(&declaration_symbol)
             })
-            .context("Native declaration mapping unavailable")?
-            .start;
+            .map(|definition| definition.start);
+        let position = if let Some(position) = position {
+            position
+        } else if self.alternate_source.enabled()
+            && code
+                .source
+                .contains(crate::alternate_source::UNVERIFIED_WARNING)
+        {
+            let native = self.render_with_metadata(&owner)?;
+            native
+                .definitions
+                .iter()
+                .find(|definition| {
+                    self.definition_symbol(&owner, &native.source, &native.links, definition)
+                        .as_deref()
+                        == Some(&declaration_symbol)
+                })
+                .and_then(|definition| {
+                    relocate_copied_source_range(
+                        &native.source,
+                        &code.source,
+                        definition.start..definition.end,
+                    )
+                })
+                .map_or(0, |range| range.start)
+        } else {
+            anyhow::bail!("Native declaration mapping unavailable");
+        };
         Ok(SharedNavigationResult {
             class: owner,
             code,
@@ -2057,4 +2369,64 @@ pub(crate) fn archive_text(bytes: &[u8]) -> Result<&str> {
         "BINARY_RESOURCE: resource contains binary control characters"
     );
     Ok(text)
+}
+
+#[cfg(test)]
+mod browse_relocation_tests {
+    use super::*;
+    fn wrapper(id: &str, raw: &str) -> String {
+        let payload = format!(
+            "// method_id={}; native_failure=\"failure\"; original DEX: dex://sample.A\n// Androguard diagnostic: unverified test output\n{raw}",
+            serde_json::to_string(id).unwrap()
+        );
+        format!(
+            "// {}\n{}{}\n{payload}{}\nvoid replaced() {{ String text = \"same\"; }}\n",
+            crate::alternate_source::UNVERIFIED_WARNING,
+            crate::alternate_source::ORIGINAL_DEX_BEGIN,
+            payload.len(),
+            crate::alternate_source::ORIGINAL_DEX_END
+        )
+    }
+    #[test]
+    fn copied_spans_relocate_repeated_unicode_hits_in_multiple_methods_and_below_edits() {
+        let prefix = "// α😀 same\nclass A {\n";
+        let first = ".method sample.A.a()V // access=0x1\n    const-string \"same\"\n.end method\n";
+        let middle = "void ordinary() { String x = \"same\"; }\n";
+        let second =
+            ".method sample.A.b()V // access=0x1\n    const-string \"same\"\n.end method\n";
+        let suffix = "void below() { String x = \"same\"; }\n}\n";
+        let original = format!("{prefix}{first}{middle}{second}{suffix}");
+        let displayed = format!(
+            "// optional header\n{prefix}{}{middle}{}{suffix}",
+            wrapper("sample.A.a()V", first),
+            wrapper("sample.A.b()V", second)
+        );
+        let mut mapped_positions = Vec::new();
+        for (byte, _) in original.match_indices("same") {
+            let start = original[..byte].chars().count();
+            let mapped =
+                relocate_copied_source_range(&original, &displayed, start..start + 4).unwrap();
+            assert_eq!(
+                displayed
+                    .chars()
+                    .skip(mapped.start)
+                    .take(4)
+                    .collect::<String>(),
+                "same"
+            );
+            mapped_positions.push(mapped.start);
+        }
+        assert_eq!(mapped_positions.len(), 5);
+        assert!(mapped_positions.windows(2).all(|pair| pair[0] < pair[1]));
+        let altered = displayed.replace("void ordinary()", "void changed()");
+        assert!(relocate_copied_source_range(&original, &altered, 0..2).is_none());
+        assert!(
+            relocate_copied_source_range(
+                &original,
+                &displayed,
+                original.chars().count() + 1..original.chars().count() + 2
+            )
+            .is_none()
+        );
+    }
 }

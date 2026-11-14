@@ -1,12 +1,20 @@
-//! Display-only folding for Kotlin metadata and Java import blocks.
+//! Display-only folding for metadata, imports, and exact original DEX methods.
 use std::{borrow::Cow, ops::Range};
 
 pub const SUMMARY: &str = "@Metadata — Kotlin compiler metadata";
+const DEX_HEADING: &str = "Original DEX\n";
+
+#[derive(Clone, Debug)]
+struct OriginalPayload {
+    bytes: Range<usize>,
+    chars: Range<usize>,
+}
 
 #[derive(Clone, Debug)]
 pub enum FoldKind {
     Metadata,
     Imports(usize),
+    OriginalDex,
 }
 
 #[derive(Clone, Debug)]
@@ -15,6 +23,7 @@ pub struct MetadataFold {
     pub chars: Range<usize>,
     pub expanded: bool,
     pub kind: FoldKind,
+    original: Option<OriginalPayload>,
 }
 
 impl MetadataFold {
@@ -22,6 +31,7 @@ impl MetadataFold {
         match self.kind {
             FoldKind::Metadata => Cow::Borrowed(SUMMARY),
             FoldKind::Imports(count) => Cow::Owned(format!("imports ({count})")),
+            FoldKind::OriginalDex => Cow::Borrowed("Original DEX"),
         }
     }
     pub fn tooltip(&self) -> &'static str {
@@ -30,11 +40,14 @@ impl MetadataFold {
             (FoldKind::Metadata, true) => "Collapse Kotlin compiler metadata",
             (FoldKind::Imports(_), false) => "Expand imports",
             (FoldKind::Imports(_), true) => "Collapse imports",
+            (FoldKind::OriginalDex, false) => "Expand exact original DEX method",
+            (FoldKind::OriginalDex, true) => "Collapse original DEX method",
         }
     }
     pub fn expanded_header_len(&self, source: &str) -> usize {
         match self.kind {
             FoldKind::Imports(_) => 6,
+            FoldKind::OriginalDex => "Original DEX".len(),
             FoldKind::Metadata => {
                 if source[self.bytes.start..].starts_with("@kotlin.Metadata") {
                     16
@@ -96,6 +109,7 @@ impl MetadataFold {
                 chars,
                 expanded: false,
                 kind: FoldKind::Metadata,
+                original: None,
             });
             offset += line.len();
         }
@@ -109,17 +123,33 @@ impl MetadataFold {
     pub fn collapsed(&self) -> bool {
         !self.expanded
     }
+    fn projected_len(&self) -> usize {
+        if self.collapsed() {
+            self.summary().chars().count()
+        } else if let Some(original) = &self.original {
+            DEX_HEADING.chars().count() + original.chars.len()
+        } else {
+            self.chars.len()
+        }
+    }
+    fn projected(&self) -> bool {
+        self.collapsed() || self.original.is_some()
+    }
+    fn projected_text<'a>(&self, source: &'a str) -> Cow<'a, str> {
+        if self.collapsed() {
+            Cow::Owned(self.summary().into_owned())
+        } else if let Some(original) = &self.original {
+            Cow::Owned(format!("{DEX_HEADING}{}", &source[original.bytes.clone()]))
+        } else {
+            Cow::Borrowed(&source[self.bytes.clone()])
+        }
+    }
     #[cfg(test)]
     pub fn display(&self, source: &str) -> String {
-        if self.expanded {
-            return source.to_owned();
+        MetadataFolds {
+            folds: vec![self.clone()],
         }
-        let mut text =
-            String::with_capacity(source.len() - self.bytes.len() + self.summary().len());
-        text.push_str(&source[..self.bytes.start]);
-        text.push_str(&self.summary());
-        text.push_str(&source[self.bytes.end..]);
-        text
+        .display(source)
     }
     #[cfg(test)]
     pub fn summary_chars(&self) -> Range<usize> {
@@ -127,23 +157,17 @@ impl MetadataFold {
     }
     #[cfg(test)]
     pub fn source_to_display(&self, source: usize) -> usize {
-        if self.expanded || source <= self.chars.start {
-            source
-        } else if source < self.chars.end {
-            self.chars.start
-        } else {
-            source - self.chars.len() + self.summary().chars().count()
+        MetadataFolds {
+            folds: vec![self.clone()],
         }
+        .source_to_display(source)
     }
     #[cfg(test)]
     pub fn display_to_source(&self, display: usize) -> Option<usize> {
-        if self.expanded || display < self.chars.start {
-            Some(display)
-        } else if display < self.summary_chars().end {
-            None
-        } else {
-            Some(display - self.summary().chars().count() + self.chars.len())
+        MetadataFolds {
+            folds: vec![self.clone()],
         }
+        .display_to_source(display)
     }
     pub fn overlaps(&self, range: &Range<usize>) -> bool {
         range.start < self.chars.end && self.chars.start < range.end
@@ -158,70 +182,232 @@ impl MetadataFolds {
     pub fn detect(source: &str, syntax: &str) -> Option<Self> {
         let mut folds = MetadataFold::detect_all(source, syntax);
         folds.extend(import_folds(source, syntax));
+        let original_dex = original_dex_folds(source, syntax);
+        // DEX strings/annotations can resemble Java preamble or metadata. A
+        // containing original-method fold owns that range exclusively.
+        folds.retain(|fold| {
+            !original_dex
+                .iter()
+                .any(|dex| fold.bytes.start < dex.bytes.end && dex.bytes.start < fold.bytes.end)
+        });
+        folds.extend(original_dex);
         folds.sort_by_key(|fold| fold.bytes.start);
         (!folds.is_empty()).then_some(Self { folds })
     }
     pub fn collapsed(&self) -> bool {
         self.folds.iter().any(MetadataFold::collapsed)
     }
+    pub fn projected(&self) -> bool {
+        self.collapsed() || self.folds.iter().any(|fold| fold.original.is_some())
+    }
     pub fn display(&self, source: &str) -> String {
         let mut text = source.to_owned();
-        for fold in self.folds.iter().rev().filter(|f| f.collapsed()) {
-            text.replace_range(fold.bytes.clone(), &fold.summary());
+        for fold in self.folds.iter().rev().filter(|fold| fold.projected()) {
+            text.replace_range(fold.bytes.clone(), &fold.projected_text(source));
         }
         text
     }
     pub fn source_to_display(&self, source: usize) -> usize {
-        let mut removed = 0;
-        for fold in self.folds.iter().filter(|f| f.collapsed()) {
+        let mut removed = 0isize;
+        for fold in self.folds.iter().filter(|fold| fold.projected()) {
             if source <= fold.chars.start {
                 break;
             }
+            let start = (fold.chars.start as isize - removed) as usize;
             if source < fold.chars.end {
-                return (fold.chars.start as isize - removed) as usize;
+                return if !fold.collapsed()
+                    && let Some(original) = &fold.original
+                {
+                    if source < original.chars.start {
+                        start
+                    } else {
+                        start + DEX_HEADING.chars().count() + source.min(original.chars.end)
+                            - original.chars.start
+                    }
+                } else {
+                    start
+                };
             }
-            removed += fold.chars.len() as isize - fold.summary().chars().count() as isize;
+            removed += fold.chars.len() as isize - fold.projected_len() as isize;
         }
         (source as isize - removed) as usize
     }
     pub fn display_range(&self, fold: &MetadataFold) -> Range<usize> {
         let start = self.source_to_display(fold.chars.start);
-        start
-            ..start
-                + if fold.collapsed() {
-                    fold.summary().chars().count()
-                } else {
-                    fold.chars.len()
-                }
+        start..start + fold.projected_len()
     }
     pub fn display_to_source(&self, display: usize) -> Option<usize> {
-        let mut source = display as isize;
-        for fold in self.folds.iter().filter(|f| f.collapsed()) {
-            let range = self.display_range(fold);
-            if display < range.start {
+        let mut removed = 0isize;
+        for fold in self.folds.iter().filter(|fold| fold.projected()) {
+            let start = (fold.chars.start as isize - removed) as usize;
+            if display < start {
                 break;
             }
-            if display < range.end {
-                return None;
+            if display < start + fold.projected_len() {
+                return if !fold.collapsed()
+                    && let Some(original) = &fold.original
+                {
+                    let relative = display - start;
+                    (relative >= DEX_HEADING.chars().count())
+                        .then(|| original.chars.start + relative - DEX_HEADING.chars().count())
+                } else {
+                    None
+                };
             }
-            source += fold.chars.len() as isize - fold.summary().chars().count() as isize;
+            removed += fold.chars.len() as isize - fold.projected_len() as isize;
         }
-        Some(source as usize)
+        Some((display as isize + removed) as usize)
     }
     pub fn source_boundary(&self, display: usize, end: bool) -> usize {
         self.display_to_source(display).unwrap_or_else(|| {
             let fold = self
                 .folds
                 .iter()
-                .find(|f| f.collapsed() && self.display_range(f).contains(&display))
+                .find(|fold| fold.projected() && self.display_range(fold).contains(&display))
                 .unwrap();
             if end {
-                fold.chars.end
+                fold.original
+                    .as_ref()
+                    .filter(|_| fold.expanded)
+                    .map_or(fold.chars.end, |original| original.chars.start)
             } else {
                 fold.chars.start
             }
         })
     }
+    /// Clipboard ranges are source ranges; metadata/imports remain exact while
+    /// Original DEX protocol headers/footers become a clean heading and payload.
+    pub fn copy_source_range(&self, source: &str, range: Range<usize>) -> String {
+        let mut edits = Vec::new();
+        for fold in &self.folds {
+            if let Some(original) = &fold.original {
+                edits.push((fold.chars.start..original.chars.start, DEX_HEADING));
+                edits.push((original.chars.end..fold.chars.end, ""));
+            }
+        }
+        let mut chars = source.chars().skip(range.start);
+        let mut cursor = range.start;
+        let mut text = String::new();
+        for (removed, replacement) in edits {
+            let start = removed.start.max(range.start);
+            let end = removed.end.min(range.end);
+            if start >= end {
+                continue;
+            }
+            text.extend(chars.by_ref().take(start - cursor));
+            chars.by_ref().take(end - start).for_each(drop);
+            text.push_str(replacement);
+            cursor = end;
+        }
+        text.extend(chars.take(range.end.saturating_sub(cursor)));
+        text
+    }
+    pub fn copy_display_range(&self, source: &str, range: Range<usize>) -> String {
+        let mut text = String::new();
+        let mut source_start = 0;
+        let mut display_start = 0;
+        let append = |text: &mut String, original: Range<usize>, displayed: usize| {
+            let start = range.start.max(displayed);
+            let end = range.end.min(displayed + original.len());
+            if start < end {
+                text.extend(
+                    source
+                        .chars()
+                        .skip(original.start + start - displayed)
+                        .take(end - start),
+                );
+            }
+        };
+        for fold in self.folds.iter().filter(|fold| fold.projected()) {
+            append(&mut text, source_start..fold.chars.start, display_start);
+            display_start += fold.chars.start - source_start;
+            let finish = display_start + fold.projected_len();
+            if fold.collapsed() {
+                if range.start < finish && display_start < range.end {
+                    text.push_str(&self.copy_source_range(source, fold.chars.clone()));
+                }
+            } else if let Some(original) = &fold.original {
+                let end = range.end.min(display_start + DEX_HEADING.chars().count());
+                let start = range.start.max(display_start);
+                if start < end {
+                    text.extend(
+                        DEX_HEADING
+                            .chars()
+                            .skip(start - display_start)
+                            .take(end - start),
+                    );
+                }
+                append(
+                    &mut text,
+                    original.chars.clone(),
+                    display_start + DEX_HEADING.chars().count(),
+                );
+            }
+            source_start = fold.chars.end;
+            display_start = finish;
+        }
+        append(
+            &mut text,
+            source_start..source.chars().count(),
+            display_start,
+        );
+        text
+    }
+}
+
+fn original_dex_folds(source: &str, syntax: &str) -> Vec<MetadataFold> {
+    use rdx::alternate_source::{ORIGINAL_DEX_BEGIN, ORIGINAL_DEX_END};
+    if syntax != "java" {
+        return Vec::new();
+    }
+    let mut folds = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = source[cursor..].find(ORIGINAL_DEX_BEGIN) {
+        let start = cursor + relative;
+        cursor = start + ORIGINAL_DEX_BEGIN.len();
+        if start > 0 && source.as_bytes()[start - 1] != b'\n' {
+            continue;
+        }
+        let Some(header_end) = source[cursor..].find('\n').map(|offset| cursor + offset) else {
+            break;
+        };
+        let Ok(length) = source[cursor..header_end].parse::<usize>() else {
+            continue;
+        };
+        let body_start = header_end + 1;
+        let Some(body_end) = body_start
+            .checked_add(length)
+            .filter(|end| *end <= source.len() && source.is_char_boundary(*end))
+        else {
+            continue;
+        };
+        let original = &source[body_start..body_end];
+        if rdx::alternate_source::original_dex_method_offset(original).is_none()
+            || !source[body_end..].starts_with(ORIGINAL_DEX_END)
+        {
+            continue;
+        }
+        let end = body_end + ORIGINAL_DEX_END.len();
+        if source
+            .as_bytes()
+            .get(end)
+            .is_some_and(|byte| *byte != b'\n')
+        {
+            continue;
+        }
+        folds.push(MetadataFold {
+            bytes: start..end,
+            chars: source[..start].chars().count()..source[..end].chars().count(),
+            expanded: false,
+            kind: FoldKind::OriginalDex,
+            original: Some(OriginalPayload {
+                bytes: body_start..body_end,
+                chars: source[..body_start].chars().count()..source[..body_end].chars().count(),
+            }),
+        });
+        cursor = end;
+    }
+    folds
 }
 
 // Restrict import folding to complete declarations in the Java preamble.
@@ -241,6 +427,7 @@ fn import_folds(source: &str, syntax: &str) -> Vec<MetadataFold> {
                 chars: source[..start].chars().count()..source[..end].chars().count(),
                 expanded: false,
                 kind: FoldKind::Imports(count),
+                original: None,
             });
         }
     };
@@ -418,6 +605,55 @@ fn balanced_end(bytes: &[u8], open: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn original_dex_folds_below_visible_warning_and_above_reconstruction() {
+        use rdx::alternate_source::{ORIGINAL_DEX_BEGIN, ORIGINAL_DEX_END, UNVERIFIED_WARNING};
+        let original = ".method sample.Café.a()V // access=0x1\n    // @kotlin.Metadata(\"fake\")\n    return-void\n.end method\n";
+        let source = format!(
+            "import kotlin.Metadata;\nimport java.util.List;\n// {UNVERIFIED_WARNING}\n{ORIGINAL_DEX_BEGIN}{}\n{original}{ORIGINAL_DEX_END}\nvoid a() {{ broken(); }}\n",
+            original.len()
+        );
+        let mut group = MetadataFolds::detect(&source, "java").unwrap();
+        let dex = group
+            .folds
+            .iter()
+            .position(|fold| matches!(fold.kind, FoldKind::OriginalDex))
+            .unwrap();
+        assert!(group.folds[dex].collapsed());
+        let display = group.display(&source);
+        assert!(display.contains(&format!("// {UNVERIFIED_WARNING}\nOriginal DEX\nvoid a()")));
+        assert!(!display.contains("return-void"));
+        let method = source[..source.find("void a()").unwrap()].chars().count();
+        let displayed = display[..display.find("void a()").unwrap()].chars().count();
+        assert_eq!(group.source_to_display(method), displayed);
+        assert_eq!(group.display_to_source(displayed), Some(method));
+        group.folds[dex].expanded = true;
+        assert!(group.display(&source).contains(original));
+    }
+
+    #[test]
+    fn multiple_original_methods_use_exact_lengths_and_nonoverlapping_folds() {
+        use rdx::alternate_source::{ORIGINAL_DEX_BEGIN, ORIGINAL_DEX_END};
+        let raw = ".method sample.A.a()V\n@kotlin.Metadata(x=1)\n.end method\n";
+        let block = format!(
+            "{ORIGINAL_DEX_BEGIN}{}\n{raw}{ORIGINAL_DEX_END}\n",
+            raw.len()
+        );
+        let source = format!("{block}void a() {{}}\n{block}void b() {{}}\n");
+        let group = MetadataFolds::detect(&source, "java").unwrap();
+        assert_eq!(group.folds.len(), 2);
+        assert!(
+            group
+                .folds
+                .iter()
+                .all(|fold| matches!(fold.kind, FoldKind::OriginalDex))
+        );
+        assert!(group.folds[0].bytes.end <= group.folds[1].bytes.start);
+        assert!(group.display(&source).contains("void b()"));
+        let malformed =
+            format!("{ORIGINAL_DEX_BEGIN}999999999999999999\n{raw}{ORIGINAL_DEX_END}\n");
+        assert!(original_dex_folds(&malformed, "java").is_empty());
+    }
     #[test]
     fn imported_metadata_folds_with_unicode_and_exact_offsets() {
         let source = "import kotlin.Metadata;\n// café\n@Metadata(d1 = {\"a)\\\"b\"},\n d2 = {\"c\"})\nclass Test {}\n";

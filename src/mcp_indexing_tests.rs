@@ -469,3 +469,100 @@ fn headless_open_request_deduplicates_mode_and_path_and_releases_registration() 
     assert!(!record.exists());
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn headless_load_profiles_validate_and_bind_retry_identity() {
+    let directory =
+        std::env::temp_dir().join(format!("rdx-headless-profiles-{}", random_id().unwrap()));
+    fs::create_dir_all(&directory).unwrap();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+    let mut opened = std::collections::HashMap::new();
+    let mut args = json!({"path":path,"headless":true,"request_key":"standard"});
+    validate("open_apk", &args).unwrap();
+    let first = open_apk_request(&args, &mut opened, directory.clone()).unwrap();
+    assert_eq!(first["load_profile"], "standard");
+    args["load_profile"] = json!("standard");
+    let retry = open_apk_request(&args, &mut opened, directory.clone()).unwrap();
+    assert_eq!(first["instance_id"], retry["instance_id"]);
+    args["load_profile"] = json!("large");
+    let conflict = open_apk_request(&args, &mut opened, directory.clone())
+        .unwrap_err()
+        .to_string();
+    assert!(conflict.contains("REQUEST_KEY_CONFLICT"), "{conflict}");
+    assert!(conflict.contains("new request_key"), "{conflict}");
+    assert_eq!(opened.len(), 1);
+    args["request_key"] = json!("larger-retry");
+    validate("open_apk", &args).unwrap();
+    let large = open_apk_request(&args, &mut opened, directory.clone()).unwrap();
+    assert_eq!(large["load_profile"], "large");
+    assert_ne!(large["instance_id"], first["instance_id"]);
+    let repeated_large = open_apk_request(&args, &mut opened, directory.clone()).unwrap();
+    assert_eq!(repeated_large["instance_id"], large["instance_id"]);
+    for (key, profile) in [("standard", "standard"), ("larger-retry", "large")] {
+        let server = opened[key].server.as_ref().unwrap();
+        until(|| server.status().state == "Running");
+        let registration: Registration =
+            serde_json::from_slice(&fs::read(&server.registration).unwrap()).unwrap();
+        let info = remote(&registration, "get_instance_info", &json!({})).unwrap();
+        assert_eq!(info["load_profile"], profile);
+    }
+    for value in [
+        json!("Large"),
+        json!("unbounded"),
+        json!(2),
+        Value::Null,
+        json!(true),
+    ] {
+        args["load_profile"] = value;
+        assert!(validate("open_apk", &args).is_err());
+        assert!(open_apk_request(&args, &mut opened, directory.clone()).is_err());
+    }
+    args["load_profile"] = json!("large");
+    args["headless"] = json!(false);
+    assert!(
+        validate("open_apk", &args)
+            .unwrap_err()
+            .to_string()
+            .contains("headless=true")
+    );
+    assert_eq!(opened.len(), 2);
+    drop(opened);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn failed_headless_profile_retry_requires_new_request_key() {
+    let directory = std::env::temp_dir().join(format!(
+        "rdx-headless-failed-profile-{}",
+        random_id().unwrap()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("broken.apk");
+    fs::write(&path, b"invalid zip").unwrap();
+    let mut opened = std::collections::HashMap::new();
+    let mut args = json!({"path":path,"headless":true,"request_key":"failed"});
+    let first = open_apk_request(&args, &mut opened, directory.clone()).unwrap();
+    until(|| opened["failed"].server.as_ref().unwrap().status().state == "Failed");
+    let retry = open_apk_request(&args, &mut opened, directory.clone()).unwrap();
+    assert_eq!(retry["instance_id"], first["instance_id"]);
+    args["load_profile"] = json!("large");
+    let error = open_apk_request(&args, &mut opened, directory.clone())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("REQUEST_KEY_CONFLICT"), "{error}");
+    args["request_key"] = json!("explicit-large-retry");
+    let large = open_apk_request(&args, &mut opened, directory.clone()).unwrap();
+    assert_ne!(first["instance_id"], large["instance_id"]);
+    assert_eq!(large["load_profile"], "large");
+    until(|| {
+        opened["explicit-large-retry"]
+            .server
+            .as_ref()
+            .unwrap()
+            .status()
+            .state
+            == "Failed"
+    });
+    drop(opened);
+    fs::remove_dir_all(directory).unwrap();
+}

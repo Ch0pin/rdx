@@ -1,5 +1,5 @@
 //! One parsed project shared by interactive and service consumers.
-use crate::engine::{DecompilerEngine, NativeEngine, Project};
+use crate::engine::{NativeEngine, Project};
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{
@@ -24,7 +24,11 @@ pub(crate) struct InputIdentity {
 
 impl ProjectSnapshot {
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with(path, |engine| engine.open(path))
+        Self::open_with_limits(path, crate::load_limits::LoadLimits::Standard)
+    }
+
+    pub fn open_with_limits(path: &Path, limits: crate::load_limits::LoadLimits) -> Result<Self> {
+        Self::open_with(path, |engine| engine.open_with_limits(path, limits))
     }
 
     /// Open once, allowing the GUI to reuse its prepared archive and report progress.

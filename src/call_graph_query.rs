@@ -173,6 +173,7 @@ impl<'a> Options<'a> {
 struct Catalog<'a> {
     classes: BTreeMap<String, &'a DexClass>,
     method_positions: RefCell<HashMap<String, HashMap<String, usize>>>,
+    root_resolutions: RefCell<HashMap<String, &'static str>>,
     cancel: &'a AtomicBool,
 }
 
@@ -192,6 +193,7 @@ impl<'a> Catalog<'a> {
         Ok(Self {
             classes: indexed,
             method_positions: RefCell::new(HashMap::new()),
+            root_resolutions: RefCell::new(HashMap::new()),
             cancel,
         })
     }
@@ -255,6 +257,113 @@ impl<'a> Catalog<'a> {
             }
         }
         method.into()
+    }
+
+    /// Declaration availability and DEX reference evidence are separate from bodies.
+    /// Scan each shared DEX symbol table once; no source reconstruction is required.
+    fn root_resolution(&self, method: &str) -> Result<&'static str> {
+        if let Some(status) = self.root_resolutions.borrow().get(method) {
+            return Ok(*status);
+        }
+        let status = self.resolve_root(method)?;
+        self.root_resolutions
+            .borrow_mut()
+            .insert(method.to_owned(), status);
+        Ok(status)
+    }
+
+    fn resolve_root(&self, method: &str) -> Result<&'static str> {
+        let canonical = self.canonical(method);
+        if self.available(&canonical) {
+            return Ok(if canonical == method {
+                "declared"
+            } else {
+                "inherited_declaration"
+            });
+        }
+        let original = crate::method_lookup::owner(method)?;
+        let member = &method[original.len() + 1..];
+        let (name, signature) = member.split_once('(').context("Missing signature")?;
+        let (parameters, returned) = signature
+            .split_once(')')
+            .context("Missing return descriptor")?;
+        let mut aliases = HashSet::from([original.to_owned()]);
+        // An unloaded ancestor can own a referenced inherited member. Constructors
+        // cannot inherit. This is reference evidence, not a loaded declaration.
+        let mut current = original.to_owned();
+        if !matches!(name, "<init>" | "<clinit>") {
+            while aliases.len() < 256 {
+                check_cancel(self.cancel)?;
+                let Some(parent) = self.parent(&current) else {
+                    break;
+                };
+                if !aliases.insert(parent.clone()) {
+                    break;
+                }
+                current = parent;
+            }
+        }
+        let loaded_owner = self.class(original).is_some();
+        let external_ancestry = aliases.iter().any(|name| self.class(name).is_none());
+        let mut seen = HashSet::new();
+        let mut unresolved_alias_reference = false;
+        if !loaded_owner || external_ancestry {
+            for class in self.classes.values() {
+                check_cancel(self.cancel)?;
+                if !seen.insert(std::sync::Arc::as_ptr(&class.symbols)) {
+                    continue;
+                }
+                let symbols = &class.symbols;
+                for (i, &(owner, proto, named)) in symbols.methods.iter().enumerate() {
+                    if i % 256 == 0 {
+                        check_cancel(self.cancel)?;
+                    }
+                    if symbols.strings.get(named as usize).map(String::as_str) != Some(name) {
+                        continue;
+                    }
+                    let Some((ret, params)) = symbols.protos.get(proto as usize) else {
+                        continue;
+                    };
+                    if ret.as_ref() != returned
+                        || params.iter().map(|s| s.len()).sum::<usize>() != parameters.len()
+                    {
+                        continue;
+                    }
+                    if !parameters.bytes().eq(params.iter().flat_map(|s| s.bytes())) {
+                        continue;
+                    }
+                    let Some(descriptor) = symbols.types.get(owner as usize) else {
+                        continue;
+                    };
+                    let referenced_owner = crate::native_engine::disassembly::type_name(descriptor);
+                    if loaded_owner
+                        && aliases.contains(&referenced_owner)
+                        && self.class(&referenced_owner).is_some()
+                    {
+                        unresolved_alias_reference = true;
+                    }
+                    if aliases.contains(&referenced_owner)
+                        && (!loaded_owner || self.class(&referenced_owner).is_none())
+                    {
+                        return Ok(if loaded_owner {
+                            "inherited_external_reference"
+                        } else {
+                            "external_reference"
+                        });
+                    }
+                }
+            }
+        }
+        if loaded_owner && external_ancestry && unresolved_alias_reference {
+            return Ok("unresolved_inherited_reference");
+        }
+        if loaded_owner {
+            return Err(crate::method_lookup::missing_graph_declaration(
+                method,
+                |name| self.class(name),
+            ));
+        }
+        Ok("unresolved_external")
     }
 
     fn available(&self, method: &str) -> bool {
@@ -423,6 +532,7 @@ fn query_cached_catalog(
 ) -> Result<Value> {
     let options = Options::parse(args)?;
     let normalized = crate::method_lookup::graph_selector(root, |name| catalog.class(name))?;
+    catalog.root_resolution(&normalized)?;
     if options.direction == "callees" {
         return query_catalog(catalog, &normalized, args, cancel);
     }
@@ -482,6 +592,7 @@ fn graph_cached_catalog(
     options.semantic_edges = lambda_creators;
     options.lambda_creators_only = lambda_creators;
     let normalized = crate::method_lookup::graph_selector(root, |name| catalog.class(name))?;
+    catalog.root_resolution(&normalized)?;
     let provided = match direction {
         Direction::Callees => None,
         Direction::Callers | Direction::Both => {
@@ -1392,6 +1503,7 @@ fn query_catalog_with_sites(
     let options = Options::parse(args)?;
     let normalized_root = crate::method_lookup::graph_selector(root, |name| catalog.class(name))?;
     let root = normalized_root.as_str();
+    let root_resolution = catalog.root_resolution(root)?;
     let t = traverse(&catalog, root, &options, cancel, provided)?;
     let root_key = t.root_key.as_str();
     let aliases = &t.dispatch.aliases;
@@ -1401,6 +1513,7 @@ fn query_catalog_with_sites(
         "component_type":options.component_type.map(|c| c.label().to_ascii_lowercase())});
     let metadata = json!({
         "root_method_id":root,"resolved_root_method_id":root_key,"root_body":catalog.body_state(root_key),
+        "root_resolution":root_resolution,"root_resolution_complete":!root_resolution.starts_with("unresolved_"),
         "direction":options.direction,"depth":options.depth,"direct_only":options.direct_only,
         "projection":options.projection,"filters":filters,"depth_boundary_reached":boundary,
         "depth_boundary_semantics":"true when a traversed method lies at the requested depth; its own neighbors were not expanded, so deeper relationships may exist. false means every method reachable in the requested direction was expanded before the depth limit.",
@@ -1416,6 +1529,16 @@ fn query_catalog_with_sites(
         }
     });
     let mut result = metadata;
+    if root_resolution == "unresolved_external" {
+        result["root_resolution_diagnostic"] = json!(
+            "No loaded declaration or matching DEX method reference establishes this external signature. Zero matches describes the searched DEX only; it does not establish a valid method with no callers."
+        );
+    }
+    if root_resolution == "unresolved_inherited_reference" {
+        result["root_resolution_diagnostic"] = json!(
+            "A DEX method reference names this loaded owner, but no matching declaration is loaded. A known superclass is external, so this may be an inherited framework member. The declaration remains unresolved; counts describe observed DEX sites and do not prove method existence or absence of callers."
+        );
+    }
     if root_key != root {
         result["root_resolution_note"] = json!(
             "method_id names an inherited member that its class does not declare. Traversal uses the declaring ancestor resolved_root_method_id, so callers include invokes naming any class that resolves to that declaration."
@@ -2503,6 +2626,119 @@ mod tests {
     }
 
     #[test]
+    fn complete_roots_validate_declarations_and_keep_external_reference_evidence() {
+        let mut classes = vec![
+            class(
+                "app.Owner",
+                Some("java.lang.Object"),
+                vec![
+                    ("run", vec!["Ljava/lang/String;"], vec![]),
+                    ("unused", vec![], vec![]),
+                ],
+            ),
+            class("app.Child", Some("ext.Framework"), vec![]),
+            class(
+                "app.Caller",
+                None,
+                vec![(
+                    "entry",
+                    vec![],
+                    vec![
+                        "ext.Framework.run()V",
+                        "app.Child.run()V",
+                        "app.Child.sdkOnly()V",
+                    ],
+                )],
+            ),
+        ];
+        // Add a dead pool-only reference whose loaded owner declares a different
+        // overload. It must remain unresolved, rather than prove a zero-caller method.
+        let symbols = Arc::get_mut(&mut classes[2].symbols).unwrap();
+        let named = symbols.strings.len() as u32;
+        symbols.strings.push("run".into());
+        let owner = symbols.types.len() as u16;
+        symbols.types.push("Lapp/Owner;".into());
+        let proto = symbols.protos.len() as u16;
+        symbols.protos.push(("V".into(), vec![]));
+        symbols.methods.push((owner, proto, named));
+        let cancel = AtomicBool::new(false);
+        for wrong in [
+            "app.Owner.run(Lwrong/String;)V",
+            "app.Owner.run(Ljava/lang/String;)I",
+        ] {
+            for projection in ["graph", "call_sites"] {
+                let error = query_catalog(
+                    Catalog::new(&classes, &cancel).unwrap(),
+                    wrong,
+                    &json!({"direction":"callers","projection":projection}),
+                    &cancel,
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains("SYMBOL_NOT_FOUND"), "{error}");
+                assert!(
+                    error.contains("app.Owner.run(Ljava/lang/String;)V"),
+                    "{error}"
+                );
+                assert!(error.contains("candidate_count"), "{error}");
+            }
+        }
+        let unused = run(
+            &classes,
+            "app.Owner.unused()V",
+            json!({"direction":"callers","projection":"call_sites"}),
+        );
+        assert_eq!(unused["matching_total"], 0);
+        assert_eq!(unused["root_resolution"], "declared");
+        assert_eq!(unused["root_resolution_complete"], true);
+        for (root, resolution) in [
+            ("ext.Framework.run()V", "external_reference"),
+            ("app.Child.run()V", "inherited_external_reference"),
+        ] {
+            let result = run(
+                &classes,
+                root,
+                json!({"direction":"callers","projection":"call_sites"}),
+            );
+            assert_eq!(result["matching_total"], 1);
+            assert_eq!(result["root_resolution"], resolution);
+            assert_eq!(result["root_resolution_complete"], true);
+        }
+        // A reference naming only a loaded subclass can represent an SDK-inherited
+        // member. A same-owner pool entry alone establishes no declaration, even
+        // when the owner has other overloads and Object is external.
+        for (root, sites) in [("app.Child.sdkOnly()V", 1), ("app.Owner.run()V", 0)] {
+            let result = run(
+                &classes,
+                root,
+                json!({"direction":"callers","projection":"call_sites"}),
+            );
+            assert_eq!(result["root_resolution"], "unresolved_inherited_reference");
+            assert_eq!(result["root_resolution_complete"], false);
+            assert!(result["root_resolution_diagnostic"].is_string());
+            assert_eq!(result["matching_total"], sites);
+        }
+        let missing_constructor = query_catalog(
+            Catalog::new(&classes, &cancel).unwrap(),
+            "app.Child.<init>()V",
+            &json!({"direction":"callers"}),
+            &cancel,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing_constructor.contains("SYMBOL_NOT_FOUND"));
+        let unknown = run(
+            &classes,
+            "ext.Unknown.run()V",
+            json!({"direction":"callers","projection":"call_sites"}),
+        );
+        assert_eq!(unknown["root_resolution"], "unresolved_external");
+        assert_eq!(unknown["root_resolution_complete"], false);
+        assert!(unknown["root_resolution_diagnostic"].is_string());
+        assert_eq!(unknown["scan_complete"], true);
+    }
+
+    #[test]
     fn resolved_ids_expose_inherited_root_and_callee_declarations() {
         let fixture = |abstract_parent: bool| {
             let mut parent = class("app.Parent", None, vec![("run", vec![], vec![])]);
@@ -2575,6 +2811,7 @@ mod tests {
             json!({"projection":"call_sites","direction":"callers"}),
         );
         assert_eq!(no_code["root_body"], "no_code");
+        assert_eq!(no_code["root_resolution"], "inherited_declaration");
         assert_eq!(no_code["matching_total"], 1);
         let external = run(
             &classes,

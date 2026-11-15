@@ -48,6 +48,8 @@ pub struct NativeDexEngine {
     nested_children: Arc<BTreeMap<String, Vec<String>>>,
     hierarchy_index: Arc<OnceLock<HierarchyIndex>>,
     opened: bool,
+    #[cfg(test)]
+    test_total_dex_limits: Option<[u64; 2]>,
 }
 impl NativeDexEngine {
     /// Conservative admission estimate, including nested classes rendered in this document.
@@ -311,6 +313,13 @@ impl NativeDexEngine {
         self.hierarchy_index = Arc::default();
         self.nested_children = Arc::default();
         self.opened = false;
+        let total_dex_limit = limits.total_dex_bytes();
+        #[cfg(test)]
+        let total_dex_limit = self
+            .test_total_dex_limits
+            .map_or(total_dex_limit, |values| {
+                values[usize::from(limits == LoadLimits::Large)]
+            });
         let mut classes = BTreeMap::new();
         let mut class_origins = BTreeMap::<String, String>::new();
         let mut resources = Vec::new();
@@ -383,7 +392,7 @@ impl NativeDexEngine {
                     container.entries().len() <= MAX_ZIP_ENTRIES,
                     "Package has too many entries"
                 );
-                let mut remaining = limits.total_dex_bytes();
+                let mut remaining = total_dex_limit;
                 let mut dex_count = 0;
                 let mut resource_name_bytes = 0;
                 for entry in container.entries() {
@@ -404,8 +413,8 @@ impl NativeDexEngine {
                         entry.size <= remaining,
                         LoadLimitExceeded {
                             resource: LoadResource::TotalDex,
-                            limit: limits.total_dex_bytes(),
-                            required_at_least: limits.total_dex_bytes() - remaining + entry.size
+                            limit: total_dex_limit,
+                            required_at_least: total_dex_limit - remaining + entry.size
                         }
                     );
                     let bytes = container.read_member(entry.index, remaining.min(MAX_DEX_BYTES))?;
@@ -574,6 +583,34 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn explicit_larger_profile_retries_limit_failure_without_partial_project() {
+        let mut engine = NativeDexEngine {
+            test_total_dex_limits: Some([1, 1024 * 1024]),
+            ..Default::default()
+        };
+        let error = engine
+            .open_input(&fixture("navigation.apk"), None, LoadLimits::Standard)
+            .unwrap_err();
+        let limit = error
+            .downcast_ref::<LoadLimitExceeded>()
+            .expect("typed load failure");
+        assert_eq!(limit.resource, LoadResource::TotalDex);
+        assert_eq!(limit.limit, 1);
+        assert!(engine.graph_classes().next().is_none());
+        assert!(!engine.opened);
+        let project = engine
+            .open_input(&fixture("navigation.apk"), None, LoadLimits::Large)
+            .unwrap();
+        assert!(engine.opened);
+        assert_eq!(project.classes.len(), engine.graph_classes().count());
+        let mut standard = NativeDexEngine::default();
+        assert_eq!(
+            project.classes,
+            standard.open(&fixture("navigation.apk")).unwrap().classes
+        );
+    }
+
     #[test]
     fn navigation_fixture_keeps_native_declarations() {
         let mut engine = NativeDexEngine::default();

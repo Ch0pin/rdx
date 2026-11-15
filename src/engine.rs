@@ -212,6 +212,7 @@ pub trait DecompilerEngine: Send {
 /// Native application boundary with an optional isolated, on-demand class helper.
 #[derive(Clone, Default)]
 pub struct NativeEngine {
+    load_limits: crate::load_limits::LoadLimits,
     native: NativeDexEngine,
     alternate_source: crate::alternate_source::Session,
     pub(crate) retained_budget: std::sync::Arc<crate::retained_budget::RetainedBudget>,
@@ -378,6 +379,9 @@ impl NativeEngine {
             crate::load_limits::LoadLimits::Standard,
         )
     }
+    pub fn load_limits(&self) -> crate::load_limits::LoadLimits {
+        self.load_limits
+    }
     pub fn open_with_limits(
         &mut self,
         path: &Path,
@@ -399,6 +403,7 @@ impl NativeEngine {
         supplied: Option<std::sync::Arc<crate::package_container::PackageContainer>>,
         limits: crate::load_limits::LoadLimits,
     ) -> Result<Project> {
+        self.load_limits = limits;
         let alternate_enabled = self.alternate_source.enabled();
         self.alternate_source = Default::default();
         self.alternate_source.set_enabled(alternate_enabled);

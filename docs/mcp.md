@@ -574,8 +574,18 @@ selected registration, leaving GUI processes and project files intact.
 
 `open_apk.request_key` is required and described in the schema. Its uniqueness
 scope is one gateway connection: reuse the same key for retries of the same
-canonical path, and choose a new key to launch another window. A different path
-with the same key is rejected.
+canonical path, launch mode and effective load profile, and choose a new key to
+launch another window. A different path, mode or profile with the same key is
+rejected. A failed launch keeps that key's identity; retrying with higher limits
+requires a new key.
+
+Headless loads accept `load_profile: "standard"` (default) or the explicit bounded
+`load_profile: "large"`, reusing the GUI's existing per-project limits. For example:
+`{"path":"/absolute/path/app.apk","request_key":"large-retry-1","headless":true,"load_profile":"large"}`.
+Launch responses and `get_instance_info.load_profile` report the effective profile;
+shared GUI projects report the GUI-selected profile. `load_profile` requires
+`headless: true`; the GUI selects its own profile. Limit failures preserve complete
+project loading and remain failures until an explicitly larger load succeeds.
 
 `get_health` accepts the same filters and discovery pagination. It reports
 `transport: "connected"`, gateway executable path, version, PID, and executable
@@ -1670,3 +1680,23 @@ Keys require agreement across the supported constant-flow analysis; result
 registers identify the immediate `move-result`, not subsequent taint flow.
 Unsupported or over-budget proofs remain explicit. This optional summary does
 not trigger Java reconstruction beyond the requested source format.
+
+### Call-graph root resolution
+
+Complete signatures on loaded owners are checked against declarations and known
+superclass aliases. Missing signatures return `SYMBOL_NOT_FOUND` with bounded
+same-name candidates in both `get_call_graph` and per-query batch errors;
+`failed_queries` counts those errors. Declared methods remain valid with zero
+callers, including abstract methods and declarations without code.
+
+`root_resolution` distinguishes `declared`, `inherited_declaration`,
+`external_reference`, `inherited_external_reference`, `unresolved_inherited_reference`
+and `unresolved_external`.
+Reference statuses establish an exact DEX method reference while the external
+implementation may be unavailable. A reference naming a loaded subclass whose
+ancestor is external remains `unresolved_inherited_reference` when no declaration
+or matching reference on the external ancestor is available. Unknown external signatures remain queryable
+with `root_resolution_complete: false` and an explicit diagnostic: zero matches
+cannot establish a valid target with no callers. `scan_complete` retains its
+DEX traversal meaning independently of root resolution. Batch `complete` means
+all input queries were processed, including explicit errors.

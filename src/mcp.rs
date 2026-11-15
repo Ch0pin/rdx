@@ -1,5 +1,6 @@
 //! Local authenticated GUI service and stdio MCP gateway.
 use crate::engine::{DecompilerEngine, NativeEngine, Project};
+use crate::load_limits::LoadLimits;
 use crate::project_snapshot::ProjectSnapshot;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -111,6 +112,7 @@ struct Registration {
 }
 #[derive(Default, Clone)]
 pub struct Status {
+    pub load_profile: LoadLimits,
     pub state: String,
     pub project_id: String,
     pub apk_sha256: String,
@@ -234,6 +236,7 @@ impl Server {
             snapshot.identity.path.clone(),
             registry()?,
             random_id()?,
+            snapshot.engine().load_limits(),
             Some(snapshot),
             plugins,
         )
@@ -247,17 +250,27 @@ impl Server {
             snapshot.identity.path.clone(),
             directory,
             instance_id,
+            snapshot.engine().load_limits(),
             Some(snapshot),
             Arc::default(),
         )
     }
     fn start_in(path: PathBuf, directory: PathBuf, instance_id: String) -> Result<Self> {
-        Self::start_source(path, directory, instance_id, None, Arc::default())
+        Self::start_with_limits_in(path, directory, instance_id, LoadLimits::Standard)
+    }
+    fn start_with_limits_in(
+        path: PathBuf,
+        directory: PathBuf,
+        instance_id: String,
+        limits: LoadLimits,
+    ) -> Result<Self> {
+        Self::start_source(path, directory, instance_id, limits, None, Arc::default())
     }
     fn start_source(
         path: PathBuf,
         directory: PathBuf,
         instance_id: String,
+        limits: LoadLimits,
         snapshot: Option<ProjectSnapshot>,
         plugins: Arc<crate::plugin_analysis::Controller>,
     ) -> Result<Self> {
@@ -280,6 +293,7 @@ impl Server {
         let index = Arc::new(Mutex::new(None::<literals::Controller>));
         let status = Arc::new(Mutex::new(Status {
             state: "Loading".into(),
+            load_profile: limits,
             ..Default::default()
         }));
         let (stopped, shared, watched, index_handle) = (
@@ -300,7 +314,7 @@ impl Server {
                             snapshot.verify_current()?;
                             snapshot
                         }
-                        None => ProjectSnapshot::open(&loading_path)?,
+                        None => ProjectSnapshot::open_with_limits(&loading_path, limits)?,
                     };
                     let mut loaded = LoadedProject::from_snapshot(snapshot, loading_stop)?;
                     loaded.plugins = loaded_plugins;
@@ -399,7 +413,7 @@ impl Server {
                             let s = status.lock().unwrap();
                             return Ok(
                                 json!({"instance_id":entry.instance_id,"project_id":s.project_id,"state":s.state,
-                                "apk_path":path,"apk_sha256":s.apk_sha256,"package_selection":s.package_selection,"package_name":s.package_name,
+                                "apk_path":path,"load_profile":s.load_profile.name(),"apk_sha256":s.apk_sha256,"package_selection":s.package_selection,"package_name":s.package_name,
                                 "invoke_index":loaded.as_ref().map(|project|project.analysis_snapshot.invoke_index.status()),
                                 "literal_index":loaded.as_ref().map(|project| project.literals.status()).unwrap_or_else(|| s.literal_index.clone()),"active_requests":s.active_requests,
                                 "error":if s.state == "Failed" {s.last_error.as_str()} else {""},
@@ -1783,7 +1797,7 @@ fn tools_list() -> Value {
         ),
         (
             "get_call_graph_batch",
-            "Query 1..16 methods against a shared project-owned invoke index. Defaults to callers/call_sites/depth 1. Options apply to each method; per-method next_offset pages call sites and next_method_offset pages input methods if the response budget is reached. Per-method lookup errors are explicit. Cancellation stops the batch; get_instance_info.invoke_index reports build and active-batch progress.",
+            "Query 1..16 methods against a shared project-owned invoke index. Defaults to callers/call_sites/depth 1. Options apply to each method; per-method next_offset pages call sites and next_method_offset pages input methods if the response budget is reached. Per-method lookup errors are explicit and counted in failed_queries. Batch complete means inputs were processed; inspect per-query errors and root_resolution_complete before interpreting zero matches. Cancellation stops the batch; get_instance_info.invoke_index reports build and active-batch progress.",
             vec!["method_ids"],
             true,
         ),
@@ -1795,7 +1809,7 @@ fn tools_list() -> Value {
         ),
         (
             "get_call_graph",
-            "Query static DEX calls. Direction: callers, callees (default), or both. Accepts pkg.Class.method(desc)ret or Lpkg/Class;->method(desc)ret. Incomplete method selectors return bounded overload candidates; retry with an exact signature. direct_only selects depth 1. projection=call_sites defaults to depth 1 (explicit depth includes transitive sites) and returns paginated exact caller IDs/signatures and DEX code-unit offsets, raw invoke words/target, DEX entry and traversal depth without graph payload or graph-size caps (limit <=500). Optional package_prefix, exact class_name, class/method annotation and component_type filters select neighboring declarations after traversal. Caller queries reuse a project-owned disk invoke index; get_instance_info reports build progress. Optional include_source_locations adds method-local locations with explicit precision and reconstruction status; include_forwarders adds verified static delegates and separately labelled exact cross-namespace helper calls. Default graph has component-path highlights and a 5000-node/20000-edge cap.",
+            "Query static DEX calls. Missing loaded-root signatures return SYMBOL_NOT_FOUND with bounded candidates. Check root_resolution_complete: unresolved external or inherited references do not establish a valid method with no callers; scan_complete describes DEX traversal separately. Direction: callers, callees (default), or both. Accepts pkg.Class.method(desc)ret or Lpkg/Class;->method(desc)ret. Incomplete method selectors return bounded overload candidates; retry with an exact signature. direct_only selects depth 1. projection=call_sites defaults to depth 1 (explicit depth includes transitive sites) and returns paginated exact caller IDs/signatures and DEX code-unit offsets, raw invoke words/target, DEX entry and traversal depth without graph payload or graph-size caps (limit <=500). Optional package_prefix, exact class_name, class/method annotation and component_type filters select neighboring declarations after traversal. Caller queries reuse a project-owned disk invoke index; get_instance_info reports build progress. Optional include_source_locations adds method-local locations with explicit precision and reconstruction status; include_forwarders adds verified static delegates and separately labelled exact cross-namespace helper calls. Default graph has component-path highlights and a 5000-node/20000-edge cap.",
             vec!["method_id"],
             true,
         ),
@@ -1942,8 +1956,9 @@ fn tools_list() -> Value {
             properties["package_prefix"]["minLength"] = json!(0);
         }
         if name=="open_apk" {
+            properties.insert("load_profile".into(),json!({"type":"string","enum":["standard","large"],"default":"standard","description":"Headless only. Explicit bounded loader profile; standard is the default. large uses the existing higher limits for this project only. Profile changes require a new request_key, including after failure. The effective profile is returned in launch and instance info."}));
             properties.insert("headless".into(),json!({"type":"boolean","default":false,"description":"Host the project in this MCP gateway without a GUI. Closing the gateway stops this service and cancels work. Poll get_instance_info for Running and project_id."}));
-            properties.insert("request_key".into(),json!({"type":"string","minLength":1,"description":"Unique launch key within this gateway connection, e.g. review-temu-1. Reuse for retries of the same canonical path; a new key opens another window. Reusing it for a different path is rejected."}));
+            properties.insert("request_key".into(),json!({"type":"string","minLength":1,"description":"Unique launch key within this gateway connection, e.g. review-temu-1. Reuse for retries of the same canonical path; a new key opens another window. Reusing it for a different path, launch mode or load_profile is rejected; use a new key for an explicit larger-profile retry."}));
         }
         if ["get_method_source","find_field_references","export_source"].contains(&name) {
             let id = if name=="find_field_references" {"field_id"} else {"method_id"};
@@ -2270,6 +2285,9 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
             }
         }
     }
+    if name == "open_apk" {
+        open_load_profile(args)?;
+    }
     if name == "get_call_graph_batch" {
         let mut query = args.clone();
         let object = query.as_object_mut().unwrap();
@@ -2432,6 +2450,21 @@ struct OpenedInstance {
     id: String,
     // Own the headless service until the gateway closes; Drop cancels work and unregisters.
     server: Option<Server>,
+    load_profile: LoadLimits,
+}
+
+fn open_load_profile(args: &Value) -> Result<LoadLimits> {
+    let profile = match args.get("load_profile") {
+        None => LoadLimits::Standard,
+        Some(value) if value == "standard" => LoadLimits::Standard,
+        Some(value) if value == "large" => LoadLimits::Large,
+        Some(_) => bail!("Invalid load_profile: expected standard or large"),
+    };
+    ensure!(
+        args.get("load_profile").is_none() || args["headless"] == true,
+        "load_profile requires headless=true; GUI loads select their profile in the GUI"
+    );
+    Ok(profile)
 }
 
 fn open_apk_request(
@@ -2451,28 +2484,36 @@ fn open_apk_request(
     );
     let key = required(args, "request_key")?;
     let headless = args["headless"].as_bool().unwrap_or(false);
+    let profile = open_load_profile(args)?;
     if let Some(existing) = opened.get(key) {
         ensure!(
             existing.path == path && existing.server.is_some() == headless,
-            "request_key belongs to a different package or launch mode"
+            "request_key belongs to a different package or launch mode; use a new request_key"
+        );
+        ensure!(
+            existing.load_profile == profile,
+            "REQUEST_KEY_CONFLICT: request_key already uses load_profile={}; use a new request_key for load_profile={}",
+            existing.load_profile.name(),
+            profile.name()
         );
         return Ok(
-            json!({"instance_id":existing.id,"state":"launching","apk_path":path,"headless":headless}),
+            json!({"instance_id":existing.id,"state":"launching","apk_path":path,"headless":headless,"load_profile":profile.name()}),
         );
     }
     let id = random_id()?;
     if headless {
-        let server = Server::start_in(path.clone(), directory, id.clone())?;
+        let server = Server::start_with_limits_in(path.clone(), directory, id.clone(), profile)?;
         opened.insert(
             key.into(),
             OpenedInstance {
                 path: path.clone(),
                 id: id.clone(),
                 server: Some(server),
+                load_profile: profile,
             },
         );
         return Ok(
-            json!({"instance_id":id,"state":"launching","apk_path":path,"headless":true,"lifetime":"this MCP gateway connection","next_action":"Poll get_instance_info until Running, then pin its project_id"}),
+            json!({"instance_id":id,"state":"launching","apk_path":path,"headless":true,"load_profile":profile.name(),"lifetime":"this MCP gateway connection","next_action":"Poll get_instance_info until Running, then pin its project_id"}),
         );
     }
     let mut child = std::process::Command::new(std::env::current_exe()?)
@@ -2492,6 +2533,7 @@ fn open_apk_request(
             path: path.clone(),
             id: id.clone(),
             server: None,
+            load_profile: profile,
         },
     );
     Ok(json!({"instance_id":id,"state":"launching","apk_path":path}))
@@ -3183,6 +3225,64 @@ mod tests {
         query["project_id"] = json!("wrong");
         assert!(remote(&record, "search_code", &query).is_err());
         assert!(remote(&record, "get_manifest_summary", &query).is_err());
+    }
+
+    #[test]
+    fn complete_call_graph_roots_report_per_query_signature_errors() {
+        let dir = TestDir::new();
+        let (_server, record, mut args) = start(&dir, "navigation.apk");
+        let invalid = [
+            "sample.Target.doubleValue(Lwrong/String;)Ljava/lang/String;",
+            "sample.Target.doubleValue(I)V",
+        ];
+        for method in invalid {
+            args["method_id"] = json!(method);
+            for projection in ["graph", "call_sites"] {
+                args["projection"] = json!(projection);
+                let error = remote(&record, "get_call_graph", &args)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("SYMBOL_NOT_FOUND"), "{error}");
+                assert!(error.contains("sample.Target.doubleValue(I)I"), "{error}");
+                assert!(error.contains("candidate_count"), "{error}");
+            }
+        }
+        args.as_object_mut().unwrap().remove("method_id");
+        args["method_ids"] = json!(["sample.Target.doubleValue(I)I", invalid[0], invalid[1]]);
+        let response = remote(&record, "get_call_graph_batch", &args).unwrap();
+        let result = &response["data"];
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["failed_queries"], 2);
+        assert!(
+            result["results"][0]["data"]["matching_total"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        for i in [1, 2] {
+            assert!(
+                result["results"][i]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("SYMBOL_NOT_FOUND")
+            );
+            assert!(result["results"][i].get("data").is_none());
+        }
+    }
+
+    #[test]
+    fn shared_large_snapshot_reports_effective_load_profile() {
+        let dir = TestDir::new();
+        let path = fixture("navigation.apk");
+        let snapshot = ProjectSnapshot::open_with(&path, |engine| {
+            engine.open_with_limits(&path, LoadLimits::Large)
+        })
+        .unwrap();
+        let server =
+            Server::start_shared_in(snapshot, dir.0.clone(), random_id().unwrap()).unwrap();
+        let (record, _) = wait_shared(&server);
+        let info = remote(&record, "get_instance_info", &json!({})).unwrap();
+        assert_eq!(info["load_profile"], "large");
     }
 
     #[test]

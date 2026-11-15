@@ -8,6 +8,13 @@ pub enum LoadLimits {
     Large,
 }
 impl LoadLimits {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Large => "large",
+        }
+    }
+
     pub const fn retained_bytes(self) -> usize {
         match self {
             Self::Standard => 1024 * 1024 * 1024,

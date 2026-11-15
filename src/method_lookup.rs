@@ -182,8 +182,9 @@ fn bounded<'a>(candidates: impl IntoIterator<Item = &'a String>) -> Vec<String> 
 
 pub(crate) const SELECTION_SCOPE: &str = "same-name declarations in the requested class and known superclass chain (up to 256 types); constructors use their own class only";
 
-/// Call graphs keep exact external/inherited selectors intact. Incomplete
-/// selectors receive declaration-backed choices and never select an overload.
+/// Normalize graph syntax while keeping exact external/inherited identity.
+/// The graph catalog validates complete roots against declarations/references.
+/// Incomplete selectors receive declaration-backed choices without guessing an overload.
 pub(crate) fn graph_selector<'a>(
     requested: &str,
     class_for: impl Fn(&str) -> Option<&'a DexClass>,
@@ -202,6 +203,19 @@ pub(crate) fn graph_selector<'a>(
     anyhow::bail!(
         "Expected exact DEX method signature, e.g. {EXAMPLE} or {SMALI_EXAMPLE}; include parameter descriptors in parentheses and a return descriptor after ')' (V for void); {detail}"
     )
+}
+
+/// A complete graph root with a loaded owner failed declaration/reference resolution.
+pub(crate) fn missing_graph_declaration<'a>(
+    id: &str,
+    class_for: impl Fn(&str) -> Option<&'a DexClass>,
+) -> anyhow::Error {
+    let (candidates, _) = same_name_declarations(id, &class_for).unwrap_or_default();
+    let shown = bounded(&candidates);
+    let detail = serde_json::json!({"candidates":shown,"candidate_count":candidates.len(),
+        "candidates_truncated":shown.len()<candidates.len(),"scope":SELECTION_SCOPE,
+        "hint":"No declaration matches the complete signature; retry with an exact candidate including parameter and return descriptors; get_methods_of_class lists declarations"});
+    anyhow::anyhow!("SYMBOL_NOT_FOUND: method_id={id}; {detail}")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -563,6 +563,7 @@ pub struct App {
     search_query: SearchQuery,
     pending_search_metadata: Vec<(String, String)>,
     interactive_requests: Arc<Mutex<Vec<InteractiveRequest>>>,
+    preferences_window: crate::preferences_window::PreferencesWindow,
     settings_store: SettingsStore,
     last_preferences: Settings,
     tx: mpsc::Sender<Event>,
@@ -715,6 +716,7 @@ impl App {
             search_query: SearchQuery::default(),
             pending_search_metadata: Vec::new(),
             interactive_requests: Arc::new(Mutex::new(Vec::new())),
+            preferences_window: Default::default(),
             settings_store,
             last_preferences,
             tx,
@@ -859,7 +861,8 @@ impl App {
         if (preferences.font_size != self.last_preferences.font_size
             || preferences.search_workers != self.last_preferences.search_workers
             || preferences.search.max_results != self.last_preferences.search.max_results)
-            && ctx.input(|input| input.pointer.primary_down())
+            && (ctx.input(|input| input.pointer.primary_down())
+                || self.preferences_window.adjusting)
         {
             return;
         }
@@ -3782,7 +3785,6 @@ impl eframe::App for App {
             || ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| reveal.contains(p)))
             || ctx.memory(|m| m.any_popup_open());
         self.menu_hovered = show_menu;
-        let mut refresh_source = None;
         if show_menu {
             egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
                 ui.add_space(3.0);
@@ -3842,115 +3844,18 @@ impl eframe::App for App {
                             }
                         });
                         ui.menu_button("View", |ui| {
-                            ui.checkbox(&mut self.tabs_auto_hide, "Autohide tabs");
-                            ui.checkbox(&mut self.menu_auto_hide, "Autohide menu");
                             if ui.checkbox(&mut self.word_wrap, "Word wrap").clicked() {
                                 ui.close_menu();
                             }
                             ui.separator();
-                            ui.menu_button("Settings", |ui| {
-                                ui.horizontal(|ui| {
-                                    icons::small(ui, Icon::Settings);
-                                    ui.strong("Preferences");
-                                });
-                                ui.separator();
-                                if ui
-                                    .add_enabled(
-                                        !self.busy,
-                                        egui::Checkbox::new(&mut self.androguard_fallback, "Androguard fallback"),
-                                    )
-                                    .on_hover_ui(|ui| {
-                                        ui.set_max_width(400.0);
-                                        ui.label(rdx::alternate_source::availability());
-                                        ui.label("Automatically tries Androguard for failed methods. Changing this setting refreshes the current class.");
-                                        ui.label("Runs when browsing classes; each attempt stops after 30 seconds.");
-                                        if let Some(path) = rdx::alternate_source::helper_path() {
-                                            ui.small(format!("Decompiler executable: {}", path.display()));
-                                        }
-                                    })
-                                    .changed()
-                                {
-                                    if let Some(engine) = &self.engine {
-                                        engine
-                                            .set_alternate_source_enabled(self.androguard_fallback);
-                                    }
-                                    if let Some(snapshot) = &self.shared_project {
-                                        snapshot
-                                            .engine()
-                                            .set_alternate_source_enabled(self.androguard_fallback);
-                                    }
-                                    refresh_source = self.tabs.get(self.selected).and_then(|tab| match &tab.target {
-                                        Target::Class(name) if !name.starts_with("dex://") && !name.starts_with(rdx::resource_table::PREFIX) => Some(name.clone()),
-                                        _ => None,
-                                    });
-                                }
-                                ui.separator();
-                                ui.menu_button("Interface theme", |ui| {
-                                    let mut appearance =
-                                        ctx.options(|options| options.theme_preference);
-                                    for (value, label) in [
-                                        (egui::ThemePreference::System, "System"),
-                                        (egui::ThemePreference::Light, "Light"),
-                                        (egui::ThemePreference::Dark, "Dark"),
-                                    ] {
-                                        if ui
-                                            .selectable_value(&mut appearance, value, label)
-                                            .clicked()
-                                        {
-                                            ctx.set_theme(appearance);
-                                            ui.close_menu();
-                                        }
-                                    }
-                                });
-                                ui.menu_button("Code theme", |ui| {
-                                    for (light, label) in [(true, "Light"), (false, "Dark")] {
-                                        if !light {
-                                            ui.separator();
-                                        }
-                                        ui.weak(label);
-                                        for theme in CodeTheme::ALL
-                                            .into_iter()
-                                            .filter(|theme| theme.is_light() == light)
-                                        {
-                                            if ui
-                                                .selectable_value(
-                                                    &mut self.theme,
-                                                    theme,
-                                                    theme.label(),
-                                                )
-                                                .clicked()
-                                            {
-                                                ui.close_menu();
-                                            }
-                                        }
-                                    }
-                                });
-                                ui.menu_button("Code font", |ui| {
-                                    for font in CodeFont::ALL {
-                                        if ui
-                                            .selectable_value(
-                                                &mut self.code_font,
-                                                font,
-                                                font.label(),
-                                            )
-                                            .clicked()
-                                        {
-                                            ui.close_menu();
-                                        }
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Code font size");
-                                    ui.add(
-                                        egui::DragValue::new(&mut self.font_size)
-                                            .range(10.0..=28.0)
-                                            .speed(0.5)
-                                            .suffix(" px"),
-                                    );
-                                });
-                                ui.separator();
-                                ui.weak("Changes save automatically");
-                            });
+                            if ui.button("Preferences…").clicked() {
+                                self.preferences_window.visible = true;
+                                ctx.send_viewport_cmd_to(
+                                    crate::preferences_window::viewport_id(),
+                                    egui::ViewportCommand::Focus,
+                                );
+                                ui.close_menu();
+                            }
                         });
                         ui.menu_button("Search", |ui| {
                             let can_find = self
@@ -3979,16 +3884,6 @@ impl eframe::App for App {
                                 self.open_analysis(AnalysisKind::Annotations);
                                 ui.close_menu();
                             }
-                            ui.separator();
-                            ui.strong("Scan");
-                            ui.horizontal(|ui| {
-                                ui.label("Workers");
-                                ui.add(search_workers_control(&mut self.search_workers));
-                            });
-                            ui.weak(format!(
-                                "Auto uses {} on this machine · applies to the next search",
-                                search::resolve_workers(0)
-                            ));
                         });
                         ui.menu_button("Tools", |ui| {
                             if ui.button("Retrofit services…").clicked() {
@@ -4136,8 +4031,44 @@ impl eframe::App for App {
                     );
                 });
         }
-        if let Some(class) = refresh_source {
-            self.decompile(class, None, ctx);
+        let previous_fallback = self.androguard_fallback;
+        self.preferences_window.show(
+            ctx,
+            crate::preferences_window::Controls {
+                theme: &mut self.theme,
+                font: &mut self.code_font,
+                font_size: &mut self.font_size,
+                fallback: &mut self.androguard_fallback,
+                workers: &mut self.search_workers,
+                tabs_auto_hide: &mut self.tabs_auto_hide,
+                menu_auto_hide: &mut self.menu_auto_hide,
+                busy: self.busy,
+            },
+        );
+        if previous_fallback != self.androguard_fallback {
+            if let Some(engine) = &self.engine {
+                engine.set_alternate_source_enabled(self.androguard_fallback);
+            }
+            if let Some(snapshot) = &self.shared_project {
+                snapshot
+                    .engine()
+                    .set_alternate_source_enabled(self.androguard_fallback);
+            }
+            let class = self
+                .tabs
+                .get(self.selected)
+                .and_then(|tab| match &tab.target {
+                    Target::Class(name)
+                        if !name.starts_with("dex://")
+                            && !name.starts_with(rdx::resource_table::PREFIX) =>
+                    {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                });
+            if let Some(class) = class {
+                self.decompile(class, None, ctx);
+            }
         }
         if choose_file && let Some(id) = self.begin_dialog() {
             let future = rfd::AsyncFileDialog::new()
@@ -4622,7 +4553,7 @@ fn snapshot_preferences(
 
 /// Drag control for the Code search pool: `0` reads "Auto"; explicit counts run
 /// from one worker to the machine's cores, within the pool bound.
-fn search_workers_control(workers: &mut usize) -> egui::DragValue<'_> {
+pub(crate) fn search_workers_control(workers: &mut usize) -> egui::DragValue<'_> {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     egui::DragValue::new(workers)
         .range(0..=cores.min(search::MAX_WORKERS))
@@ -5160,6 +5091,7 @@ mod settings_tests {
             search_query: SearchQuery::default(),
             pending_search_metadata: Vec::new(),
             interactive_requests: Arc::new(Mutex::new(Vec::new())),
+            preferences_window: Default::default(),
             settings_store: SettingsStore::new(),
             search_workers: 0,
             last_preferences: Settings::default(),

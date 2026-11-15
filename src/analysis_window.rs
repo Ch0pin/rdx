@@ -323,7 +323,7 @@ impl AnalysisWindow {
                                 ui.strong("Method"); ui.strong("Verb"); ui.strong("Path / dynamic URL"); ui.strong("Action"); ui.end_row();
                                 for (index,row) in rows.iter().enumerate() {
                                     let method=row["method_id"].as_str().unwrap_or("unknown method");
-                                    if ui.selectable_label(self.selected_row==Some(index),method).clicked() {
+                                    if ui.selectable_label(self.selected_row==Some(index),crate::search::member_node(method)).on_hover_text(method).clicked() {
                                         self.selected_row=Some(index);
                                         self.selected_preview=bounded(serde_json::to_string_pretty(row).unwrap_or_default(),16_000);
                                     }
@@ -450,7 +450,10 @@ fn row_preview(row: &Value, kind: AnalysisKind) -> (String, String) {
         )
     };
     (
-        bounded(format!("{first}  {owner}"), 500),
+        bounded(
+            format!("{first}  {}", crate::search::member_node(owner)),
+            500,
+        ),
         bounded(detail, 1000),
     )
 }

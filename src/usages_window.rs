@@ -35,7 +35,7 @@ impl Default for UsagesWindow {
             selected_result: None,
             cancel_requested: false,
             errors: Vec::new(),
-            node_fraction: 0.45,
+            node_fraction: 0.5,
             preview_cache: VecDeque::new(),
         }
     }
@@ -196,15 +196,7 @@ impl UsagesWindow {
                     for index in rows {
                         let hit = &self.results[index];
                         ui.push_id(index, |ui| {
-                            let title = format!(
-                                "{}:{}",
-                                if hit.kind.is_empty() {
-                                    &hit.origin.name
-                                } else {
-                                    &hit.kind
-                                },
-                                hit.line
-                            );
+                            let title = hit.title();
                             let (rect, response) = ui.allocate_exact_size(
                                 egui::vec2(
                                     ui.available_width(),
@@ -256,7 +248,7 @@ impl UsagesWindow {
                             ui.painter().with_clip_rect(node_rect).text(
                                 node_rect.left_center(),
                                 egui::Align2::LEFT_CENTER,
-                                title,
+                                &title,
                                 egui::FontId::monospace(13.0),
                                 ui.visuals().text_color(),
                             );
@@ -293,8 +285,8 @@ impl UsagesWindow {
                                 ui.visuals().text_color(),
                             );
                             let response = response.on_hover_text(format!(
-                                "{} · {}:{}\n{}",
-                                hit.kind, hit.origin.name, hit.line, hit.preview
+                                "{}\n{} · {}:{}\n{}",
+                                title, hit.kind, hit.origin.name, hit.line, hit.preview
                             ));
                             // A single click selects; only a double click opens the code.
                             if response.clicked() {
@@ -414,7 +406,7 @@ mod tests {
                 end: 13,
                 line: 1,
                 kind: "code".into(),
-                node: String::new(),
+                node: "sample.Example.run() void".into(),
                 preview: "return target;".into(),
                 preview_match: 7..13,
             }],
@@ -453,7 +445,7 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("{needle} is painted"))
         };
-        let node_x = text_x("code:1");
+        let node_x = text_x("sample.Example.run() void");
         let code_x = text_x("return target;");
         assert!(
             (node_x - text_x("Node")).abs() < 10.0,

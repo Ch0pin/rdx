@@ -100,7 +100,7 @@ matches without cached source are rendered again. Records contain a small
 metadata frame and UTF-8 source, using fast DEFLATE compression when it saves
 space. Compressed and expanded records both retain the 32 MiB document bound.
 The render pool defaults to one fewer than the cores (at most 12) and can be set
-from Search → Scan → Workers; the preference persists with the other settings.
+from View → Preferences… → Search & Scanning → Code search workers; the preference persists with the other settings.
 Scans stop at a configurable result limit (`ScanOptions::limit`, set from the Max results preference, 2,000 by default). A stopped scan returns a `SearchResume`: the classes still to scan in their order, how many matches of the first one were already reported, and where the resource pass continues. Raising the limit in the search window reruns with that resume point, so nothing already covered is scanned again; a changed query, scope or project drops it.
 Hits do not retain source: each carries its target, offsets and the source hash
 the scan recorded. Result memory grows with the configured limit; pending

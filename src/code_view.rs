@@ -1497,13 +1497,18 @@ impl CodeDocument {
                                 gutter_highlight,
                                 egui::Shape::rect_filled(marker, 2.0, jump_gutter_tint(theme)),
                             );
-                            if self.jump.take().is_some() {
-                                ui.scroll_to_rect_animation(
-                                    first.translate(output.galley_pos.to_vec2()),
-                                    Some(egui::Align::Center),
-                                    egui::style::ScrollAnimation::none(),
-                                );
-                            }
+                        }
+                        // Folded DEX search results land on their warning without
+                        // a highlight. Consume that jump too, so later frames do
+                        // not keep resetting the user's scroll position.
+                        if let Some(position) = self.jump.take() {
+                            let position = self.highlight.as_ref().map_or(position, |range| range.start);
+                            let target = output.galley.pos_from_ccursor(egui::text::CCursor::new(self.source_to_display(position)));
+                            ui.scroll_to_rect_animation(
+                                target.translate(output.galley_pos.to_vec2()),
+                                Some(egui::Align::Center),
+                                egui::style::ScrollAnimation::none(),
+                            );
                         }
                         ui.painter()
                             .with_clip_rect(painter.clip_rect())
@@ -3373,6 +3378,70 @@ mod tests {
         assert!(expanded.contains(&format!("Original DEX\n{dex}")));
         assert!(!expanded.contains("RDX_ORIGINAL_DEX_"));
         assert!(!doc.clipboard_source().contains("RDX_ORIGINAL_DEX_"));
+    }
+
+    #[test]
+    fn collapsed_original_dex_search_jump_allows_manual_scrolling() {
+        use rdx::alternate_source::{ORIGINAL_DEX_BEGIN, ORIGINAL_DEX_END, UNVERIFIED_WARNING};
+        let dex =
+            ".method sample.C.run()V // access=0x1\n    const-string \"needle\"\n.end method\n";
+        let source = format!(
+            "{}// {UNVERIFIED_WARNING}\n{ORIGINAL_DEX_BEGIN}{}\n{dex}{ORIGINAL_DEX_END}\n{}",
+            "// before α\n".repeat(60),
+            dex.len(),
+            "void after() {{}}\n".repeat(180),
+        );
+        let hit = source[..source.find("needle").unwrap()].chars().count();
+        let mut doc = CodeDocument::new(source, "java");
+        assert!(doc.jump_to_search_range(hit, hit + 6).unwrap());
+        let context = egui::Context::default();
+        let render = |doc: &mut CodeDocument, time, events| {
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 400.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        doc.show(ui, CodeTheme::Ocean, 14.0);
+                    });
+                },
+            )
+        };
+        render(&mut doc, 0.0, vec![]);
+        render(&mut doc, 0.1, vec![]);
+        assert!(doc.jump.is_none(), "a folded search jump is consumed once");
+        let before = doc.last_galley_pos.unwrap().y;
+        render(
+            &mut doc,
+            0.2,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(400.0, 200.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -200.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        render(&mut doc, 0.3, vec![]);
+        let after = doc.last_galley_pos.unwrap().y;
+        assert!(
+            after < before - 50.0,
+            "manual scrolling moves the code: {before} -> {after}"
+        );
+        render(&mut doc, 0.4, vec![]);
+        assert!(
+            doc.last_galley_pos.unwrap().y <= after + 1.0,
+            "later frames must not snap back"
+        );
+        assert!(doc.original_search_is_collapsed());
+        assert_eq!(doc.original_search_match(), Some(hit..hit + 6));
     }
 
     #[test]

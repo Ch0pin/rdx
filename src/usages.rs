@@ -341,6 +341,7 @@ fn hits(mut result: ClassUsages) -> Result<Vec<SearchHit>, String> {
             Err("Usage source is unavailable".into())
         };
     };
+    let definitions = code.definitions;
     let doc = Arc::new(SearchDocument {
         target: SearchTarget::Class(result.class.clone()),
         name: result.class,
@@ -350,6 +351,7 @@ fn hits(mut result: ClassUsages) -> Result<Vec<SearchHit>, String> {
         source_hash: Some(code.source_hash),
         metadata_complete: true,
     });
+    let nodes = crate::search::member_nodes(&doc, &definitions);
     // Usage sources never reach the session index, so the hits keep them.
     let origin = HitOrigin::retaining(doc.clone());
     result.occurrences.sort_by_key(|reference| reference.start);
@@ -398,7 +400,12 @@ fn hits(mut result: ClassUsages) -> Result<Vec<SearchHit>, String> {
             end: reference.end,
             line,
             kind: reference.enclosing,
-            node: String::new(),
+            node: crate::search::enclosing_node(
+                &nodes,
+                reference.start,
+                &source[byte..],
+                &doc.name,
+            ),
             preview,
             preview_match: start..end,
         });
@@ -410,6 +417,63 @@ fn hits(mut result: ClassUsages) -> Result<Vec<SearchHit>, String> {
 mod tests {
     use super::*;
     use rdx::engine::{DecompiledCode, DecompilerEngine, UsageOccurrence};
+
+    #[test]
+    fn usage_nodes_include_full_owner_and_overload_like_search_results() {
+        use rdx::engine::{CodeDefinition, CodeLink};
+        let source = "// α\nvoid run(String arg) { target(); }\nvoid run(int arg) { target(); }";
+        let definitions: Vec<_> = source
+            .match_indices("run(")
+            .map(|(byte, _)| {
+                let start = source[..byte].chars().count();
+                CodeDefinition {
+                    start,
+                    end: start + 3,
+                    kind: "method".into(),
+                    name: "run".into(),
+                }
+            })
+            .collect();
+        let links = definitions
+            .iter()
+            .zip(["Ljava/lang/String;", "I"])
+            .map(|(d, parameter)| CodeLink {
+                start: d.start,
+                end: d.end,
+                label: format!("com.example.Screen.run({parameter})V"),
+            })
+            .collect();
+        let occurrences = source
+            .match_indices("target")
+            .map(|(byte, _)| {
+                let start = source[..byte].chars().count();
+                UsageOccurrence {
+                    start,
+                    end: start + 6,
+                    enclosing: "run".into(),
+                }
+            })
+            .collect();
+        let hits = hits(ClassUsages {
+            class: "com.example.Screen".into(),
+            code: Some(DecompiledCode {
+                source: source.into(),
+                source_hash: "test".into(),
+                links,
+                definitions,
+            }),
+            occurrences,
+            limited: false,
+        })
+        .unwrap();
+        assert_eq!(hits[0].title(), "com.example.Screen.run(String) void");
+        assert_eq!(hits[1].title(), "com.example.Screen.run(int) void");
+        assert_eq!(hits[0].line, 2);
+        assert_eq!(hits[1].line, 3);
+        for hit in hits {
+            assert_eq!(&hit.preview[hit.preview_match], "target");
+        }
+    }
 
     #[test]
     fn distinct_symbols_reuse_ready_index_and_report_candidate_scanning() {

@@ -17,7 +17,7 @@ Keep the accompanying notices and documentation when redistributing an archive.
 
 macOS and Linux packages also include the native `rdx-androguard-helper` beside
 RDX, with its license notices and corresponding MPL source. Normal launch needs
-no environment variable or additional runtime. **View → Settings → Androguard
+no environment variable or additional runtime. **View → Preferences… → Decompilation → Androguard
 fallback** enables optional unverified reconstruction for native-failed methods;
 the warning and collapsed Original DEX remain available for inspection. Windows
 packages use the native RDX engine and keep Androguard fallback unavailable.

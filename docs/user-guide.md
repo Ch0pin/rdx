@@ -31,7 +31,7 @@ open target/RDX.app
 ```
 
 The macOS package includes the Androguard helper and its notices. Enable
-**View → Settings → Androguard fallback** to inspect unverified alternate output
+**View → Preferences… → Decompilation → Androguard fallback** to inspect unverified alternate output
 for methods the native engine could not reconstruct. Expand **Original DEX**
 above a reconstructed method to see its diagnostics and original instructions.
 Linux release archives include the same optional helper; Windows fallback is
@@ -105,9 +105,9 @@ The default engine is native. `--engine jadx` and `--engine auto` are no longer 
 
 The desktop has project navigation on the left, source and asset tabs in the center, and status/error information below. **File → Open…** opens a project; **File → Reload** refreshes it. Cmd+O / Ctrl+O and drag-and-drop are supported. The project tree groups classes, manifest, assets, resources, libraries, DEX bytecode, signatures/metadata, split APKs, and container files.
 
-**View → Settings** contains interface theme (System, Light, Dark), code theme (Atom One Light, Quiet Light, Solarized light; Ocean, Eighties, Solarized dark, One Dark, Dracula), and font size (10–28 px). Code themes are grouped into Light and Dark; all palettes are bundled for offline use. Changes save automatically across sessions. Settings live at `~/Library/Application Support/rdx/settings.json` on macOS, `%APPDATA%/rdx/settings.json` on Windows, or `$XDG_CONFIG_HOME/rdx/settings.json` (default `~/.config/rdx/settings.json`) on Linux.
+**View → Preferences…** opens an independent window that can move outside the main RDX window. Its tabs group Appearance, Decompilation, Search & Scanning, and General settings. General contains menu/tab autohide; Appearance contains interface theme (System, Light, Dark), code theme (Atom One Light, Quiet Light, Solarized light; Ocean, Eighties, Solarized dark, One Dark, Dracula), and font size (10–28 px). Code themes are grouped into Light and Dark; all palettes are bundled for offline use. Changes save automatically across sessions. Settings live at `~/Library/Application Support/rdx/settings.json` on macOS, `%APPDATA%/rdx/settings.json` on Windows, or `$XDG_CONFIG_HOME/rdx/settings.json` (default `~/.config/rdx/settings.json`) on Linux.
 
-**View → Settings → Code font** offers default monospace, JetBrains Mono,
+**View → Preferences… → Appearance → Code font** offers default monospace, JetBrains Mono,
 Fira Code and Source Code Pro. Fonts are bundled with Unicode fallbacks; the
 choice saves automatically. Click a word in the source viewer to highlight its other exact occurrences.
 Find results and navigation highlights remain separate.
@@ -196,7 +196,7 @@ copied/exported text retain their original positions and content.
 
 **Search → Class / Code / Methods / Fields** opens a separate search window with one selected scope. Code search examines the native representation, which may include DEX disassembly; it cannot yet reproduce all searches against JADX-generated Java. Definition searches use native class/member metadata. Resources, Comments, case sensitivity, regex, Auto search, and Keep open remain separate options. Closing the window clears the query and its results; the scope options are kept for the next search.
 
-**Search → Scan → Workers** sets how many threads a Code search uses to render classes. Auto, the default, uses one fewer than the machine's cores, at most 12, and the menu shows that number. Lower it to keep the machine responsive during a long cold scan; the change applies to the next search and is saved with the other preferences. The status bar shows the count in use while a scan runs.
+**View → Preferences… → Search & Scanning → Code search workers** sets how many threads a Code search uses to render classes. Auto, the default, uses one fewer than the machine's cores, at most 12, and Preferences shows that number. Lower it to keep the machine responsive during a long cold scan; the change applies to the next search and is saved with the other preferences. The status bar shows the count in use while a scan runs.
 
 **Excluded packages** contains editable defaults for Android, AndroidX, Kotlin, Java, and related namespaces. Remove an entry to include that package, add another pattern, restore defaults, or include all. Preferences save automatically. Nonstandard packages are searched first.
 

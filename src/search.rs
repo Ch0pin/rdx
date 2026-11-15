@@ -441,7 +441,10 @@ fn comments(source: &str) -> Vec<(usize, usize)> {
 }
 
 /// Member declarations in source order with the node label each one shows.
-fn member_nodes(document: &SearchDocument, definitions: &[CodeDefinition]) -> Vec<(usize, String)> {
+pub fn member_nodes(
+    document: &SearchDocument,
+    definitions: &[CodeDefinition],
+) -> Vec<(usize, String)> {
     let members: Vec<_> = definitions
         .iter()
         .filter(|d| matches!(d.kind.as_str(), "method" | "field"))
@@ -536,7 +539,7 @@ fn simple_type(descriptor: &str) -> String {
 }
 
 /// The member declared before the hit, or the one declared on the hit's own row.
-fn enclosing_node(nodes: &[(usize, String)], start: usize, rest: &str, class: &str) -> String {
+pub fn enclosing_node(nodes: &[(usize, String)], start: usize, rest: &str, class: &str) -> String {
     let next = nodes.partition_point(|(member, _)| *member <= start);
     let same_row = nodes
         .get(next)

@@ -62,7 +62,7 @@ pub struct SearchWindow {
     started_at: Option<Instant>,
     node_fraction: f32,
     preview_cache: VecDeque<((usize, bool), egui::text::LayoutJob)>,
-    result_widths: Option<(usize, f32, egui::Vec2)>,
+    result_preview_width: Option<(usize, f32, f32)>,
     exclusion_input: String,
     mode_changed: bool,
     stale_scope: bool,
@@ -102,9 +102,9 @@ impl Default for SearchWindow {
             errors: Vec::new(),
             was_visible: false,
             started_at: None,
-            node_fraction: 0.45,
+            node_fraction: 0.5,
             preview_cache: VecDeque::new(),
-            result_widths: None,
+            result_preview_width: None,
             exclusion_input: String::new(),
             mode_changed: false,
             stale_scope: false,
@@ -121,24 +121,16 @@ impl Default for SearchWindow {
 }
 
 impl SearchWindow {
-    fn measured_result_widths(&mut self, ui: &egui::Ui) -> egui::Vec2 {
+    fn measured_preview_width(&mut self, ui: &egui::Ui) -> f32 {
         let scale = ui.ctx().pixels_per_point();
-        let (mut count, _, mut widths) = self
-            .result_widths
+        let (mut count, _, mut width) = self
+            .result_preview_width
             .filter(|(count, old_scale, _)| *count <= self.results.len() && *old_scale == scale)
-            .unwrap_or((0, scale, egui::Vec2::ZERO));
+            .unwrap_or((0, scale, 0.0));
         ui.fonts(|fonts| {
             for hit in &self.results[count..] {
                 let font = egui::FontId::monospace(13.0);
-                let title = hit.title();
-                widths.x = widths.x.max(
-                    fonts
-                        .layout_no_wrap(title, font.clone(), egui::Color32::WHITE)
-                        .size()
-                        .x
-                        + 32.0,
-                );
-                widths.y = widths.y.max(
+                width = width.max(
                     fonts
                         .layout_no_wrap(hit.preview.clone(), font, egui::Color32::WHITE)
                         .size()
@@ -148,8 +140,8 @@ impl SearchWindow {
                 count += 1;
             }
         });
-        self.result_widths = Some((count, scale, widths));
-        widths
+        self.result_preview_width = Some((count, scale, width));
+        width
     }
 
     pub fn viewport_id() -> egui::ViewportId {
@@ -184,7 +176,7 @@ impl SearchWindow {
             self.stale_scope = self.running;
             self.results.clear();
             self.preview_cache.clear();
-            self.result_widths = None;
+            self.result_preview_width = None;
             self.selected_result = None;
             self.errors.clear();
             self.scanned = 0;
@@ -237,7 +229,7 @@ impl SearchWindow {
         self.running = true;
         self.results.clear();
         self.preview_cache.clear();
-        self.result_widths = None;
+        self.result_preview_width = None;
         self.selected_result = None;
         self.errors.clear();
         self.cancel_requested = false;
@@ -285,7 +277,7 @@ impl SearchWindow {
         self.query.text.clear();
         self.results.clear();
         self.preview_cache.clear();
-        self.result_widths = None;
+        self.result_preview_width = None;
         self.selected_result = None;
         self.errors.clear();
         self.scanned = 0;
@@ -371,7 +363,7 @@ impl SearchWindow {
     pub fn error(&mut self, error: String) {
         self.results.clear();
         self.preview_cache.clear();
-        self.result_widths = None;
+        self.result_preview_width = None;
         self.selected_result = None;
         self.running = false;
         self.cancel_requested = false;
@@ -614,16 +606,17 @@ impl SearchWindow {
                 });
             }
             ui.separator();
-            let widths = self.measured_result_widths(ui);
+            let preview_width = self.measured_preview_width(ui);
             let fraction = self.node_fraction.clamp(0.1, 0.9);
             let viewport_width = ui.available_width();
             let minimum = 140.0_f32.min(viewport_width / 2.0);
+            // Column geometry follows the viewport and the user's divider,
+            // never the length of a result's declaration.
             let node_width = (viewport_width * fraction)
-                .clamp(minimum, viewport_width - minimum)
-                .max(widths.x);
+                .clamp(minimum, viewport_width - minimum);
             // A long code preview expands its own column, keeping short node
             // names and the beginning of the code visible before scrolling.
-            let table_width = node_width + (viewport_width - node_width).max(widths.y);
+            let table_width = node_width + (viewport_width - node_width).max(preview_width);
             let header_height = 24.0;
             let (header, _) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width(), header_height),
@@ -690,7 +683,7 @@ impl SearchWindow {
                             ui.painter().with_clip_rect(node_rect).text(
                                 node_rect.left_center(),
                                 egui::Align2::LEFT_CENTER,
-                                title,
+                                &title,
                                 egui::FontId::monospace(13.0),
                                 ui.visuals().text_color(),
                             );
@@ -727,7 +720,7 @@ impl SearchWindow {
                                 ui.visuals().text_color(),
                             );
                             let response = response.on_hover_text(format!(
-                                "{} · {}:{}\n{}",
+                                "{title}\n{} · {}:{}\n{}",
                                 hit.kind, hit.origin.name, hit.line, hit.preview
                             ));
                             // A single click selects; only a double click opens the code.
@@ -818,7 +811,7 @@ impl SearchWindow {
                 self.stale_scope = self.running;
                 self.results.clear();
                 self.preview_cache.clear();
-                self.result_widths = None;
+                self.result_preview_width = None;
                 self.selected_result = None;
                 self.errors.clear();
                 self.scanned = 0;
@@ -1287,16 +1280,20 @@ mod tests {
     #[test]
     fn divider_drag_resizes_columns_and_options_stay_at_bottom() {
         let ctx = egui::Context::default();
+        let mut long_hit = session_hit(7);
+        long_hit.node = format!("{}.run(String) void", "LongObfuscatedName".repeat(40));
+        long_hit.preview = format!("{} target", "long_preview_".repeat(30));
         let mut window = SearchWindow {
             visible: true,
+            results: vec![long_hit],
             ..Default::default()
         };
-        let mut render = |events| {
+        let render = |window: &mut SearchWindow, width, events| {
             ctx.run(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
-                        egui::vec2(1000.0, 600.0),
+                        egui::vec2(width, 600.0),
                     )),
                     events,
                     ..Default::default()
@@ -1306,8 +1303,8 @@ mod tests {
                 },
             )
         };
-        render(vec![]);
-        let output = render(vec![]);
+        render(&mut window, 1000.0, vec![]);
+        let output = render(&mut window, 1000.0, vec![]);
         let text_position = |output: &egui::FullOutput, label| {
             output
                 .shapes
@@ -1322,6 +1319,10 @@ mod tests {
                 .unwrap()
         };
         let code = text_position(&output, "Code");
+        assert!(
+            (code.x - 8.0 - 500.0).abs() < 1.0,
+            "divider starts exactly in the middle despite a long node: {code:?}"
+        );
         assert!(text_position(&output, "Auto search").y > 550.0);
         assert!(text_position(&output, "Keep open").y > 550.0);
         let divider = egui::pos2(code.x - 8.0, code.y + 5.0);
@@ -1331,15 +1332,52 @@ mod tests {
             pressed,
             modifiers: egui::Modifiers::NONE,
         };
-        render(vec![
-            egui::Event::PointerMoved(divider),
-            button(divider, true),
-        ]);
+        render(
+            &mut window,
+            1000.0,
+            vec![egui::Event::PointerMoved(divider), button(divider, true)],
+        );
         let destination = divider + egui::vec2(120.0, 0.0);
-        render(vec![egui::Event::PointerMoved(destination)]);
-        let output = render(vec![button(destination, false)]);
+        render(
+            &mut window,
+            1000.0,
+            vec![egui::Event::PointerMoved(destination)],
+        );
+        let output = render(&mut window, 1000.0, vec![button(destination, false)]);
         assert!(text_position(&output, "Code").x > code.x + 100.0);
         assert!(window.node_fraction > 0.5);
+
+        // Drag left through the result body, where long row text must not win
+        // the drag interaction or impose a content-sized minimum.
+        let code = text_position(&output, "Code");
+        let divider = egui::pos2(code.x - 8.0, code.y + 45.0);
+        render(
+            &mut window,
+            1000.0,
+            vec![egui::Event::PointerMoved(divider), button(divider, true)],
+        );
+        let destination = divider - egui::vec2(300.0, 0.0);
+        render(
+            &mut window,
+            1000.0,
+            vec![egui::Event::PointerMoved(destination)],
+        );
+        let output = render(&mut window, 1000.0, vec![button(destination, false)]);
+        let moved = text_position(&output, "Code");
+        assert!(moved.x < code.x - 250.0);
+        assert!(window.node_fraction < 0.5);
+
+        let fraction = window.node_fraction;
+        let mut later = session_hit(9);
+        later.node = "LongerName".repeat(300);
+        window.results.push(later);
+        let output = render(&mut window, 1000.0, vec![]);
+        assert!((text_position(&output, "Code").x - moved.x).abs() < 1.0);
+        render(&mut window, 1200.0, vec![]);
+        let output = render(&mut window, 1200.0, vec![]);
+        let left = text_position(&output, "Node").x - 26.0;
+        let expected = left + (1200.0 - 2.0 * left) * fraction + 8.0;
+        assert!((text_position(&output, "Code").x - expected).abs() < 1.0);
     }
 
     #[test]
@@ -1557,7 +1595,7 @@ mod tests {
             position(&before, "Search:"),
             "search controls stay fixed"
         );
-        assert_eq!(window.result_widths.unwrap().0, 1);
+        assert_eq!(window.result_preview_width.unwrap().0, 1);
         let button = |pressed| egui::Event::PointerButton {
             pos: point,
             button: egui::PointerButton::Primary,
@@ -1571,7 +1609,7 @@ mod tests {
         let (actions, _) = render(&mut window, 0.7, vec![button(false)]);
         assert_eq!(actions.open.unwrap().start, 7);
         window.begin();
-        assert!(window.result_widths.is_none());
+        assert!(window.result_preview_width.is_none());
     }
 
     #[test]

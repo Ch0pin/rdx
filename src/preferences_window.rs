@@ -6,6 +6,38 @@ pub fn viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("rdx_preferences")
 }
 
+/// Both controls edit the same setting and expose the same platform/worker limits.
+pub(crate) fn fallback_selector(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    selected: &mut rdx::alternate_source::FallbackEngine,
+    busy: bool,
+) -> egui::Response {
+    ui.add_enabled_ui(!busy, |ui| {
+        egui::ComboBox::from_id_salt(id)
+            .width(105.0)
+            .selected_text(selected.label())
+            .show_ui(ui, |ui| {
+                for engine in rdx::alternate_source::FallbackEngine::ALL {
+                    let supported = !engine.enabled() || cfg!(any(target_os = "macos", target_os = "linux"));
+                    ui.add_enabled_ui(supported, |ui| {
+                        ui.selectable_value(selected, engine, engine.label())
+                    }).inner.on_disabled_hover_text(rdx::alternate_source::availability_for(engine));
+                }
+            }).response
+            .on_hover_ui(|ui| {
+                ui.set_max_width(400.0);
+                ui.strong("Fallback decompiler · native engine runs first");
+                ui.label(rdx::alternate_source::availability_for(*selected));
+                ui.label("Tries the selected decompiler for failed methods while browsing classes. Each attempt stops after 30 seconds.");
+                if let Some(path) = rdx::alternate_source::helper_path_for(*selected) {
+                    ui.small(format!("Decompiler executable: {}", path.display()));
+                }
+            })
+            .on_disabled_hover_text("Fallback decompiler is available when the current loading operation finishes.")
+    }).inner
+}
+
 #[derive(Default, PartialEq, Eq, Clone, Copy)]
 enum Tab {
     #[default]
@@ -26,7 +58,7 @@ pub struct Controls<'a> {
     pub theme: &'a mut CodeTheme,
     pub font: &'a mut CodeFont,
     pub font_size: &'a mut f32,
-    pub fallback: &'a mut bool,
+    pub fallback: &'a mut rdx::alternate_source::FallbackEngine,
     pub workers: &'a mut usize,
     pub tabs_auto_hide: &'a mut bool,
     pub menu_auto_hide: &'a mut bool,
@@ -151,15 +183,10 @@ impl PreferencesWindow {
                     Tab::Decompilation => {
                         ui.heading("Decompilation");
                         ui.add_space(12.0);
-                        ui.add_enabled(!controls.busy, egui::Checkbox::new(controls.fallback, "Androguard fallback"))
-                            .on_hover_ui(|ui| {
-                                ui.set_max_width(400.0);
-                                ui.label(rdx::alternate_source::availability());
-                                ui.label("Automatically tries Androguard for failed methods while browsing classes. Each attempt stops after 30 seconds.");
-                                if let Some(path) = rdx::alternate_source::helper_path() {
-                                    ui.small(format!("Decompiler executable: {}", path.display()));
-                                }
-                            });
+                        ui.horizontal(|ui| {
+                            ui.label("Fallback decompiler");
+                            fallback_selector(ui, "preferences_fallback_decompiler", controls.fallback, controls.busy);
+                        });
                         ui.weak("Changing fallback refreshes the current class.");
                         if controls.busy {
                             ui.weak("Available when the current loading operation finishes.");

@@ -17,6 +17,12 @@ import package_macos
 import package_release
 
 
+RADGUARD_BACKEND = 'radguard-6535e121a5923b54111619001de7f25872575895-rdx1'
+
+def completed(command, **kwargs):
+    backend = RADGUARD_BACKEND if 'rdx-radguard-helper' in str(command[0]) else EXPECTED_BACKEND
+    return subprocess.CompletedProcess(command, 0, stdout=backend + '\n')
+
 EXPECTED_BACKEND = 'androguard-f7fa4a4853d957ebc3c54355d128a3835ef5ae22-rdx2'
 
 
@@ -46,6 +52,10 @@ class PackagingTests(unittest.TestCase):
             'third_party/androguard/dependencies/dep/LICENSE': 'Dependency notice',
             'third_party/androguard/mpl-source/colored/src/lib.rs': '// corresponding source',
         }
+        for name, content in list(fixtures.items()):
+            if 'androguard' in name and 'mpl-source' not in name:
+                fixtures[name.replace('androguard', 'radguard')] = content
+        fixtures['third_party/radguard/method-api.patch'] = 'visibility-only API patch'
         for name, content in fixtures.items():
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -55,20 +65,26 @@ class PackagingTests(unittest.TestCase):
         self.helper = self.root / 'tools/androguard-helper/target/release/rdx-androguard-helper'
         self.helper.parent.mkdir(parents=True)
         self.helper.write_bytes(b'helper')
+        verifier = Path(__file__).resolve().parents[2] / 'tools/radguard-helper/package.py'
+        shutil.copy2(verifier, self.root / 'tools/radguard-helper/package.py')
+        self.radguard_helper = self.root / 'target/release/rdx-radguard-helper'
+        self.radguard_helper.parent.mkdir(parents=True)
+        self.radguard_helper.write_bytes(b'radguard helper')
 
     def release(self, platform, helper=None):
         args = ['package_release.py', '--platform', platform, '--binary-dir', str(self.binary), '--tag', 'v0.8.0']
         if helper is not None:
             args += ['--helper', str(helper)]
-        with mock.patch.object(package_release, 'ROOT', self.root), mock.patch.object(sys, 'argv', args), mock.patch.object(package_macos.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout=EXPECTED_BACKEND + '\n')):
+        with mock.patch.object(package_release, 'ROOT', self.root), mock.patch.object(sys, 'argv', args), mock.patch.object(package_macos.subprocess, 'run', side_effect=completed):
             package_release.main()
 
     def test_macos_default_helper_notices_plugins_and_signing_order(self):
         output = self.root / 'isolated/RDX.app'
-        with mock.patch.object(package_macos.subprocess, 'check_output', return_value='arm64\n'), mock.patch.object(package_macos.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout=EXPECTED_BACKEND + '\n')) as run:
+        with mock.patch.object(package_macos.subprocess, 'check_output', return_value='arm64\n'), mock.patch.object(package_macos.subprocess, 'run', side_effect=completed) as run:
             package_macos.package_app(self.binary, output, root=self.root)
         executable = output / 'Contents/MacOS'
         self.assertEqual((executable / package_macos.HELPER).read_bytes(), b'helper')
+        self.assertEqual((executable / package_macos.RADGUARD_HELPER).read_bytes(), b'radguard helper')
         self.assertEqual((executable / 'rdx-source-stats').read_bytes(), b'rdx-source-stats')
         resources = output / 'Contents/Resources'
         self.assertTrue((resources / 'third_party/androguard/mpl-source/colored/src/lib.rs').is_file())
@@ -101,7 +117,7 @@ class PackagingTests(unittest.TestCase):
         other.parent.mkdir()
         other.write_bytes(b'other target')
         output = self.root / 'cross/RDX.app'
-        with mock.patch.object(package_macos.subprocess, 'check_output', side_effect=['arm64\n', 'arm64\n', 'x86_64\n']), mock.patch.object(package_macos.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout=EXPECTED_BACKEND + '\n')):
+        with mock.patch.object(package_macos.subprocess, 'check_output', side_effect=['arm64\n', 'arm64\n', 'x86_64\n', 'arm64\n']), mock.patch.object(package_macos.subprocess, 'run', side_effect=completed):
             with self.assertRaisesRegex(SystemExit, 'architecture mismatch'):
                 package_macos.package_app(self.binary, output, other, root=self.root)
         self.assertFalse(output.exists())
@@ -113,7 +129,7 @@ class PackagingTests(unittest.TestCase):
                 package_macos.package_app(self.binary, output, root=self.root)
         self.assertFalse(output.exists())
         lock = self.root / 'tools/androguard-helper/Cargo.lock'
-        with mock.patch.object(package_macos.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout=EXPECTED_BACKEND + '\n')):
+        with mock.patch.object(package_macos.subprocess, 'run', side_effect=completed):
             lock.write_text('unreviewed lock')
             with self.assertRaisesRegex(SystemExit, 'Cargo.lock changed'):
                 package_macos.resolve_helper(self.root)
@@ -121,6 +137,20 @@ class PackagingTests(unittest.TestCase):
             (self.root / 'tools/androguard-helper/vendor/dep/src/lib.rs').write_text('modified source')
             with self.assertRaisesRegex(SystemExit, 'vendored source changed'):
                 package_macos.resolve_helper(self.root)
+
+    def test_radguard_backend_and_source_provenance_must_match(self):
+        with mock.patch.object(package_macos.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='different-backend')):
+            with self.assertRaisesRegex(SystemExit, 'backend/version does not match'):
+                package_macos.resolve_radguard_helper(self.root)
+        lock = self.root / 'tools/radguard-helper/Cargo.lock'
+        with mock.patch.object(package_macos.subprocess, 'run', side_effect=completed):
+            lock.write_text('unreviewed lock')
+            with self.assertRaisesRegex(SystemExit, 'Cargo.lock changed'):
+                package_macos.resolve_radguard_helper(self.root)
+            lock.write_text('audited lock')
+            (self.root / 'tools/radguard-helper/vendor/dep/src/lib.rs').write_text('modified source')
+            with self.assertRaisesRegex(SystemExit, 'vendored source changed'):
+                package_macos.resolve_radguard_helper(self.root)
 
     def test_linux_archive_has_explicit_helper_and_required_notices(self):
         explicit = self.root / 'matching-linux-target/helper'
@@ -132,10 +162,19 @@ class PackagingTests(unittest.TestCase):
             prefix = 'rdx-v0.8.0-linux-x86_64/'
             self.assertEqual(archive.extractfile(prefix + package_macos.HELPER).read(), b'linux helper')
             self.assertIn(prefix + 'rdx-source-stats', archive.getnames())
+            self.assertEqual(archive.extractfile(prefix + package_macos.RADGUARD_HELPER).read(), b'radguard helper')
             self.assertIn(prefix + 'third_party/androguard/mpl-source/colored/src/lib.rs', archive.getnames())
             self.assertIn(prefix + 'plugins/example/main.py', archive.getnames())
             self.assertNotIn(prefix + 'plugins/example/tests/private-test.py', archive.getnames())
         self.assertTrue(path.with_name(path.name + '.sha256').is_file())
+
+    def test_missing_radguard_fails_before_touching_existing_bundle(self):
+        self.radguard_helper.unlink()
+        output = self.root / 'isolated/RDX.app'
+        with mock.patch.object(package_macos.subprocess, 'run', side_effect=completed):
+            with self.assertRaisesRegex(SystemExit, 'Required RadGuard release helper is missing'):
+                package_macos.package_app(self.binary, output, root=self.root)
+        self.assertFalse(output.exists())
 
     def test_windows_archive_stays_native_only(self):
         self.helper.unlink()

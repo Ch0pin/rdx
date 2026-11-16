@@ -26,15 +26,16 @@ To package the macOS app after building (Python 3.11 or newer):
 
 ```sh
 cargo build --release --locked --manifest-path "$PWD/tools/androguard-helper/Cargo.toml"
+cargo build --release --locked --manifest-path "$PWD/tools/radguard-helper/Cargo.toml" --target-dir "$PWD/target"
 python3 scripts/package_macos.py
 open target/RDX.app
 ```
 
-The macOS package includes the Androguard helper and its notices. Enable
-**View → Preferences… → Decompilation → Androguard fallback** to inspect unverified alternate output
+The macOS package includes the Androguard and RadGuard helpers and their notices. Choose
+**View → Preferences… → Decompilation → Fallback decompiler → Androguard** or **RadGuard** to inspect unverified alternate output
 for methods the native engine could not reconstruct. Expand **Original DEX**
 above a reconstructed method to see its diagnostics and original instructions.
-Linux release archives include the same optional helper; Windows fallback is
+The dropdown also offers **None** to use native source only. Linux release archives include both optional helpers; Windows fallback is
 currently unavailable.
 
 ## Headless commands

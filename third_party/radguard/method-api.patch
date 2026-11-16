@@ -1,0 +1,11 @@
+--- upstream/src/decompiler.rs
++++ vendor/radguard/src/decompiler.rs
+@@ -380,7 +380,7 @@
+         Ok(())
+     }
+ 
+-    fn write_method(
++    pub fn write_method(
+         &self,
+         mut output: SourceOutput,
+         class_descriptor: &str,

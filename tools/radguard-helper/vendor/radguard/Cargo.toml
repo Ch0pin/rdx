@@ -1,0 +1,22 @@
+[package]
+name = "radguard"
+version = "0.1.4"
+edition = "2024"
+
+[lib]
+name = "radguard"
+path = "src/lib.rs"
+
+[[bin]]
+name = "radguard"
+path = "src/main.rs"
+
+[dependencies]
+libdeflater = "1.26.1"
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

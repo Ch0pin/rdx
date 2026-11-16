@@ -1,0 +1,19 @@
+[package]
+name = "rdx-radguard-helper"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Separate build: ordinary RDX builds never link this backend.
+[workspace]
+exclude = ["vendor/radguard"]
+
+[dependencies]
+radguard = { path = "vendor/radguard" }
+serde_json = "1"
+anyhow = "1"
+
+[profile.release]
+strip = true
+debug = 0

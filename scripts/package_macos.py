@@ -11,6 +11,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = 'rdx-androguard-helper'
+RADGUARD_HELPER = 'rdx-radguard-helper'
 
 
 def resolve_helper(root, explicit=None):
@@ -32,11 +33,31 @@ def resolve_helper(root, explicit=None):
     return helper.resolve()
 
 
-def package_app(binary_dir, output, helper=None, root=ROOT):
+def resolve_radguard_helper(root, explicit=None):
+    helper = Path(explicit) if explicit is not None else root / 'target/release' / RADGUARD_HELPER
+    if not helper.is_file():
+        raise SystemExit(f'Required RadGuard release helper is missing: {helper}. Build with cargo build --release --locked --manifest-path {root / "tools/radguard-helper/Cargo.toml"} --target-dir {root / "target"}, or supply --radguard-helper with the matching target binary.')
+    notices = root / 'third_party/radguard'
+    for required in ('LICENSE', 'README.md', 'dependency-audit.json', 'vendored-source-audit.json', 'dependencies', 'method-api.patch'):
+        if not (notices / required).exists():
+            raise SystemExit(f'Required RadGuard notice/source artifact is missing: {notices / required}')
+    verifier_path = root / 'tools/radguard-helper/package.py'
+    spec = importlib.util.spec_from_file_location('rdx_radguard_package_verifier', verifier_path)
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    try:
+        verifier.verify_helper(helper, root=root)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SystemExit(f'Cannot verify matching-target RadGuard helper {helper}: {error}') from error
+    return helper.resolve()
+
+
+def package_app(binary_dir, output, helper=None, root=ROOT, radguard_helper=None):
     """Preflight everything before touching the destination; return its app path."""
     binary_dir = Path(binary_dir).resolve()
     helper = resolve_helper(root, helper)
-    binaries = [binary_dir / name for name in ('rdx', 'rdx-source-stats')] + [helper]
+    radguard_helper = resolve_radguard_helper(root, radguard_helper)
+    binaries = [binary_dir / name for name in ('rdx', 'rdx-source-stats')] + [helper, radguard_helper]
     for source in binaries:
         if not source.is_file():
             raise SystemExit(f'Release binary is missing: {source}. Run cargo build --release --bins first.')
@@ -53,7 +74,7 @@ def package_app(binary_dir, output, helper=None, root=ROOT):
     executable_dir.mkdir(parents=True, exist_ok=True)
     resources.mkdir(parents=True, exist_ok=True)
     for source in binaries:
-        name = HELPER if source == helper else source.name
+        name = HELPER if source == helper else RADGUARD_HELPER if source == radguard_helper else source.name
         temporary = executable_dir / (name + '.new')
         shutil.copy2(source, temporary)
         os.replace(temporary, executable_dir / name)
@@ -78,7 +99,7 @@ def package_app(binary_dir, output, helper=None, root=ROOT):
     with (bundle / 'Info.plist').open('wb') as file:
         plistlib.dump(info, file)
     # Sign nested executables explicitly before sealing the enclosing bundle.
-    for name in ('rdx', 'rdx-source-stats', HELPER):
+    for name in ('rdx', 'rdx-source-stats', HELPER, RADGUARD_HELPER):
         subprocess.run(['codesign', '--force', '--sign', '-', str(executable_dir / name)], check=True)
     subprocess.run(['codesign', '--force', '--sign', '-', str(output)], check=True)
     subprocess.run(['codesign', '--verify', '--deep', '--strict', str(output)], check=True)
@@ -90,11 +111,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary-dir', type=Path, default=ROOT / 'target/release')
     parser.add_argument('--helper', type=Path, help='Matching release helper; defaults to the local separate helper build')
+    parser.add_argument('--radguard-helper', type=Path, help='Matching RadGuard release helper')
     parser.add_argument('--output', type=Path, default=ROOT / 'target/RDX.app')
     args = parser.parse_args()
     if sys.platform != 'darwin':
         raise SystemExit('Run this packaging script on macOS.')
-    app = package_app(args.binary_dir, args.output, args.helper)
+    app = package_app(args.binary_dir, args.output, args.helper, radguard_helper=args.radguard_helper)
     print(f'Packaged {app}')
 
 

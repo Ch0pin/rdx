@@ -630,6 +630,31 @@ mod tests {
         group.folds[dex].expanded = true;
         assert!(group.display(&source).contains(original));
     }
+    #[test]
+    fn radguard_original_dex_folds_below_visible_warning_and_above_reconstruction() {
+        use rdx::alternate_source::{ORIGINAL_DEX_BEGIN, ORIGINAL_DEX_END, RADGUARD_WARNING};
+        let original = ".method sample.Café.a()V // access=0x1\n    // @kotlin.Metadata(\"fake\")\n    return-void\n.end method\n";
+        let source = format!(
+            "import kotlin.Metadata;\nimport java.util.List;\n// {RADGUARD_WARNING}\n{ORIGINAL_DEX_BEGIN}{}\n{original}{ORIGINAL_DEX_END}\nvoid a() {{ broken(); }}\n",
+            original.len()
+        );
+        let mut group = MetadataFolds::detect(&source, "java").unwrap();
+        let dex = group
+            .folds
+            .iter()
+            .position(|fold| matches!(fold.kind, FoldKind::OriginalDex))
+            .unwrap();
+        assert!(group.folds[dex].collapsed());
+        let display = group.display(&source);
+        assert!(display.contains(&format!("// {RADGUARD_WARNING}\nOriginal DEX\nvoid a()")));
+        assert!(!display.contains("return-void"));
+        let method = source[..source.find("void a()").unwrap()].chars().count();
+        let displayed = display[..display.find("void a()").unwrap()].chars().count();
+        assert_eq!(group.source_to_display(method), displayed);
+        assert_eq!(group.display_to_source(displayed), Some(method));
+        group.folds[dex].expanded = true;
+        assert!(group.display(&source).contains(original));
+    }
 
     #[test]
     fn multiple_original_methods_use_exact_lengths_and_nonoverlapping_folds() {

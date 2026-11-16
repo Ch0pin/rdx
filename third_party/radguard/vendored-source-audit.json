@@ -1,0 +1,94 @@
+[
+  {
+    "component": "radguard",
+    "repository": "https://github.com/MG1937/radguard",
+    "revision": "6535e121a5923b54111619001de7f25872575895",
+    "files": [
+      {
+        "path": "Cargo.toml",
+        "sha256": "87b0f5c440e79925a0f753dcade0fbe8c8ce86e2d0df006228080b70414c02c1",
+        "upstream_sha256": "87b0f5c440e79925a0f753dcade0fbe8c8ce86e2d0df006228080b70414c02c1"
+      },
+      {
+        "path": "LICENSE",
+        "sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1",
+        "upstream_sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1"
+      },
+      {
+        "path": "src/analysis.rs",
+        "sha256": "b73bfec5e4735fc258e87ee4c1892cfdcf395091b5f74c05dc7d4595d3cf9251",
+        "upstream_sha256": "b73bfec5e4735fc258e87ee4c1892cfdcf395091b5f74c05dc7d4595d3cf9251"
+      },
+      {
+        "path": "src/cli.rs",
+        "sha256": "4d66d875d00402755c36996ceb7934c742366ef4ca5debaf12e3bd08b3ad9512",
+        "upstream_sha256": "4d66d875d00402755c36996ceb7934c742366ef4ca5debaf12e3bd08b3ad9512"
+      },
+      {
+        "path": "src/control_flow.rs",
+        "sha256": "724cb23be5fc06ec0569d9d066b025133761c2be2d2652f603a522e3d9510212",
+        "upstream_sha256": "724cb23be5fc06ec0569d9d066b025133761c2be2d2652f603a522e3d9510212"
+      },
+      {
+        "path": "src/dataflow.rs",
+        "sha256": "1a7c5595228f45baabc8f75a3952b41d3856c1731a94bd763198a2157a67ea25",
+        "upstream_sha256": "1a7c5595228f45baabc8f75a3952b41d3856c1731a94bd763198a2157a67ea25"
+      },
+      {
+        "path": "src/decompiler.rs",
+        "sha256": "404bc2aac128c106166eb950758dbbca2ba5147a368401259c5fd9e34feab740",
+        "upstream_sha256": "61ea51df4e993f23c5879b0bc252af317cf14411a8b0df6d120c4b98699d91cd"
+      },
+      {
+        "path": "src/dex/instruction.rs",
+        "sha256": "bf9c30500c0e1af65bbf117b4b753415f7fe05d3309a75f6bd5ff4394b9b4e11",
+        "upstream_sha256": "bf9c30500c0e1af65bbf117b4b753415f7fe05d3309a75f6bd5ff4394b9b4e11"
+      },
+      {
+        "path": "src/dex/mod.rs",
+        "sha256": "288eeb6c756115cbfe13150423c5640c4537618e57a21fa2e17b6cfc47cb7734",
+        "upstream_sha256": "288eeb6c756115cbfe13150423c5640c4537618e57a21fa2e17b6cfc47cb7734"
+      },
+      {
+        "path": "src/error.rs",
+        "sha256": "b3c0ca91a6abee3a6213a2c3fe118c6b8e13069210f27928e5e28bc7aa319769",
+        "upstream_sha256": "b3c0ca91a6abee3a6213a2c3fe118c6b8e13069210f27928e5e28bc7aa319769"
+      },
+      {
+        "path": "src/graph.rs",
+        "sha256": "27abac8067fe2d6fdeaebd698324952dc303f444ca8e7dbcaba6691a817b1b17",
+        "upstream_sha256": "27abac8067fe2d6fdeaebd698324952dc303f444ca8e7dbcaba6691a817b1b17"
+      },
+      {
+        "path": "src/ir/mod.rs",
+        "sha256": "16209d80028d021028642e1d7fcfbba29433aaf8716ecdb1985db485cba32fdf",
+        "upstream_sha256": "16209d80028d021028642e1d7fcfbba29433aaf8716ecdb1985db485cba32fdf"
+      },
+      {
+        "path": "src/ir/opcode.rs",
+        "sha256": "a743c8d94551c3f9e98a472dd52a096fcfa2e9044b2bc2a115ff58bae3636b7b",
+        "upstream_sha256": "a743c8d94551c3f9e98a472dd52a096fcfa2e9044b2bc2a115ff58bae3636b7b"
+      },
+      {
+        "path": "src/lib.rs",
+        "sha256": "e89e13132e3a5fa26cb0765c0740deda7383c3127058635e1edfd166b6a7abe1",
+        "upstream_sha256": "e89e13132e3a5fa26cb0765c0740deda7383c3127058635e1edfd166b6a7abe1"
+      },
+      {
+        "path": "src/main.rs",
+        "sha256": "3c81664f96732d792ada203686a1e3b862cfd474de7abd2c5169f97081b73213",
+        "upstream_sha256": "3c81664f96732d792ada203686a1e3b862cfd474de7abd2c5169f97081b73213"
+      },
+      {
+        "path": "src/types.rs",
+        "sha256": "fcb13ea2dc1fe05738a9f93aad5746456bf39052f7b0c81d5402063b7d338cbb",
+        "upstream_sha256": "fcb13ea2dc1fe05738a9f93aad5746456bf39052f7b0c81d5402063b7d338cbb"
+      },
+      {
+        "path": "src/writer.rs",
+        "sha256": "127931aa660e20f704b871e796a9f774642bb904a5b7df5d7474863ca11d151c",
+        "upstream_sha256": "127931aa660e20f704b871e796a9f774642bb904a5b7df5d7474863ca11d151c"
+      }
+    ]
+  }
+]

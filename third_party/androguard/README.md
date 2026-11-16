@@ -9,7 +9,7 @@ The separate optional helper includes Rust sources from:
 | https://github.com/androguard/dex-parser | 30bde726dd30a0d8c442ea7006666da2ef72b9bd | Apache-2.0 |
 | https://github.com/androguard/apk-parser | 95ec9b00b4e2e30d16ac98c09868e5d6b58d3fdb | Apache-2.0 (repository LICENSE) |
 
-Vendored source is in `/Users/ch0pin/Desktop/Git-Projects/rdx/tools/androguard-helper/vendor`. Each repository license is preserved there; the Apache license is also included here. Upstream authors and source-file copyright notices remain intact. No radguard code or dependency is used.
+Vendored source is in `/Users/ch0pin/Desktop/Git-Projects/rdx/tools/androguard-helper/vendor`. Each repository license is preserved there; the Apache license is also included here. Upstream authors and source-file copyright notices remain intact. The Androguard helper is independent of the separately packaged RadGuard helper.
 
 The upstream ASC fast path adapts algorithms by **WeiMin Cheng (MG1937)** and **Zhihan Lin (0chencc)**, *Droid ASC: R8 Compiler Optimization as a DeCompiler Primitive*, https://github.com/MG1937/ASC (Apache-2.0). Preserve this acknowledgement when redistributing the optional helper.
 

@@ -293,8 +293,17 @@ pub fn relocate_copied_source_range(
             // Previous emitted shape: detail comments preceded the warning.
             displayed[..marker].rfind(&wrapper)?
         } else {
-            let warning = format!("// {}\n", crate::alternate_source::UNVERIFIED_WARNING);
-            displayed[..marker].strip_suffix(&warning)?.len()
+            let line = displayed[..marker]
+                .strip_suffix('\n')?
+                .rsplit('\n')
+                .next()?;
+            if !line
+                .strip_prefix("// ")
+                .is_some_and(crate::alternate_source::is_unverified_warning)
+            {
+                return None;
+            }
+            displayed[..marker].len() - line.len() - 1
         };
         if replacement > 0 && displayed.as_bytes()[replacement - 1] != b'\n' {
             return None;
@@ -404,9 +413,9 @@ impl NativeEngine {
         limits: crate::load_limits::LoadLimits,
     ) -> Result<Project> {
         self.load_limits = limits;
-        let alternate_enabled = self.alternate_source.enabled();
+        let alternate_engine = self.alternate_source.engine();
         self.alternate_source = Default::default();
-        self.alternate_source.set_enabled(alternate_enabled);
+        self.alternate_source.set_engine(alternate_engine);
         self.input = None;
         self.prepared = None;
         self.native = NativeDexEngine::default();
@@ -659,8 +668,9 @@ impl NativeEngine {
             !cancel.load(std::sync::atomic::Ordering::Relaxed),
             "CANCELLED"
         );
-        let key = if self.alternate_source.enabled() {
-            format!("{class}\0alternate=true")
+        let alternate_engine = self.alternate_source.engine();
+        let key = if alternate_engine.enabled() {
+            format!("{class}\0alternate={}", alternate_engine.backend())
         } else {
             class.to_owned()
         };
@@ -669,13 +679,13 @@ impl NativeEngine {
         }
         let mut cacheable = true;
         let mut code = SharedCode::from(
-            if !self.alternate_source.enabled()
+            if !alternate_engine.enabled()
                 || class.starts_with("dex://")
                 || class.starts_with(crate::resource_table::PREFIX)
             {
                 self.render_with_metadata(class)?
             } else {
-                let (code, coverage) = self.decompile_class_source_report(class, cancel)?;
+                let (code, coverage) = self.class_source_report(class, cancel, alternate_engine)?;
                 cacheable = coverage["alternate"]["status"]
                     .as_str()
                     .is_none_or(|status| {
@@ -720,11 +730,17 @@ impl NativeEngine {
     pub fn set_alternate_source_enabled(&self, enabled: bool) {
         self.alternate_source.set_enabled(enabled);
     }
+    pub fn set_alternate_source_engine(&self, engine: crate::alternate_source::FallbackEngine) {
+        self.alternate_source.set_engine(engine);
+    }
+    pub fn alternate_source_engine(&self) -> crate::alternate_source::FallbackEngine {
+        self.alternate_source.engine()
+    }
     pub fn alternate_source_enabled(&self) -> bool {
         self.alternate_source.enabled()
     }
     /// Search-hit metadata keeps the native document's hash and offsets. The UI
-    /// exposes an explicit rebuild action to request alternate browsing source.
+    /// opens the result under the selected browsing policy, preserving exact native spans.
     pub fn native_source_view(&self) -> Self {
         let mut view = self.clone();
         view.alternate_source = Default::default();
@@ -782,7 +798,7 @@ impl NativeEngine {
         class: &str,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(DecompiledCode, serde_json::Value)> {
-        self.class_source_report(class, cancel, true)
+        self.class_source_report(class, cancel, self.alternate_source.engine())
     }
     /// Bulk export/index path: never starts the optional helper.
     pub fn decompile_native_class_source_report(
@@ -790,13 +806,13 @@ impl NativeEngine {
         class: &str,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(DecompiledCode, serde_json::Value)> {
-        self.class_source_report(class, cancel, false)
+        self.class_source_report(class, cancel, crate::alternate_source::FallbackEngine::None)
     }
     fn class_source_report(
         &mut self,
         class: &str,
         cancel: &std::sync::atomic::AtomicBool,
-        allow_alternate: bool,
+        alternate_engine: crate::alternate_source::FallbackEngine,
     ) -> Result<(DecompiledCode, serde_json::Value)> {
         let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
         let (mut code, mut coverage) = self.native.render_reported(class, &cancelled)?;
@@ -804,11 +820,12 @@ impl NativeEngine {
         self.resources
             .decorate_java(&mut code, &self.native.shared_classes());
         crate::source_coverage::refresh_offsets(&mut coverage, &code);
-        if allow_alternate
+        if alternate_engine.enabled()
             && let (Some(input), Some(metadata)) = (self.input.as_deref(), self.native.class(class))
         {
             self.alternate_source.apply(
                 crate::alternate_source::ClassInput {
+                    engine: alternate_engine,
                     input,
                     container: self.prepared.as_deref(),
                     owner: class,
@@ -844,6 +861,7 @@ impl NativeEngine {
             !cancel.load(std::sync::atomic::Ordering::Relaxed),
             "CANCELLED"
         );
+        let alternate_engine = self.alternate_source.engine();
         let normalized = crate::method_lookup::normalize(id)?;
         let id = normalized.as_str();
         let owner = crate::method_lookup::owner(id)?;
@@ -883,6 +901,7 @@ impl NativeEngine {
                 let mut coverage = serde_json::json!({"counts":{"dex-fallback":1},"methods":[{"method_id":id,"status":"dex-fallback","reason":reason,"declaration_offset":declaration.map(|d| serde_json::json!({"start":d.start,"end":d.end}))}]});
                 self.alternate_source.apply(
                     crate::alternate_source::ClassInput {
+                        engine: alternate_engine,
                         input,
                         container: self.prepared.as_deref(),
                         owner,
@@ -913,7 +932,11 @@ impl NativeEngine {
         Ok(MethodSource {
             code,
             format: if alternate {
-                "androguard-java"
+                if alternate_engine == crate::alternate_source::FallbackEngine::RadGuard {
+                    "radguard-java"
+                } else {
+                    "androguard-java"
+                }
             } else if format == MethodSourceFormat::Dex || fallback.is_some() {
                 "rdx-dex"
             } else {
@@ -1143,9 +1166,7 @@ impl NativeEngine {
         let position = if let Some(position) = position {
             position
         } else if self.alternate_source.enabled()
-            && code
-                .source
-                .contains(crate::alternate_source::UNVERIFIED_WARNING)
+            && crate::alternate_source::contains_unverified(&code.source)
         {
             let native = self.render_with_metadata(&owner)?;
             native

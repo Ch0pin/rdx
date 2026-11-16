@@ -64,4 +64,17 @@ jobs:
           "$helper" tests/fixtures/hello.dex sample.Hello > helper-smoke.json
           python -c "import json; d=json.load(open('helper-smoke.json')); assert d['class']=='sample.Hello'; assert d['methods'][0]['id']=='sample.Hello.answer()I'; assert 'return 42;' in d['methods'][0]['java']"
           RDX_ANDROGUARD_HELPER="$helper" cargo test --locked --test androguard_real -- --ignored
+      - name: Build pinned native RadGuard helper
+        if: runner.os != 'Windows'
+        run: cargo build --locked --release --manifest-path tools/radguard-helper/Cargo.toml --target-dir target --target ${{ matrix.target }}
+      - name: Smoke test pinned RadGuard helper and real adapter
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          helper="$PWD/target/${{ matrix.target }}/release/rdx-radguard-helper"
+          "$helper" --version
+          "$helper" tests/fixtures/hello.dex sample.Hello > radguard-smoke.json
+          python -c "import json; d=json.load(open('radguard-smoke.json')); assert d['class']=='sample.Hello'; assert d['methods'][0]['id']=='sample.Hello.answer()I'; assert 'return 42;' in d['methods'][0]['java']"
+          RDX_RADGUARD_HELPER="$helper" cargo test --locked --test radguard_real -- --ignored
+          cargo test --locked --manifest-path tools/radguard-helper/Cargo.toml --target-dir target
       # Ignored corpus tests require locally supplied APKs; never publish those inputs.

@@ -15,3 +15,8 @@ In macOS application bundles, these files are in Contents/Resources/.
 The optional native Androguard helper includes separately licensed components.
 Pinned source revisions, modifications, ASC fast-path acknowledgements,
 dependency notices, and corresponding MPL source are in third_party/androguard/.
+
+Optional RadGuard helper: RadGuard by WeiMin Cheng (MG1937),
+https://github.com/MG1937/radguard, revision 6535e121a5923b54111619001de7f25872575895,
+licensed under Apache-2.0. A documented visibility-only method API patch is applied.
+Source provenance, modifications and dependency notices are in third_party/radguard.

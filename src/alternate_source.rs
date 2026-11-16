@@ -12,13 +12,78 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
 
 pub const BACKEND: &str = "androguard-f7fa4a4853d957ebc3c54355d128a3835ef5ae22-rdx2";
 pub const UNVERIFIED_WARNING: &str = "Unverified Androguard reconstruction";
+pub const RADGUARD_BACKEND: &str = "radguard-6535e121a5923b54111619001de7f25872575895-rdx1";
+pub const RADGUARD_WARNING: &str = "Unverified RadGuard reconstruction";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum FallbackEngine {
+    #[default]
+    None,
+    Androguard,
+    #[serde(rename = "radguard", alias = "rad_guard")]
+    RadGuard,
+}
+impl FallbackEngine {
+    pub const ALL: [Self; 3] = [Self::None, Self::Androguard, Self::RadGuard];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Androguard => "Androguard",
+            Self::RadGuard => "RadGuard",
+        }
+    }
+    pub fn enabled(self) -> bool {
+        self != Self::None
+    }
+    pub fn backend(self) -> &'static str {
+        match self {
+            Self::RadGuard => RADGUARD_BACKEND,
+            _ => BACKEND,
+        }
+    }
+    pub fn warning(self) -> &'static str {
+        match self {
+            Self::RadGuard => RADGUARD_WARNING,
+            _ => UNVERIFIED_WARNING,
+        }
+    }
+}
+pub fn is_unverified_warning(line: &str) -> bool {
+    [UNVERIFIED_WARNING, RADGUARD_WARNING].contains(&line)
+}
+pub fn contains_unverified(source: &str) -> bool {
+    source.lines().any(|line| {
+        line.trim()
+            .strip_prefix("// ")
+            .is_some_and(is_unverified_warning)
+    })
+}
+/// Accept the previous boolean setting while storing the engine name from now on.
+pub fn deserialize_engine<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<FallbackEngine, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Setting {
+        Legacy(bool),
+        Engine(FallbackEngine),
+    }
+    Ok(match Setting::deserialize(deserializer)? {
+        Setting::Legacy(true) => FallbackEngine::Androguard,
+        Setting::Legacy(false) => FallbackEngine::None,
+        Setting::Engine(engine) => engine,
+    })
+}
+
 pub const ORIGINAL_DEX_BEGIN: &str = "// RDX_ORIGINAL_DEX_BEGIN ";
 pub const ORIGINAL_DEX_END: &str = "// RDX_ORIGINAL_DEX_END";
 const RESULT_LIMIT: u64 = 8 * 1024 * 1024;
@@ -88,13 +153,14 @@ struct State {
 /// Clones share project lifetime, opt-in and disk cache; no alternate APK model is retained.
 #[derive(Clone, Default)]
 pub(crate) struct Session {
-    enabled: Arc<AtomicBool>,
+    selected: Arc<AtomicU8>,
     state: Arc<Mutex<State>>,
     helper: Option<PathBuf>,
     timeout: Option<Duration>,
 }
 
 pub(crate) struct ClassInput<'a> {
+    pub engine: FallbackEngine,
     pub input: &'a Path,
     pub container: Option<&'a PackageContainer>,
     pub owner: &'a str,
@@ -120,13 +186,25 @@ struct Response {
 }
 
 pub fn helper_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("RDX_ANDROGUARD_HELPER") {
+    helper_path_for(FallbackEngine::Androguard)
+}
+pub fn helper_path_for(engine: FallbackEngine) -> Option<PathBuf> {
+    if engine == FallbackEngine::None {
+        return None;
+    }
+    let variable = if engine == FallbackEngine::RadGuard {
+        "RDX_RADGUARD_HELPER"
+    } else {
+        "RDX_ANDROGUARD_HELPER"
+    };
+    if let Some(path) = std::env::var_os(variable) {
         return Some(path.into());
     }
-    let name = if cfg!(windows) {
-        "rdx-androguard-helper.exe"
-    } else {
-        "rdx-androguard-helper"
+    let name = match (engine, cfg!(windows)) {
+        (FallbackEngine::RadGuard, true) => "rdx-radguard-helper.exe",
+        (FallbackEngine::RadGuard, false) => "rdx-radguard-helper",
+        (_, true) => "rdx-androguard-helper.exe",
+        (_, false) => "rdx-androguard-helper",
     };
     std::env::current_exe()
         .ok()?
@@ -134,12 +212,23 @@ pub fn helper_path() -> Option<PathBuf> {
         .map(|path| path.join(name))
 }
 pub fn availability() -> String {
-    if !cfg!(any(target_os = "macos", target_os = "linux")) {
-        return "Androguard fallback unavailable on this platform: worker memory enforcement is unsupported".into();
+    availability_for(FallbackEngine::Androguard)
+}
+pub fn availability_for(engine: FallbackEngine) -> String {
+    if engine == FallbackEngine::None {
+        return "Native decompilation is selected".into();
     }
-    match helper_path().filter(|p| p.is_file()) {
-        Some(_) => "Androguard decompiler is available".into(),
-        None => "Androguard helper unavailable; install the optional release helper beside RDX or set RDX_ANDROGUARD_HELPER".into(),
+    let label = engine.label();
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        return format!(
+            "{label} fallback unavailable on this platform: worker memory enforcement is unsupported"
+        );
+    }
+    match helper_path_for(engine).filter(|p| p.is_file()) {
+        Some(_) => format!("{label} decompiler is available"),
+        None => {
+            format!("{label} helper unavailable; install the matching release helper beside RDX")
+        }
     }
 }
 
@@ -158,14 +247,31 @@ impl Session {
         Ok(())
     }
     pub fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Relaxed);
+        self.set_engine(if enabled {
+            FallbackEngine::Androguard
+        } else {
+            FallbackEngine::None
+        });
     }
     pub fn enabled(&self) -> bool {
-        self.enabled.load(Ordering::Relaxed)
+        self.engine().enabled()
     }
 
+    pub fn set_engine(&self, engine: FallbackEngine) {
+        self.selected.store(engine as u8, Ordering::Relaxed);
+    }
+    pub fn engine(&self) -> FallbackEngine {
+        match self.selected.load(Ordering::Relaxed) {
+            1 => FallbackEngine::Androguard,
+            2 => FallbackEngine::RadGuard,
+            _ => FallbackEngine::None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn obtain(
         &self,
+        engine: FallbackEngine,
         input: &Path,
         container: Option<&PackageContainer>,
         origin: &str,
@@ -177,12 +283,14 @@ impl Session {
             cfg!(any(target_os = "macos", target_os = "linux")),
             "alternate worker memory enforcement unsupported on this platform"
         );
+        ensure!(engine.enabled(), "alternate engine is disabled");
+        let backend = engine.backend();
         let helper = self
             .helper
             .clone()
-            .or_else(helper_path)
+            .or_else(|| helper_path_for(engine))
             .filter(|p| p.is_file())
-            .context("optional Androguard helper unavailable")?;
+            .with_context(|| format!("optional {} helper unavailable", engine.label()))?;
         let mut state = loop {
             ensure!(!cancelled(), "CANCELLED");
             match self.state.try_lock() {
@@ -231,7 +339,7 @@ impl Session {
         let key = format!(
             "{:x}",
             Sha256::digest(format!(
-                "{}\0{class}\0{BACKEND}\0default-restructure",
+                "{}\0{class}\0{backend}\0default-restructure",
                 state.identity.as_ref().unwrap().3
             ))
         );
@@ -250,7 +358,7 @@ impl Session {
         let cached = directory.join(format!("{key}.json"));
         let mut previous = Vec::new();
         if cached.is_file() {
-            let response = read_response(&cached, class)?;
+            let response = read_response_for(&cached, class, backend)?;
             if let Some(index) = state.entries.iter().position(|(id, _)| id == &key) {
                 let entry = state.entries.remove(index).unwrap();
                 state.entries.push_back(entry);
@@ -406,7 +514,7 @@ impl Session {
                 .collect::<String>()
         );
         ensure!(!cancelled(), "CANCELLED");
-        let mut response = read_response(&output, class)?;
+        let mut response = read_response_for(&output, class, backend)?;
         verify_input(input, state.identity.as_ref().unwrap(), cancelled)?;
         for method in &mut response.methods {
             if let Some(java) = &method.java
@@ -438,7 +546,7 @@ impl Session {
         if !accepted.is_empty() {
             let saved = Response {
                 protocol: 1,
-                backend: BACKEND.into(),
+                backend: backend.into(),
                 class: class.into(),
                 methods: accepted,
             };
@@ -475,13 +583,16 @@ impl Session {
         cancelled: &impl Fn() -> bool,
     ) -> Result<()> {
         let ClassInput {
+            engine,
             input,
             container,
             owner: class,
             metadata,
         } = request;
+        let backend = engine.backend();
+        let label = engine.label();
         let origin = metadata.symbols.origin.get().map_or("", String::as_str);
-        if !self.enabled() || coverage["counts"]["dex-fallback"].as_u64().unwrap_or(0) == 0 {
+        if !engine.enabled() || coverage["counts"]["dex-fallback"].as_u64().unwrap_or(0) == 0 {
             return Ok(());
         }
         ensure!(!cancelled(), "CANCELLED");
@@ -515,23 +626,25 @@ impl Session {
         if requested.is_empty() {
             return Ok(());
         }
-        let result = self.obtain(input, container, origin, class, &requested, cancelled);
+        let result = self.obtain(
+            engine, input, container, origin, class, &requested, cancelled,
+        );
         ensure!(!cancelled(), "CANCELLED");
         match result {
             Ok((response, hit, (worker_rss, combined_rss))) => {
                 let replaced = substitute(code, coverage, &response);
                 let host_rss = resident_bytes(std::process::id()).unwrap_or(0);
-                coverage["alternate"] = json!({"backend":BACKEND,"status":if replaced > 0 {"substituted"} else {"no_usable_methods"},"replaced_methods":replaced,"cache_hit":hit,"worker_peak_sampled_rss_bytes":worker_rss,"combined_peak_sampled_rss_bytes":combined_rss.max(host_rss),"host_post_substitution_rss_bytes":host_rss,"rss_sampling_ms":20});
+                coverage["alternate"] = json!({"backend":backend,"status":if replaced > 0 {"substituted"} else {"no_usable_methods"},"replaced_methods":replaced,"cache_hit":hit,"worker_peak_sampled_rss_bytes":worker_rss,"combined_peak_sampled_rss_bytes":combined_rss.max(host_rss),"host_post_substitution_rss_bytes":host_rss,"rss_sampling_ms":20});
             }
             Err(error) => {
                 coverage["alternate"] =
-                    json!({"backend":BACKEND,"status":"failed","error":format!("{error:#}")});
+                    json!({"backend":backend,"status":"failed","error":format!("{error:#}")});
             }
         }
         // Cache/measurement metadata stays out of source so the same successful
         // document has a stable hash and native offsets on cached reopening.
         let mut text = format!(
-            "// Optional Androguard: backend={BACKEND}; status={}; substituted_methods={}\n",
+            "// Optional {label}: backend={backend}; status={}; substituted_methods={}\n",
             coverage["alternate"]["status"],
             coverage["alternate"]["replaced_methods"]
                 .as_u64()
@@ -546,7 +659,7 @@ impl Session {
         }
         if let Some(error) = coverage["alternate"]["error"].as_str() {
             text.push_str(&format!(
-                "// Androguard diagnostic: {}\n",
+                "// {label} diagnostic: {}\n",
                 serde_json::to_string(&error.chars().take(1200).collect::<String>())?
             ));
         }
@@ -556,14 +669,18 @@ impl Session {
     }
 }
 
+#[cfg(test)]
 fn read_response(path: &Path, class: &str) -> Result<Response> {
+    read_response_for(path, class, BACKEND)
+}
+fn read_response_for(path: &Path, class: &str, backend: &str) -> Result<Response> {
     ensure!(
         fs::metadata(path)?.len() <= RESULT_LIMIT,
         "alternate result exceeds 8 MiB"
     );
     let response: Response = serde_json::from_reader(File::open(path)?)?;
     ensure!(
-        response.protocol == 1 && response.backend == BACKEND && response.class == class,
+        response.protocol == 1 && response.backend == backend && response.class == class,
         "alternate protocol/backend/class mismatch"
     );
     let mut ids = BTreeSet::new();
@@ -912,11 +1029,18 @@ fn substitute(code: &mut DecompiledCode, coverage: &mut Value, response: &Respon
         // Preserve exactly this original method, bounded by the existing native
         // document's method range. No whole-class DEX duplication or guessed links.
         let original = &code.source[begin..end];
+        let engine = if response.backend == RADGUARD_BACKEND {
+            FallbackEngine::RadGuard
+        } else {
+            FallbackEngine::Androguard
+        };
+        let label = engine.label();
+        let warning = engine.warning();
         let diagnostic_lines: String = diagnostics
             .iter()
             .map(|reason| {
                 format!(
-                    "// Androguard diagnostic: {}\n",
+                    "// {label} diagnostic: {}\n",
                     serde_json::to_string(reason).unwrap()
                 )
             })
@@ -929,12 +1053,12 @@ fn substitute(code: &mut DecompiledCode, coverage: &mut Value, response: &Respon
             diagnostic_lines,
         );
         let text = format!(
-            "// {UNVERIFIED_WARNING}\n{ORIGINAL_DEX_BEGIN}{}\n{payload}{ORIGINAL_DEX_END}\n{java}\n",
+            "// {warning}\n{ORIGINAL_DEX_BEGIN}{}\n{payload}{ORIGINAL_DEX_END}\n{java}\n",
             payload.len()
         );
         method["original_dex"] = json!({"method_id":alternate.id,"preserved":true,"inline_bytes":original.len(),"folded_by_default":true,"source_links":false});
         replacements.push((begin, end, text));
-        method["origin"] = json!(BACKEND);
+        method["origin"] = json!(response.backend);
         method["representation"] = json!("alternate_java_unverified");
         method["native_status"] = json!("dex-fallback");
         method["native_failure_reason"] = method["reason"].clone();
@@ -987,6 +1111,7 @@ fn substitute(code: &mut DecompiledCode, coverage: &mut Value, response: &Respon
 mod tests {
     use super::*;
     use crate::engine::{CodeDefinition, CodeLink};
+    use std::sync::atomic::AtomicBool;
 
     fn response(class: &str, methods: Vec<Method>) -> Response {
         Response {
@@ -1004,6 +1129,79 @@ mod tests {
             diagnostics: vec![],
         }
     }
+    #[test]
+    fn radguard_substitution_is_labelled_and_preserves_exact_native_diagnostics() {
+        let raw = ".method sample.A.a()V // access=0x8\n    return-void\n.end method\n";
+        let mut code = DecompiledCode {
+            source: raw.into(),
+            source_hash: String::new(),
+            links: vec![],
+            definitions: vec![],
+        };
+        let mut coverage = json!({"counts":{"dex-fallback":1},"java_complete":false,"methods":[{"method_id":"sample.A.a()V","status":"dex-fallback","reason":"native failure","declaration_offset":{"start":8}}]});
+        let mut result = response(
+            "sample.A",
+            vec![candidate("sample.A.a()V", "void a() { return; }")],
+        );
+        result.backend = RADGUARD_BACKEND.into();
+        assert_eq!(substitute(&mut code, &mut coverage, &result), 1);
+        assert!(code.source.contains(RADGUARD_WARNING));
+        assert!(code.source.contains(raw));
+        assert_eq!(coverage["methods"][0]["origin"], RADGUARD_BACKEND);
+        assert_eq!(coverage["alternate_output_verified"], false);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn engine_switch_segregates_cache_and_validates_backend_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.dex");
+        fs::write(&input, include_bytes!("../tests/fixtures/hello.dex")).unwrap();
+        let helper_exe = helper(directory.path(), "exit 1");
+        let session = Session {
+            helper: Some(helper_exe.clone()),
+            ..Session::default()
+        };
+        let requested = BTreeSet::from(["sample.Hello.answer()I".into()]);
+        for (engine, expected_hit) in [
+            (FallbackEngine::Androguard, false),
+            (FallbackEngine::RadGuard, false),
+            (FallbackEngine::Androguard, true),
+            (FallbackEngine::RadGuard, true),
+        ] {
+            session.set_engine(engine);
+            let mut response = response(
+                "sample.Hello",
+                vec![candidate(
+                    "sample.Hello.answer()I",
+                    "int answer() { return 42; }",
+                )],
+            );
+            response.backend = engine.backend().into();
+            helper(
+                directory.path(),
+                &format!(
+                    "printf '%s' '{}'",
+                    serde_json::to_string(&response).unwrap()
+                ),
+            );
+            let (response, hit, _) = session
+                .obtain(
+                    engine,
+                    &input,
+                    None,
+                    "",
+                    "sample.Hello",
+                    &requested,
+                    &|| false,
+                )
+                .unwrap();
+            assert_eq!(hit, expected_hit);
+            assert_eq!(response.backend, engine.backend());
+        }
+        assert_eq!(session.state.lock().unwrap().entries.len(), 2);
+    }
+
     #[test]
     fn exact_overload_substitution_preserves_native_text_and_navigation() {
         let good = "    public java.lang.String same(java.lang.String text) { return text; }\n";
@@ -1207,6 +1405,7 @@ mod tests {
         };
         let (first, hit, _) = session
             .obtain(
+                FallbackEngine::Androguard,
                 &input,
                 None,
                 "",
@@ -1239,6 +1438,7 @@ mod tests {
         assert!(
             session
                 .obtain(
+                    FallbackEngine::Androguard,
                     &input,
                     None,
                     "",
@@ -1252,6 +1452,7 @@ mod tests {
         assert!(
             session
                 .obtain(
+                    FallbackEngine::Androguard,
                     &input,
                     None,
                     "",
@@ -1266,6 +1467,7 @@ mod tests {
         assert!(
             session
                 .obtain(
+                    FallbackEngine::Androguard,
                     &input,
                     None,
                     "",
@@ -1297,6 +1499,7 @@ mod tests {
             assert!(
                 session
                     .obtain(
+                        FallbackEngine::Androguard,
                         &input,
                         None,
                         "",
@@ -1319,6 +1522,7 @@ mod tests {
         assert!(
             session
                 .obtain(
+                    FallbackEngine::Androguard,
                     &input,
                     None,
                     "",
@@ -1336,6 +1540,7 @@ mod tests {
         let started = Instant::now();
         let error = session
             .obtain(
+                FallbackEngine::Androguard,
                 &input,
                 None,
                 "",
@@ -1386,13 +1591,29 @@ mod tests {
         let requested = BTreeSet::from([good.clone()]);
         let began = Instant::now();
         let (_, hit, memory) = session
-            .obtain(&input, None, "", "sample.Collision", &requested, &|| false)
+            .obtain(
+                FallbackEngine::Androguard,
+                &input,
+                None,
+                "",
+                "sample.Collision",
+                &requested,
+                &|| false,
+            )
             .unwrap();
         let first = began.elapsed();
         assert!(!hit);
         let began = Instant::now();
         let (cached, hit, _) = session
-            .obtain(&input, None, "", "sample.Collision", &requested, &|| false)
+            .obtain(
+                FallbackEngine::Androguard,
+                &input,
+                None,
+                "",
+                "sample.Collision",
+                &requested,
+                &|| false,
+            )
             .unwrap();
         assert!(hit);
         assert_eq!(cached.methods.len(), 1);
@@ -1406,7 +1627,15 @@ mod tests {
         let requested = BTreeSet::from([good, bad.clone()]);
         for attempt in 0..2 {
             let (result, hit, _) = session
-                .obtain(&input, None, "", "sample.Collision", &requested, &|| false)
+                .obtain(
+                    FallbackEngine::Androguard,
+                    &input,
+                    None,
+                    "",
+                    "sample.Collision",
+                    &requested,
+                    &|| false,
+                )
                 .unwrap();
             assert_eq!(hit, attempt != 0, "nonempty unverified output is reusable");
             assert!(result.methods.iter().any(|method| {
@@ -1488,6 +1717,7 @@ mod tests {
         }
         session
             .obtain(
+                FallbackEngine::Androguard,
                 &input,
                 None,
                 "",
@@ -1508,6 +1738,7 @@ mod tests {
         assert!(
             session
                 .obtain(
+                    FallbackEngine::Androguard,
                     &input,
                     None,
                     "",

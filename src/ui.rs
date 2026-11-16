@@ -535,8 +535,8 @@ impl Tab {
 }
 
 pub struct App {
-    source_policies: std::collections::BTreeMap<String, bool>,
-    androguard_fallback: bool,
+    source_policies: std::collections::BTreeMap<String, rdx::alternate_source::FallbackEngine>,
+    alternate_fallback: rdx::alternate_source::FallbackEngine,
     render_recovery: crate::render_recovery::RenderRecovery,
     toolbar_icon: Option<egui::TextureHandle>,
     application_icon: Option<egui::TextureHandle>,
@@ -686,12 +686,12 @@ impl App {
         last_preferences.tabs_auto_hide = preferences.tabs_auto_hide;
         last_preferences.menu_auto_hide = preferences.menu_auto_hide;
         last_preferences.search_workers = preferences.search_workers;
-        last_preferences.androguard_fallback = preferences.androguard_fallback;
+        last_preferences.alternate_fallback = preferences.alternate_fallback;
         crate::ui_style::install(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
         Self {
             source_policies: Default::default(),
-            androguard_fallback: preferences.androguard_fallback,
+            alternate_fallback: preferences.alternate_fallback,
             render_recovery: Default::default(),
             toolbar_icon: None,
             application_icon: None,
@@ -853,7 +853,7 @@ impl App {
         preferences.tabs_auto_hide = self.tabs_auto_hide;
         preferences.menu_auto_hide = self.menu_auto_hide;
         preferences.search_workers = self.search_workers;
-        preferences.androguard_fallback = self.androguard_fallback;
+        preferences.alternate_fallback = self.alternate_fallback;
         if preferences == self.last_preferences {
             return;
         }
@@ -1073,9 +1073,9 @@ impl App {
             if let Target::Class(name) = &target
                 && !name.starts_with("dex://")
                 && !name.starts_with(rdx::resource_table::PREFIX)
-                && (self.androguard_fallback
-                    || self.source_policies.get(name).copied().unwrap_or(false)
-                        != self.androguard_fallback)
+                && (self.alternate_fallback.enabled()
+                    || self.source_policies.get(name).copied().unwrap_or_default()
+                        != self.alternate_fallback)
             {
                 self.decompile(name.clone(), None, ctx);
             }
@@ -1104,6 +1104,37 @@ impl App {
             ctx.request_repaint();
         });
     }
+    fn apply_fallback_change(
+        &mut self,
+        previous: rdx::alternate_source::FallbackEngine,
+        ctx: &egui::Context,
+    ) {
+        if previous != self.alternate_fallback {
+            if let Some(engine) = &self.engine {
+                engine.set_alternate_source_engine(self.alternate_fallback);
+            }
+            if let Some(snapshot) = &self.shared_project {
+                snapshot
+                    .engine()
+                    .set_alternate_source_engine(self.alternate_fallback);
+            }
+            let class = self
+                .tabs
+                .get(self.selected)
+                .and_then(|tab| match &tab.target {
+                    Target::Class(name)
+                        if !name.starts_with("dex://")
+                            && !name.starts_with(rdx::resource_table::PREFIX) =>
+                    {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                });
+            if let Some(class) = class {
+                self.decompile(class, None, ctx);
+            }
+        }
+    }
     fn refresh_selected_source_policy(&mut self, ctx: &egui::Context) {
         if self.busy || self.engine.is_none() {
             return;
@@ -1116,7 +1147,8 @@ impl App {
         };
         if !name.starts_with("dex://")
             && !name.starts_with(rdx::resource_table::PREFIX)
-            && self.source_policies.get(name).copied().unwrap_or(false) != self.androguard_fallback
+            && self.source_policies.get(name).copied().unwrap_or_default()
+                != self.alternate_fallback
         {
             self.decompile(name.clone(), None, ctx);
         }
@@ -1129,7 +1161,7 @@ impl App {
     ) -> Result<(), String> {
         let code = code.into();
         self.source_policies
-            .insert(name.clone(), self.androguard_fallback);
+            .insert(name.clone(), self.alternate_fallback);
         let target = Target::Class(name.clone());
         if let Some(index) = self.tabs.iter().position(|tab| {
             tab.target == target
@@ -1997,8 +2029,8 @@ impl App {
             self.cancelled_history = Some(pending.destination.target);
         }
         self.deferred_target = None;
-        let policy_open =
-            self.androguard_fallback && matches!(hit.origin.target, SearchTarget::Class(_));
+        let policy_open = self.alternate_fallback.enabled()
+            && matches!(hit.origin.target, SearchTarget::Class(_));
         if !policy_open && self.select_hit_in_open_view(&hit) {
             return;
         }
@@ -2073,7 +2105,8 @@ impl App {
         if let SearchTarget::Class(name) = &snapshot.target {
             // This callback receives native search snapshots, even if the user
             // changed the setting while the request was in flight.
-            self.source_policies.insert(name.clone(), false);
+            self.source_policies
+                .insert(name.clone(), rdx::alternate_source::FallbackEngine::None);
         }
         if self.select_hit_in_open_view(&hit) {
             return;
@@ -2669,7 +2702,7 @@ impl App {
                     match result {
                         Ok(snapshot) => {
                             let engine = snapshot.engine().clone();
-                            engine.set_alternate_source_enabled(self.androguard_fallback);
+                            engine.set_alternate_source_engine(self.alternate_fallback);
                             let project = snapshot.project().clone();
                             self.shared_project = Some(snapshot);
                             self.usage_index = engine.usage_index_handle();
@@ -2758,7 +2791,7 @@ impl App {
                                 if target.position == 0
                                     && let Some(tab) = self.tabs.get_mut(self.selected)
                                     && tab.text().is_some_and(|source| {
-                                        source.contains(rdx::alternate_source::UNVERIFIED_WARNING)
+                                        rdx::alternate_source::contains_unverified(source)
                                     })
                                 {
                                     tab.note = Some("Opened updated class at its start; an exact declaration position was unavailable.".into());
@@ -3785,6 +3818,7 @@ impl eframe::App for App {
             || ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| reveal.contains(p)))
             || ctx.memory(|m| m.any_popup_open());
         self.menu_hovered = show_menu;
+        let previous_fallback = self.alternate_fallback;
         if show_menu {
             egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
                 ui.add_space(3.0);
@@ -4015,6 +4049,12 @@ impl eframe::App for App {
                         {
                             self.show_mcp = true;
                         }
+                        crate::preferences_window::fallback_selector(
+                            ui,
+                            "toolbar_fallback_decompiler",
+                            &mut self.alternate_fallback,
+                            self.busy,
+                        );
                     });
                 });
                 ui.add_space(3.0);
@@ -4031,45 +4071,20 @@ impl eframe::App for App {
                     );
                 });
         }
-        let previous_fallback = self.androguard_fallback;
         self.preferences_window.show(
             ctx,
             crate::preferences_window::Controls {
                 theme: &mut self.theme,
                 font: &mut self.code_font,
                 font_size: &mut self.font_size,
-                fallback: &mut self.androguard_fallback,
+                fallback: &mut self.alternate_fallback,
                 workers: &mut self.search_workers,
                 tabs_auto_hide: &mut self.tabs_auto_hide,
                 menu_auto_hide: &mut self.menu_auto_hide,
                 busy: self.busy,
             },
         );
-        if previous_fallback != self.androguard_fallback {
-            if let Some(engine) = &self.engine {
-                engine.set_alternate_source_enabled(self.androguard_fallback);
-            }
-            if let Some(snapshot) = &self.shared_project {
-                snapshot
-                    .engine()
-                    .set_alternate_source_enabled(self.androguard_fallback);
-            }
-            let class = self
-                .tabs
-                .get(self.selected)
-                .and_then(|tab| match &tab.target {
-                    Target::Class(name)
-                        if !name.starts_with("dex://")
-                            && !name.starts_with(rdx::resource_table::PREFIX) =>
-                    {
-                        Some(name.clone())
-                    }
-                    _ => None,
-                });
-            if let Some(class) = class {
-                self.decompile(class, None, ctx);
-            }
-        }
+        self.apply_fallback_change(previous_fallback, ctx);
         if choose_file && let Some(id) = self.begin_dialog() {
             let future = rfd::AsyncFileDialog::new()
                 .add_filter(
@@ -4531,7 +4546,7 @@ fn snapshot_preferences(
     usages_keep_open: bool,
 ) -> Settings {
     Settings {
-        androguard_fallback: false,
+        alternate_fallback: rdx::alternate_source::FallbackEngine::None,
         interface_theme: match ctx.options(|options| options.theme_preference) {
             egui::ThemePreference::System => "system",
             egui::ThemePreference::Light => "light",
@@ -5066,7 +5081,7 @@ mod settings_tests {
         let (tx, rx) = mpsc::channel();
         App {
             source_policies: Default::default(),
-            androguard_fallback: false,
+            alternate_fallback: rdx::alternate_source::FallbackEngine::None,
             render_recovery: Default::default(),
             toolbar_icon: None,
             application_icon: None,
@@ -6228,7 +6243,7 @@ mod settings_tests {
         let (mut app, ctx) = (navigation_test_app(), egui::Context::default());
         app.project = Some(Arc::new(project));
         app.engine = Some(engine);
-        app.androguard_fallback = true;
+        app.alternate_fallback = rdx::alternate_source::FallbackEngine::Androguard;
         app.engine
             .as_ref()
             .unwrap()
@@ -6236,10 +6251,10 @@ mod settings_tests {
         let original_methods = regex::Regex::new(r"(?m)^\.method ").unwrap();
         for route in ["retained", "reused", "queued"] {
             if route == "reused" {
-                app.androguard_fallback = false;
+                app.alternate_fallback = rdx::alternate_source::FallbackEngine::None;
                 app.display_code(CLASS.into(), native.clone(), None)
                     .unwrap();
-                app.androguard_fallback = true;
+                app.alternate_fallback = rdx::alternate_source::FallbackEngine::Androguard;
             } else {
                 app.tabs.clear();
             }
@@ -6321,7 +6336,10 @@ mod settings_tests {
             assert!(!shown.display_text().contains("RDX_ORIGINAL_DEX_"));
             assert!(!shown.clipboard_source().contains("RDX_ORIGINAL_DEX_"));
             check_details(shown);
-            assert_eq!(app.source_policies.get(CLASS), Some(&true));
+            assert_eq!(
+                app.source_policies.get(CLASS),
+                Some(&rdx::alternate_source::FallbackEngine::Androguard)
+            );
             assert!(
                 tab.note
                     .as_deref()
@@ -6653,7 +6671,7 @@ mod settings_tests {
     #[test]
     fn late_native_search_result_is_not_marked_as_an_alternate_view() {
         let mut app = navigation_test_app();
-        app.androguard_fallback = true;
+        app.alternate_fallback = rdx::alternate_source::FallbackEngine::Androguard;
         let document = Arc::new(SearchDocument {
             target: SearchTarget::Class("sample.Hello".into()),
             name: "sample.Hello".into(),
@@ -6664,8 +6682,11 @@ mod settings_tests {
             metadata_complete: true,
         });
         app.open_hit_document(sample_hit("sample.Hello", Some("native"), 0), document);
-        assert_eq!(app.source_policies.get("sample.Hello"), Some(&false));
-        assert!(app.androguard_fallback);
+        assert_eq!(
+            app.source_policies.get("sample.Hello"),
+            Some(&rdx::alternate_source::FallbackEngine::None)
+        );
+        assert!(app.alternate_fallback.enabled());
     }
 
     #[test]
@@ -7278,6 +7299,106 @@ mod settings_tests {
         );
         assert_eq!(tab.text(), Some("// fresh\nreturn target;"));
     }
+    #[test]
+    fn toolbar_fallback_refreshes_current_class_and_shared_engine_for_each_selection() {
+        use rdx::alternate_source::FallbackEngine;
+        let ctx = egui::Context::default();
+        let mut app = navigation_test_app();
+        let snapshot = ProjectSnapshot::open(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hello.apk"),
+        )
+        .unwrap();
+        app.tx
+            .send(Event::Opened(app.generation, Ok(snapshot)))
+            .unwrap();
+        app.events(&ctx);
+        let code = app
+            .engine
+            .as_mut()
+            .unwrap()
+            .decompile_shared("sample.Hello")
+            .unwrap();
+        app.display_code("sample.Hello".into(), code, None).unwrap();
+        for selected in [
+            FallbackEngine::Androguard,
+            FallbackEngine::RadGuard,
+            FallbackEngine::None,
+        ] {
+            let previous = app.alternate_fallback;
+            app.alternate_fallback = selected;
+            app.apply_fallback_change(previous, &ctx);
+            assert!(app.busy, "changed selection must refresh current class");
+            assert_eq!(
+                app.shared_project
+                    .as_ref()
+                    .unwrap()
+                    .engine()
+                    .alternate_source_engine(),
+                selected
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while app.busy {
+                app.events(&ctx);
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert_eq!(
+                app.engine.as_ref().unwrap().alternate_source_engine(),
+                selected
+            );
+            assert_eq!(app.source_policies.get("sample.Hello"), Some(&selected));
+            assert!(
+                app.tabs[app.selected]
+                    .text()
+                    .unwrap()
+                    .contains("return 42;")
+            );
+            app.apply_fallback_change(selected, &ctx);
+            assert!(!app.busy, "unchanged selection keeps the current document");
+        }
+    }
+
+    #[test]
+    fn toolbar_fallback_fits_minimum_width_before_mcp_and_disables_when_busy() {
+        use rdx::alternate_source::FallbackEngine;
+        for selected in FallbackEngine::ALL {
+            for busy in [false, true] {
+                let ctx = egui::Context::default();
+                let mut selected = selected;
+                let _ = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0))),
+                    ..Default::default()
+                }, |ctx| {
+                    egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                            ui.separator();
+                            plain_menu_bar(ui, |ui| {
+                                for name in ["File", "View", "Search", "Tools", "Navigate"] {
+                                    ui.menu_button(name, |_| {});
+                                }
+                            });
+                            ui.separator();
+                            for icon in [Icon::Open, Icon::Reload, Icon::Back, Icon::Forward, Icon::Plugin] {
+                                icons::button(ui, icon, "toolbar action", true);
+                            }
+                            let search = icons::button(ui, Icon::Search, "Code search", true).rect;
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.checkbox(&mut false, "Autohide");
+                                let (mcp, _) = ui.allocate_exact_size(egui::vec2(62.0, 28.0), egui::Sense::click());
+                                let dropdown = crate::preferences_window::fallback_selector(ui, "toolbar_fallback_decompiler", &mut selected, busy);
+                                assert_eq!(dropdown.enabled(), !busy);
+                                assert!(dropdown.rect.right() < mcp.left());
+                                assert!(search.right() < dropdown.rect.left(), "800 px toolbar overlap: search={search:?}, dropdown={:?}", dropdown.rect);
+                                assert!(dropdown.rect.top() < 40.0, "selector wrapped below toolbar");
+                            });
+                        });
+                    });
+                });
+            }
+        }
+    }
+
     #[test]
     fn plain_menu_labels_keep_hover_feedback_and_do_not_restyle_toolbar() {
         for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {

@@ -671,10 +671,14 @@ impl CodeDocument {
         });
         if let Some(fold) = original {
             fold.expanded = false;
-            let warning = format!("// {}\n", rdx::alternate_source::UNVERIFIED_WARNING);
-            let anchor = self.source[..fold.bytes.start]
-                .rfind(&warning)
-                .unwrap_or(fold.bytes.start);
+            let anchor = [
+                rdx::alternate_source::UNVERIFIED_WARNING,
+                rdx::alternate_source::RADGUARD_WARNING,
+            ]
+            .iter()
+            .filter_map(|warning| self.source[..fold.bytes.start].rfind(&format!("// {warning}\n")))
+            .max()
+            .unwrap_or(fold.bytes.start);
             let position = self.source[..anchor].chars().count();
             self.original_search_match = Some(start..end);
             self.navigation_position = position;
@@ -880,8 +884,10 @@ impl CodeDocument {
             let mut highlighter = HighlightLines::new(syntax, palette);
             for line in LinesWithEndings::from(text) {
                 let highlighted = highlighter.highlight_line(line, set);
-                if line.trim().strip_prefix("// ")
-                    == Some(rdx::alternate_source::UNVERIFIED_WARNING)
+                if line
+                    .trim()
+                    .strip_prefix("// ")
+                    .is_some_and(rdx::alternate_source::is_unverified_warning)
                 {
                     let red = if theme.is_light() {
                         Color32::from_rgb(180, 25, 35)
@@ -3387,6 +3393,69 @@ mod tests {
             ".method sample.C.run()V // access=0x1\n    const-string \"needle\"\n.end method\n";
         let source = format!(
             "{}// {UNVERIFIED_WARNING}\n{ORIGINAL_DEX_BEGIN}{}\n{dex}{ORIGINAL_DEX_END}\n{}",
+            "// before α\n".repeat(60),
+            dex.len(),
+            "void after() {{}}\n".repeat(180),
+        );
+        let hit = source[..source.find("needle").unwrap()].chars().count();
+        let mut doc = CodeDocument::new(source, "java");
+        assert!(doc.jump_to_search_range(hit, hit + 6).unwrap());
+        let context = egui::Context::default();
+        let render = |doc: &mut CodeDocument, time, events| {
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 400.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        doc.show(ui, CodeTheme::Ocean, 14.0);
+                    });
+                },
+            )
+        };
+        render(&mut doc, 0.0, vec![]);
+        render(&mut doc, 0.1, vec![]);
+        assert!(doc.jump.is_none(), "a folded search jump is consumed once");
+        let before = doc.last_galley_pos.unwrap().y;
+        render(
+            &mut doc,
+            0.2,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(400.0, 200.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -200.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        render(&mut doc, 0.3, vec![]);
+        let after = doc.last_galley_pos.unwrap().y;
+        assert!(
+            after < before - 50.0,
+            "manual scrolling moves the code: {before} -> {after}"
+        );
+        render(&mut doc, 0.4, vec![]);
+        assert!(
+            doc.last_galley_pos.unwrap().y <= after + 1.0,
+            "later frames must not snap back"
+        );
+        assert!(doc.original_search_is_collapsed());
+        assert_eq!(doc.original_search_match(), Some(hit..hit + 6));
+    }
+    #[test]
+    fn radguard_collapsed_original_dex_search_jump_allows_manual_scrolling() {
+        use rdx::alternate_source::{ORIGINAL_DEX_BEGIN, ORIGINAL_DEX_END, RADGUARD_WARNING};
+        let dex =
+            ".method sample.C.run()V // access=0x1\n    const-string \"needle\"\n.end method\n";
+        let source = format!(
+            "{}// {RADGUARD_WARNING}\n{ORIGINAL_DEX_BEGIN}{}\n{dex}{ORIGINAL_DEX_END}\n{}",
             "// before α\n".repeat(60),
             dex.len(),
             "void after() {{}}\n".repeat(180),

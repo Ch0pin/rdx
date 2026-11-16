@@ -55,7 +55,11 @@ impl Default for SearchPreferences {
 #[serde(default)]
 pub struct Settings {
     /// Experimental isolated class fallback, used only while browsing source.
-    pub androguard_fallback: bool,
+    #[serde(
+        alias = "androguard_fallback",
+        deserialize_with = "rdx::alternate_source::deserialize_engine"
+    )]
+    pub alternate_fallback: rdx::alternate_source::FallbackEngine,
     pub interface_theme: String,
     pub code_theme: String,
     pub font_size: f32,
@@ -73,7 +77,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            androguard_fallback: false,
+            alternate_fallback: rdx::alternate_source::FallbackEngine::None,
             interface_theme: "system".into(),
             code_theme: "ocean".into(),
             font_size: 15.0,
@@ -265,6 +269,29 @@ mod tests {
     }
 
     #[test]
+    fn fallback_engine_migrates_legacy_boolean_and_preserves_named_selection() {
+        use rdx::alternate_source::FallbackEngine;
+        for (text, expected) in [
+            (
+                r#"{"androguard_fallback":true}"#,
+                FallbackEngine::Androguard,
+            ),
+            (r#"{"androguard_fallback":false}"#, FallbackEngine::None),
+            (
+                r#"{"alternate_fallback":"radguard"}"#,
+                FallbackEngine::RadGuard,
+            ),
+            ("{}", FallbackEngine::None),
+        ] {
+            let settings: Settings = serde_json::from_str(text).unwrap();
+            assert_eq!(settings.alternate_fallback, expected);
+            let saved = serde_json::to_string(&settings).unwrap();
+            assert!(!saved.contains("androguard_fallback"));
+            assert_eq!(serde_json::from_str::<Settings>(&saved).unwrap(), settings);
+        }
+    }
+
+    #[test]
     fn bundled_font_choices_persist_and_old_settings_keep_default() {
         let store = TemporaryStore::new();
         assert_eq!(store.0.load().unwrap().code_font, "default");
@@ -289,7 +316,7 @@ mod tests {
         let store = TemporaryStore::new();
         assert_eq!(store.0.load().unwrap(), Settings::default());
         let settings = Settings {
-            androguard_fallback: false,
+            alternate_fallback: rdx::alternate_source::FallbackEngine::None,
             interface_theme: "light".into(),
             code_theme: "solarized_light".into(),
             font_size: 22.0,

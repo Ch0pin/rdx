@@ -2,3 +2,9 @@
 tools/androguard-helper/vendor/** -text
 tools/androguard-helper/Cargo.lock -text
 third_party/androguard/** -text
+tools/radguard-helper/vendor/** -text -whitespace
+tools/radguard-helper/Cargo.lock -text
+third_party/radguard/** -text
+
+# Unified patch context and vendored upstream whitespace are retained verbatim.
+third_party/radguard/method-api.patch -whitespace

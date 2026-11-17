@@ -6,6 +6,36 @@ pub fn viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("rdx_preferences")
 }
 
+pub(crate) const FALLBACK_EXPLANATION: &str = "Used when RDX cannot decompile a method. The selected decompiler tries to reconstruct that method instead. None keeps the original DEX output. Alternate output is unverified.";
+
+pub(crate) fn fallback_label(ui: &mut egui::Ui) -> egui::Response {
+    ui.add(egui::Label::new("Fallback decompiler:").wrap_mode(egui::TextWrapMode::Extend))
+        .on_hover_text(FALLBACK_EXPLANATION)
+}
+
+/// Width needed by the right-hand toolbar group, including its descriptive label.
+pub(crate) fn toolbar_controls_width(ui: &egui::Ui) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let text_width = ui.fonts(|fonts| {
+        ["Fallback decompiler:", "Autohide"]
+            .into_iter()
+            .map(|label| {
+                fonts
+                    .layout_no_wrap(label.into(), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x
+            })
+            .sum::<f32>()
+    });
+    text_width
+        + 105.0
+        + 62.0
+        + ui.spacing().icon_width
+        + ui.spacing().icon_spacing
+        + 5.0 * ui.spacing().item_spacing.x
+        + 2.0 * ui.spacing().button_padding.x
+}
+
 /// Both controls edit the same setting and expose the same platform/worker limits.
 pub(crate) fn fallback_selector(
     ui: &mut egui::Ui,
@@ -27,7 +57,8 @@ pub(crate) fn fallback_selector(
             }).response
             .on_hover_ui(|ui| {
                 ui.set_max_width(400.0);
-                ui.strong("Fallback decompiler · native engine runs first");
+                ui.strong("Fallback decompiler");
+                ui.label(FALLBACK_EXPLANATION);
                 ui.label(rdx::alternate_source::availability_for(*selected));
                 ui.label("Tries the selected decompiler for failed methods while browsing classes. Each attempt stops after 30 seconds.");
                 if let Some(path) = rdx::alternate_source::helper_path_for(*selected) {
@@ -184,7 +215,7 @@ impl PreferencesWindow {
                         ui.heading("Decompilation");
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
-                            ui.label("Fallback decompiler");
+                            fallback_label(ui);
                             fallback_selector(ui, "preferences_fallback_decompiler", controls.fallback, controls.busy);
                         });
                         ui.weak("Changing fallback refreshes the current class.");

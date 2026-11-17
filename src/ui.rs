@@ -597,6 +597,7 @@ pub struct App {
     /// Requested Code search pool size; `0` is automatic.
     search_workers: usize,
     menu_hovered: bool,
+    menu_height: f32,
     tabs_hovered: bool,
     #[cfg(test)]
     tab_ui_controls: Vec<(String, egui::Rect)>,
@@ -753,6 +754,7 @@ impl App {
             menu_auto_hide: preferences.menu_auto_hide,
             search_workers: preferences.search_workers,
             menu_hovered: false,
+            menu_height: 48.0,
             tabs_hovered: false,
             #[cfg(test)]
             tab_ui_controls: Vec::new(),
@@ -3812,7 +3814,14 @@ impl eframe::App for App {
         let screen = ctx.screen_rect();
         let reveal = egui::Rect::from_min_size(
             screen.min,
-            egui::vec2(screen.width(), if self.menu_hovered { 48.0 } else { 8.0 }),
+            egui::vec2(
+                screen.width(),
+                if self.menu_hovered {
+                    self.menu_height
+                } else {
+                    8.0
+                },
+            ),
         );
         let show_menu = !self.menu_auto_hide
             || ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| reveal.contains(p)))
@@ -3820,9 +3829,9 @@ impl eframe::App for App {
         self.menu_hovered = show_menu;
         let previous_fallback = self.alternate_fallback;
         if show_menu {
-            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            let toolbar = egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
                 ui.add_space(3.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let texture = self.toolbar_icon.get_or_insert_with(|| {
                         let icon =
                             image::load_from_memory(include_bytes!("../assets/icons/rdx.png"))
@@ -4010,6 +4019,12 @@ impl eframe::App for App {
                     {
                         self.search.open_mode(SearchMode::Code);
                     }
+                    // Keep the full label and selector together on narrow windows.
+                    if ui.available_size_before_wrap().x
+                        < crate::preferences_window::toolbar_controls_width(ui)
+                    {
+                        ui.end_row();
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.checkbox(&mut self.menu_auto_hide, "Autohide");
                         let running = self.mcp_server.is_some();
@@ -4055,10 +4070,12 @@ impl eframe::App for App {
                             &mut self.alternate_fallback,
                             self.busy,
                         );
+                        crate::preferences_window::fallback_label(ui);
                     });
                 });
                 ui.add_space(3.0);
             });
+            self.menu_height = toolbar.response.rect.height();
         } else {
             egui::TopBottomPanel::top("toolbar_reveal")
                 .exact_height(5.0)
@@ -5139,6 +5156,7 @@ mod settings_tests {
             tabs_auto_hide: false,
             menu_auto_hide: false,
             menu_hovered: false,
+            menu_height: 48.0,
             tabs_hovered: false,
             #[cfg(test)]
             tab_ui_controls: Vec::new(),
@@ -7359,42 +7377,55 @@ mod settings_tests {
     }
 
     #[test]
-    fn toolbar_fallback_fits_minimum_width_before_mcp_and_disables_when_busy() {
+    fn toolbar_fallback_label_wraps_without_overlap_and_disables_when_busy() {
         use rdx::alternate_source::FallbackEngine;
-        for selected in FallbackEngine::ALL {
-            for busy in [false, true] {
-                let ctx = egui::Context::default();
-                let mut selected = selected;
-                let _ = ctx.run(egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0))),
-                    ..Default::default()
-                }, |ctx| {
-                    egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
-                            ui.separator();
-                            plain_menu_bar(ui, |ui| {
-                                for name in ["File", "View", "Search", "Tools", "Navigate"] {
-                                    ui.menu_button(name, |_| {});
+        for width in [800.0, 1200.0] {
+            for selected in FallbackEngine::ALL {
+                for busy in [false, true] {
+                    let ctx = egui::Context::default();
+                    let mut selected = selected;
+                    let _ = ctx.run(egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 500.0))),
+                        ..Default::default()
+                    }, |ctx| {
+                        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                                ui.separator();
+                                plain_menu_bar(ui, |ui| {
+                                    for name in ["File", "View", "Search", "Tools", "Navigate"] {
+                                        ui.menu_button(name, |_| {});
+                                    }
+                                });
+                                ui.separator();
+                                for icon in [Icon::Open, Icon::Reload, Icon::Back, Icon::Forward, Icon::Plugin] {
+                                    icons::button(ui, icon, "toolbar action", true);
                                 }
-                            });
-                            ui.separator();
-                            for icon in [Icon::Open, Icon::Reload, Icon::Back, Icon::Forward, Icon::Plugin] {
-                                icons::button(ui, icon, "toolbar action", true);
-                            }
-                            let search = icons::button(ui, Icon::Search, "Code search", true).rect;
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.checkbox(&mut false, "Autohide");
-                                let (mcp, _) = ui.allocate_exact_size(egui::vec2(62.0, 28.0), egui::Sense::click());
-                                let dropdown = crate::preferences_window::fallback_selector(ui, "toolbar_fallback_decompiler", &mut selected, busy);
-                                assert_eq!(dropdown.enabled(), !busy);
-                                assert!(dropdown.rect.right() < mcp.left());
-                                assert!(search.right() < dropdown.rect.left(), "800 px toolbar overlap: search={search:?}, dropdown={:?}", dropdown.rect);
-                                assert!(dropdown.rect.top() < 40.0, "selector wrapped below toolbar");
+                                let search = icons::button(ui, Icon::Search, "Code search", true).rect;
+                                if ui.available_size_before_wrap().x < crate::preferences_window::toolbar_controls_width(ui) {
+                                    ui.end_row();
+                                }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.checkbox(&mut false, "Autohide");
+                                    let (mcp, _) = ui.allocate_exact_size(egui::vec2(62.0, 28.0), egui::Sense::click());
+                                    let dropdown = crate::preferences_window::fallback_selector(ui, "toolbar_fallback_decompiler", &mut selected, busy);
+                                    let label = crate::preferences_window::fallback_label(ui).rect;
+                                    assert_eq!(dropdown.enabled(), !busy);
+                                    assert!(label.right() < dropdown.rect.left());
+                                    assert!(dropdown.rect.right() < mcp.left());
+                                    assert!(label.left() >= 0.0 && mcp.right() <= width);
+                                    assert!(!search.intersects(label), "toolbar overlap at {width}px: search={search:?}, label={label:?}");
+                                    if width == 800.0 {
+                                        assert!(label.top() >= search.bottom(), "narrow toolbar gets a second row");
+                                    } else {
+                                        assert!(search.right() < label.left());
+                                        assert!(label.top() < 40.0, "wide toolbar stays on one row");
+                                    }
+                                });
                             });
                         });
                     });
-                });
+                }
             }
         }
     }

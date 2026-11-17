@@ -94,7 +94,9 @@ class PackagingTests(unittest.TestCase):
         info = plistlib.loads((output / 'Contents/Info.plist').read_bytes())
         self.assertEqual(info['CFBundleExecutable'], 'rdx')
         signed = [Path(call.args[0][-1]) for call in run.call_args_list if '--sign' in call.args[0]]
-        self.assertLess(signed.index(executable / package_macos.HELPER), signed.index(output))
+        for name in ('rdx-source-stats', package_macos.HELPER, package_macos.RADGUARD_HELPER):
+            self.assertLess(signed.index(executable / name), signed.index(executable / 'rdx'))
+        self.assertLess(signed.index(executable / 'rdx'), signed.index(output))
         self.assertEqual(run.call_args_list[-1].args[0][:4], ['codesign', '--verify', '--deep', '--strict'])
         self.assertFalse((self.root / 'target/RDX.app').exists())
 

@@ -98,8 +98,9 @@ def package_app(binary_dir, output, helper=None, root=ROOT, radguard_helper=None
     }
     with (bundle / 'Info.plist').open('wb') as file:
         plistlib.dump(info, file)
-    # Sign nested executables explicitly before sealing the enclosing bundle.
-    for name in ('rdx', 'rdx-source-stats', HELPER, RADGUARD_HELPER):
+    # Signing CFBundleExecutable can resolve to the enclosing app and inspect
+    # nested code. Sign auxiliaries first, including unsigned Intel binaries.
+    for name in ('rdx-source-stats', HELPER, RADGUARD_HELPER, 'rdx'):
         subprocess.run(['codesign', '--force', '--sign', '-', str(executable_dir / name)], check=True)
     subprocess.run(['codesign', '--force', '--sign', '-', str(output)], check=True)
     subprocess.run(['codesign', '--verify', '--deep', '--strict', str(output)], check=True)

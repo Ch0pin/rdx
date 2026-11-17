@@ -912,6 +912,17 @@ impl CodeDocument {
         job
     }
     pub fn show(&mut self, ui: &mut egui::Ui, theme: CodeTheme, font_size: f32) -> Option<usize> {
+        self.show_with_selection(ui, theme, font_size, true)
+    }
+
+    /// Hide selection paint for captured frames without changing cursor/copy state.
+    pub fn show_with_selection(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: CodeTheme,
+        font_size: f32,
+        paint_selection: bool,
+    ) -> Option<usize> {
         self.find_bar(ui);
         let mut clicked = None;
         let size = font_size.clamp(10.0, 28.0);
@@ -988,11 +999,16 @@ impl CodeDocument {
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
                 ui.visuals_mut().override_text_color = Some(foreground);
-                ui.visuals_mut().selection.bg_fill = if theme.is_light() {
+                ui.visuals_mut().selection.bg_fill = if !paint_selection {
+                    Color32::TRANSPARENT
+                } else if theme.is_light() {
                     Color32::from_rgb(180, 211, 221)
                 } else {
                     Color32::from_rgb(62, 83, 112)
                 };
+                if !paint_selection {
+                    ui.visuals_mut().text_cursor.stroke = egui::Stroke::NONE;
+                }
                 let mut scroll =
                     egui::ScrollArea::new([!self.word_wrap, true]).auto_shrink([false, false]);
                 if let Some(position) = self.jump {
@@ -1428,6 +1444,7 @@ impl CodeDocument {
                                 for range in self.selection_occurrences[first..]
                                     .iter()
                                     .take_while(|range| range.start < row_end)
+                                    .filter(|_| paint_selection)
                                 {
                                     if selected.as_ref() == Some(range) {
                                         continue;
@@ -2244,6 +2261,65 @@ mod tests {
             append(&shape.shape, shape.clip_rect, &mut shapes);
         }
         shapes
+    }
+
+    #[test]
+    fn screenshot_hides_selection_paint_and_restores_it_without_changing_range() {
+        for theme in CodeTheme::ALL {
+            for range in [6..12, 6..24] {
+                let context = egui::Context::default();
+                let mut doc = CodeDocument::new("class Target {}\nTarget next;\n".into(), "java");
+                let render = |doc: &mut CodeDocument, paint_selection| {
+                    context.run(egui::RawInput::default(), |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            doc.show_with_selection(ui, theme, 14.0, paint_selection);
+                        });
+                    })
+                };
+                render(&mut doc, true);
+                let id = doc.last_editor_id.unwrap();
+                let selected = Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(range.start),
+                    egui::text::CCursor::new(range.end),
+                ));
+                let mut state = egui::text_edit::TextEditState::load(&context, id).unwrap();
+                state.cursor.set_char_range(selected);
+                state.store(&context, id);
+                context.memory_mut(|memory| memory.request_focus(id));
+                let color = if theme.is_light() {
+                    Color32::from_rgb(180, 211, 221)
+                } else {
+                    Color32::from_rgb(62, 83, 112)
+                };
+                let selection_is_painted = |output: &egui::FullOutput| {
+                    painted_shapes(output).iter().any(|shape| {
+                        matches!(&shape.shape,
+                        egui::Shape::Text(text) if text.galley.rows.iter().any(|row|
+                            row.visuals.mesh.vertices.iter().any(|vertex| vertex.color == color)))
+                    })
+                };
+                assert!(selection_is_painted(&render(&mut doc, true)));
+                // Cover the release frame and delayed capture frames with the same galley cache.
+                for _ in 0..3 {
+                    assert!(!selection_is_painted(&render(&mut doc, false)), "{theme:?}");
+                    assert_eq!(
+                        egui::text_edit::TextEditState::load(&context, id)
+                            .unwrap()
+                            .cursor
+                            .char_range(),
+                        selected
+                    );
+                }
+                assert!(selection_is_painted(&render(&mut doc, true)));
+                assert_eq!(
+                    egui::text_edit::TextEditState::load(&context, id)
+                        .unwrap()
+                        .cursor
+                        .char_range(),
+                    selected
+                );
+            }
+        }
     }
 
     #[test]

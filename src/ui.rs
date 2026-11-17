@@ -4390,7 +4390,16 @@ impl eframe::App for App {
                             document.set_usages_enabled(
                                 tab.source_hash.is_some() && self.engine.is_some() && !self.busy,
                             );
-                            let clicked = document.show(ui, self.theme, self.font_size);
+                            // Region capture requests pixels after this document is painted.
+                            // Keep selection invisible through release and delayed renderer replies.
+                            let clicked = if matches!(
+                                self.screenshot,
+                                crate::screenshot::RegionCapture::Idle
+                            ) {
+                                document.show(ui, self.theme, self.font_size)
+                            } else {
+                                document.show_with_selection(ui, self.theme, self.font_size, false)
+                            };
                             document_area = document.document_body_rect();
                             if let Some(position) = clicked
                                 && (!self.busy || self.search_cancel.is_some())

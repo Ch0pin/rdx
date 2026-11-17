@@ -128,15 +128,24 @@ fn resident_bytes(pid: u32) -> Option<u64> {
 }
 #[cfg(target_os = "linux")]
 fn resident_bytes(pid: u32) -> Option<u64> {
-    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    status.lines().find_map(|line| {
-        line.strip_prefix("VmRSS:")?
-            .split_whitespace()
-            .next()?
-            .parse::<u64>()
-            .ok()
-            .map(|kb| kb * 1024)
-    })
+    // During exit_mm(), Linux removes VmRSS from status before waitpid must
+    // report completion. statm still reports zero resident pages for that
+    // address-space-free process. Do not mistake this exit window for a
+    // monitoring failure, or relax enforcement for genuinely unreadable data.
+    let statm = fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+    let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    resident_bytes_from_statm(&statm, page_size)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn resident_bytes_from_statm(statm: &str, page_size: u64) -> Option<u64> {
+    if page_size == 0 {
+        return None;
+    }
+    let mut fields = statm.split_whitespace();
+    let _virtual_pages = fields.next()?.parse::<u64>().ok()?;
+    let resident_pages = fields.next()?.parse::<u64>().ok()?;
+    resident_pages.checked_mul(page_size)
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn resident_bytes(_: u32) -> Option<u64> {
@@ -1112,6 +1121,56 @@ mod tests {
     use super::*;
     use crate::engine::{CodeDefinition, CodeLink};
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn statm_reports_released_address_spaces_and_preserves_memory_limits() {
+        assert_eq!(resident_bytes_from_statm("0 0 0 0 0 0 0\n", 4096), Some(0));
+        assert_eq!(
+            resident_bytes_from_statm("100 17 5 1 0 20 0\n", 4096),
+            Some(69_632)
+        );
+        assert_eq!(
+            resident_bytes_from_statm("100 17 5 1 0 20 0\n", 65536),
+            Some(1_114_112)
+        );
+        assert!(
+            resident_bytes_from_statm("200000 131073 0 0 0 0 0", 4096).unwrap() > 512 * 1024 * 1024
+        );
+        for statm in ["", "0", "bad 1", "1 bad", "1 -1", "1 18446744073709551615"] {
+            assert_eq!(resident_bytes_from_statm(statm, 4096), None, "{statm}");
+        }
+        assert_eq!(resident_bytes_from_statm("1 1", 0), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn exited_worker_has_zero_rss_before_reaping() {
+        let mut child = WorkerChild(
+            Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .unwrap(),
+        );
+        let status_path = format!("/proc/{}/status", child.id());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = fs::read_to_string(&status_path).unwrap();
+            if status
+                .lines()
+                .any(|line| line.starts_with("State:") && line.contains('Z'))
+            {
+                // The old VmRSS reader returned None here. Keep the child
+                // unreaped so this kernel transition is deterministic.
+                assert!(!status.lines().any(|line| line.starts_with("VmRSS:")));
+                assert_eq!(resident_bytes(child.id()), Some(0));
+                break;
+            }
+            assert!(Instant::now() < deadline, "helper did not exit");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(child.wait().unwrap().success());
+        assert_eq!(resident_bytes(child.id()), None);
+    }
 
     fn response(class: &str, methods: Vec<Method>) -> Response {
         Response {

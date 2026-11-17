@@ -55,7 +55,7 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         );
     }
     let tools = replies[2]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 51);
+    assert_eq!(tools.len(), 56);
     let schema = |name: &str| {
         &tools
             .iter()

@@ -71,17 +71,88 @@ For example, `com.baogong.app_login.activity.LoginActivity` can suggest
 `com.baogong.app_login.LoginActivity`. Retry explicitly with the intended ID;
 suggestions preserve exact FQCN and unique short-name selection rules.
 
-## Currently available (47 tools)
+## Background source sweeps
+
+For a broad generated-source sweep, call `start_source_search` once with pinned
+`instance_id`/`project_id` and the same query, regex, case and package/resource filters
+that `search_code` source mode accepts. This is an explicit source-text operation;
+identifier searches retain their existing separate semantics. `query` also accepts
+`keyword`, `text`, or `value`. The existing synchronous `search_code` defaults and
+GUI search are unchanged. Opening a project starts no eager source scan or source
+index build.
+
+```json
+{"instance_id":"PINNED_INSTANCE","project_id":"PINNED_PROJECT","query":"loadUrl|WebView","regex":true,"scope":"all","limit":100}
+```
+
+1. Send that object to `start_source_search`; save its `job_id`. Serialized start
+   arguments are capped at 32 KiB to bound retained query metadata.
+2. Poll `get_source_search_status` with the pinned IDs and `job_id`, about once per
+   second. `get_instance_info.source_search_jobs` discovers active/retained job IDs.
+3. Read `get_source_search_results` using result `offset`/`next_offset` (default
+   100 hits, maximum 500). Results become visible after each whole page commits.
+   If a running scan has published no new hits, `next_offset` can equal the current
+   offset: wait before polling again. `max_output_bytes` bounds the serialized
+   result, default 65536, accepted range 16384–1048576.
+4. Inspect cumulative coverage, then call `release_source_search` to remove the
+   job and its retained results. `cancel_source_search` requests cancellation while
+   preserving committed hits and an exact continuation.
+
+The server follows every existing source cursor automatically. One background job
+runs per project, sharing the existing immutable parsed project and bounded source
+render index. It acquires source-page admission per page and keeps neither the
+interactive engine mutex nor a request work slot for the job lifetime. Status,
+cancel and release have reserved control paths even when eight ordinary work
+requests are active. Live `progress` describes uncommitted matching/prepared
+lookahead; `committed_position` and `committed_source_offset` are the exact stored
+frontier. Class/resource visit counts can include a partially searched document on
+several pages; completed-document frontier fields avoid double-counting those
+visits as distinct completed classes.
+
+`scan_complete` means all source continuations from this job's starting point were
+consumed. `coverage_complete` additionally requires a start at the beginning and
+no errors, lost error details or truncated resources across any committed page.
+A clean final page cannot erase earlier coverage gaps. `worker_finished` describes
+worker resource lifetime; `results_exhausted` describes retained results only.
+Neither establishes scan coverage. A completed empty search establishes absence
+within scope only when `coverage_complete=true`.
+
+Hits are private disk-backed JSONL with a disk offset index, not one retained
+in-memory hit vector. `disk_budget_bytes` includes both files: default 16 MiB,
+minimum 16 KiB, maximum 64 MiB. Four jobs, including released spools still held by in-flight readers, may be
+retained per project (at most 256 MiB of result spool); release an earlier job when the explicit retention limit
+is reached. Existing shared source-index storage is independent of this result
+budget. Result reads do not free stored hits or restart a scan.
+
+When another complete page will exceed the disk cap, the job stops with
+`status=storage_limit`. The entire unpublished page remains uncommitted. Its
+`continuation` contains exact pinned query/scope arguments for `start_source_search`
+at the first unpublished page, replaying that page in full. A first-page limit
+explicitly returns `from_beginning=true` even though `next_cursor` is null; null
+there is not exhaustion. Preserve the earlier job's hits and diagnostics, retrieve
+or export them, and release it before starting more retained jobs. Increase the
+budget or reduce `limit` if one page alone cannot fit. A resumed suffix reports
+`prior_coverage_unknown=true` and cannot independently establish whole-scope
+absence. Cancellation and worker failures use the same committed checkpoint;
+partial writes rewind both spool files before publishing a checkpoint.
+
+Project/service shutdown cancels work. Files are removed after the final worker
+and in-flight reader release their handles, preserving safe cleanup on Windows as
+well as Unix. Retained jobs belong to one project session and are unavailable
+through another project or after service shutdown.
+
+## Currently available (56 tools)
 
 | Area | Tools |
 | --- | --- |
 | Instances | `list_instances`, `get_health`, `get_instance_info`, `open_apk`, `forget_instance` |
 | Classes | `get_all_classes`, `search_classes_by_keyword`, `find_direct_subclasses`, `find_implementations`, `get_class_hierarchy` |
-| Code search | `search_code` (source text or indexed identifiers) |
+| Code search | `search_code` (source text or indexed identifiers), `start_source_search`, `get_source_search_status`, `get_source_search_results`, `cancel_source_search`, `release_source_search` |
 | Source and metadata | `get_class_source`, `get_method_source`, `get_class_disassembly`, `get_methods_of_class`, `get_fields_of_class`, `export_source`, `export_package_source`, `get_export_status`, `cancel_export`, `resolve_reference`, `search_kotlin_metadata` |
 | Resources | `get_all_resource_file_names`, `get_android_manifest`, `get_manifest_summary`, `get_manifest_components`, `get_resource_file`, `get_strings`, `get_resource_value`, `search_resources`, `search_resource_xml`, `list_nav_deeplinks`, `find_layout_references` |
 | Call graphs | `get_call_graph_batch`, `get_call_graph` (exact `method_id`, `direction`: `callers` / `callees` / `both`, `depth`: 1–100, default 20 for graph / 1 for call sites) |
 | DEX analysis | `find_field_references`, `get_lambda_branch`, `resolve_switch_case_callers`, `find_network_stacks`, `find_config_key_consumers`, `find_instantiations`, `find_integer_references`, `find_annotation_usages`, `find_type_references`, `find_webview_chooser_flows` |
+| Analysis plugins | `list_analysis_plugins`, `run_plugin_analysis`, `get_plugin_analysis`, `cancel_plugin_analysis` |
 | DEX strings | `get_dex_strings` (strings from the DEX containing `class_id`), `find_string_references` |
 
 `search_classes_by_keyword` searches literal class-name substrings only; its

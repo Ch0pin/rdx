@@ -43,6 +43,8 @@ mod review;
 mod scan;
 #[path = "mcp_socket.rs"]
 mod socket;
+#[path = "mcp_source_jobs.rs"]
+mod source_jobs;
 #[path = "mcp_source_search.rs"]
 mod source_search;
 #[path = "mcp_xml.rs"]
@@ -145,6 +147,7 @@ struct LoadedProject {
     package_selection: String,
     literals: literals::Controller,
     exports: exports::Controller,
+    source_jobs: Arc<source_jobs::Controller>,
     plugins: Arc<crate::plugin_analysis::Controller>,
 }
 impl LoadedProject {
@@ -177,6 +180,7 @@ impl LoadedProject {
             package_selection,
             literals,
             exports: exports::Controller::default(),
+            source_jobs: Arc::default(),
             plugins: Arc::default(),
         })
     }
@@ -209,6 +213,7 @@ pub struct Server {
     stop: Arc<AtomicBool>,
     requests: Arc<Mutex<Vec<RequestWatch>>>,
     literals: Arc<Mutex<Option<literals::Controller>>>,
+    source_jobs: Arc<source_jobs::Controller>,
     status: Arc<Mutex<Status>>,
     registration: PathBuf,
 }
@@ -291,6 +296,8 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(Mutex::new(Vec::<RequestWatch>::new()));
         let index = Arc::new(Mutex::new(None::<literals::Controller>));
+        let source_jobs = Arc::new(source_jobs::Controller::default());
+        let loaded_source_jobs = source_jobs.clone();
         let status = Arc::new(Mutex::new(Status {
             state: "Loading".into(),
             load_profile: limits,
@@ -318,6 +325,7 @@ impl Server {
                     };
                     let mut loaded = LoadedProject::from_snapshot(snapshot, loading_stop)?;
                     loaded.plugins = loaded_plugins;
+                    loaded.source_jobs = loaded_source_jobs;
                     Ok(Arc::new(loaded))
                 })();
                 let _ = tx.send(loaded);
@@ -415,6 +423,7 @@ impl Server {
                                 json!({"instance_id":entry.instance_id,"project_id":s.project_id,"state":s.state,
                                 "apk_path":path,"load_profile":s.load_profile.name(),"apk_sha256":s.apk_sha256,"package_selection":s.package_selection,"package_name":s.package_name,
                                 "invoke_index":loaded.as_ref().map(|project|project.analysis_snapshot.invoke_index.status()),
+                                "source_search_jobs":loaded.as_ref().map(|project|project.source_jobs.summaries()),
                                 "literal_index":loaded.as_ref().map(|project| project.literals.status()).unwrap_or_else(|| s.literal_index.clone()),"active_requests":s.active_requests,
                                 "error":if s.state == "Failed" {s.last_error.as_str()} else {""},
                                 "last_request_error":if s.last_error.is_empty() || s.state == "Failed" {Value::Null} else {json!({"message":s.last_error,"tool":s.last_error_tool,"requested_class_id":s.last_error_class_id})},"build":build}),
@@ -435,6 +444,14 @@ impl Server {
                             "PROJECT_CHANGED"
                         );
                         validate(name, args)?;
+                        // Job controls cannot be starved by eight long-running work requests.
+                        if source_jobs::is_control(name) {
+                            let data = project_request(project, name, args, &cancel)?;
+                            return Ok(
+                                json!({"identity":{"instance_id":entry.instance_id,"project_id":project.project_id,"apk_path":project.path,
+                                "apk_sha256":project.hash,"package_selection":project.package_selection},"data":data}),
+                            );
+                        }
                         let mut active = slots.load(Ordering::Relaxed);
                         loop {
                             ensure!(
@@ -499,6 +516,7 @@ impl Server {
             if let Some(project) = loaded {
                 project.literals.cancel();
                 project.exports.cancel_all();
+                project.source_jobs.cancel_all();
             }
         });
         Ok(Self {
@@ -507,6 +525,7 @@ impl Server {
             stop,
             requests,
             literals: index,
+            source_jobs,
             status,
             registration,
         })
@@ -526,6 +545,7 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.source_jobs.cancel_all();
         for request in self.requests.lock().unwrap().iter() {
             request.cancel.store(true, Ordering::Relaxed);
         }
@@ -612,6 +632,23 @@ fn project_request(
     }
     let normalized = feedback::aliases(name, args)?;
     let args = &normalized;
+    match name {
+        "start_source_search" => {
+            ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+            check_project_file(project)?;
+            return project.source_jobs.start(project, args);
+        }
+        "get_source_search_status" | "cancel_source_search" => {
+            return project
+                .source_jobs
+                .status(required(args, "job_id")?, name == "cancel_source_search");
+        }
+        "get_source_search_results" => {
+            return project.source_jobs.results(required(args, "job_id")?, args);
+        }
+        "release_source_search" => return project.source_jobs.release(required(args, "job_id")?),
+        _ => {}
+    }
     if name == "get_export_status" || name == "cancel_export" {
         return project
             .exports
@@ -1832,6 +1869,36 @@ fn tools_list() -> Value {
             true,
         ),
         (
+            "start_source_search",
+            "Start an on-demand background source-text search that automatically follows every source cursor. Prefer this for broad generated-source sweeps; search_code stays synchronous and identifiers stay explicit. Accepts source filters and existing resume_cursor/legacy offsets. Reuses the parsed project and shared source-render index; opening a project does no eager source search. One active job per project; at most four retained jobs. Private disk-backed hits default to 16 MiB (max 64 MiB including result offsets); storage_limit stops before the first unpublished page and returns an exact replay continuation. Poll status, page results while running, then explicitly release. scan_complete and coverage_complete are independent; retain all error/truncation counts. Resumed suffixes require earlier coverage evidence for a whole-scope negative.",
+            vec!["query"],
+            true,
+        ),
+        (
+            "get_source_search_status",
+            "Poll live background source progress and cumulative coverage diagnostics. Committed coverage is separate from approximate live page preparation. worker_finished is separate from scan_complete; a clean final page cannot erase earlier errors. storage_limit/cancelled/failed jobs retain results and an exact first-unpublished-page continuation. Poll about once per second; explicit release cleans files.",
+            vec!["job_id"],
+            true,
+        ),
+        (
+            "get_source_search_results",
+            "Page committed background source hits in scan order, including while running, using result offsets. Default 100/max 500 hits, max_output_bytes default 65536/max1048576. next_offset may equal offset while waiting for committed hits; poll about once per second. results_exhausted describes retained output only and never proves scan_complete or coverage_complete. Status reports cumulative errors and any scan continuation.",
+            vec!["job_id"],
+            true,
+        ),
+        (
+            "cancel_source_search",
+            "Cancel without discarding committed source results. Poll worker_finished; continuation replays the entire first unpublished page. Only the pinned project can access this job.",
+            vec!["job_id"],
+            true,
+        ),
+        (
+            "release_source_search",
+            "Release one source job and its retained results. Cancels an active worker; files disappear after the worker and in-flight readers drop their handles. A released worker retains active admission until it stops. Project/service shutdown cancels and cleans every job.",
+            vec!["job_id"],
+            true,
+        ),
+        (
             "get_manifest_summary",
             "Read manifest Markdown (character offsets), or format=records for structured components and permissions (record offsets, limit <=500). Any filter selects records. component and permission are literal substrings; component_type is exact. route_match_mode selects exact/contains literal matching for host/scheme/path; omitted mode preserves exact host/scheme and substring path matching. Effective modes and bounded zero-result hints are returned. Route filters must match the same intent-filter. query is a case-insensitive substring. Declarations do not prove runtime reachability.",
             vec![],
@@ -2046,7 +2113,7 @@ fn tools_list() -> Value {
             properties.insert("match_mode".into(),json!({"type":"string","enum":["exact","contains"],"default":"contains"}));
             properties.insert("package_prefix".into(),json!({"type":"string"}));
         }
-        if name=="search_code" {
+        if name=="search_code" || name=="start_source_search" {
             properties.insert("search_mode".into(),json!({"type":"string","enum":["auto","index","scan"],"default":"auto","description":"Identifiers only: auto directly scans method references; scan supports bounded cursor pages for every identifier kind; index explicitly requests the historical index path"}));
             properties.insert("projection".into(),json!({"type":"string","enum":["full","summary","callers"],"default":"full","description":"Identifiers only: summary returns cumulative counts; callers pages unique enclosing methods; full retains instruction evidence"}));
             properties.insert("resume_cursor".into(),json!({"type":"string","description":"Opaque next_cursor from a previous scan. Keep pinned instance_id/project_id and query filters unchanged; omit offset and source_offset. Follow every source page through exhausted=true with no continuation, accumulating coverage diagnostics across every page."}));
@@ -2062,9 +2129,20 @@ fn tools_list() -> Value {
             properties.insert("pagination".into(),json!({"type":"string","enum":["classes","hits"],"default":"hits","description":"hits (default) returns only matching source occurrences across classes until limit matches or a 20-second budget; classes scans limit classes per page. Identifier mode accepts only hits."}));
             properties.insert("source_offset".into(),json!({"type":"integer","minimum":0}));
         }
-        if ["search_code","get_all_classes","search_classes_by_keyword"].contains(&name) {
+        if ["search_code","start_source_search","get_all_classes","search_classes_by_keyword"].contains(&name) {
             properties.insert("package_prefix".into(),package_prefix_schema());
         }
+        if name=="start_source_search" {
+            for key in ["match_mode","symbol_kind","occurrence","projection","search_mode"] { properties.remove(key); }
+            properties["mode"]["enum"]=json!(["source"]);
+            properties["limit"]["maximum"]=json!(500);
+            properties.insert("disk_budget_bytes".into(),json!({"type":"integer","minimum":16384,"maximum":source_jobs::MAX_DISK_BYTES,"default":source_jobs::DEFAULT_DISK_BYTES,"description":"Result data plus disk offset index budget. Whole pages commit atomically; storage_limit returns an exact replay continuation for the first unpublished page."}));
+        }
+        if name=="get_source_search_results" {
+            properties["limit"]["maximum"]=json!(500);
+            properties.insert("max_output_bytes".into(),json!({"type":"integer","minimum":16384,"maximum":1048576,"default":65536}));
+        }
+        if ["get_source_search_status","cancel_source_search","release_source_search"].contains(&name) { properties.remove("offset"); properties.remove("limit"); }
         if ["get_method_source","get_class_source","get_class_disassembly","get_android_manifest","get_resource_file","get_manifest_summary"].contains(&name) {
             properties.insert("source_hash".into(),json!({"type":"string","minLength":1,"description":"Optional source_hash from an earlier page of the same document; the request fails with SOURCE_CHANGED when the current text hashes differently"}));
         }
@@ -2141,7 +2219,7 @@ fn tools_list() -> Value {
         let description = if name == "search_code" {
             format!("{} {description}", source_search::COMPLETION_GUIDANCE)
         } else { description.to_owned() };
-        json!({"name":name,"description":description,"inputSchema":schema,"annotations":{"readOnlyHint":!["open_apk","forget_instance","export_source","export_package_source","cancel_export","run_plugin_analysis","cancel_plugin_analysis"].contains(&name),"destructiveHint":name=="forget_instance","openWorldHint":false}})
+        json!({"name":name,"description":description,"inputSchema":schema,"annotations":{"readOnlyHint":!["open_apk","forget_instance","export_source","export_package_source","cancel_export","run_plugin_analysis","cancel_plugin_analysis","start_source_search","cancel_source_search","release_source_search"].contains(&name),"destructiveHint":name=="forget_instance","openWorldHint":false}})
     }).collect::<Vec<_>>()})
 }
 #[derive(Debug)]
@@ -2356,6 +2434,9 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
     {
         crate::package_scope::PackageScope::from_args(args)?;
     }
+    if name == "start_source_search" {
+        source_jobs::validate_start(args)?;
+    }
     if name == "search_code" {
         if args["mode"] == "identifiers" {
             ensure!(
@@ -2451,6 +2532,18 @@ struct OpenedInstance {
     // Own the headless service until the gateway closes; Drop cancels work and unregisters.
     server: Option<Server>,
     load_profile: LoadLimits,
+}
+
+impl Drop for OpenedInstance {
+    fn drop(&mut self) {
+        if let Some(server) = &self.server {
+            // A headless gateway exits immediately after EOF. Drain source files
+            // here rather than relying on listener threads running after main exits.
+            server.stop.store(true, Ordering::Relaxed);
+            server.cancel_request();
+            server.source_jobs.shutdown_and_drain();
+        }
+    }
 }
 
 fn open_load_profile(args: &Value) -> Result<LoadLimits> {
@@ -3454,6 +3547,57 @@ mod tests {
     }
 
     #[test]
+    fn background_source_controls_remain_responsive_with_eight_source_waiters() {
+        let dir = TestDir::new();
+        let snapshot = ProjectSnapshot::open(&fixture("hello.apk")).unwrap();
+        let index = snapshot.engine().search_index();
+        let permit = index.source_page(|| false).unwrap();
+        let server =
+            Server::start_shared_in(snapshot, dir.0.clone(), random_id().unwrap()).unwrap();
+        let (record, mut args) = wait_shared(&server);
+        args["query"] = json!("return");
+        let job = remote(&record, "start_source_search", &args).unwrap()["data"]["job_id"].clone();
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let record = record.clone();
+            let args = args.clone();
+            workers.push(thread::spawn(move || remote(&record, "search_code", &args)));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server.status().active_requests < 8 {
+            assert!(
+                Instant::now() < deadline,
+                "source requests did not occupy all work slots"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let control =
+            json!({"instance_id":args["instance_id"],"project_id":args["project_id"],"job_id":job});
+        let started = Instant::now();
+        assert_eq!(
+            remote(&record, "cancel_source_search", &control).unwrap()["data"]["cancel_requested"],
+            true
+        );
+        loop {
+            let state = remote(&record, "get_source_search_status", &control).unwrap();
+            if state["data"]["worker_finished"] == true {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            remote(&record, "release_source_search", &control).unwrap()["data"]["released"],
+            true
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(permit);
+        for worker in workers {
+            assert!(worker.join().unwrap().is_ok());
+        }
+    }
+
+    #[test]
     fn immutable_hierarchy_requests_complete_while_interactive_engine_is_locked() {
         let path = fixture("navigation.apk");
         let mut engine = NativeEngine::default();
@@ -3461,6 +3605,7 @@ mod tests {
         let analysis_snapshot = Arc::new(engine.clone());
         let loaded = Arc::new(LoadedProject {
             exports: exports::Controller::default(),
+            source_jobs: Arc::default(),
             plugins: Arc::default(),
             engine: Mutex::new(engine),
             analysis_snapshot: analysis_snapshot.clone(),

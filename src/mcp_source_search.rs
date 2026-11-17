@@ -8,7 +8,7 @@ use std::{
 };
 
 /// Agent completion contract, shared by initialize, tool discovery and page messages.
-pub(super) const COMPLETION_GUIDANCE: &str = "For source-mode search_code, follow EVERY next_cursor as resume_cursor, keeping the pinned instance_id/project_id, query, filters, scopes and pagination unchanged; legacy clients follow both next_offset and next_source_offset. Honor requested page sizes; limit may change between pages. Continue until exhausted=true and no continuation remains. Inspect EVERY page and accumulate errors, page_error_count, errors_truncated, truncated_resources and other coverage diagnostics across the whole search. Zero hits on a partial page mean the search remains incomplete. page_status.complete describes this response only; a clean final page cannot erase an earlier page's errors or truncation. Report complete coverage or absence within the requested scope only after every continuation is consumed and no unresolved coverage gaps remain across ANY page. Pagination remains client-driven; these instructions guide agents and clients are responsible for following them.";
+pub(super) const COMPLETION_GUIDANCE: &str = "For broad source-text sweeps prefer start_source_search, poll get_source_search_status and page get_source_search_results; release_source_search cleans retained output. Background jobs follow source cursors automatically and distinguish scan_complete from coverage_complete. Source mode is explicit generated-text search; do not silently change it to identifiers. For synchronous source-mode search_code, follow EVERY next_cursor as resume_cursor, keeping the pinned instance_id/project_id, query, filters, scopes and pagination unchanged; legacy clients follow both next_offset and next_source_offset. Honor requested page sizes; limit may change between pages. Continue until exhausted=true and no continuation remains. Inspect EVERY page and accumulate errors, page_error_count, errors_truncated, truncated_resources and other coverage diagnostics across the whole search. Zero hits on a partial page mean the search remains incomplete. page_status.complete describes this response only; a clean final page cannot erase an earlier page's errors or truncation. Report complete coverage or absence within the requested scope only after every continuation is consumed and no unresolved coverage gaps remain across ANY page. Synchronous pagination remains client-driven; these instructions guide agents and clients are responsible for following them.";
 
 /// The boolean describes this page; agents must retain diagnostics across all pages.
 pub(super) fn page_status(empty: bool, more: bool, errors: bool) -> Value {
@@ -55,6 +55,17 @@ pub(super) fn search_hits(
     project: &Project,
     args: &Value,
     cancel: &AtomicBool,
+) -> Result<Value> {
+    search_hits_with_progress(engine, project, args, cancel, &mut |_| {})
+}
+
+/// The callback receives bounded live page progress, including before a 20s page returns.
+pub(super) fn search_hits_with_progress(
+    engine: &mut NativeEngine,
+    project: &Project,
+    args: &Value,
+    cancel: &AtomicBool,
+    progress: &mut impl FnMut(Value),
 ) -> Result<Value> {
     use crate::search::{CompiledQuery, SearchQuery, SearchUpdate};
     let query = required(args, "query")?;
@@ -135,6 +146,10 @@ pub(super) fn search_hits(
         offset <= total && (offset < total || source_offset == 0),
         "Invalid search page"
     );
+    progress(
+        json!({"phase":"waiting_for_source_page","position":offset,"source_offset":source_offset,
+        "total_classes":classes.len(),"total_resources":resources.len(),"page_hits":0,"page_scanned_classes":0,"page_scanned_resources":0}),
+    );
     let index = engine.search_index();
     let _permit = index
         .source_page(|| cancel.load(Ordering::Relaxed))
@@ -157,6 +172,11 @@ pub(super) fn search_hits(
     let mut position = offset;
     let mut next_source = 0;
     let mut boundary = "exhausted";
+    progress(
+        json!({"phase":"scanning","position":offset,"source_offset":source_offset,
+        "total_classes":classes.len(),"total_resources":resources.len(),"page_hits":0,"page_scanned_classes":0,"page_scanned_resources":0}),
+    );
+
     if position < classes.len() && position < end {
         let summary = crate::search::source_page(
             engine,
@@ -166,9 +186,14 @@ pub(super) fn search_hits(
             hit_limit,
             source_offset,
             deadline,
-            &mut |update| {
-                if let SearchUpdate::Batch(batch) = update {
-                    hits.extend(batch);
+            &mut |update| match update {
+                SearchUpdate::Batch(batch) => hits.extend(batch),
+                SearchUpdate::Progress { scanned, .. } => {
+                    progress(
+                        json!({"phase":"scanning","approximate_prepared_position":offset + scanned,"position_precision":"prepared lookahead; not committed coverage",
+                            "total_classes":classes.len(),"total_resources":resources.len(),"page_hits":hits.len(),
+                            "page_scanned_classes":scanned,"page_scanned_resources":0}),
+                    );
                 }
             },
         );
@@ -255,6 +280,11 @@ pub(super) fn search_hits(
         }
         position += 1;
         next_source = 0;
+        progress(
+            json!({"phase":"scanning","position":position,"source_offset":0,
+            "total_classes":classes.len(),"total_resources":resources.len(),"page_hits":hits.len(),
+            "page_scanned_classes":scanned_classes,"page_scanned_resources":scanned_resources}),
+        );
     }
     if boundary == "exhausted" && position < total {
         boundary = if hits.len() == hit_limit {

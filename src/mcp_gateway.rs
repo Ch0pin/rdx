@@ -318,6 +318,8 @@ fn asynchronous_tool(name: &str) -> bool {
     matches!(
         name,
         "find_string_references"
+            | "start_source_search"
+            | "get_source_search_results"
             | "search_code"
             | "resolve_switch_case_callers"
             | "find_network_stacks"
@@ -338,6 +340,17 @@ fn asynchronous_tool(name: &str) -> bool {
 #[cfg(test)]
 mod controlled_reader_tests {
     use super::*;
+    #[test]
+    fn background_source_controls_bypass_the_async_request_cap() {
+        for name in [
+            "get_source_search_status",
+            "cancel_source_search",
+            "release_source_search",
+        ] {
+            assert!(!asynchronous_tool(name));
+        }
+        assert!(asynchronous_tool("start_source_search"));
+    }
 
     fn rejected_gui_tool(name: &str, message: &str) -> anyhow::Error {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -19,3 +19,15 @@ metrics as if they were identical or infer Java-source parity from native timing
 The new engine is in-process Rust; there is no JVM memory component. Matching
 and index handling remain Rust. Current source-generation capability limits are
 listed in [native-engine.md](native-engine.md).
+
+## On-demand background MCP search
+
+`start_source_search` automates the existing source-page loop with live progress,
+cancellation and bounded disk-backed hit retrieval. It shares the same parsed
+project, filters, matcher, source-render cache and per-page source permit as
+synchronous `search_code`. Cold scanning therefore performs roughly the same
+reconstruction/matching work while continuing automatically; warm scans reuse the
+same source cache. Added overhead is page JSON serialization and bounded result
+disk I/O, with one page of hits buffered instead of every result. No source scan
+runs merely because an APK is opened. See the background source sweep contract
+in `docs/mcp.md` for storage limits and separate scan/coverage completion.

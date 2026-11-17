@@ -31,6 +31,7 @@ pub(super) fn argument_aliases(name: &str) -> Vec<(&'static str, &'static [&'sta
         "find_config_key_consumers" => table.push(("key", &["query", "value", "config_key"])),
         "search_classes_by_keyword"
         | "search_code"
+        | "start_source_search"
         | "search_kotlin_metadata"
         | "search_resource_xml"
         | "search_resources"

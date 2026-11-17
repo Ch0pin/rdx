@@ -49,10 +49,10 @@ Current implementation evidence (pinned to this audit): [type-reference query](h
 | Filtered discovery noise; mixed identifier-query hints | P2 | Actionable usability gaps, but the notes show a reachable target or successful alternative query. Free-text identifier matching is not a validated method-selector API. |
 | Named networking/concrete implementation hook maps; guard semantics; Compose registrations | P2 | Valuable supported analyses. Current results explicitly distinguish structural maps, API evidence and supported navigation sources; missing interpretations are separate from a proven missing raw reference. |
 | Huge-method search, member anchoring, aliases, batching, runtime identity, framework relationships, DI/client/provenance and WebView extensions | P2–P3 | Existing source export, paginated queries and direct references remain usable. Keep the bounded scopes and unknown-result reporting below. |
-| Source-search 20-second budget (R6) | Core paging already addressed; remaining requests P3/P4 | Current source search supplies resumable cursors and explicit page/coverage status. The remaining gap is convenience/background operation, not a demonstrated hard stop at one page. |
+| Source-search 20-second budget (R6) | Implemented | Existing synchronous cursor paging remains available. On-demand start_source_search now automatically consumes source pages with live progress, cancellation, bounded disk-backed results and cumulative coverage diagnostics. Storage limits return an exact first-unpublished-page continuation. |
 | Stripped Retrofit, all native transports, complete mutation write-surface mapping | P3/P4 for bounded inventories; P5 for completeness guarantees | Missing Java hooks or decompiler annotations do not establish all runtime paths or a static engine defect. The mutation request is captured as ANALYSIS-11 below. |
 
-This review changes prioritization/documentation only. Existing tests were inspected; the prior green cross-platform run covers the baseline. TRIAGE-01 was rerun against the exact Zappos APK and independently checked against its raw DEX bytes. Other target APK reproductions were not rerun. No production code was changed.
+This review changes prioritization/documentation only. Existing tests were inspected; the prior green cross-platform run covers the baseline. TRIAGE-01 was rerun against the exact Zappos APK and independently checked against its raw DEX bytes. Other target APK reproductions were not rerun. The prioritization review itself changed no production code; CORE-12 was subsequently implemented and validated as recorded below.
 
 ## Current implementation foundations
 
@@ -125,7 +125,7 @@ Baseline evidence: https://github.com/Ch0pin/rdx/blob/6d6804d4434218fcd51d169c2a
 | CORE-09 | P3 | Short-name reference lookup latency | Unrevalidated APK-specific report. Measure cold and warm queries before changing indexes. |
 | CORE-10 | P3 | Multi-query asset search | Missing. Scan each asset once, group hits by query and share coverage/diagnostics. |
 | CORE-11 | P3 | Class-literal search guidance | Add targeted guidance toward find_type_references for X.class/const-class queries. Existing type-reference indexing needs no replacement. |
-| CORE-12 | P4 | Background source-search jobs | Defer pending demonstrated need beyond existing resumable searches. |
+| CORE-12 | P4 | Background source-search jobs | Implemented: explicit start/status/results/cancel/release tools; one active job, four retained jobs, shared parsed project/source cache, bounded disk spool and byte-budgeted retrieval. Focused tests cover Unicode pagination, early-page errors, storage-limit replay, safe cleanup and responsive controls with eight source waiters. |
 
 ## Bounded analysis-plugin backlog
 

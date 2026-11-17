@@ -43,6 +43,20 @@ pub fn paint(ui: &egui::Ui, rect: Rect, icon: Icon) {
     };
     let tint = if !ui.is_enabled() {
         ui.visuals().weak_text_color().gamma_multiply(0.45)
+    } else if matches!(
+        icon,
+        Icon::Search
+            | Icon::Open
+            | Icon::Reload
+            | Icon::Back
+            | Icon::Forward
+            | Icon::Plugin
+            | Icon::Copy
+            | Icon::Settings
+            | Icon::Pin
+            | Icon::Bookmark
+    ) {
+        ui.visuals().text_color()
     } else if ui.visuals().dark_mode {
         Color32::from_rgb(accent.0, accent.1, accent.2)
     } else {

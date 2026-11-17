@@ -622,8 +622,9 @@ impl SearchWindow {
                 egui::vec2(ui.available_width(), header_height),
                 egui::Sense::hover(),
             );
+            crate::ui_style::result_header(ui, header);
             ui.separator();
-            let row_height = 25.0;
+            let row_height = 28.0;
             let mut content_left = header.left();
             egui::ScrollArea::both()
                 .id_salt("rdx_search_results")
@@ -639,19 +640,10 @@ impl SearchWindow {
                                 egui::vec2(table_width, row_height - ui.spacing().item_spacing.y),
                                 egui::Sense::click(),
                             );
-                            if self.selected_result == Some(index) {
-                                ui.painter().rect_filled(
-                                    rect,
-                                    0.0,
-                                    ui.visuals().selection.bg_fill.gamma_multiply(0.35),
-                                );
-                            } else if response.hovered() || response.has_focus() {
-                                ui.painter().rect_filled(
-                                    rect,
-                                    0.0,
-                                    ui.visuals().widgets.hovered.bg_fill,
-                                );
-                            }
+                            crate::ui_style::result_row(
+                                ui, rect, index, self.selected_result == Some(index),
+                                response.hovered() || response.has_focus(),
+                            );
                             let icon = match hit.origin.target {
                                 crate::search::SearchTarget::Class(_) => {
                                     crate::icons::Icon::Classes

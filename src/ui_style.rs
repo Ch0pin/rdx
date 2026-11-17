@@ -10,27 +10,27 @@ fn refine(style: &mut egui::Style) {
     let rgb = Color32::from_rgb;
     let (panel, window, field, hover, border, text, muted, accent, selection) = if dark {
         (
-            rgb(29, 33, 39),
-            rgb(33, 38, 45),
-            rgb(23, 27, 33),
-            rgb(43, 51, 61),
-            rgb(56, 64, 75),
-            rgb(225, 231, 239),
-            rgb(163, 177, 192),
-            rgb(93, 198, 231),
-            rgb(34, 66, 82),
+            rgb(23, 27, 34),
+            rgb(29, 34, 43),
+            rgb(19, 23, 30),
+            rgb(39, 47, 60),
+            rgb(53, 63, 78),
+            rgb(231, 237, 246),
+            rgb(171, 184, 202),
+            rgb(138, 180, 255),
+            rgb(37, 54, 82),
         )
     } else {
         (
-            rgb(246, 248, 251),
+            rgb(247, 249, 252),
             rgb(255, 255, 255),
             rgb(255, 255, 255),
-            rgb(231, 237, 244),
-            rgb(209, 217, 228),
-            rgb(35, 46, 61),
-            rgb(89, 105, 123),
-            rgb(0, 103, 137),
-            rgb(211, 235, 246),
+            rgb(235, 240, 248),
+            rgb(219, 226, 236),
+            rgb(30, 41, 59),
+            rgb(88, 103, 124),
+            rgb(29, 78, 216),
+            rgb(226, 236, 255),
         )
     };
     style
@@ -44,7 +44,7 @@ fn refine(style: &mut egui::Style) {
         .insert(TextStyle::Small, FontId::proportional(12.0));
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(8.0, 5.0);
-    style.spacing.interact_size.y = 26.0;
+    style.spacing.interact_size.y = 28.0;
     style.spacing.indent = 18.0;
     // No animated transitions or additional redraw requests for decorative chrome.
     style.animation_time = 0.0;
@@ -55,8 +55,8 @@ fn refine(style: &mut egui::Style) {
     v.faint_bg_color = hover;
     v.hyperlink_color = accent;
     v.window_stroke = Stroke::new(1.0_f32, border);
-    v.window_corner_radius = CornerRadius::same(6);
-    v.menu_corner_radius = CornerRadius::same(5);
+    v.window_corner_radius = CornerRadius::same(10);
+    v.menu_corner_radius = CornerRadius::same(8);
     v.selection.bg_fill = selection;
     v.selection.stroke = Stroke::new(1.0_f32, accent);
     for widget in [
@@ -66,7 +66,7 @@ fn refine(style: &mut egui::Style) {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        widget.corner_radius = CornerRadius::same(4);
+        widget.corner_radius = CornerRadius::same(6);
         widget.bg_stroke = Stroke::new(1.0_f32, border);
         widget.fg_stroke = Stroke::new(1.0_f32, text);
         widget.expansion = 0.0;
@@ -83,6 +83,41 @@ fn refine(style: &mut egui::Style) {
     v.widgets.active.bg_stroke = Stroke::new(1.0_f32, accent);
     v.widgets.open.bg_fill = selection;
     v.widgets.open.weak_bg_fill = selection;
+}
+
+/// Shared table treatment keeps search and reference views visually consistent.
+pub fn result_row(ui: &egui::Ui, rect: egui::Rect, index: usize, selected: bool, hovered: bool) {
+    let fill = if selected {
+        ui.visuals().selection.bg_fill
+    } else if hovered {
+        ui.visuals().widgets.hovered.bg_fill
+    } else if index.is_multiple_of(2) {
+        ui.visuals().window_fill
+    } else {
+        ui.visuals().panel_fill
+    };
+    ui.painter().rect_filled(rect, 3.0, fill);
+    if selected {
+        let marker = egui::Rect::from_min_max(
+            rect.min + egui::vec2(0.0, 2.0),
+            egui::pos2(rect.left() + 3.0, rect.bottom() - 2.0),
+        );
+        ui.painter()
+            .rect_filled(marker, 1.5, ui.visuals().selection.stroke.color);
+    }
+}
+
+pub fn result_header(ui: &egui::Ui, rect: egui::Rect) {
+    ui.painter()
+        .rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
+}
+
+/// Flat grouping around toolbar actions; no state or extra repaint work.
+pub fn action_group(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(4, 2))
 }
 
 #[cfg(test)]
@@ -118,6 +153,14 @@ mod tests {
             assert!(contrast(v.widgets.inactive.fg_stroke.color, v.panel_fill) >= 4.5);
             assert!(contrast(v.widgets.noninteractive.fg_stroke.color, v.panel_fill) >= 4.5);
             assert!(contrast(v.selection.stroke.color, v.selection.bg_fill) >= 4.5);
+            assert!(contrast(v.widgets.inactive.fg_stroke.color, v.selection.bg_fill) >= 4.5);
+            assert!(contrast(v.widgets.inactive.fg_stroke.color, v.window_fill) >= 4.5);
+            assert!(
+                contrast(
+                    v.widgets.inactive.fg_stroke.color,
+                    v.widgets.hovered.bg_fill
+                ) >= 4.5
+            );
         }
     }
 

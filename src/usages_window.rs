@@ -173,6 +173,7 @@ impl UsagesWindow {
                 egui::vec2(ui.available_width(), header_height),
                 egui::Sense::hover(),
             );
+            crate::ui_style::result_header(ui, header);
             ui.painter().text(
                 header.min + egui::vec2(26.0, 4.0),
                 egui::Align2::LEFT_TOP,
@@ -188,7 +189,7 @@ impl UsagesWindow {
                 ui.visuals().text_color(),
             );
             ui.separator();
-            let row_height = 25.0;
+            let row_height = 28.0;
             egui::ScrollArea::vertical()
                 .id_salt("rdx_usages_results")
                 .auto_shrink([false, false])
@@ -204,19 +205,10 @@ impl UsagesWindow {
                                 ),
                                 egui::Sense::click(),
                             );
-                            if self.selected_result == Some(index) {
-                                ui.painter().rect_filled(
-                                    rect,
-                                    0.0,
-                                    ui.visuals().selection.bg_fill.gamma_multiply(0.35),
-                                );
-                            } else if response.hovered() || response.has_focus() {
-                                ui.painter().rect_filled(
-                                    rect,
-                                    0.0,
-                                    ui.visuals().widgets.hovered.bg_fill,
-                                );
-                            }
+                            crate::ui_style::result_row(
+                                ui, rect, index, self.selected_result == Some(index),
+                                response.hovered() || response.has_focus(),
+                            );
                             let icon = match hit.origin.target {
                                 crate::search::SearchTarget::Class(_) => {
                                     crate::icons::Icon::Classes

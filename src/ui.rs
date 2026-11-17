@@ -2518,14 +2518,31 @@ impl App {
                                     label.to_owned()
                                 };
                                 let response = ui
-                                    .add(egui::Button::new(label).frame(false))
+                                    .add({
+                                        let active = self.selected == i;
+                                        let text = egui::RichText::new(label).color(if active {
+                                            ui.visuals().selection.stroke.color
+                                        } else {
+                                            ui.visuals().weak_text_color()
+                                        });
+                                        let text = if active { text.strong() } else { text };
+                                        let button = egui::Button::new(text)
+                                            .frame(active)
+                                            .stroke(egui::Stroke::NONE)
+                                            .corner_radius(6);
+                                        if active {
+                                            button.fill(ui.visuals().selection.bg_fill)
+                                        } else {
+                                            button
+                                        }
+                                    })
                                     .on_hover_text(&tab.name);
                                 if self.selected == i {
                                     let accent = ui.visuals().selection.stroke.color;
                                     ui.painter().line_segment(
                                         [
-                                            response.rect.left_bottom() + egui::vec2(0.0, 2.0),
-                                            response.rect.right_bottom() + egui::vec2(0.0, 2.0),
+                                            response.rect.left_bottom() + egui::vec2(8.0, -1.0),
+                                            response.rect.right_bottom() + egui::vec2(-8.0, -1.0),
                                         ],
                                         egui::Stroke::new(2.0_f32, accent),
                                     );
@@ -3829,7 +3846,11 @@ impl eframe::App for App {
         self.menu_hovered = show_menu;
         let previous_fallback = self.alternate_fallback;
         if show_menu {
-            let toolbar = egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            let toolbar_frame = egui::Frame::new()
+                .fill(ctx.style().visuals.window_fill)
+                .inner_margin(egui::Margin::symmetric(8, 4));
+            let toolbar_panel = egui::TopBottomPanel::top("toolbar").frame(toolbar_frame);
+            let toolbar = toolbar_panel.show(ctx, |ui| {
                 ui.add_space(3.0);
                 ui.horizontal_wrapped(|ui| {
                     let texture = self.toolbar_icon.get_or_insert_with(|| {
@@ -3970,55 +3991,64 @@ impl eframe::App for App {
                         });
                     });
                     ui.separator();
-                    choose_file |= icons::button(
-                        ui,
-                        Icon::Open,
-                        "Open APK / XAPK / APKS / DEX (Cmd/Ctrl+O)",
-                        true,
-                    )
-                    .clicked();
-                    if icons::button(
-                        ui,
-                        Icon::Reload,
-                        "Reload project",
-                        self.path.is_some() && !self.busy,
-                    )
-                    .clicked()
-                    {
-                        self.open(self.path.clone().unwrap(), ctx);
-                    }
-                    if icons::button(
-                        ui,
-                        Icon::Back,
-                        "Back to previous reference (Alt+Left)",
-                        self.can_history(false),
-                    )
-                    .clicked()
-                    {
-                        self.go_back(ctx);
-                    }
-                    if icons::button(
-                        ui,
-                        Icon::Forward,
-                        "Forward to next reference (Alt+Right)",
-                        self.can_history(true),
-                    )
-                    .clicked()
-                    {
-                        self.go_forward(ctx);
-                    }
-                    if icons::button(ui, Icon::Plugin, "Manage plugins", true).clicked() {
-                        self.show_plugins = true;
-                        ctx.send_viewport_cmd_to(
-                            crate::plugin_window::manager_id(),
-                            egui::ViewportCommand::Focus,
-                        );
-                    }
-                    if icons::button(ui, Icon::Search, "Code search (Cmd/Ctrl+Shift+F)", true)
-                        .clicked()
-                    {
-                        self.search.open_mode(SearchMode::Code);
-                    }
+                    crate::ui_style::action_group(ui).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            choose_file |= icons::button(
+                                ui,
+                                Icon::Open,
+                                "Open APK / XAPK / APKS / DEX (Cmd/Ctrl+O)",
+                                true,
+                            )
+                            .clicked();
+                            if icons::button(
+                                ui,
+                                Icon::Reload,
+                                "Reload project",
+                                self.path.is_some() && !self.busy,
+                            )
+                            .clicked()
+                            {
+                                self.open(self.path.clone().unwrap(), ctx);
+                            }
+                            if icons::button(
+                                ui,
+                                Icon::Back,
+                                "Back to previous reference (Alt+Left)",
+                                self.can_history(false),
+                            )
+                            .clicked()
+                            {
+                                self.go_back(ctx);
+                            }
+                            if icons::button(
+                                ui,
+                                Icon::Forward,
+                                "Forward to next reference (Alt+Right)",
+                                self.can_history(true),
+                            )
+                            .clicked()
+                            {
+                                self.go_forward(ctx);
+                            }
+                            if icons::button(ui, Icon::Plugin, "Manage plugins", true).clicked() {
+                                self.show_plugins = true;
+                                ctx.send_viewport_cmd_to(
+                                    crate::plugin_window::manager_id(),
+                                    egui::ViewportCommand::Focus,
+                                );
+                            }
+                            if icons::button(
+                                ui,
+                                Icon::Search,
+                                "Code search (Cmd/Ctrl+Shift+F)",
+                                true,
+                            )
+                            .clicked()
+                            {
+                                self.search.open_mode(SearchMode::Code);
+                            }
+                        });
+                    });
                     // Keep the full label and selector together on narrow windows.
                     if ui.available_size_before_wrap().x
                         < crate::preferences_window::toolbar_controls_width(ui)
@@ -4031,10 +4061,32 @@ impl eframe::App for App {
                         let (rect, response) =
                             ui.allocate_exact_size(egui::vec2(62.0, 28.0), egui::Sense::click());
                         let color = if running {
-                            egui::Color32::from_rgb(55, 180, 95)
+                            if ui.visuals().dark_mode {
+                                egui::Color32::from_rgb(90, 213, 145)
+                            } else {
+                                egui::Color32::from_rgb(25, 127, 75)
+                            }
                         } else {
-                            egui::Color32::from_gray(140)
+                            ui.visuals().weak_text_color()
                         };
+                        let badge_fill = if running {
+                            if ui.visuals().dark_mode {
+                                egui::Color32::from_rgb(29, 53, 43)
+                            } else {
+                                egui::Color32::from_rgb(230, 246, 235)
+                            }
+                        } else {
+                            ui.visuals().faint_bg_color
+                        };
+                        ui.painter().rect_filled(rect.shrink(1.0), 14.0, badge_fill);
+                        if response.hovered() {
+                            ui.painter().rect_stroke(
+                                rect.shrink(1.0),
+                                14.0,
+                                ui.visuals().widgets.hovered.bg_stroke,
+                                egui::StrokeKind::Inside,
+                            );
+                        }
                         ui.painter().circle_filled(
                             egui::pos2(rect.left() + 9.0, rect.center().y),
                             5.0,

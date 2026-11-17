@@ -33,7 +33,7 @@ services. See [performance measurements](docs/search-performance.md) for the tes
 | Identify the active app | App icon with RDX fallback and package name in the window title |
 | Customize your workflow | Light/dark themes, bundled code fonts, occurrence highlighting, Frida snippet copying and CLI access |
 
-**Status: alpha.** Java reconstruction is still expanding. Unsupported methods
+**Reconstruction coverage.** Java reconstruction is still expanding. Unsupported methods
 remain visible as labelled DEX disassembly. See [engine coverage and limitations](docs/native-engine.md).
 
 macOS and Linux packages include optional **Androguard** and **RadGuard** fallback for browsing

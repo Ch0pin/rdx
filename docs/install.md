@@ -27,7 +27,7 @@ Keep the helpers and accompanying notices with the extracted package.
 
 ## First launch
 
-**macOS:** this first release is ad-hoc signed, not Developer ID signed or
+**macOS:** release builds are ad-hoc signed, not Developer ID signed or
 notarized. After attempting to open it, macOS may require **System Settings →
 Privacy & Security → Open Anyway**. See [Apple's instructions](https://support.apple.com/en-gb/102445).
 

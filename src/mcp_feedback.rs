@@ -49,6 +49,26 @@ pub(super) fn argument_aliases(name: &str) -> Vec<(&'static str, &'static [&'sta
 /// canonical parameter must carry the same value.
 pub(super) fn aliases(name: &str, args: &Value) -> Result<Value> {
     let mut args = args.clone();
+    if matches!(name, "get_manifest_components" | "get_manifest_summary")
+        && let Some(value) = args.get("exported_only")
+    {
+        let enabled = value.as_bool().context("exported_only must be a boolean; use exported_state for true/false/unresolved filtering")?;
+        let object = args
+            .as_object_mut()
+            .context("Arguments must be an object")?;
+        object.remove("exported_only");
+        // false disables the convenience filter; an explicit exported_state
+        // remains authoritative. true must agree with any explicit state.
+        if enabled {
+            ensure!(
+                object
+                    .get("exported_state")
+                    .is_none_or(|state| state == "true"),
+                "CONFLICTING_ARGUMENTS: exported_only=true requires exported_state=\"true\"; omit exported_state or use exported_only=false"
+            );
+            object.insert("exported_state".into(), json!("true"));
+        }
+    }
     let table = argument_aliases(name);
     if table.is_empty() {
         return Ok(args);

@@ -229,6 +229,138 @@ fn manifest_server(path: PathBuf, dir: &Scratch) -> (Server, Registration, Value
     }
 }
 
+#[test]
+fn exported_only_alias_validates_booleans_and_conflicts() {
+    for tool in ["get_manifest_components", "get_manifest_summary"] {
+        let base = json!({"instance_id":"test","project_id":"test"});
+        for enabled in [true, false] {
+            let mut args = base.clone();
+            args["exported_only"] = json!(enabled);
+            validate(tool, &args).unwrap();
+            let normalized = feedback::aliases(tool, &args).unwrap();
+            assert!(normalized.get("exported_only").is_none());
+            assert_eq!(
+                normalized["exported_state"],
+                if enabled { json!("true") } else { Value::Null }
+            );
+            for state in ["true", "false", "unresolved"] {
+                args["exported_state"] = json!(state);
+                if enabled && state != "true" {
+                    let error = validate(tool, &args).unwrap_err();
+                    assert!(error.to_string().contains("CONFLICTING_ARGUMENTS"));
+                    assert!(error.to_string().contains("exported_only=true"));
+                    assert!(error.downcast_ref::<ArgumentError>().unwrap().details["accepted_parameters"]["properties"]["exported_only"].is_object());
+                } else {
+                    validate(tool, &args).unwrap();
+                    assert_eq!(
+                        feedback::aliases(tool, &args).unwrap()["exported_state"],
+                        state
+                    );
+                }
+            }
+        }
+        for invalid in [
+            json!("true"),
+            json!("false"),
+            json!(1),
+            Value::Null,
+            json!([]),
+        ] {
+            let mut args = base.clone();
+            args["exported_only"] = invalid;
+            assert!(
+                validate(tool, &args)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exported_only must be a boolean")
+            );
+        }
+    }
+    assert!(
+        validate(
+            "get_all_classes",
+            &json!({"instance_id":"test","project_id":"test","exported_only":true})
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn exported_only_alias_preserves_manifest_results_and_pagination() {
+    use std::io::Write;
+    let dir = Scratch::new();
+    let path = dir.0.join("exported-alias.apk");
+    let mut archive = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    archive.start_file("classes.dex", options).unwrap();
+    archive
+        .write_all(include_bytes!("../tests/fixtures/hello.dex"))
+        .unwrap();
+    archive.start_file("AndroidManifest.xml", options).unwrap();
+    archive.write_all(br#"<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="sample">
+      <uses-permission android:name="sample.PERMISSION"/>
+      <application>
+        <activity android:name=".Yes" android:exported="true"/>
+        <activity-alias android:name=".Alias" android:targetActivity=".Yes" android:exported="true"/>
+        <service android:name=".Service" android:exported="true"/>
+        <receiver android:name=".Receiver" android:exported="true"/>
+        <provider android:name=".Provider" android:authorities="sample.provider" android:exported="true"/>
+        <activity android:name=".No" android:exported="false"/>
+        <activity android:name=".Unknown" android:exported="@bool/missing"/>
+      </application>
+    </manifest>"#).unwrap();
+    archive.finish().unwrap();
+    let (_server, record, base) = manifest_server(path, &dir);
+    for tool in ["get_manifest_components", "get_manifest_summary"] {
+        let mut base = base.clone();
+        base["limit"] = json!(2);
+        if tool == "get_manifest_summary" {
+            base["format"] = json!("records");
+        }
+        let data = |args: &Value| remote(&record, tool, args).unwrap()["data"].clone();
+        let mut canonical = base.clone();
+        canonical["exported_state"] = json!("true");
+        let mut alias = base.clone();
+        alias["exported_only"] = json!(true);
+        let mut hits = Vec::new();
+        loop {
+            let actual = data(&alias);
+            assert_eq!(actual, data(&canonical), "{tool}");
+            assert_eq!(actual["total"], 5);
+            hits.extend(actual["items"].as_array().unwrap().iter().cloned());
+            let Some(next) = actual["next_offset"].as_u64() else {
+                break;
+            };
+            alias["offset"] = json!(next);
+            canonical["offset"] = json!(next);
+        }
+        assert_eq!(hits.len(), 5);
+        assert!(
+            hits.iter()
+                .all(|item| item["exported_state"]["effective"] == true)
+        );
+        alias = base.clone();
+        alias["exported_only"] = json!(false);
+        assert_eq!(data(&alias), data(&base));
+        for state in ["true", "false", "unresolved"] {
+            canonical = base.clone();
+            canonical["exported_state"] = json!(state);
+            alias = canonical.clone();
+            alias["exported_only"] = json!(false);
+            assert_eq!(data(&alias), data(&canonical));
+        }
+        if tool == "get_manifest_summary" {
+            canonical.as_object_mut().unwrap().remove("limit");
+            canonical["format"] = json!("counts");
+            canonical["exported_state"] = json!("true");
+            alias = canonical.clone();
+            alias.as_object_mut().unwrap().remove("exported_state");
+            alias["exported_only"] = json!(true);
+            assert_eq!(data(&alias), data(&canonical));
+        }
+    }
+}
+
 /// Counts, exported filtering and record paging must describe one record set.
 fn check_manifest_counts(record: &Registration, base: &Value) -> Value {
     let data = |args: &Value| remote(record, "get_manifest_summary", args).unwrap()["data"].clone();

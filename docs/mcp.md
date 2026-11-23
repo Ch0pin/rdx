@@ -702,6 +702,10 @@ queries; runtime route delivery and callback reachability require separate proof
 
 `exported_state: "true"`, `"false"` or `"unresolved"` selects component records by
 their effective resolved `android:exported` state and excludes permission records.
+Both manifest tools also accept `exported_only: true` as an alias for
+`exported_state: "true"`. `exported_only: false` adds no restriction and preserves
+an explicitly supplied `exported_state`. Combining `exported_only: true` with
+`exported_state: "false"` or `"unresolved"` returns a conflict error.
 `format: "counts"` returns one unpaged object instead of records: `components`
 carries overall and per-`component_type` totals split into `exported`,
 `non_exported` and `unresolved_exported` buckets, `permissions` counts matching
@@ -1707,7 +1711,7 @@ Multiple instances may open the same APK path/hash. Registration continuation
 pages are not accumulated into an implicit selection.
 
 `get_manifest_components` accepts `exported_state:"true"|"false"|"unresolved"`,
-filtering effective exported state before projection and pagination. Existing
+or `exported_only:true`, filtering effective exported state before projection and pagination. Existing
 class/type/route filters compose with it. `max_bytes` bounds the serialized
 items array (default 32768, maximum 1048576; response metadata is additional).
 Follow `next_offset` even when fewer than `limit` records are returned. A single

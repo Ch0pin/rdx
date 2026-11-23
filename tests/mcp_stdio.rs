@@ -425,6 +425,14 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     let components = schema("get_manifest_components");
     for tool in ["get_manifest_components", "get_manifest_summary"] {
         assert_eq!(
+            schema(tool)["properties"]["exported_only"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            schema(tool)["properties"]["exported_only"]["default"],
+            false
+        );
+        assert_eq!(
             schema(tool)["properties"]["route_match_mode"]["enum"],
             json!(["exact", "contains"])
         );

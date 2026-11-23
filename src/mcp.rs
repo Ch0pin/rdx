@@ -2097,6 +2097,7 @@ fn tools_list() -> Value {
             properties.insert("format".into(),json!({"type":"string","enum":["markdown","records","exposure","counts"],"description":"markdown (default) pages the GUI summary; records, or any filter, returns structured component and permission records; exposure summarizes an unfiltered manifest; counts returns one unpaged object of matching component totals per type and effective exported state"}));
         }
         if ["get_manifest_summary", "get_manifest_components"].contains(&name) {
+            properties.insert("exported_only".into(),json!({"type":"boolean","default":false,"description":"Convenience alias: true sets exported_state=\"true\"; false adds no restriction and preserves an explicit exported_state. true conflicts with exported_state=\"false\" or \"unresolved\"."}));
             properties.insert("exported_state".into(),json!({"type":"string","enum":["true","false","unresolved"],"description":"Effective resolved android:exported state; selects component records only, so permission records are excluded"}));
             properties.insert("route_match_mode".into(),json!({"type":"string","enum":["exact","contains"],"description":"Case-sensitive literal matching for host, scheme and declared path attributes. If omitted, host/scheme are exact and path uses contains. This searches declarations, not Android runtime URI matching."}));
             properties.insert("projection".into(),json!({"type":"string","enum":["full","compact"],"default":"full"}));

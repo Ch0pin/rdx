@@ -591,10 +591,35 @@ fn parse_inner(bytes: &[u8], budget: &mut Budget) -> Result<DexFile> {
         data_start >= 112 && data_start.is_multiple_of(4),
         "invalid DEX data section"
     );
+    let data_end = data_start
+        .checked_add(data_size)
+        .filter(|&end| end <= bytes.len())
+        .context("DEX data size mismatch")?;
+    // DEX 035–040 may end with opaque link_data after the normal data section.
+    // See https://source.android.com/docs/core/runtime/dex-format#header-item
+    let link_size = reader.u32(44)? as usize;
+    let link_start = reader.u32(48)? as usize;
     ensure!(
-        data_start.checked_add(data_size) == Some(bytes.len()),
-        "DEX data size mismatch"
+        (link_size == 0) == (link_start == 0),
+        "invalid empty DEX link section"
     );
+    if link_size == 0 {
+        ensure!(data_end == bytes.len(), "DEX data size mismatch");
+    } else {
+        ensure!(
+            link_start >= data_end,
+            "DEX link section overlaps data section"
+        );
+        ensure!(
+            link_start.checked_add(link_size) == Some(bytes.len()),
+            "DEX link size mismatch"
+        );
+    }
+    // All following offsets and variable-length reads belong to tables/data,
+    // never to the opaque link section. Restrict the reader without copying.
+    let reader = Reader {
+        bytes: &bytes[..data_end],
+    };
     let mut ranges = Vec::new();
     for (header, width) in [(56, 4), (64, 4), (72, 12), (80, 8), (88, 8), (96, 32)] {
         let (count, offset) = reader.table(header, width)?;
@@ -876,6 +901,83 @@ mod tests {
         let mut bytes = original.to_vec();
         bytes[4..7].copy_from_slice(b"041");
         assert!(parse(&bytes).is_err());
+    }
+
+    fn linked_fixture() -> Vec<u8> {
+        let mut bytes = include_bytes!("../tests/fixtures/hello.dex").to_vec();
+        let link_start = bytes.len() as u32;
+        bytes.extend_from_slice(&[0x5a; 408]);
+        let file_size = bytes.len() as u32;
+        for (offset, value) in [(32, file_size), (44, 408), (48, link_start)] {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn trailing_link_data_preserves_classes_and_instructions() {
+        let original = parse(include_bytes!("../tests/fixtures/hello.dex")).unwrap();
+        for version in [b"035", b"037", b"038", b"039", b"040"] {
+            let mut bytes = linked_fixture();
+            bytes[4..7].copy_from_slice(version);
+            let linked = parse(&bytes).unwrap();
+            assert_eq!(linked.classes.len(), original.classes.len());
+            for (actual, expected) in linked.classes.iter().zip(&original.classes) {
+                assert_eq!(actual.descriptor, expected.descriptor);
+                assert_eq!(actual.methods.len(), expected.methods.len());
+                for (actual, expected) in actual.methods.iter().zip(&expected.methods) {
+                    assert_eq!(actual.name, expected.name);
+                    assert_eq!(
+                        actual.code.as_ref().map(|c| &c.instructions),
+                        expected.code.as_ref().map(|c| &c.instructions)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_link_bounds_and_data_references_into_link_data_are_rejected() {
+        let original = linked_fixture();
+        let link_start = u32::from_le_bytes(original[48..52].try_into().unwrap());
+        for (offset, value) in [
+            (44, 0),
+            (48, 0),
+            (44, 409),
+            (44, 407),
+            (44, u32::MAX),
+            (48, u32::MAX),
+            (48, link_start - 4),
+            (104, u32::MAX),
+        ] {
+            let mut bytes = original.clone();
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(parse(&bytes).is_err(), "offset={offset}, value={value}");
+        }
+        // Even a valid-looking string in link_data must not satisfy a string ID.
+        let mut bytes = original.clone();
+        let table = u32::from_le_bytes(bytes[60..64].try_into().unwrap()) as usize;
+        bytes[table..table + 4].copy_from_slice(&link_start.to_le_bytes());
+        bytes[link_start as usize..link_start as usize + 3].copy_from_slice(&[1, b'X', 0]);
+        assert!(
+            parse(&bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid DEX data offset")
+        );
+        // A string starting inside data must not read its terminator from link_data.
+        bytes[table..table + 4].copy_from_slice(&(link_start - 2).to_le_bytes());
+        bytes[link_start as usize - 2..link_start as usize + 1].copy_from_slice(&[1, b'X', 0]);
+        assert!(parse(&bytes).is_err());
+        // Extra bytes without a declared link section remain invalid.
+        bytes = original;
+        bytes[44..52].fill(0);
+        assert!(
+            parse(&bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("DEX data size mismatch")
+        );
     }
 
     #[test]

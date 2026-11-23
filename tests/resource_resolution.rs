@@ -39,8 +39,16 @@ fn pool(strings: &[&str]) -> Vec<u8> {
     b
 }
 fn table(flags: u8, compact: bool) -> Vec<u8> {
-    let global = pool(&["Hello café", "res/layout/main.xml", "res/xml/settings.xml"]);
-    let types = pool(&["string", "layout", "xml"]);
+    table_values(
+        flags,
+        compact,
+        &["Hello café", "res/layout/main.xml", "res/xml/settings.xml"],
+        &["string", "layout", "xml"],
+    )
+}
+fn table_values(flags: u8, compact: bool, values: &[&str], kinds: &[&str]) -> Vec<u8> {
+    let global = pool(values);
+    let types = pool(kinds);
     let keys = pool(&["title", "main", "settings"]);
     let mut package = chunk(0x200, 288, 288);
     put32(&mut package, 8, 127);
@@ -118,6 +126,65 @@ fn malformed_table_is_rejected_without_panics() {
     let mut b = table(0, false);
     put32(&mut b, 8, 2);
     assert!(ResourceTable::parse(&b).is_err());
+}
+
+#[test]
+fn relocated_resource_files_preserve_paths_without_reclassifying_strings() {
+    for flags in [0, 1, 2] {
+        for compact in [false, true] {
+            for paths in [
+                ["WV.xml", "WV.xml", "obfuscated/AbC"],
+                ["res/a.png", "res/a.png", "xy.png"],
+            ] {
+                let parsed = ResourceTable::parse(&table_values(
+                    flags,
+                    compact,
+                    &paths,
+                    &["string", "mipmap", "drawable"],
+                ))
+                .unwrap();
+                assert_eq!(parsed.entries[&0x7f010000].variants[0].value, paths[0]);
+                assert!(parsed.entries[&0x7f010000].variants[0].file.is_none());
+                assert_eq!(
+                    parsed.entries[&0x7f020000].variants[0].file.as_deref(),
+                    Some(paths[1])
+                );
+                assert_eq!(
+                    parsed.entries[&0x7f030000].variants[0].file.as_deref(),
+                    Some(paths[2])
+                );
+            }
+        }
+    }
+    for invalid in [
+        "",
+        "/icon.png",
+        "../icon.png",
+        "res/../icon",
+        "a//b",
+        "a/./b",
+        "https://host/icon",
+        "C:\\icon",
+        "#ffffff",
+        "@drawable/icon",
+        "?attr/icon",
+        "a\nb",
+    ] {
+        let parsed = ResourceTable::parse(&table_values(
+            0,
+            false,
+            &[invalid; 3],
+            &["string", "mipmap", "drawable"],
+        ))
+        .unwrap();
+        assert!(
+            parsed
+                .entries
+                .values()
+                .all(|r| r.variants[0].file.is_none()),
+            "{invalid:?}"
+        );
+    }
 }
 #[test]
 fn resource_symbols_preserve_unicode_offsets_and_skip_strings_comments() {

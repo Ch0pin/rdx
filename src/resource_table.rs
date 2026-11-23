@@ -12,6 +12,38 @@ mod usage;
 
 pub const PREFIX: &str = "resource://";
 const MAX_VALUES: usize = 2_000_000;
+
+fn file_value(kind: &str, ty: u8, value: &str) -> Option<String> {
+    // Optimizers may relocate file resources to the APK root and strip extensions.
+    // These resource types encode files as string values; ordinary string resources
+    // must remain text even when their value looks like an archive path.
+    let file_type = matches!(
+        kind,
+        "anim"
+            | "animator"
+            | "color"
+            | "drawable"
+            | "font"
+            | "interpolator"
+            | "layout"
+            | "menu"
+            | "mipmap"
+            | "navigation"
+            | "raw"
+            | "transition"
+            | "xml"
+    );
+    (ty == 3
+        && kind != "string"
+        && (value.starts_with("res/") || file_type)
+        && !value.starts_with(['@', '?', '#'])
+        && !value.contains(['\\', ':'])
+        && !value.chars().any(char::is_control)
+        && value
+            .split('/')
+            .all(|part| !matches!(part, "" | "." | "..")))
+    .then(|| value.to_owned())
+}
 #[derive(Clone, Debug)]
 pub struct Variant {
     pub configuration: String,
@@ -281,8 +313,7 @@ impl ResourceTable {
                             )
                         };
                         let value = typed(&global, ty, data)?;
-                        let file = (ty == 3 && kind != "string" && value.starts_with("res/"))
-                            .then(|| value.clone());
+                        let file = file_value(kind, ty, &value);
                         (value, file, matches!(ty, 1 | 2).then_some(data))
                     };
                     retained += value.len()

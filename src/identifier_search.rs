@@ -188,6 +188,27 @@ impl Cache {
             });
             return scan::run(classes, args, query, cancel, session);
         }
+        self.search_postings(classes, query, cancel, budget)
+    }
+
+    pub(crate) fn search_compact_types(
+        &self,
+        classes: Arc<BTreeMap<String, DexClass>>,
+        args: &Value,
+        cancel: &AtomicBool,
+    ) -> Result<Value> {
+        let mut query = Query::parse(args)?;
+        query.compact_type_sites = true;
+        self.search_postings(classes, query, cancel, MAX_INDEX_BYTES)
+    }
+
+    fn search_postings(
+        &self,
+        classes: Arc<BTreeMap<String, DexClass>>,
+        query: Query,
+        cancel: &AtomicBool,
+        budget: usize,
+    ) -> Result<Value> {
         let started = Instant::now();
         // A scoped request never waits for or builds unrelated global postings.
         // Once the global build exceeds its budget, remember the execution mode,
@@ -225,6 +246,8 @@ impl Cache {
 
 struct Query {
     array_components: bool,
+    compact_type_sites: bool,
+    exact_method_owner_name: bool,
     matcher: Regex,
     kind: String,
     occurrence: String,
@@ -246,11 +269,16 @@ fn number(args: &Value, key: &str, default: usize) -> Result<usize> {
             .context("Page value is too large")
     })
 }
-fn normalized_query(text: &str) -> String {
-    if let Some((owner, member)) = text.split_once("->")
-        && owner.starts_with('L')
-        && owner.ends_with(';')
-    {
+fn normalized_query(text: &str) -> Result<String> {
+    let normalized = if let Some((owner, member)) = text.split_once("->") {
+        ensure!(
+            owner.starts_with('L')
+                && owner.ends_with(';')
+                && owner.len() > 2
+                && !member.is_empty()
+                && !member.contains("->"),
+            "INVALID_IDENTIFIER_QUERY: put a DEX class descriptor before '->', for example Landroid/webkit/WebView;->loadUrl(Ljava/lang/String;)V. For an owner-qualified name without a descriptor, use android.webkit.WebView.loadUrl with symbol_kind=method."
+        );
         format!("{}.{}", type_name(owner), member)
     } else if text.starts_with('L')
         && text.ends_with(';')
@@ -260,7 +288,10 @@ fn normalized_query(text: &str) -> String {
         type_name(text)
     } else {
         text.to_owned()
-    }
+    };
+    // The resolver accepts an optional colon just before the method
+    // prototype. Keep field name:type and arbitrary literal substrings.
+    Ok(normalized.replacen(":(", "(", 1))
 }
 impl Query {
     fn parse(args: &Value) -> Result<Self> {
@@ -288,7 +319,18 @@ impl Query {
         let sensitive = args.get("case_sensitive").map_or(Ok(true), |v| {
             v.as_bool().context("case_sensitive must be a boolean")
         })?;
-        let pattern = regex::escape(&normalized_query(query));
+        let normalized = normalized_query(query)?;
+        let kind = choice(
+            args,
+            "symbol_kind",
+            "all",
+            &["all", "class", "method", "field"],
+        )?;
+        let exact_method_owner_name = match_mode == "exact"
+            && (kind == "method" || query.contains("->"))
+            && normalized.contains('.')
+            && !normalized.contains(['(', ':']);
+        let pattern = regex::escape(&normalized);
         let pattern = if match_mode == "exact" {
             format!("^(?:{pattern})$")
         } else {
@@ -303,14 +345,10 @@ impl Query {
         let package = crate::package_scope::PackageScope::from_args(args)?;
         Ok(Self {
             array_components: args["include_array_components"].as_bool().unwrap_or(false),
+            compact_type_sites: false,
+            exact_method_owner_name,
             matcher,
-            kind: choice(
-                args,
-                "symbol_kind",
-                "all",
-                &["all", "class", "method", "field"],
-            )?
-            .into(),
+            kind: kind.into(),
             occurrence: choice(
                 args,
                 "occurrence",
@@ -336,9 +374,15 @@ impl Query {
         (self.kind == "all" || self.kind == symbol.kind.name())
             && (self.matcher.is_match(&symbol.id)
                 || self.matcher.is_match(&symbol.name)
+                || (self.exact_method_owner_name
+                    && symbol.kind == Kind::Method
+                    && symbol
+                        .id
+                        .split_once('(')
+                        .is_some_and(|(head, _)| self.matcher.is_match(head)))
                 || (self.array_components
                     && symbol.kind == Kind::Class
-                    && self.matcher.is_match(symbol.id.trim_end_matches("[]"))))
+                    && array_component(&symbol.id).is_some_and(|ty| self.matcher.is_match(ty))))
     }
     fn matches_site(&self, site: &Site) -> bool {
         match self.occurrence.as_str() {
@@ -352,42 +396,128 @@ impl Query {
     }
 }
 
+fn array_component(id: &str) -> Option<&str> {
+    let descriptor = id.strip_prefix('[')?.trim_start_matches('[');
+    Some(
+        descriptor
+            .strip_prefix('L')
+            .and_then(|body| body.strip_suffix(';'))
+            .unwrap_or(descriptor),
+    )
+}
+
 // Retains at most one response page (1 MiB / 500 records), regardless of offset.
 // The complete scan computes the exact total and digest without retaining hits.
-struct Stream {
-    query: Query,
+struct StreamPage {
     items: Vec<Value>,
     total: usize,
     bytes: usize,
     full: bool,
     digest: Sha256,
 }
-impl Stream {
-    fn record(&mut self, item: Value) -> Result<()> {
+impl StreamPage {
+    fn record(&mut self, query: &Query, item: Value) -> Result<()> {
         let encoded = serde_json::to_vec(&item)?;
         self.digest.update(&encoded);
         self.digest.update(b"\n");
-        if self.total >= self.query.offset && !self.full {
-            ensure!(
-                encoded.len() <= 1_000_000,
-                "Identifier record exceeds output budget"
-            );
-            if self.bytes + encoded.len() > 1_000_000 {
+        if self.total >= query.offset && !self.full {
+            let (item, size) = if query.compact_type_sites {
+                let compact = compact_type_site(item);
+                let size = serde_json::to_vec(&compact)?.len();
+                (compact, size)
+            } else {
+                (item, encoded.len())
+            };
+            ensure!(size <= 1_000_000, "Identifier record exceeds output budget");
+            if self.bytes + size > 1_000_000 {
                 self.full = true;
             } else {
-                self.bytes += encoded.len();
+                self.bytes += size;
                 self.items.push(item);
-                self.full = self.items.len() == self.query.limit;
+                self.full = self.items.len() == query.limit;
             }
         }
         self.total += 1;
         Ok(())
     }
 }
+
+pub(crate) fn compact_type_site(mut item: Value) -> Value {
+    let object = item.as_object_mut().expect("DEX identifier site object");
+    let kind = object.remove("context").unwrap();
+    object.retain(|key, value| {
+        !value.is_null()
+            && matches!(
+                key.as_str(),
+                "symbol_id"
+                    | "class_id"
+                    | "method_id"
+                    | "field_id"
+                    | "dex_entry"
+                    | "code_unit_offset"
+                    | "parameter_index"
+                    | "opcode_value"
+            )
+    });
+    object.insert("reference_kind".into(), kind);
+    item
+}
+
 fn stream(
     classes: Arc<BTreeMap<String, DexClass>>,
     query: Query,
     cancel: &AtomicBool,
+) -> Result<Value> {
+    let mut page = StreamPage {
+        items: vec![],
+        total: 0,
+        bytes: 0,
+        full: false,
+        digest: Sha256::new(),
+    };
+    let mut coverage = visit_stream(classes, &query, cancel, |item, _| page.record(&query, item))?;
+    ensure!(
+        query.offset <= page.total,
+        "Invalid matching-occurrence offset"
+    );
+    let next = query.offset + page.items.len();
+    coverage["pagination"] = json!("hits");
+    coverage["items"] = json!(page.items);
+    coverage["total"] = json!(page.total);
+    coverage["offset"] = json!(query.offset);
+    coverage["offset_unit"] = json!("matching identifier occurrences");
+    coverage["next_offset"] = json!((next < page.total).then_some(next));
+    coverage["exhausted"] = json!(next == page.total);
+    coverage["source_hash"] = json!(format!("{:x}", page.digest.finalize()));
+    Ok(coverage)
+}
+
+pub(crate) fn visit_type_references(
+    classes: Arc<BTreeMap<String, DexClass>>,
+    args: &Value,
+    cancel: &AtomicBool,
+    mut emit: impl FnMut(Value) -> Result<()>,
+) -> Result<Value> {
+    let query = Query::parse(args)?;
+    visit_stream(classes, &query, cancel, |item, site| {
+        let mut item = compact_type_site(item);
+        if site.owner != Kind::Class {
+            item["member_declaration_index"] = json!(site.member);
+        }
+        emit(item)
+    })
+}
+
+struct Stream<'a> {
+    query: &'a Query,
+    emit: &'a mut dyn FnMut(Value, Site) -> Result<()>,
+}
+
+fn visit_stream(
+    classes: Arc<BTreeMap<String, DexClass>>,
+    query: &Query,
+    cancel: &AtomicBool,
+    mut emit: impl FnMut(Value, Site) -> Result<()>,
 ) -> Result<Value> {
     let mut builder = Builder {
         index: Index {
@@ -404,17 +534,13 @@ fn stream(
         budget: 0,
         stream: Some(Stream {
             query,
-            items: vec![],
-            total: 0,
-            bytes: 0,
-            full: false,
-            digest: Sha256::new(),
+            emit: &mut emit,
         }),
     };
     let mut scanned = 0;
     for (name, class) in classes.iter() {
         ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-        if !builder.stream.as_ref().unwrap().query.accepts_class(name) {
+        if !query.accepts_class(name) {
             continue;
         }
         builder.index.names.clear();
@@ -423,36 +549,25 @@ fn stream(
         scanned += 1;
     }
     ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-    let stream = builder.stream.unwrap();
-    ensure!(
-        stream.query.offset <= stream.total,
-        "Invalid matching-occurrence offset"
-    );
-    let next = stream.query.offset + stream.items.len();
-    Ok(
-        json!({"mode":"identifiers","pagination":"hits","execution_mode":"streaming",
-        "pagination_order":"class_then_dex_occurrence","items":stream.items,"total":stream.total,
-        "offset":stream.query.offset,"offset_unit":"matching identifier occurrences",
-        "next_offset":(next<stream.total).then_some(next),"exhausted":next==stream.total,
-        "source_hash":format!("{:x}",stream.digest.finalize()),"index_hash":null,"index_complete":false,
+    Ok(json!({"mode":"identifiers","execution_mode":"streaming",
+        "pagination_order":"class_then_dex_occurrence","index_hash":null,"index_complete":false,
         "coverage_complete":true,"scanned_classes":scanned,"skipped_classes":0,
-        "out_of_scope_classes":classes.len()-scanned,"package_scope":stream.query.package.describe(),
+        "out_of_scope_classes":classes.len()-scanned,"package_scope":query.package.describe(),
         "scanned_code_methods":builder.index.code_methods,"indexed_classes":0,
         "dynamic_instruction_sites_excluded":builder.index.dynamic_sites,
-        "scope":IDENTIFIER_SCOPE}),
-    )
+        "scope":IDENTIFIER_SCOPE}))
 }
 
 const IDENTIFIER_SCOPE: &str = "Original DEX class/method/field declarations, superclass/interfaces, declaration types, and direct type/field/method instruction operands. Method references are declared targets, including unreachable instructions. Generated Java names, locals, comments, string literals, annotations, encoded values, catch metadata, dynamic call sites/handles/prototypes and runtime dispatch are outside this index.";
 
-struct Builder {
+struct Builder<'a> {
     index: Index,
     ids: BTreeMap<(Kind, Arc<str>), u32>,
     operands: HashMap<(usize, Kind, u32), u32>,
     budget: usize,
-    stream: Option<Stream>,
+    stream: Option<Stream<'a>>,
 }
-impl Builder {
+impl Builder<'_> {
     fn charge(&mut self, bytes: usize) -> Result<()> {
         if self.stream.is_some() {
             return Ok(());
@@ -500,7 +615,7 @@ impl Builder {
             let symbol = &self.index.symbols[symbol as usize];
             if stream.query.matches(symbol, &site) {
                 let item = self.index.item(symbol, &site)?;
-                stream.record(item)?;
+                (stream.emit)(item, site)?;
             }
             return Ok(());
         }
@@ -830,7 +945,10 @@ impl Index {
                     continue;
                 }
                 if total >= query.offset && !full {
-                    let item = self.item(symbol, site)?;
+                    let mut item = self.item(symbol, site)?;
+                    if query.compact_type_sites {
+                        item = compact_type_site(item);
+                    }
                     let size = serde_json::to_vec(&item)?.len();
                     ensure!(size <= 1_000_000, "Identifier record exceeds output budget");
                     if bytes + size > 1_000_000 {
@@ -923,6 +1041,134 @@ mod tests {
             .search(&Query::parse(&args).unwrap(), &AtomicBool::new(false))
             .unwrap()
     }
+
+    #[test]
+    fn identifier_query_feedback_preserves_exact_method_and_descriptor_forms() {
+        let cache = Cache::default();
+        let classes = classes();
+        let cancel = AtomicBool::new(false);
+        let mut args =
+            json!({"symbol_kind":"method","occurrence":"reference","match_mode":"exact"});
+        for query in [
+            "Lframework/Api;->parseUri(Ljava/lang/String;)V",
+            "Lframework/Api;->parseUri:(Ljava/lang/String;)V",
+            "framework.Api.parseUri:(Ljava/lang/String;)V",
+            "framework.Api.parseUri",
+            "Lframework/Api;->parseUri",
+            "parseUri",
+        ] {
+            args["query"] = json!(query);
+            let result = cache.search(classes.clone(), &args, &cancel).unwrap();
+            let rows = result["items"].as_array().unwrap();
+            assert_eq!(rows.len(), 1, "{query}: {result}");
+            assert_eq!(
+                rows[0]["symbol_id"],
+                "framework.Api.parseUri(Ljava/lang/String;)V"
+            );
+            assert_eq!(rows[0]["dex_entry"], "classes.dex");
+        }
+        args["query"] = json!("android.webkit.WebView;->loadUrl");
+        let error = cache
+            .search(classes.clone(), &args, &cancel)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("INVALID_IDENTIFIER_QUERY")
+                && error.contains("Landroid/webkit/WebView;->loadUrl"),
+            "{error}"
+        );
+        let raw = cache
+            .search(
+                classes,
+                &json!({"query":"Lframework/Api;","symbol_kind":"class","match_mode":"exact"}),
+                &cancel,
+            )
+            .unwrap();
+        assert!(raw["total"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn array_components_match_raw_dex_object_and_primitive_arrays() {
+        let mut owner = fixture("app.One", "classes.dex", "parseUri");
+        Arc::get_mut(&mut owner.symbols).unwrap().types.extend([
+            "[Lframework/Api;".into(),
+            "[[Lframework/Api;".into(),
+            "[I".into(),
+            "[[I".into(),
+        ]);
+        owner.methods[0].code.as_mut().unwrap().instructions =
+            vec![0x1c, 0, 0x1c, 2, 0x1c, 3, 0x1c, 4, 0x1c, 5];
+        let classes = Arc::new(BTreeMap::from([("app.One".into(), owner)]));
+        let cache = Cache::default();
+        let cancel = AtomicBool::new(false);
+        let sites = |rows: &[Value]| {
+            let mut sites: Vec<_> = rows
+                .iter()
+                .filter_map(|row| {
+                    Some((
+                        row["code_unit_offset"].as_u64()?,
+                        row["symbol_id"].as_str()?.to_owned(),
+                    ))
+                })
+                .collect();
+            sites.sort_unstable();
+            sites
+        };
+        for (query, expected, without_components) in [
+            (
+                "framework.Api",
+                vec![
+                    (0, "framework.Api"),
+                    (2, "[Lframework.Api;"),
+                    (4, "[[Lframework.Api;"),
+                ],
+                1,
+            ),
+            ("I", vec![(6, "[I"), (8, "[[I")], 0),
+            ("[Lframework.Api;", vec![(2, "[Lframework.Api;")], 1),
+            ("[I", vec![(6, "[I")], 1),
+        ] {
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|(pc, ty)| (pc, ty.to_owned()))
+                .collect();
+            let mut args = json!({"query":query,"match_mode":"exact","symbol_kind":"class","occurrence":"reference","include_array_components":true});
+            for package_prefix in [None, Some("app")] {
+                if let Some(prefix) = package_prefix {
+                    args["package_prefix"] = json!(prefix);
+                }
+                let full = cache.search(classes.clone(), &args, &cancel).unwrap();
+                let compact = cache
+                    .search_compact_types(classes.clone(), &args, &cancel)
+                    .unwrap();
+                assert_eq!(
+                    full["execution_mode"],
+                    if package_prefix.is_some() {
+                        "streaming"
+                    } else {
+                        "index"
+                    }
+                );
+                assert_eq!(compact["execution_mode"], full["execution_mode"]);
+                assert_eq!(sites(full["items"].as_array().unwrap()), expected);
+                assert_eq!(sites(compact["items"].as_array().unwrap()), expected);
+                let mut visited = Vec::new();
+                visit_type_references(classes.clone(), &args, &cancel, |item| {
+                    visited.push(item);
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(sites(&visited), expected);
+            }
+            args["include_array_components"] = json!(false);
+            let unchanged = cache.search(classes.clone(), &args, &cancel).unwrap();
+            assert_eq!(
+                sites(unchanged["items"].as_array().unwrap()).len(),
+                without_components
+            );
+        }
+    }
+
     #[test]
     fn package_scope_lists_stream_each_listed_root() {
         let cancel = AtomicBool::new(false);

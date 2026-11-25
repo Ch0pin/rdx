@@ -9,7 +9,10 @@ pub(super) fn argument_aliases(name: &str) -> Vec<(&'static str, &'static [&'sta
     if matches!(
         name,
         "get_method_source"
+            | "search_method_source"
             | "get_call_graph"
+            | "get_hook_targets"
+            | "get_guard_summary"
             | "export_source"
             | "resolve_reference"
             | "resolve_switch_case_callers"
@@ -17,6 +20,8 @@ pub(super) fn argument_aliases(name: &str) -> Vec<(&'static str, &'static [&'sta
         table.push(("method_id", &["method_signature", "signature"]));
     }
     match name {
+        "get_class_source" => table.push(("limit", &["max_chars"])),
+        "export_source" => table.push(("class_name", &["class_id"])),
         "get_call_graph_batch" => {
             table.push((
                 "method_ids",
@@ -96,7 +101,10 @@ pub(super) fn aliases(name: &str, args: &Value) -> Result<Value> {
                 value
             };
             ensure!(
-                if list {
+                if canonical == "limit" {
+                    // The canonical integer validator reports the range and type.
+                    true
+                } else if list {
                     value.as_array().is_some_and(|items| {
                         !items.is_empty()
                             && items

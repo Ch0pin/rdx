@@ -7,6 +7,7 @@ use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 #[derive(Debug, Deserialize)]
@@ -157,6 +158,24 @@ pub struct MethodSource {
     pub fallback_reason: Option<String>,
 }
 
+/// The method search keeps just the text and renderer evidence.
+pub(crate) struct MethodSearchDocument {
+    pub source: String,
+    pub source_hash: String,
+    pub format: &'static str,
+    pub reconstruction_attempted: bool,
+    pub fallback_reason: Option<String>,
+    _retention: Option<Arc<crate::retained_budget::Reservation>>,
+}
+
+struct MethodSearchEntry {
+    method_id: String,
+    requested_format: MethodSourceFormat,
+    fallback_engine: crate::alternate_source::FallbackEngine,
+    helper_identity: Option<(PathBuf, u64, std::time::SystemTime)>,
+    document: Arc<MethodSearchDocument>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct NavigationResult {
     pub class: String,
@@ -218,6 +237,7 @@ pub struct NativeEngine {
     pub(crate) retained_budget: std::sync::Arc<crate::retained_budget::RetainedBudget>,
     source_cache: source_cache::SourceCache,
     search_index: crate::search_index::SharedIndex,
+    method_search: Arc<Mutex<Option<MethodSearchEntry>>>,
     input: Option<PathBuf>,
     prepared: Option<std::sync::Arc<crate::package_container::PackageContainer>>,
     classes: std::sync::Arc<Vec<String>>,
@@ -225,6 +245,7 @@ pub struct NativeEngine {
     resource_error: Option<String>,
     usage_index: Option<crate::usage_index::UsageIndexHandle>,
     identifier_index: crate::identifier_search::Cache,
+    network_hook_maps: crate::network_hook_maps::Cache,
     pub(crate) invoke_index: crate::call_graph::QueryCache,
 }
 
@@ -355,6 +376,16 @@ pub fn relocate_copied_source_range(
 }
 
 impl NativeEngine {
+    #[cfg(test)]
+    pub(crate) fn from_test_classes(
+        classes: std::collections::BTreeMap<String, crate::native_dex::DexClass>,
+    ) -> Self {
+        Self {
+            native: crate::native_engine::NativeDexEngine::from_test_classes(classes),
+            ..Self::default()
+        }
+    }
+
     /// Query exact original DEX annotation usages in the loaded project.
     pub fn annotation_usages(
         &self,
@@ -371,6 +402,9 @@ impl NativeEngine {
         args: &serde_json::Value,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<serde_json::Value> {
+        if args["projection"] == "hook_maps" {
+            return self.network_hook_maps.search(self, project, args, cancel);
+        }
         crate::network_stacks::search(self, project, args, cancel)
     }
     pub(crate) fn opened_path(&self) -> Option<&Path> {
@@ -421,9 +455,11 @@ impl NativeEngine {
         self.native = NativeDexEngine::default();
         self.source_cache = Default::default();
         self.search_index = Default::default();
+        self.method_search = Default::default();
         self.retained_budget = Default::default();
         self.identifier_index =
             crate::identifier_search::Cache::with_budget(self.retained_budget.clone());
+        self.network_hook_maps = Default::default();
         self.invoke_index = Default::default();
         self.classes = Default::default();
         self.resources = Default::default();
@@ -529,6 +565,14 @@ impl NativeEngine {
         self.native.class(name)
     }
 
+    pub(crate) fn hook_targets(
+        &self,
+        args: &serde_json::Value,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<serde_json::Value> {
+        crate::hook_targets::query(&self.native, args, cancel)
+    }
+
     pub fn search_identifiers(
         &self,
         args: &serde_json::Value,
@@ -536,6 +580,29 @@ impl NativeEngine {
     ) -> Result<serde_json::Value> {
         self.identifier_index
             .search(self.native.shared_classes(), args, cancel)
+    }
+
+    pub(crate) fn search_compact_type_references(
+        &self,
+        args: &serde_json::Value,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<serde_json::Value> {
+        self.identifier_index
+            .search_compact_types(self.native.shared_classes(), args, cancel)
+    }
+
+    pub(crate) fn visit_type_references(
+        &self,
+        args: &serde_json::Value,
+        cancel: &std::sync::atomic::AtomicBool,
+        emit: impl FnMut(serde_json::Value) -> Result<()>,
+    ) -> Result<serde_json::Value> {
+        crate::identifier_search::visit_type_references(
+            self.native.shared_classes(),
+            args,
+            cancel,
+            emit,
+        )
     }
 
     pub fn hierarchy_name_candidates(&self, short: &str) -> Vec<String> {
@@ -945,6 +1012,73 @@ impl NativeEngine {
             reconstruction_attempted: format == MethodSourceFormat::Auto,
             fallback_reason: fallback,
         })
+    }
+
+    /// Use the shared source-page permit before fetching a search document.
+    pub(crate) fn method_search_document(
+        &mut self,
+        method_id: &str,
+        requested_format: MethodSourceFormat,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(Arc<MethodSearchDocument>, bool, bool)> {
+        const MAX_RETAINED_METHOD_BYTES: usize = 16 * 1024 * 1024;
+        let fallback_engine = self.alternate_source.engine();
+        let helper_identity = (requested_format == MethodSourceFormat::Auto)
+            .then(|| self.alternate_source.helper_identity(fallback_engine))
+            .flatten();
+        if let Some(entry) = self.method_search.lock().unwrap().as_ref()
+            && entry.method_id == method_id
+            && entry.requested_format == requested_format
+            && entry.fallback_engine == fallback_engine
+            && entry.helper_identity == helper_identity
+        {
+            return Ok((entry.document.clone(), true, true));
+        }
+        let report = self.method_source(method_id, requested_format, cancel)?;
+        let bytes = report
+            .code
+            .source
+            .capacity()
+            .saturating_add(report.code.source_hash.capacity())
+            .saturating_add(report.fallback_reason.as_ref().map_or(0, String::capacity))
+            .saturating_add(method_id.len())
+            .saturating_add(
+                std::mem::size_of::<MethodSearchEntry>()
+                    + std::mem::size_of::<MethodSearchDocument>(),
+            );
+        let mut entry = self.method_search.lock().unwrap();
+        let helper_unchanged = requested_format != MethodSourceFormat::Auto
+            || self.alternate_source.helper_identity(fallback_engine) == helper_identity;
+        let retention = if bytes <= MAX_RETAINED_METHOD_BYTES
+            && self.alternate_source.engine() == fallback_engine
+            && helper_unchanged
+        {
+            // Make room for the replacement. In-flight readers keep their
+            // original shared reservation until they release the document.
+            *entry = None;
+            self.retained_budget.reserve(bytes)
+        } else {
+            None
+        };
+        let retained = retention.is_some();
+        let document = Arc::new(MethodSearchDocument {
+            source: report.code.source,
+            source_hash: report.code.source_hash,
+            format: report.format,
+            reconstruction_attempted: report.reconstruction_attempted,
+            fallback_reason: report.fallback_reason,
+            _retention: retention,
+        });
+        if retained {
+            *entry = Some(MethodSearchEntry {
+                method_id: method_id.into(),
+                requested_format,
+                fallback_engine,
+                helper_identity,
+                document: document.clone(),
+            });
+        }
+        Ok((document, false, retained))
     }
     pub fn decompile_source(&mut self, class: &str) -> Result<DecompiledSource> {
         let code = self.render_with_metadata(class)?;

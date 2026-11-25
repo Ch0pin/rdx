@@ -31,10 +31,14 @@ mod budget;
 mod dex_summary;
 #[path = "mcp_feedback.rs"]
 mod feedback;
+#[path = "mcp_instance_discovery.rs"]
+mod instance_discovery;
 #[path = "mcp_registry.rs"]
 mod instance_registry;
 #[path = "mcp_literals.rs"]
 mod literals;
+#[path = "mcp_method_search.rs"]
+mod method_search;
 #[path = "mcp_navigation.rs"]
 mod navigation;
 #[path = "mcp_review.rs"]
@@ -100,7 +104,7 @@ fn private_write(path: &Path, value: &Value) -> Result<()> {
     file.flush()?;
     Ok(())
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Registration {
     instance_id: String,
     address: SocketAddr,
@@ -654,10 +658,11 @@ fn project_request(
             .exports
             .status(required(args, "job_id")?, name == "cancel_export");
     }
-    if name == "export_package_source" && args["background"] != false {
+    if name == "export_package_source" {
         ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
         check_project_file(project)?;
-        return project.exports.start(project, args);
+        let wait = (args["background"] == false).then_some(cancel);
+        return project.exports.start(project, args, wait);
     }
     if matches!(
         name,
@@ -678,7 +683,6 @@ fn project_request(
             | "get_resource_value"
             | "find_type_references"
             | "search_kotlin_metadata"
-            | "export_package_source"
             | "search_resource_xml"
             | "list_nav_deeplinks"
             | "find_layout_references"
@@ -704,12 +708,15 @@ fn project_request(
         check_project_file(project)?;
         return Ok(result);
     }
-    // Immutable DEX queries bypass the interactive engine mutex entirely.
+    // DEX and request-local source queries bypass the interactive engine mutex.
     if matches!(
         name,
         "search_code"
+            | "search_method_source"
             | "get_call_graph"
             | "get_call_graph_batch"
+            | "get_hook_targets"
+            | "get_guard_summary"
             | "resolve_reference"
             | "find_field_references"
             | "get_lambda_branch"
@@ -722,7 +729,6 @@ fn project_request(
             | "get_resource_value"
             | "find_type_references"
             | "search_kotlin_metadata"
-            | "export_package_source"
             | "search_resource_xml"
             | "list_nav_deeplinks"
             | "find_layout_references"
@@ -1066,32 +1072,29 @@ fn unix_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+#[cfg(test)]
 fn discover(entries: &[Registration], args: &Value) -> Result<Value> {
+    discover_snapshot(entries, args, true)
+}
+
+fn discover_snapshot(
+    entries: &[Registration],
+    args: &Value,
+    registry_complete: bool,
+) -> Result<Value> {
     let start = args["registration_offset"].as_u64().unwrap_or(0) as usize;
     ensure!(start <= entries.len(), "Invalid registration_offset");
     let end = start.saturating_add(16).min(entries.len());
-    let mut items = Vec::new();
-    let mut diagnostics = Vec::new();
+    let mut scan = instance_discovery::Scan::new(args);
     for entry in &entries[start..end] {
-        match remote(entry, "get_instance_info", &json!({})) {
-            Ok(info) => { let mut info = normalize_instance_info(info);
-                info["reachability"] = json!("reachable");
-                info["last_seen_unix_ms"] = json!(unix_ms());
-                info["owner_pid"] = json!(entry.owner_pid);
-                info["registered_at_unix_ms"] = json!(entry.registered_at_unix_ms);
-                if instance_matches(&info,args) { items.push(info); } },
-            Err(error) => diagnostics.push(json!({"instance_id":entry.instance_id,
-                "status":"instance_unreachable", "error":format!("{error:#}"),
-                "checked_at_unix_ms":unix_ms(),"last_seen_unix_ms":Value::Null,
-                "owner_pid":entry.owner_pid,"apk_path":entry.apk_path,"registered_at_unix_ms":entry.registered_at_unix_ms,
-                "recovery":{"tool":"open_apk","arguments":{"path":entry.apk_path,"request_key":format!("recovery-{}",entry.instance_id),"headless":true},"requires_explicit_call":true},
-                "action":"Check the GUI MCP status and retry. If the GUI has closed, reopen it; an unreachable registration alone does not prove a stale process."})),
-        }
+        scan.record(entry, remote(entry, "get_instance_info", &json!({})), false);
     }
-    let selection = feedback::selection(&items, args, start == 0 && end == entries.len());
-    let mut result = page(items, args)?;
-    result["diagnostics"] = json!(diagnostics);
-    result["discovery_complete"] = json!(end == entries.len());
+    let complete = registry_complete && end == entries.len();
+    let selection = feedback::selection(&scan.items, args, start == 0 && complete);
+    let mut result = page(std::mem::take(&mut scan.items), args)?;
+    scan.attach_diagnostics(&mut result);
+    result["discovery_complete"] = json!(complete);
+    result["registry_scan_complete"] = json!(registry_complete);
     result["next_registration_offset"] = json!((end < entries.len()).then_some(end));
     result["registered_instances"] = json!(entries.len());
     result["selection"] = selection;
@@ -1214,13 +1217,43 @@ fn dispatch(
     cancel: &AtomicBool,
 ) -> Result<Value> {
     let mut normalized = feedback::aliases(name, args)?;
+    if name == "get_call_graph" {
+        validate_graph_root(&normalized)?;
+    }
+    let method_text = matches!(name, "get_method_source" | "search_method_source");
+    let named_root =
+        (method_text || name == "get_call_graph") && normalized.get("method_id").is_none();
     let mut selection = None;
-    if let Some(key) = method_selector(name)
+    let mut named_selection = None;
+    if named_root {
+        let class_name = required(&normalized, "class_name")?;
+        let method_name = required(&normalized, "method_name")?;
+        let descriptor = normalized["descriptor"].as_str();
+        let owner = resolve_class_id(project, class_name)?;
+        let method_id = review::named_member(engine, owner, method_name, descriptor, true)?;
+        let method_id = crate::method_lookup::normalize(&method_id)?;
+        let mut selector = json!({"class_name":class_name,"method_name":method_name});
+        if let Some(descriptor) = descriptor {
+            selector["descriptor"] = json!(descriptor);
+        }
+        named_selection = Some((selector, owner, method_id.clone()));
+        let object = normalized.as_object_mut().unwrap();
+        for key in ["class_name", "method_name", "descriptor"] {
+            object.remove(key);
+        }
+        object.insert("method_id".into(), json!(method_id));
+    } else if let Some(key) = method_selector(name)
         && let Some(requested) = normalized[key].as_str().map(str::to_owned)
     {
         let chosen = select_method(engine, project, &requested, name == "get_call_graph")?;
         normalized[key] = json!(chosen.method_id);
         selection = Some((key, requested, chosen));
+    }
+    if name == "get_call_graph" {
+        let object = normalized.as_object_mut().unwrap();
+        if let Some(filter) = object.remove("neighbor_class_name") {
+            object.insert("class_name".into(), filter);
+        }
     }
     if class_scoped(name)
         && (name != "find_instantiations"
@@ -1265,10 +1298,10 @@ fn dispatch(
         review::call_arguments(engine, &mut result, cancel)?;
     }
     if argument_filter {
-        review::argument_filter(&mut result, args)?;
+        review::argument_filter(&mut result, &normalized)?;
     }
     if name == "get_call_graph" {
-        navigation::enrich(engine, &mut result, args, cancel)?;
+        navigation::enrich(engine, &mut result, &normalized, cancel)?;
         feedback::caller_status(&mut result);
     }
     if class_scoped(name) {
@@ -1282,24 +1315,81 @@ fn dispatch(
     if let Some((key, requested, chosen)) = selection {
         if key == "method_id" {
             result["requested_method_id"] = json!(requested);
-            if matches!(name, "get_method_source" | "get_call_graph") {
+            if method_text || name == "get_call_graph" {
                 result["method_id"] = json!(chosen.method_id);
             }
         }
         result["method_selection"] = json!({"parameter":key,"requested_method_id":requested,"method_id":chosen.method_id,
             "status":if chosen.exact {"exact"} else {"unique_candidate"},"owner_qualified":chosen.owner_qualified,
             "scope":crate::method_lookup::SELECTION_SCOPE});
+        if method_text {
+            let selector = json!({"method_id":requested});
+            let requested_id = crate::method_lookup::normalize(&requested)?;
+            let requested_class = crate::method_lookup::owner(&requested_id)?;
+            method_resolution(
+                &mut result,
+                selector,
+                requested_class,
+                &chosen.requested_owner,
+                &chosen.method_id,
+            )?;
+        }
+    }
+    if let Some((selector, owner, method_id)) = named_selection {
+        let class_name = required(&selector, "class_name")?.to_owned();
+        method_resolution(&mut result, selector, &class_name, owner, &method_id)?;
+        result["method_id"] = json!(method_id);
     }
     if name == "get_call_graph" {
         budget::call_graph(&mut result, args)?;
     }
     Ok(result)
 }
+
+fn method_resolution(
+    result: &mut Value,
+    selector: Value,
+    requested_class_name: &str,
+    requested_class_id: &str,
+    method_id: &str,
+) -> Result<()> {
+    let declaring_class_id = crate::method_lookup::owner(method_id)?;
+    result["requested_selector"] = selector;
+    result["requested_class_name"] = json!(requested_class_name);
+    result["requested_class_id"] = json!(requested_class_id);
+    result["declaring_class_id"] = json!(declaring_class_id);
+    result["inherited"] = json!(declaring_class_id != requested_class_id);
+    Ok(())
+}
+
+fn validate_graph_root(args: &Value) -> Result<()> {
+    if args.get("method_id").is_some() {
+        ensure!(
+            args.get("method_name").is_none() && args.get("descriptor").is_none(),
+            "CONFLICTING_METHOD_SELECTORS: use method_id or class_name plus method_name and optional descriptor"
+        );
+        if let (Some(class), Some(neighbor)) =
+            (args.get("class_name"), args.get("neighbor_class_name"))
+        {
+            ensure!(
+                class == neighbor,
+                "CONFLICTING_ARGUMENTS: class_name and neighbor_class_name must agree when method_id selects the root"
+            );
+        }
+    } else {
+        required(args, "class_name")
+            .context("Select the root with method_id or class_name plus method_name")?;
+        required(args, "method_name")
+            .context("Select the root with method_id or class_name plus method_name")?;
+    }
+    Ok(())
+}
 /// Parameters that name one method and accept short owners or incomplete
 /// selectors.
 fn method_selector(name: &str) -> Option<&'static str> {
     match name {
         "get_method_source"
+        | "search_method_source"
         | "get_call_graph"
         | "export_source"
         | "resolve_reference"
@@ -1313,6 +1403,7 @@ struct MethodSelection {
     method_id: String,
     exact: bool,
     owner_qualified: bool,
+    requested_owner: String,
 }
 /// A short or unloaded owner resolves like a class selector before overload
 /// selection. Complete signatures of unloaded owners stay exact only where the
@@ -1344,6 +1435,7 @@ fn select_method(
         owner_qualified: qualified != id,
         method_id: selection.method_id,
         exact: selection.exact,
+        requested_owner: crate::method_lookup::owner(&qualified)?.to_owned(),
     })
 }
 fn class_scoped(name: &str) -> bool {
@@ -1436,6 +1528,8 @@ fn dispatch_resolved(
         },
         "get_call_graph" => engine.call_graph_query_by_id(required(args,"method_id")?,args,cancel),
         "get_call_graph_batch" => navigation::batch(engine,project,args,cancel),
+        "get_hook_targets" => engine.hook_targets(args,cancel),
+        "get_guard_summary" => crate::guard_summary::query(engine,args,cancel),
         "resolve_reference" => navigation::resolve(engine,project,args,cancel),
         "get_method_source" => {
             let requested = review::member_selector(engine,project,args,true)?;
@@ -1477,6 +1571,7 @@ fn dispatch_resolved(
             Ok(result)
         },
         "search_code" => search_code(engine, project, args, cancel),
+        "search_method_source" => method_search::query(engine,project,args,cancel),
         "get_all_classes" | "search_classes_by_keyword" => discovery::classes(project,args),
         "find_type_references" => discovery::types(engine,project,args,cancel),
         "search_kotlin_metadata" => discovery::metadata(engine,project,args,cancel),
@@ -1548,8 +1643,16 @@ fn registrations() -> Result<Vec<Registration>> {
     registrations_in(&registry()?)
 }
 fn registrations_in(directory: &Path) -> Result<Vec<Registration>> {
+    registration_snapshot(directory).map(|(entries, _)| entries)
+}
+fn registration_snapshot(directory: &Path) -> Result<(Vec<Registration>, bool)> {
     let mut out = Vec::new();
-    for entry in fs::read_dir(directory)?.take(1024) {
+    let mut complete = true;
+    for (index, entry) in fs::read_dir(directory)?.take(1025).enumerate() {
+        if index == 1024 {
+            complete = false;
+            break;
+        }
         let path = entry?.path();
         if path.extension().is_none_or(|x| x != "json") {
             continue;
@@ -1568,7 +1671,7 @@ fn registrations_in(directory: &Path) -> Result<Vec<Registration>> {
         }
     }
     out.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
-    Ok(out)
+    Ok((out, complete))
 }
 fn forget_instance_in(directory: &Path, id: &str) -> Result<Value> {
     ensure!(
@@ -1696,7 +1799,7 @@ fn tools_list() -> Value {
         ),
         (
             "find_type_references",
-            "Paged original DEX type operands, declaration types, and explicit class/field/method/parameter annotation type usages with decoded values. Annotation references follow identifier references in hit pagination. XML references use find_layout_references.",
+            "Page original DEX type operands, declaration types, and explicit class/field/method/parameter annotations. Full projection includes raw evidence and decoded values. Compact keeps exact owners, reference kinds and site locations. For compact counts by owner and kind, set group_by=owner_and_kind. Annotation references follow identifier references. XML references use find_layout_references.",
             vec!["class_name"],
             true,
         ),
@@ -1714,7 +1817,7 @@ fn tools_list() -> Value {
         ),
         (
             "list_nav_deeplinks",
-            "Inventory navigation XML deep links and Hotwire destination URI annotations. Includes destination arguments, graph includes, resource configurations, and bounded ordered class-array evidence. Candidate array indexes and conditional route strings are distinct from proven runtime registration.",
+            "Inventory navigation XML deep links and Hotwire destination URI annotations. Includes destination arguments, graph includes, resource configurations, and bounded ordered class-array evidence. Opt in with include_compose=true to include supported DEX type-safe Compose registrations and argument evidence. Static rows do not establish external reachability.",
             vec![],
             true,
         ),
@@ -1738,7 +1841,7 @@ fn tools_list() -> Value {
         ),
         (
             "export_package_source",
-            "Start a background source export (default) and return job_id immediately. Poll get_export_status; cancel with cancel_export. Durable export-status.json and completion.json describe progress, errors and interruption; resume=true validates and continues the same out_path with the same APK, renderer and package_prefix. Empty package_prefix selects all classes. Numeric paths and manifest.jsonl preserve case-colliding identities. background=false waits synchronously and remains subject to the transport deadline.",
+            "Start a source export for one package_prefix or a union of up to 64 prefixes. An empty string selects all classes. One worker per project exports each matching class once in deterministic order. Poll get_export_status; cancel with cancel_export. Durable export-status.json and completion.json describe progress, errors and interruption; resume=true validates the same out_path, APK, renderer and normalized package scope. Numeric paths and manifest.jsonl preserve case-colliding identities. background=false waits synchronously and remains subject to the transport deadline.",
             vec!["out_path", "package_prefix"],
             true,
         ),
@@ -1768,7 +1871,7 @@ fn tools_list() -> Value {
         ),
         (
             "export_source",
-            "Export complete class or method source plus coverage.json into a NEW absolute directory supplied as out_path. Returns paths, hashes, byte size and project identity. Never overwrites existing paths. Select class_name, method_id, or class_name plus method_name/descriptor. format=dex is available for method export.",
+            "Export complete class or method source plus coverage.json into a NEW absolute directory supplied as out_path. Returns paths, hashes, byte size and project identity. Never overwrites existing paths. Select class_name (or class_id), method_id, or class_name plus method_name/descriptor. format=dex is available for method export.",
             vec!["out_path"],
             true,
         ),
@@ -1815,6 +1918,12 @@ fn tools_list() -> Value {
             false,
         ),
         (
+            "resolve_instance",
+            "Resolve one running local project by exact package_name and APK SHA-256 across registration batches. Reports reachable candidates and whether the registration snapshot was fully checked. Incomplete scans and ambiguous matches leave selected empty. No project is opened or selected automatically.",
+            vec!["package_name", "apk_sha256"],
+            false,
+        ),
+        (
             "get_instance_info",
             "Read instance state, project identity and literal_index build state/progress. Available while literal indexing and other work slots are busy.",
             vec!["instance_id"],
@@ -1846,13 +1955,25 @@ fn tools_list() -> Value {
         ),
         (
             "get_call_graph",
-            "Query static DEX calls. Missing loaded-root signatures return SYMBOL_NOT_FOUND with bounded candidates. Check root_resolution_complete: unresolved external or inherited references do not establish a valid method with no callers; scan_complete describes DEX traversal separately. Direction: callers, callees (default), or both. Accepts pkg.Class.method(desc)ret or Lpkg/Class;->method(desc)ret. Incomplete method selectors return bounded overload candidates; retry with an exact signature. direct_only selects depth 1. projection=call_sites defaults to depth 1 (explicit depth includes transitive sites) and returns paginated exact caller IDs/signatures and DEX code-unit offsets, raw invoke words/target, DEX entry and traversal depth without graph payload or graph-size caps (limit <=500). Optional package_prefix, exact class_name, class/method annotation and component_type filters select neighboring declarations after traversal. Caller queries reuse a project-owned disk invoke index; get_instance_info reports build progress. Optional include_source_locations adds method-local locations with explicit precision and reconstruction status; include_forwarders adds verified static delegates and separately labelled exact cross-namespace helper calls. Default graph has component-path highlights and a 5000-node/20000-edge cap.",
+            "Query static DEX calls. Select the root by method_id (dotted or smali signature), or by class_name plus method_name and optional descriptor from the loaded class hierarchy. Name selectors return bounded candidates on ambiguity. Use neighbor_class_name to filter neighbors of a named root; with method_id, class_name also retains its neighbor-filter meaning. Missing loaded-root signatures return SYMBOL_NOT_FOUND with bounded candidates. Check root_resolution_complete for external/inherited reference resolution; scan_complete describes DEX traversal separately. Direction: callers, callees (default), or both. direct_only selects depth 1. projection=call_sites defaults to depth 1 (explicit depth includes transitive sites) and returns paginated exact caller IDs/signatures and DEX code-unit offsets, raw invoke words/target, DEX entry and traversal depth without graph payload or graph-size caps (limit <=500). Optional package_prefix, class/method annotation and component_type filters select neighboring declarations after traversal. Caller queries reuse a project-owned disk invoke index; get_instance_info reports build progress. Optional include_source_locations adds method-local locations with explicit precision and reconstruction status; include_forwarders adds verified static delegates and separately labelled exact cross-namespace helper calls. Default graph has component-path highlights and a 5000-node/20000-edge cap.",
             vec!["method_id"],
             true,
         ),
         (
             "get_all_classes",
             "List class names and IDs, optionally filtered by query and package_prefix (one prefix, an array, or obfuscated-root for short R8-style roots such as wr.b$a).",
+            vec![],
+            true,
+        ),
+        (
+            "get_hook_targets",
+            "Expand one exact virtual DEX method_id into deduplicated declaration hook targets for possible loaded receiver classes. projection=receivers pages every matched receiver and its declaration or unresolved status. Targets include a bounded receiver preview and identify bridge methods. Optional package_prefix restricts receivers. No runtime receiver is inferred or hook installed.",
+            vec!["method_id"],
+            true,
+        ),
+        (
+            "get_guard_summary",
+            "Summarize a small pure String/boolean DEX helper by exact method_id, or supply caller_method_id and call_site_offset to prove one static invoke and its arguments. Reports comparison direction, boolean and null cases, exact DEX locations and evidence hashes. Unsupported semantics remain unknown. The result describes comparison behavior.",
             vec![],
             true,
         ),
@@ -1917,8 +2038,14 @@ fn tools_list() -> Value {
             true,
         ),
         (
+            "search_method_source",
+            "Search one selected method's rendered text with a line-oriented regex. Each row reports the first match on a full logical line and a bounded context window. Reuses get_method_source selectors and auto/dex rendering. Follow next_cursor as resume_cursor with the same query and source representation. Check coverage_complete and source_status before interpreting a zero-result search.",
+            vec!["query"],
+            true,
+        ),
+        (
             "get_class_source",
-            "Read Java or mixed Java/DEX source with per-method decompiled/dex-fallback/omitted status and reasons. class_id or class_name accepts FQCN or unique short name. Follow next_offset until null; full_text_in_response distinguishes a whole document from a slice. Coverage describes the entire class, not just this page; decompiled status is not a proof of semantic equivalence.",
+            "Read Java or mixed Java/DEX source with per-method decompiled/dex-fallback/omitted status and reasons. class_id or class_name accepts FQCN or unique short name. limit (alias max_chars) counts Unicode characters. Follow next_offset until null; full_text_in_response distinguishes a whole document from a slice. Coverage describes the entire class, not just this page; decompiled status is not a proof of semantic equivalence.",
             vec!["class_id"],
             true,
         ),
@@ -2020,22 +2147,29 @@ fn tools_list() -> Value {
         if name=="export_package_source" {
             properties.insert("background".into(),json!({"type":"boolean","default":true}));
             properties.insert("resume".into(),json!({"type":"boolean","default":false}));
-            properties["package_prefix"]["minLength"] = json!(0);
+            properties.insert("package_prefix".into(),json!({"type":["string","array"],"minLength":0,"minItems":1,"maxItems":64,"items":{"type":"string","minLength":1},"description":"One dotted package/class prefix or the union of up to 64 prefixes, matched at package boundaries. A normalized list must fit in 16 KiB of JSON. An empty string selects all classes. Trailing dots, order and repeated prefixes do not affect resume identity."}));
         }
         if name=="open_apk" {
             properties.insert("load_profile".into(),json!({"type":"string","enum":["standard","large"],"default":"standard","description":"Headless only. Explicit bounded loader profile; standard is the default. large uses the existing higher limits for this project only. Profile changes require a new request_key, including after failure. The effective profile is returned in launch and instance info."}));
             properties.insert("headless".into(),json!({"type":"boolean","default":false,"description":"Host the project in this MCP gateway without a GUI. Closing the gateway stops this service and cancels work. Poll get_instance_info for Running and project_id."}));
             properties.insert("request_key".into(),json!({"type":"string","minLength":1,"description":"Unique launch key within this gateway connection, e.g. review-temu-1. Reuse for retries of the same canonical path; a new key opens another window. Reusing it for a different path, launch mode or load_profile is rejected; use a new key for an explicit larger-profile retry."}));
         }
-        if ["get_method_source","find_field_references","export_source"].contains(&name) {
+        if ["get_method_source","search_method_source","get_call_graph","find_field_references","export_source"].contains(&name) {
             let id = if name=="find_field_references" {"field_id"} else {"method_id"};
             let member = if name=="find_field_references" {"field_name"} else {"method_name"};
             required.retain(|k| *k!=id);
             for key in [id,"class_name",member,"descriptor"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
         }
         if ["find_type_references","search_kotlin_metadata","find_webview_chooser_flows","find_network_stacks","list_nav_deeplinks"].contains(&name) { properties.insert("package_prefix".into(),json!({"type":"string"})); }
+        if name=="find_type_references" {
+            properties.insert("projection".into(),json!({"type":"string","enum":["full","compact"],"default":"full","description":"Compact keeps target and enclosing owner IDs, reference kind and site locator. Full keeps raw instruction and decoded annotation evidence."}));
+            properties.insert("group_by".into(),json!({"type":"string","enum":["none","owner_and_kind"],"default":"none","description":"Compact only: owner_and_kind pages groups with exact occurrence_count and an example site. Offsets count groups; occurrence_total counts all individual sites."}));
+        }
         if ["get_all_classes","search_classes_by_keyword","search_kotlin_metadata","search_resource_xml"].contains(&name) { properties.insert("case_sensitive".into(),json!({"type":"boolean","default":true})); }
         if ["search_resource_xml","list_nav_deeplinks","find_layout_references"].contains(&name) { properties.insert("resource_prefix".into(),json!({"type":"string"})); }
+        if name=="list_nav_deeplinks" {
+            properties.insert("include_compose".into(),json!({"type":"boolean","default":false,"description":"Append supported type-safe Compose DEX registrations when resource_prefix is absent or empty. Reports separate static coverage."}));
+        }
         if name=="find_annotation_usages" {
             properties.insert("element".into(),json!({"type":"string","enum":["all","class","field","method","parameter"],"default":"all"}));
             properties.insert("package_prefix".into(),json!({"type":"string"}));
@@ -2052,12 +2186,18 @@ fn tools_list() -> Value {
             properties.insert("config".into(),json!({"type":"string","minLength":1}));
             if name=="get_resource_value" {for key in ["resource_id","resource_name"] {properties.insert(key.into(),json!({"type":"string","minLength":1}));}}
         }
-        if ["get_method_source","export_source"].contains(&name) {
+        if ["get_method_source","search_method_source","export_source"].contains(&name) {
             properties.insert("format".into(),json!({"type":"string","enum":["auto","dex"],"default":"auto","description":"auto attempts Java with explicit DEX fallback; dex requests native RDX DEX disassembly directly"}));
         }
         if name=="get_method_source" {
             properties.insert("include_dex_summary".into(),json!({"type":"boolean","default":false,"description":"Add physical p-register aliases and up to 32 Bundle getString/getBoolean key/result-register records with bounded constant proof"}));
             properties.insert("include_call_sites".into(),json!({"type":"boolean","default":false,"description":"Add call_sites: every invoke of this method with its DEX offset, callee, argument registers with proven constants, and the position in this text when the callee is referenced once (rdx-dex text maps every offset)"}));
+        }
+        if name=="search_method_source" {
+            properties.insert("case_sensitive".into(),json!({"type":"boolean","default":true}));
+            properties.insert("context_lines".into(),json!({"type":"integer","minimum":0,"maximum":8,"default":2,"description":"Context lines before and after each matching line"}));
+            properties.insert("start_line".into(),json!({"type":"integer","minimum":1,"description":"One-based line to start a suffix search. Omit when resuming."}));
+            properties.insert("resume_cursor".into(),json!({"type":"string","minLength":1,"description":"Opaque next_cursor from a previous page. Preserve selector, query, case sensitivity and format."}));
         }
         if name=="find_field_references" {
             properties.insert("field".into(),json!({"type":"string","minLength":1,"description":"Alias for field_id; accepts Lpkg/Class;->name:type and pkg.Class.name:type"}));
@@ -2080,8 +2220,28 @@ fn tools_list() -> Value {
             properties.insert("registration_offset".into(),json!({"type":"integer","minimum":0}));
             for key in ["apk_path", "apk_sha256", "package_name"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
         }
+        if ["list_instances","get_health","resolve_instance"].contains(&name) {
+            properties.insert("diagnostics".into(),json!({"type":"string","enum":["related","all"],"default":"related","description":"Show unknown or related diagnostics by default. Use all to include known-unrelated detail. Counts always include every checked registration."}));
+        }
         if name=="resolve_switch_case_callers" { properties["limit"]["maximum"] = json!(100); properties.remove("offset"); }
-        if name=="find_network_stacks" { properties["limit"]["maximum"] = json!(100); properties.insert("projection".into(),json!({"type":"string","enum":["all","services"],"default":"all","description":"services pages Retrofit service-method rows only"})); }
+        if name=="find_network_stacks" {
+            properties["limit"]["maximum"] = json!(100);
+            properties.insert("projection".into(),json!({"type":"string","enum":["all","services","hook_maps"],"default":"all","description":"services pages Retrofit service-method rows. hook_maps pages cached static OkHttp role evidence."}));
+            properties.insert("include_observer".into(),json!({"type":"boolean","default":false,"description":"hook_maps only. Include a local observer template when the install declaration and capture roles are proven."}));
+        }
+        if name=="get_hook_targets" {
+            properties["limit"]["maximum"] = json!(100);
+            properties.insert("package_prefix".into(),package_prefix_schema());
+            properties.insert("projection".into(),json!({"type":"string","enum":["targets","receivers"],"default":"targets","description":"targets pages deduplicated declaring methods; receivers pages exact loaded receiver-to-declaration evidence"}));
+        }
+        if name=="get_guard_summary" {
+            for key in ["method_id","caller_method_id"] {
+                properties.insert(key.into(),json!({"type":"string","minLength":1}));
+            }
+            properties.insert("call_site_offset".into(),json!({"type":"integer","minimum":0,"maximum":32767,"description":"Original invoke offset in 16-bit DEX code units"}));
+            properties.remove("offset");
+            properties.remove("limit");
+        }
         if name=="find_instantiations" { for key in ["allocating_class","allocating_method_id"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); } }
         if name=="find_integer_references" {
             properties.insert("values".into(),json!({"type":"array","minItems":1,"maxItems":64,"items":{"anyOf":[{"type":"integer"},{"type":"string","minLength":1,"maxLength":32}]},"description":"Signed decimals or decimal/0x hex strings. Hex patterns are interpreted at bit_width; duplicate normalized values are merged. Prefer strings for 64-bit precision."}));
@@ -2144,7 +2304,11 @@ fn tools_list() -> Value {
             properties.insert("max_output_bytes".into(),json!({"type":"integer","minimum":16384,"maximum":1048576,"default":65536}));
         }
         if ["get_source_search_status","cancel_source_search","release_source_search"].contains(&name) { properties.remove("offset"); properties.remove("limit"); }
-        if ["get_method_source","get_class_source","get_class_disassembly","get_android_manifest","get_resource_file","get_manifest_summary"].contains(&name) {
+        if name=="search_method_source" {
+            properties.remove("offset");
+            properties.insert("limit".into(),json!({"type":"integer","minimum":1,"maximum":100,"default":50,"description":"Maximum matching lines on this page. Each record has the first match only."}));
+        }
+        if ["get_method_source","search_method_source","get_class_source","get_class_disassembly","get_android_manifest","get_resource_file","get_manifest_summary"].contains(&name) {
             properties.insert("source_hash".into(),json!({"type":"string","minLength":1,"description":"Optional source_hash from an earlier page of the same document; the request fails with SOURCE_CHANGED when the current text hashes differently"}));
         }
         if ["get_call_graph","get_call_graph_batch"].contains(&name) {
@@ -2160,6 +2324,11 @@ fn tools_list() -> Value {
             properties.insert("direct_only".into(),json!({"type":"boolean","default":false}));
             properties.insert("projection".into(),json!({"type":"string","enum":["graph","call_sites"],"default":"graph"}));
             for key in ["package_prefix", "class_name", "annotation"] { properties.insert(key.into(),json!({"type":"string","minLength":1})); }
+            if name=="get_call_graph" {
+                properties["class_name"]["description"]=json!("Root owner when method_name is present; exact neighbor class filter when method_id is present");
+                properties["descriptor"]["description"]=json!("Optional DEX descriptor when selecting the root by class_name and method_name, e.g. (I)I");
+                properties.insert("neighbor_class_name".into(),json!({"type":"string","minLength":1,"description":"Exact neighboring class filter after traversal. With method_id, class_name is a legacy alias for this filter."}));
+            }
             properties.insert("component_type".into(),json!({"type":"string","enum":["activity","service","receiver","provider"]}));
             properties.insert("depth".into(),json!({"type":"integer","minimum":1,"maximum":100,"description":"Defaults to 1 for call_sites and 20 for graph; explicit values include transitive sites"}));
             properties.insert("direction".into(),json!({"type":"string","enum":["callers","callees","both"],"default":"callees"}));
@@ -2184,6 +2353,11 @@ fn tools_list() -> Value {
         for (canonical, names) in feedback::argument_aliases(name) {
             for alias in names {
                 let property = match canonical {
+                    "limit" => {
+                        let mut property = properties[canonical].clone();
+                        property["description"] = json!("Alias for limit; counts Unicode characters, and conflicting values are rejected");
+                        property
+                    },
                     "values" => json!({"anyOf":[{"type":"integer"},{"type":"string","minLength":1,"maxLength":32},{"type":"array","minItems":1,"maxItems":64,"items":{"anyOf":[{"type":"integer"},{"type":"string","minLength":1,"maxLength":32}]}}],"description":"Alias for values; one value or a list"}),
                     "method_ids" => json!({"type":["string","array"],"description":"Alias for method_ids; one method selector or a list"}),
                     _ => json!({"type":"string","minLength":1,"description":format!("Alias for {canonical}; conflicting values are rejected")}),
@@ -2195,12 +2369,13 @@ fn tools_list() -> Value {
         let mut schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
         if class_scoped(name) { schema["anyOf"] = json!([{"required":["class_id"]},{"required":["class_name"]}]); }
         if name=="find_instantiations" { schema["anyOf"]=json!([{"required":["class_id"]},{"required":["class_name"]},{"required":["allocating_class"]},{"required":["allocating_method_id"]}]); }
-        if ["get_method_source","find_field_references"].contains(&name) {
-            let (id,member)=if name=="get_method_source" {("method_id","method_name")}else{("field_id","field_name")};
+        if ["get_method_source","search_method_source","get_call_graph","find_field_references"].contains(&name) {
+            let (id,member)=if name=="find_field_references" {("field_id","field_name")}else{("method_id","method_name")};
             schema["anyOf"]=json!([{"required":[id]},{"required":["class_name",member]}]);
         }
         if name=="find_field_references" { schema["anyOf"].as_array_mut().unwrap().push(json!({"required":["field"]})); }
         if name=="export_source" {schema["anyOf"]=json!([{"required":["class_name"]},{"required":["method_id"]}]);}
+        if name=="get_guard_summary" {schema["anyOf"]=json!([{"required":["method_id"]},{"required":["caller_method_id","call_site_offset"]}]);}
         if name=="get_resource_value" {schema["anyOf"]=json!([{"required":["resource_id"]},{"required":["resource_name"]}]);}
         for (canonical, names) in feedback::argument_aliases(name) {
             if schema["required"].as_array().unwrap().iter().any(|v| v==canonical) {
@@ -2235,6 +2410,26 @@ impl std::fmt::Display for ArgumentError {
 }
 impl std::error::Error for ArgumentError {}
 
+fn source_argument_hint(name: &str) -> Option<&'static str> {
+    match name {
+        "get_class_source" => Some(
+            "Use class_id or class_name to select a class. Set limit or max_chars to page its source in Unicode characters.",
+        ),
+        "export_source" => Some(
+            "Use class_name or class_id for a class, or method_id or class_name plus method_name for a method. Supply a new absolute out_path.",
+        ),
+        _ => None,
+    }
+}
+
+fn input_schema(name: &str) -> Option<Value> {
+    tools_list()["tools"]
+        .as_array()?
+        .iter()
+        .find(|tool| tool["name"] == name)
+        .map(|tool| tool["inputSchema"].clone())
+}
+
 fn validate(name: &str, args: &Value) -> Result<()> {
     validate_arguments(name, args).map_err(|error| {
         if error.is::<ArgumentError>() {
@@ -2242,7 +2437,7 @@ fn validate(name: &str, args: &Value) -> Result<()> {
         } else {
             ArgumentError {
                 message: format!("{error:#}"),
-                details: json!({"tool":name,"accepted_parameters":tools_list()["tools"].as_array().and_then(|t|t.iter().find(|t|t["name"]==name)).map(|t|t["inputSchema"].clone()),"hint":"Use the named parameters and one required selector combination in accepted_parameters"}),
+                details: json!({"tool":name,"accepted_parameters":input_schema(name),"hint":source_argument_hint(name).unwrap_or("Use the named parameters and one required selector combination in accepted_parameters")}),
             }
             .into()
         }
@@ -2250,6 +2445,7 @@ fn validate(name: &str, args: &Value) -> Result<()> {
 }
 
 fn validate_arguments(name: &str, args: &Value) -> Result<()> {
+    let provided = args;
     let normalized = feedback::aliases(name, args)?;
     let args = &normalized;
     let tools = tools_list();
@@ -2265,6 +2461,9 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
     // accepted names, so the retry needs no schema lookup.
     for key in object.keys() {
         if schema["properties"][key].is_null() {
+            if source_argument_hint(name).is_some() {
+                bail!("Unknown argument: {key}");
+            }
             let accepted = schema["properties"]
                 .as_object()
                 .unwrap()
@@ -2352,13 +2551,26 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
                 .as_u64()
                 .is_some_and(|number| (minimum..=maximum).contains(&number))
             {
+                let key = if name == "get_class_source"
+                    && key == "limit"
+                    && provided.get("limit").is_none()
+                    && provided.get("max_chars").is_some()
+                {
+                    "max_chars"
+                } else {
+                    key
+                };
+                let mut details = json!({"tool":name,"parameter":key,"received":value,
+                    "expected_type":"integer","minimum":minimum,"maximum":maximum,
+                    "hint":format!("Set {key} to an integer between {minimum} and {maximum}")});
+                if source_argument_hint(name).is_some() {
+                    details["accepted_parameters"] = schema.clone();
+                }
                 return Err(ArgumentError {
                     message: format!(
                         "Invalid {key}: expected an integer from {minimum} to {maximum}"
                     ),
-                    details: json!({"tool":name,"parameter":key,"received":value,
-                        "expected_type":"integer","minimum":minimum,"maximum":maximum,
-                        "hint":format!("Set {key} to an integer between {minimum} and {maximum}")}),
+                    details,
                 }
                 .into());
             }
@@ -2366,6 +2578,35 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
     }
     if name == "open_apk" {
         open_load_profile(args)?;
+    }
+    if name == "resolve_instance" {
+        let hash = required(args, "apk_sha256")?;
+        ensure!(
+            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "apk_sha256 must be the exact 64-character hexadecimal APK digest"
+        );
+    }
+    if name == "search_method_source" {
+        method_search::validate(args)?;
+    }
+    if name == "find_network_stacks" && args["include_observer"] == true {
+        ensure!(
+            args["projection"] == "hook_maps",
+            "include_observer requires projection=hook_maps"
+        );
+    }
+    if name == "get_guard_summary" {
+        let method = args.get("method_id").is_some();
+        let caller = args.get("caller_method_id").is_some();
+        let site = args.get("call_site_offset").is_some();
+        ensure!(
+            if method {
+                !caller && !site
+            } else {
+                caller && site
+            },
+            "Supply either exact method_id or caller_method_id and call_site_offset"
+        );
     }
     if name == "get_call_graph_batch" {
         let mut query = args.clone();
@@ -2426,10 +2667,20 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
     if name == "find_integer_references" {
         crate::integer_references::validate(args)?;
     }
+    if name == "find_type_references" {
+        ensure!(
+            args["group_by"] != "owner_and_kind" || args["projection"] == "compact",
+            "group_by=owner_and_kind requires projection=compact"
+        );
+    }
+    if name == "export_package_source" {
+        crate::package_scope::PackageScope::for_export(&args["package_prefix"])?;
+    }
     if [
         "search_code",
         "get_all_classes",
         "search_classes_by_keyword",
+        "get_hook_targets",
     ]
     .contains(&name)
     {
@@ -2504,6 +2755,7 @@ fn validate_arguments(name: &str, args: &Value) -> Result<()> {
         );
     }
     if name == "get_call_graph" {
+        validate_graph_root(args)?;
         ensure!(
             args["direct_only"] != true || args["depth"].as_u64().unwrap_or(1) == 1,
             "direct_only requires depth=1 when depth is supplied"
@@ -2645,9 +2897,9 @@ fn gateway_call(
     if name == "open_apk" {
         return open_apk_request(args, opened, registry()?);
     }
-    let entries = registrations()?;
     if name == "list_instances" || name == "get_health" {
-        let mut result = discover(&entries, args)?;
+        let (entries, registry_complete) = registration_snapshot(&registry()?)?;
+        let mut result = discover_snapshot(&entries, args, registry_complete)?;
         if name == "get_health" {
             result["gateway"] = build_identity();
             result["transport"] = json!("connected");
@@ -2658,6 +2910,7 @@ fn gateway_call(
         return Ok(result);
     }
     let id = required(args, "instance_id")?;
+    let entries = registrations()?;
     let entry = entries
         .iter()
         .find(|r| r.instance_id == id)
@@ -4587,6 +4840,8 @@ mod method_format_tests;
 #[path = "mcp_reviewer_tests.rs"]
 mod reviewer_tests;
 
+#[path = "mcp_compose_navigation.rs"]
+mod compose_navigation;
 #[path = "mcp_hotwire.rs"]
 mod hotwire;
 
@@ -4606,6 +4861,7 @@ pub(crate) fn plugin_query(
                 | "get_class_hierarchy"
                 | "find_implementations"
                 | "find_instantiations"
+                | "get_guard_summary"
         ),
         "PLUGIN_QUERY_DENIED: unsupported read-only tool {name}"
     );

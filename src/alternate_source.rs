@@ -242,6 +242,20 @@ pub fn availability_for(engine: FallbackEngine) -> String {
 }
 
 impl Session {
+    pub(crate) fn helper_identity(
+        &self,
+        engine: FallbackEngine,
+    ) -> Option<(PathBuf, u64, SystemTime)> {
+        if !engine.enabled() {
+            return None;
+        }
+        let path = self.helper.clone().or_else(|| helper_path_for(engine))?;
+        let metadata = fs::metadata(&path).ok()?;
+        metadata
+            .is_file()
+            .then_some((path, metadata.len(), metadata.modified().ok()?))
+    }
+
     pub fn bind_input(&self, input: &Path) -> Result<()> {
         let metadata = fs::metadata(input)?;
         self.state

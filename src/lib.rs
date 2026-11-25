@@ -56,6 +56,9 @@ mod package_scope;
 
 mod call_arguments;
 
+mod guard_summary;
+mod hook_targets;
+mod network_hook_maps;
 mod network_stacks;
 
 mod retained_budget;

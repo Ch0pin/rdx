@@ -55,8 +55,10 @@ or `type`; `find_integer_references` takes `values` and accepts `value` (one
 value or a list); `find_config_key_consumers` takes `key` and accepts `query`,
 `value`, or `config_key`; the `search_*` tools and the optional `query` of
 `get_all_classes`, `get_all_resource_file_names`, `get_strings`, and
-`get_dex_strings` accept `keyword`, `text`, or `value`; method tools accept
-`method_signature` or `signature` for `method_id`; and `get_call_graph_batch`
+`get_dex_strings` accept `keyword`, `text`, or `value`. `get_class_source`
+accepts `max_chars` for its Unicode character `limit` (1–128,000).
+`export_source` accepts `class_id` for `class_name`. Method tools accept
+`method_signature` or `signature` for `method_id`. `get_call_graph_batch`
 accepts `method_id`, `method_signature`, or `signature` for `method_ids`,
 wrapping one selector into a one-element list. An alias supplied alongside its
 canonical parameter must carry the same value; otherwise the call fails with
@@ -141,17 +143,17 @@ and in-flight reader release their handles, preserving safe cleanup on Windows a
 well as Unix. Retained jobs belong to one project session and are unavailable
 through another project or after service shutdown.
 
-## Currently available (56 tools)
+## Currently available (60 tools)
 
 | Area | Tools |
 | --- | --- |
-| Instances | `list_instances`, `get_health`, `get_instance_info`, `open_apk`, `forget_instance` |
+| Instances | `list_instances`, `resolve_instance`, `get_health`, `get_instance_info`, `open_apk`, `forget_instance` |
 | Classes | `get_all_classes`, `search_classes_by_keyword`, `find_direct_subclasses`, `find_implementations`, `get_class_hierarchy` |
-| Code search | `search_code` (source text or indexed identifiers), `start_source_search`, `get_source_search_status`, `get_source_search_results`, `cancel_source_search`, `release_source_search` |
+| Code search | `search_code` (source text or indexed identifiers), `search_method_source`, `start_source_search`, `get_source_search_status`, `get_source_search_results`, `cancel_source_search`, `release_source_search` |
 | Source and metadata | `get_class_source`, `get_method_source`, `get_class_disassembly`, `get_methods_of_class`, `get_fields_of_class`, `export_source`, `export_package_source`, `get_export_status`, `cancel_export`, `resolve_reference`, `search_kotlin_metadata` |
 | Resources | `get_all_resource_file_names`, `get_android_manifest`, `get_manifest_summary`, `get_manifest_components`, `get_resource_file`, `get_strings`, `get_resource_value`, `search_resources`, `search_resource_xml`, `list_nav_deeplinks`, `find_layout_references` |
-| Call graphs | `get_call_graph_batch`, `get_call_graph` (exact `method_id`, `direction`: `callers` / `callees` / `both`, `depth`: 1–100, default 20 for graph / 1 for call sites) |
-| DEX analysis | `find_field_references`, `get_lambda_branch`, `resolve_switch_case_callers`, `find_network_stacks`, `find_config_key_consumers`, `find_instantiations`, `find_integer_references`, `find_annotation_usages`, `find_type_references`, `find_webview_chooser_flows` |
+| Call graphs | `get_call_graph_batch`, `get_call_graph` (root by `method_id` or class and method name, `direction`: `callers` / `callees` / `both`, `depth`: 1–100, default 20 for graph / 1 for call sites) |
+| DEX analysis | `find_field_references`, `get_lambda_branch`, `resolve_switch_case_callers`, `find_network_stacks`, `get_hook_targets`, `get_guard_summary`, `find_config_key_consumers`, `find_instantiations`, `find_integer_references`, `find_annotation_usages`, `find_type_references`, `find_webview_chooser_flows` |
 | Analysis plugins | `list_analysis_plugins`, `run_plugin_analysis`, `get_plugin_analysis`, `cancel_plugin_analysis` |
 | DEX strings | `get_dex_strings` (strings from the DEX containing `class_id`), `find_string_references` |
 
@@ -283,15 +285,23 @@ DEX ownership and package names remain unchanged; no semantic owner is inferred.
 
 ### Method call graph
 
-`get_call_graph` requires `instance_id`, `project_id`, and an exact DEX
-`method_id` from `get_methods_of_class`, such as `sample.Target.doubleValue(I)I`.
-It also accepts `sample.Target.doubleValue:(I)I`,
+`get_call_graph` requires `instance_id` and `project_id`. An exact root
+`method_id` from `get_methods_of_class` looks like `sample.Target.doubleValue(I)I`.
+Other accepted spellings include `sample.Target.doubleValue:(I)I`,
 `Lsample/Target;->doubleValue(I)I`, and
 `Lsample/Target;->doubleValue:(I)I`. The optional colon immediately before `(`
 is normalized while preserving the complete parameter and return descriptors;
 selection remains exact.
 Use `direction: "callers"` to trace into a method, `"callees"` (default) to
 follow outgoing calls, or `"both"`. Edges always point from caller to callee.
+
+To select a root by name, pass `class_name` and `method_name`, with an optional
+DEX `descriptor` such as `(I)I`. The resolver uses the loaded class and its
+known superclasses. Ambiguous names return candidate IDs. In this form,
+`neighbor_class_name` filters neighboring declarations after traversal. With
+`method_id`, `class_name` retains its existing neighbor-filter meaning and
+`neighbor_class_name` is an alias. Named roots report the requested selector,
+declaring class and inheritance metadata described for `get_method_source`.
 
 Method selectors may be short. A missing return descriptor, as in
 `sample.Target.doubleValue(I)`, selects the one declaration with that name and
@@ -451,6 +461,36 @@ example, `sample.Target.doubleValue(I)I` selects that overload alone. Short
 selectors such as `Target.doubleValue(I)` or `Caller.compute` resolve as
 described for `get_call_graph`; the response echoes `requested_method_id`, the
 selected `method_id`, and `method_selection`.
+
+Every successful method source query reports `requested_selector` with the
+original class/member spelling or method ID, `requested_class_name` with the
+requested owner, `requested_class_id` with its canonical DEX class ID, and
+`declaring_class_id` with the owner of the resolved `method_id`. An
+`inherited: true` result identifies resolution to a superclass declaration.
+These fields describe static DEX ownership.
+
+`search_method_source` uses the same selectors and `format` as
+`get_method_source`. For example, use `{"method_id":"sample.Target.doubleValue(I)I","query":"return|if","context_lines":2}`
+with the pinned instance and project IDs. The regex runs independently on each
+complete logical line. Each row reports the first match on that line, with
+one-based line and Unicode column coordinates and zero-based method-local Unicode
+offsets. End positions are exclusive. Zero-width matches, blank lines and the
+final empty line after a line break are included when the regex matches them.
+
+Each window has up to eight context lines on either side. Preview text clips
+at 512 characters per line and flags clipping. The regex searches the underlying
+line before clipping. Lines larger than 256 KiB are explicitly counted as
+unsearched. A sealed `next_cursor` resumes the exact next unconsumed line
+with the same selector, regex, case sensitivity and format. `limit` and
+`context_lines` may change between pages. `start_line` starts a suffix
+search. A start immediately after the final logical line returns an empty suffix.
+
+At the end, `scan_complete` means no continuation remains.
+`coverage_complete` also requires a search from line one and zero unsearched
+lines across all pages. `source_status`, `body_available` and reconstruction
+fields identify the representation searched and any fallback. The project
+caches one eligible method document within a 16 MiB shared-retention cap.
+The result reports whether it used or retained that document.
 
 The response renders only the requested method. It contains `method_id`, `text`,
 `format` (`java` or `rdx-dex`), `requested_format` (`auto` or `dex`),
@@ -634,7 +674,18 @@ the current batch, then continue with `registration_offset` set to
 counts matching instances in the current batch; `registered_instances` counts
 registry entries. `discovery_complete` describes registration scanning;
 `next_offset` describes result pagination. Connection failures appear in
-`diagnostics`, including the affected instance and retry guidance.
+`diagnostics`. With identity filters, known-unrelated detail is suppressed
+and unknown identities have compact instance IDs and statuses. Counts include
+both. Set `diagnostics="all"` for details and recovery guidance. Unfiltered
+legacy discovery retains the detailed connection diagnostics.
+
+Call `resolve_instance(package_name, apk_sha256)` to evaluate exact running
+project matches across a registry snapshot, independently of 16-item pages.
+It probes up to 128 registrations with eight concurrent connections and a
+five-second probe budget. It reports checked and unchecked registrations,
+identity uncertainty and timeouts. `selection.selected` contains the exact
+instance/project pair only after complete, unambiguous discovery. Pin that
+pair explicitly on subsequent requests.
 
 New registrations include an owner PID. On Unix, discovery automatically removes
 only records whose owner is confirmed absent by the OS; unknown, legacy and
@@ -1179,6 +1230,13 @@ Use `search_code` with `mode="identifiers"` for original DEX names and reference
 {"instance_id":"INSTANCE","project_id":"PROJECT","mode":"identifiers","query":"parseUri","match_mode":"exact","case_sensitive":false,"symbol_kind":"method","occurrence":"reference","limit":100}
 ```
 
+For an exact owner-qualified method-name search across overloads, use
+`query="android.webkit.WebView.loadUrl"` with `symbol_kind="method"`.
+An exact signature selects one overload, for example
+`Landroid/webkit/WebView;->loadUrl(Ljava/lang/String;)V`. A colon before
+`(` is optional. Identifier queries with `->` require a DEX class descriptor
+on the left. Source-mode queries continue to use the supplied literal or regex.
+
 `search_mode="auto"` (default) sends method-reference queries
 (`symbol_kind="method", occurrence="reference"`) through a direct method-table
 filter and resumable DEX scan. It avoids building the global identifier index.
@@ -1350,8 +1408,9 @@ host. `out_path` must be an absolute path to a **new directory** whose parent
 exists. It creates `source.txt` and `coverage.json`, returning their absolute
 paths, hashes and source size without the source text. Existing paths are never
 overwritten. Source may contain Java or explicitly labelled DEX fallback.
-Select `class_name`, an exact `method_id`, or `class_name` plus `method_name` and
-optional `descriptor`. Method exports accept `format: "auto"|"dex"`. The sidecar
+Select `class_name` (alias `class_id`), an exact `method_id`, or `class_name`
+plus `method_name` and optional `descriptor`. Method exports accept
+`format: "auto"|"dex"`. The sidecar
 records project/instance and APK identity, the source hash and reconstruction coverage.
 A failed write reports the incomplete export directory so it can be inspected.
 
@@ -1395,9 +1454,31 @@ accepted only with `projection: "call_sites"` and are not available on
 All queries below require `instance_id` and `project_id`. New scans support cancellation and stable occurrence pagination (`offset`, `limit <= 500`), bounded response pages, and explicit error coverage. `complete` describes the documented scan, never application security coverage.
 
 - `get_all_classes` and `search_classes_by_keyword` accept `case_sensitive:false`. Returned IDs preserve case; an empty case-sensitive search includes up to 20 case-insensitive near matches. Resolution never silently substitutes a case variant. Missing-class errors describe absence from the loaded DEX set, without asserting runtime loading. `package_prefix` accepts one prefix, an array of prefixes, or `obfuscated-root`; near-match `suggestions` ignore it and say so in `suggestions_scope`.
-- Validation errors include `accepted_parameters` containing the tool input schema and selector alternatives; an unknown parameter name is reported with every accepted name. `get_call_graph_batch` wraps a single `method_id` alias into `method_ids`; the plural result shape is unchanged.
+- Validation errors can include `accepted_parameters` with the tool input schema and selector alternatives. `get_class_source` and `export_source` show short selection hints in text and provide the schema in structured error details. `get_call_graph_batch` wraps a single `method_id` alias into `method_ids`.
 - `find_type_references(class_name, package_prefix?)` pages exact original DEX type references. Use FQCN or a DEX descriptor. It includes class literals, casts, type checks, allocations, inheritance, field/parameter/return declaration types, and explicit class/field/method/parameter annotation types with decoded values. Annotation hits follow identifier hits; the combined source hash covers both. Array component matches preserve the actual array operand. Annotation defaults and nested value types are outside this projection.
 - `search_kotlin_metadata(query, case_sensitive?, package_prefix?)` searches `kotlin.Metadata.d2`, returning owning DEX class, table index and matched string. These are discovery evidence, **not verified original-name aliases**: a d2 entry may describe a referenced type or member. Canonical lookup continues to use DEX identities.
+
+`find_type_references(projection="compact")` keeps the occurrence ordering and
+`next_offset` paging of the default full projection. It reuses the existing
+identifier cache where available and the same streaming fallback for scoped or
+oversized queries. Each row carries its
+target, class and applicable method or field ID, reference kind, DEX entry,
+and instruction offset or parameter index where applicable. Annotation rows
+keep their annotated element and type. Use the full projection for raw
+instruction evidence and decoded annotation values. A component-type query
+includes matching single- and multidimensional array operands and preserves
+the original array identity. An exact array descriptor selects that array.
+
+Add `group_by="owner_and_kind"` to the compact projection to page groups.
+`total`, `offset` and `next_offset` count groups, while `occurrence_total`
+counts all matched sites and each group has an exact `occurrence_count`.
+Parameter-type declarations group by method. Parameter annotations retain
+their separate parameter owners. Each group page runs a bounded scan of DEX
+declarations and instructions in the requested package scope, followed by
+annotation owners. The scan counts all matching sites within that scope.
+`first_site` is a representative DEX location. To enumerate every site, query
+the full projection with
+`package_prefix` set to the group's `owner.class_id` and follow occurrence pages.
 
 `export_source` reports the full missing parent path before rendering. Create the
 parent explicitly; a new export directory must not already exist.
@@ -1410,11 +1491,13 @@ statuses are retained. Source rendering shares the parsed project and runs off
 the interactive engine mutex. Closing the hosting GUI/headless service cancels
 its jobs. A one-shot headless connector must stay alive for the export.
 
-An empty `package_prefix` exports every loaded class, including top-level
-obfuscated packages. Files retain collision-safe numeric names
-(`class-00000000.txt`, etc.); `manifest.jsonl` maps exact descriptors to absolute
-paths, source hashes and reconstruction coverage. This manifest describes RDX
-exports, not apktool's filesystem renaming rules.
+`package_prefix` accepts one dotted package or class prefix, or an array of
+1–64 prefixes. The normalized list must fit in 16 KiB of JSON. A class
+matching overlapping prefixes is exported once in
+deterministic class order. An empty string selects every loaded class. Files
+retain collision-safe numeric names (`class-00000000.txt`, etc.).
+`manifest.jsonl` maps class IDs and exact descriptors to absolute paths,
+source hashes and reconstruction coverage.
 
 `export-status.json` is an atomically replaced checkpoint with job identity,
 `status`, `next_class`, `exported`, `failed`, `total`, and any terminal error.
@@ -1422,9 +1505,11 @@ exports, not apktool's filesystem renaming rules.
 output: check `status` and `complete`, not just file existence. After a crash,
 a persisted `running` state without a live job denotes interrupted work.
 
-Continue with the same `out_path` and `package_prefix`, setting `resume:true`.
-Resume requires the exact APK hash, renderer executable hash and class selection;
-it verifies committed source hashes before continuing. File locking excludes
+Continue with the same `out_path` and normalized `package_prefix`, setting
+`resume:true`. Trailing dots, duplicate prefixes and list order are normalized.
+Resume requires the same normalized prefix set, exact APK hash, renderer
+executable hash and class selection. It verifies committed source hashes before
+continuing. File locking excludes
 concurrent writers. An uncommitted manifest tail is discarded; a source file
 published just before interruption is reused only if re-rendering matches its
 hash. Existing source files are never overwritten. Previously recorded class
@@ -1433,8 +1518,8 @@ reject resume. Job IDs belong to a project session; after reopening, resume by
 path to obtain a new job ID. Pre-checkpoint exports from older versions cannot
 be resumed by this mechanism.
 
-`background:false` retains synchronous export for small workloads and remains
-subject to request timeouts. Use the default background mode for large packages.
+`background:false` waits on the same per-project worker and remains subject
+to request timeouts. Cancelling the waiting request cancels that export.
 
 For standalone use, `rdx --export-source INPUT OUTPUT_DIRECTORY` uses the same
 exporter without a GUI or MCP connection. It prints progress/errors to stderr,
@@ -1449,6 +1534,46 @@ When APK optimization replaces application attribute names with decimal resource
 `find_layout_references(class_name, resource_prefix?)` locates fully qualified custom view tags, `<view class=...>` and fragment class declarations. These are **possible inflation sites**, explicitly distinct from the `new-instance` instructions returned by `find_instantiations`. ARSC file identity covers obfuscated layout paths. Resource-backed class names expose default resolution; dynamic layout factories and alternate class-name configurations require further review.
 
 ### Interface caller expansion
+
+`get_hook_targets(method_id, projection="targets")` expands an exact virtual
+interface or class method to deduplicated declaring DEX methods for possible
+loaded receivers. `projection="receivers"` pages each receiver and its
+resolved declaration or unresolved status. Target rows cap receiver previews
+and flag bridges. Use the receiver projection to enumerate all retained pairs.
+The scan stops at 4,096 matched receivers or its bounded lookup budget. Narrow
+`package_prefix` when coverage is truncated. Missing ancestry and unresolved
+interface defaults remain explicit. Runtime receiver identity requires
+observation.
+
+`get_guard_summary` proves supported small String/boolean DEX helpers. Pass
+`method_id` for the full conditional rules, or `caller_method_id` and the
+exact `call_site_offset` for a static invoke. Results preserve the platform
+comparison operation, operand direction, null returns and exceptions, original
+method IDs, DEX code-unit offsets, and evidence SHA-256 hashes. Caller literals
+specialize possible cases. Packaged resource evidence follows a proved
+`Context.getString` resource ID and reports an identical table value across
+decoded configurations when available. Runtime resources remain conditional.
+Unsupported effects, cycles, and ambiguous values produce unresolved results.
+The proof applies to comparison behavior inside the helper body. Entry,
+linkage, class initialization and runtime inputs require separate evidence.
+`get_hook_targets` and `get_guard_summary` accept `method_signature` and
+`signature` as aliases for `method_id`.
+
+`find_network_stacks(projection="hook_maps")` pages a project-local inventory
+built on demand. It combines named OkHttp declaration proof and structural
+candidates. `package_prefix` filters map declaration owners. A prefix for
+application code can exclude the OkHttp library map even when the application
+calls it. Coverage counts excluded maps. Omit the prefix to page all available
+maps, or use `projection="all"` or `"services"` for usage and service evidence.
+Proposed roles use exact original IDs with bounded DEX provenance, and
+ambiguity remains explicit. Use `include_observer:true` to request a
+local static template when an installation declaration and capture roles are
+proven. Its event fields include origin components, allowlisted HTTP methods and
+header names, and credential-presence booleans for the template's named set.
+Header events include the allowlist scope, omitted-name count, and completeness.
+A credential can be reported absent only after every proved header slot was
+read successfully. Unresolved capture roles are omitted. Generating the template
+leaves the target untouched.
 
 Use `get_call_graph(method_id, direction="callers", projection="call_sites", depth=1, dispatch_through_interfaces=true)` to include `invoke-interface` and `invoke-virtual` sites whose raw target names the root member on any interface the root class implements, directly or through superinterfaces and superclasses, whether or not that interface redeclares the member and whether or not it is loaded. The original `callee_method_id`, `raw_callee_method_id`, opcode and offset remain unchanged. Rows have `relationship="exact_declared_call"` or `"possible_interface_dispatch"`; inferred rows add `possible_implementation_method_id`. `exact_matching_total` and `possible_dispatch_total` keep the counts separate. A runtime receiver may select another implementation. The opt-in is limited to direct caller call-site queries; batch queries can pass the same option. Transitive expansion of the same inference, for every traversed method, is the `semantic_edges` option below.
 
@@ -1623,12 +1748,13 @@ and no runtime values are collected; `runtime_verified` remains false.
 
 `list_instances` reports `reachability`, `owner_pid`, `registered_at_unix_ms`
 and the timestamp of this successful health check as `last_seen_unix_ms`.
-Unreachable records retain a separate error, check timestamp and explicit
-`open_apk` recovery arguments. Historical last-seen time is unknown when the
-current check fails. With an absolute `apk_path` or exact `apk_sha256`, a complete
-single-batch discovery can return `selection.selected` for one healthy match.
-Use those explicit instance/project IDs; ambiguous or paginated discovery never
-changes the active target.
+Detailed diagnostics include the check timestamp, error and `open_apk`
+recovery arguments for unreachable records. Set `diagnostics="all"` to see
+these details with a filter. A failed current check leaves the last-seen
+timestamp unknown. A complete single-batch discovery with an absolute
+`apk_path` or exact `apk_sha256` can return one healthy match. Use
+`resolve_instance` for an exact package/hash match across batches. Pass
+the returned instance and project IDs explicitly.
 
 For a closed MCP transport, reconnect the client's RDX connector using the
 configured absolute executable path and `mcp` argument. Then:
@@ -1673,6 +1799,21 @@ Array evidence alone establishes neither runtime registration nor numeric Androi
 destination IDs. `hotwire_coverage` records analysis failures and unsupported
 flow boundaries. A `resource_prefix` selects only XML resources; a package prefix
 selects destination classes.
+
+Set `include_compose:true` on `list_nav_deeplinks` to append
+`compose_registration` rows after XML and Hotwire records. The inventory
+matches supported typed destination construction, build and graph insertion
+in original DEX. When proven, rows retain route classes, serializer-derived
+destination IDs, argument fields, target components and extras forwarding.
+An unresolved field has its own status or coverage count. `package_prefix`
+scopes the Compose registration methods. A nonempty `resource_prefix`
+selects XML paths and reports the excluded Compose scope explicitly.
+`compose_coverage` describes supported-pattern coverage, with failures,
+work limits and unavailable models reported separately. Singleton serializer
+binding uses a Kotlin Lazy initializer model. Activity extras evidence records
+the Bundle copy and launch of the same Intent, with argument values at launch
+left unresolved. Static registration evidence leaves external reachability to
+a separate analysis.
 
 Config consumers additionally recognize literal map-key reads, split signatures,
 local list accumulation/iteration and URI host extraction. Map reads have no

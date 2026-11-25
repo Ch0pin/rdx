@@ -175,6 +175,8 @@ pub(super) fn search(
         .and_then(|s| s.strip_suffix(';'))
         .map(|s| s.replace('/', "."))
         .unwrap_or_else(|| requested.to_owned());
+    let include_compose = tool == "list_nav_deeplinks" && args["include_compose"] == true;
+    let programmatic_in_scope = args["resource_prefix"].as_str().is_none_or(str::is_empty);
     let mut files: Vec<_> = project
         .resources
         .iter()
@@ -197,7 +199,11 @@ pub(super) fn search(
             }
         }
     }
-    let mut reader = engine.resource_reader()?;
+    let mut reader = if include_compose && programmatic_in_scope && files.is_empty() {
+        None
+    } else {
+        Some(engine.resource_reader()?)
+    };
     for path in files {
         ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
         let identity = identities.get(path);
@@ -224,7 +230,10 @@ pub(super) fn search(
                 .unwrap_or_default()
         );
         let outcome = (|| -> Result<()> {
-            let bytes = reader.read_path(path, crate::native_resources::MAX_XML_BYTES as u64)?;
+            let bytes = reader
+                .as_mut()
+                .context("Missing XML resource reader")?
+                .read_path(path, crate::native_resources::MAX_XML_BYTES as u64)?;
             let xml = crate::native_resources::decode_with_attribute_resolver(&bytes, &|id| {
                 engine
                     .resource_table()
@@ -319,21 +328,36 @@ pub(super) fn search(
             }
         }
     }
-    let hotwire = if tool == "list_nav_deeplinks"
-        && args["resource_prefix"].as_str().is_none_or(str::is_empty)
-    {
+    let hotwire = if tool == "list_nav_deeplinks" && programmatic_in_scope {
         Some(super::hotwire::append(
             engine, project, args, cancel, &mut page,
         )?)
     } else {
         None
     };
+    let compose = if include_compose && programmatic_in_scope {
+        Some(super::compose_navigation::append(
+            engine, project, args, cancel, &mut page,
+        )?)
+    } else {
+        None
+    };
+    let compose_complete = compose
+        .as_ref()
+        .is_none_or(|coverage| coverage["complete"].as_bool().unwrap_or(false));
     let mut result = page.finish()?;
     if let Some(coverage) = hotwire {
         result["hotwire_coverage"] = coverage;
     }
+    if let Some(coverage) = compose {
+        result["compose_coverage"] = coverage;
+    } else if include_compose {
+        result["compose_coverage"] = json!({"status":"excluded_by_resource_prefix","scan_complete":false,
+            "scope":"resource_prefix selects XML archive paths. Omit it to include Compose DEX registrations."});
+    }
     result["complete"] = json!(
         failed == 0
+            && compose_complete
             && result["hotwire_coverage"]["failed_array_methods"]
                 .as_u64()
                 .unwrap_or(0)
@@ -357,6 +381,49 @@ pub(super) fn search(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compose_inventory_is_opt_in_and_resource_prefix_keeps_xml_scope() {
+        let mut engine = NativeEngine::default();
+        let apk = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let project = engine.open(&apk).unwrap();
+        let cancel = AtomicBool::new(false);
+        let default = search(
+            &mut engine,
+            &project,
+            "list_nav_deeplinks",
+            &json!({}),
+            &cancel,
+        )
+        .unwrap();
+        assert!(default.get("compose_coverage").is_none());
+        let scoped = search(
+            &mut engine,
+            &project,
+            "list_nav_deeplinks",
+            &json!({"include_compose":true,"resource_prefix":"res/navigation/"}),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            scoped["compose_coverage"]["status"],
+            "excluded_by_resource_prefix"
+        );
+
+        let dex = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hello.dex");
+        let project = engine.open(&dex).unwrap();
+        let opted_in = search(
+            &mut engine,
+            &project,
+            "list_nav_deeplinks",
+            &json!({"include_compose":true}),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(opted_in["scanned_files"], 0);
+        assert_eq!(opted_in["compose_coverage"]["registration_records"], 0);
+        assert!(opted_in["compose_coverage"]["complete"].is_boolean());
+    }
+
     #[test]
     fn nested_graph_arguments_and_includes() {
         let xml = r#"<navigation xmlns:a="http://schemas.android.com/apk/res/android" xmlns:x="http://schemas.android.com/apk/res-auto" a:id="@id/root"><navigation a:id="@id/sub"><fragment a:name="p.Screen"><deepLink x:uri="app://x/{id}"/><argument a:name="id" x:argType="string"/></fragment><include x:graph="@navigation/root"/></navigation></navigation>"#;

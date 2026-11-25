@@ -1,0 +1,8 @@
+{
+  "protocol": 2,
+  "id": "semantic-guard-summary",
+  "name": "Semantic guard summary",
+  "executable": "python3",
+  "args": ["analyzer.py"],
+  "capability": "project.analyze"
+}

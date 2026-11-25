@@ -20,8 +20,48 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         json!({"jsonrpc":"2.0","id":4,"method":"not/a/method"}),
         json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"rename_class","arguments":{}}}),
     ];
+    let invalid_tools = [
+        (
+            "resolve_instance",
+            json!({"package_name":"sample"}),
+            "Missing apk_sha256",
+        ),
+        (
+            "resolve_instance",
+            json!({"package_name":"sample","apk_sha256":"invalid"}),
+            "64-character hexadecimal",
+        ),
+        (
+            "resolve_instance",
+            json!({"package_name":"sample","apk_sha256":"a".repeat(64),"diagnostics":"invalid"}),
+            "Invalid diagnostics",
+        ),
+        (
+            "get_guard_summary",
+            json!({"instance_id":"unused","project_id":"unused",
+            "signature":"sample.Target.run()Z","caller_method_id":"sample.Caller.run()V","call_site_offset":0}),
+            "Supply either exact method_id or caller_method_id and call_site_offset",
+        ),
+        (
+            "get_guard_summary",
+            json!({"instance_id":"unused","project_id":"unused",
+            "method_id":"sample.Target.run()Z","method_signature":"sample.Target.other()Z"}),
+            "CONFLICTING_METHOD_SELECTORS",
+        ),
+        (
+            "find_network_stacks",
+            json!({"instance_id":"unused","project_id":"unused",
+            "projection":"services","include_observer":true}),
+            "include_observer requires projection=hook_maps",
+        ),
+    ];
     let mut input = child.stdin.take().unwrap();
     for message in messages {
+        writeln!(input, "{message}").unwrap();
+    }
+    for (index, (tool, arguments, _)) in invalid_tools.iter().enumerate() {
+        let message = json!({"jsonrpc":"2.0","id":index+6,"method":"tools/call",
+            "params":{"name":tool,"arguments":arguments}});
         writeln!(input, "{message}").unwrap();
     }
     drop(input);
@@ -36,7 +76,7 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(replies.len(), 6);
+    assert_eq!(replies.len(), 6 + invalid_tools.len());
     assert_eq!(replies[0]["error"]["code"], -32600);
     assert_eq!(replies[1]["result"]["protocolVersion"], "2025-06-18");
     let instructions = replies[1]["result"]["instructions"].as_str().unwrap();
@@ -55,7 +95,7 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         );
     }
     let tools = replies[2]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 56);
+    assert_eq!(tools.len(), 60);
     let schema = |name: &str| {
         &tools
             .iter()
@@ -142,9 +182,14 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         schema("export_package_source")["properties"]["resume"]["type"],
         "boolean"
     );
+    let export_prefix = &schema("export_package_source")["properties"]["package_prefix"];
+    assert_eq!(export_prefix["type"], json!(["string", "array"]));
+    assert_eq!(export_prefix["minLength"], 0);
+    assert_eq!(export_prefix["minItems"], 1);
+    assert_eq!(export_prefix["maxItems"], 64);
     assert_eq!(
-        schema("export_package_source")["properties"]["package_prefix"]["minLength"],
-        0
+        export_prefix["items"],
+        json!({"type":"string","minLength":1})
     );
     assert_eq!(
         schema("get_manifest_components")["properties"]["exported_state"]["enum"],
@@ -155,6 +200,55 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         32768
     );
     let health = schema("get_health");
+    let resolver = schema("resolve_instance");
+    assert_eq!(resolver["required"], json!(["package_name", "apk_sha256"]));
+    assert_eq!(resolver["properties"]["apk_sha256"]["type"], "string");
+    assert_eq!(
+        resolver["properties"]["diagnostics"]["enum"],
+        json!(["related", "all"])
+    );
+    assert_eq!(resolver["properties"]["diagnostics"]["default"], "related");
+    let hooks = schema("get_hook_targets");
+    assert_eq!(
+        hooks["properties"]["projection"]["enum"],
+        json!(["targets", "receivers"])
+    );
+    assert_eq!(hooks["properties"]["projection"]["default"], "targets");
+    let guards = schema("get_guard_summary");
+    assert_eq!(guards["properties"]["call_site_offset"]["maximum"], 32767);
+    assert!(
+        guards["anyOf"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"required":["caller_method_id","call_site_offset"]}))
+    );
+    for definition in [hooks, guards] {
+        for alias in ["method_signature", "signature"] {
+            assert_eq!(definition["properties"][alias]["type"], "string");
+            assert!(
+                definition["anyOf"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!({"required":[alias]}))
+            );
+        }
+    }
+    let network = schema("find_network_stacks");
+    assert_eq!(
+        network["properties"]["projection"]["enum"],
+        json!(["all", "services", "hook_maps"])
+    );
+    assert_eq!(network["properties"]["include_observer"]["default"], false);
+    assert_eq!(network["properties"]["include_observer"]["type"], "boolean");
+    let navigation = schema("list_nav_deeplinks");
+    assert_eq!(
+        navigation["properties"]["include_compose"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        navigation["properties"]["include_compose"]["default"],
+        false
+    );
     let batch = schema("get_call_graph_batch");
     assert_eq!(batch["properties"]["method_ids"]["maxItems"], 16);
     assert!(
@@ -266,6 +360,9 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     assert!(schema("forget_instance")["properties"]["instance_id"].is_object());
     let class_source = schema("get_class_source");
     assert!(class_source["properties"]["class_name"].is_object());
+    assert_eq!(class_source["properties"]["max_chars"]["type"], "integer");
+    assert_eq!(class_source["properties"]["max_chars"]["minimum"], 1);
+    assert_eq!(class_source["properties"]["max_chars"]["maximum"], 128000);
     assert_eq!(
         class_source["anyOf"],
         json!([{"required":["class_id"]},{"required":["class_name"]}])
@@ -279,6 +376,16 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         json!(["all", "read", "write"])
     );
     let method_source = schema("get_method_source");
+    let method_search = schema("search_method_source");
+    assert_eq!(method_search["anyOf"], method_source["anyOf"]);
+    assert_eq!(method_search["properties"]["context_lines"]["maximum"], 8);
+    assert_eq!(method_search["properties"]["limit"]["maximum"], 100);
+    assert_eq!(method_search["properties"]["start_line"]["minimum"], 1);
+    assert_eq!(
+        method_search["properties"]["resume_cursor"]["type"],
+        "string"
+    );
+    assert_eq!(method_search["properties"]["query"]["type"], "string");
     for key in ["instance_id", "project_id"] {
         assert!(
             method_source["required"]
@@ -311,9 +418,14 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         schema("search_resources")["properties"]["query"]["type"],
         "string"
     );
-    assert_eq!(
-        schema("export_source")["properties"]["out_path"]["type"],
-        "string"
+    let source_export = schema("export_source");
+    assert_eq!(source_export["properties"]["out_path"]["type"], "string");
+    assert_eq!(source_export["properties"]["class_id"]["type"], "string");
+    assert!(
+        source_export["anyOf"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"required":["class_id"]}))
     );
     assert_eq!(
         schema("find_string_references")["properties"]["search_mode"]["enum"],
@@ -375,6 +487,16 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         types["properties"]["type_name"]["description"],
         "Alias for class_name; conflicting values are rejected"
     );
+    assert_eq!(
+        types["properties"]["projection"]["enum"],
+        json!(["full", "compact"])
+    );
+    assert_eq!(types["properties"]["projection"]["default"], "full");
+    assert_eq!(
+        types["properties"]["group_by"]["enum"],
+        json!(["none", "owner_and_kind"])
+    );
+    assert_eq!(types["properties"]["group_by"]["default"], "none");
     assert_eq!(
         schema("search_code")["anyOf"],
         json!([{"required":["query"]},{"required":["keyword"]},{"required":["text"]},{"required":["value"]}])
@@ -480,6 +602,7 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
         assert_eq!(components["properties"][key]["type"], "string");
     }
     let graph = schema("get_call_graph");
+    assert_eq!(graph["anyOf"], method_source["anyOf"]);
     assert_eq!(graph["properties"]["direct_only"]["type"], "boolean");
     assert_eq!(
         graph["properties"]["projection"]["enum"],
@@ -489,6 +612,9 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     for key in [
         "package_prefix",
         "class_name",
+        "method_name",
+        "descriptor",
+        "neighbor_class_name",
         "annotation",
         "component_type",
     ] {
@@ -518,6 +644,19 @@ fn stdio_handshake_tools_and_errors_are_machine_readable() {
     assert_eq!(replies[3]["result"], json!({}));
     assert_eq!(replies[4]["error"]["code"], -32601);
     assert_eq!(replies[5]["result"]["isError"], true);
+    for (index, (tool, _, expected)) in invalid_tools.iter().enumerate() {
+        let reply = replies
+            .iter()
+            .find(|reply| reply["id"] == index + 6)
+            .unwrap();
+        let error = &reply["result"]["structuredContent"]["error"];
+        assert_eq!(reply["result"]["isError"], true);
+        assert_eq!(error["code"], "INVALID_ARGUMENT");
+        assert!(
+            error["message"].as_str().unwrap().contains(*expected),
+            "{tool}: {error}"
+        );
+    }
 }
 
 #[test]

@@ -103,6 +103,10 @@ impl CompiledQuery {
             .map_err(|e| format!("Invalid search expression: {e}"))?;
         Ok(Self { query, matcher })
     }
+
+    pub(crate) fn find_text<'a>(&self, text: &'a str) -> Option<regex::Match<'a>> {
+        self.matcher.find(text)
+    }
     fn accepts_class(&self, name: &str) -> bool {
         if self
             .query

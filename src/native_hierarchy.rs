@@ -18,6 +18,7 @@ use crate::native_dex::DexClass;
 use anyhow::{Result, ensure};
 pub use constructor_recovery::RecoveredConstructor;
 pub(crate) use constructor_recovery::platform_member_type;
+pub(crate) use constructor_recovery::recovered_function_reference;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 

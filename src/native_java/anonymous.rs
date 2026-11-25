@@ -37,19 +37,19 @@ fn descriptor_name(descriptor: &str) -> Result<String> {
 }
 
 fn annotation<'a>(class: &'a DexClass, descriptor: &str) -> Option<&'a DexAnnotation> {
-    annotation_directory(class)?
+    let mut matches = annotation_directory(class)?
         .class
         .as_ref()?
         .iter()
-        .find(|annotation| {
-            annotation.visibility == 2
-                && class
-                    .symbols
-                    .types
-                    .get(annotation.type_idx as usize)
-                    .is_some_and(|ty| ty.as_ref() == descriptor)
-        })
-        .map(AsRef::as_ref)
+        .filter(|annotation| {
+            class
+                .symbols
+                .types
+                .get(annotation.type_idx as usize)
+                .is_some_and(|ty| ty.as_ref() == descriptor)
+        });
+    let annotation = matches.next()?;
+    (annotation.visibility == 2 && matches.next().is_none()).then_some(annotation.as_ref())
 }
 
 fn element<'a>(
@@ -57,9 +57,11 @@ fn element<'a>(
     annotation: &'a DexAnnotation,
     name: &str,
 ) -> Option<&'a DexValue> {
-    annotation.elements.iter().find_map(|(key, value)| {
+    let mut matches = annotation.elements.iter().filter_map(|(key, value)| {
         (class.symbols.strings.get(*key as usize)?.as_str() == name).then_some(value)
-    })
+    });
+    let value = matches.next()?;
+    matches.next().is_none().then_some(value)
 }
 
 pub(crate) fn metadata(class: &DexClass) -> Result<Option<Nested>> {
@@ -157,13 +159,21 @@ pub(crate) fn index(classes: &BTreeMap<String, DexClass>) -> BTreeMap<String, Ve
 }
 
 impl Nested {
+    pub(crate) fn matches_enclosing_declaration(&self, outer: &DexClass) -> bool {
+        if descriptor_name(&outer.descriptor).ok().as_deref() != Some(&self.outer) {
+            return false;
+        }
+        let mut declarations = outer.methods.iter().filter(|method| {
+            method.declaring_type == outer.descriptor
+                && method.name.as_ref() == self.enclosing_name
+                && method.parameters == self.enclosing_parameters
+                && method.return_type == self.enclosing_return
+        });
+        declarations.next().is_some() && declarations.next().is_none()
+    }
+
     fn valid_for(&self, outer: &DexClass) -> bool {
-        descriptor_name(&outer.descriptor).ok().as_deref() == Some(&self.outer)
-            && outer.methods.iter().any(|method| {
-                method.name.as_ref() == self.enclosing_name
-                    && method.parameters == self.enclosing_parameters
-                    && method.return_type == self.enclosing_return
-            })
+        self.matches_enclosing_declaration(outer)
             && !outer
                 .fields
                 .iter()
@@ -761,6 +771,10 @@ pub(crate) fn render_nested(
     nested: &Nested,
     world: Option<&BTreeMap<String, DexClass>>,
 ) -> Result<DecompiledCode> {
+    ensure!(
+        !crate::native_hierarchy::recovered_function_reference(child),
+        "Recovered function-reference constructor uses the flat class declaration"
+    );
     ensure!(
         nested.valid_for(outer),
         "Anonymous enclosing method mismatch"

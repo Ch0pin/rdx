@@ -68,6 +68,8 @@ jobs:
         run: python -m unittest discover -s scripts/tests -v
       - name: Test bundled Python plugins
         run: python -m unittest discover -s plugins/logical-webview-inventory/tests -v
+      - name: Test semantic guard presenter
+        run: python -m unittest discover -s plugins/semantic-guard-summary/tests -v
       - name: Lint
         run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
       - name: Test

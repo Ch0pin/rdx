@@ -7,7 +7,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::atomic::{AtomicBool, Ordering},
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,6 +15,8 @@ enum Constant {
     Unknown,
     String(u32),
     Bits(i64),
+    GuardResource { id: u32, pc: usize },
+    GuardHost { pc: usize },
 }
 fn transfer(i: &Instruction, state: &mut [Constant]) {
     let v = match i.opcode {
@@ -35,6 +37,47 @@ fn transfer(i: &Instruction, state: &mut [Constant]) {
             state[r.register as usize + word] = v;
         }
     }
+}
+
+fn transfer_guard(class: &DexClass, i: &Instruction, state: &mut [Constant], provenance: bool) {
+    if !provenance {
+        transfer(i, state);
+        return;
+    }
+    // Reserve one data-flow slot for the immediately preceding invoke. Joins
+    // and exceptional entries treat it like any other must-prove operand.
+    let pending = state[state.len() - 1];
+    let next = if matches!(i.opcode, 0x6e | 0x74) {
+        let method = i.reference.and_then(|reference| {
+            crate::native_engine::disassembly::symbol(&class.symbols, 'm', reference.index as usize)
+        });
+        match (method.as_deref(), i.reads.as_slice()) {
+            (Some("android.content.Context.getString(I)Ljava/lang/String;"), [_, argument]) => {
+                match state[argument.register as usize] {
+                    Constant::Bits(bits) if (1..=i64::from(u32::MAX)).contains(&bits) => {
+                        Constant::GuardResource {
+                            id: bits as u32,
+                            pc: i.pc,
+                        }
+                    }
+                    _ => Constant::Unknown,
+                }
+            }
+            (Some("android.net.Uri.getHost()Ljava/lang/String;"), [_]) => {
+                Constant::GuardHost { pc: i.pc }
+            }
+            _ => Constant::Unknown,
+        }
+    } else {
+        Constant::Unknown
+    };
+    transfer(i, state);
+    if i.opcode == 0x0c
+        && let [destination] = i.writes.as_slice()
+    {
+        state[destination.register as usize] = pending;
+    }
+    *state.last_mut().unwrap() = next;
 }
 pub(crate) fn constant_bits_at(
     m: &DexMethod,
@@ -114,7 +157,28 @@ pub(crate) fn analyze(
     m: &DexMethod,
     cancel: &AtomicBool,
     work: &mut usize,
-    wanted: &std::collections::BTreeSet<usize>,
+    wanted: &BTreeSet<usize>,
+) -> Result<BTreeMap<usize, Value>> {
+    analyze_with_provenance(c, m, cancel, work, wanted, false)
+}
+
+pub(crate) fn analyze_guard(
+    c: &DexClass,
+    m: &DexMethod,
+    cancel: &AtomicBool,
+    work: &mut usize,
+    wanted: &BTreeSet<usize>,
+) -> Result<BTreeMap<usize, Value>> {
+    analyze_with_provenance(c, m, cancel, work, wanted, true)
+}
+
+fn analyze_with_provenance(
+    c: &DexClass,
+    m: &DexMethod,
+    cancel: &AtomicBool,
+    work: &mut usize,
+    wanted: &BTreeSet<usize>,
+    provenance: bool,
 ) -> Result<BTreeMap<usize, Value>> {
     let code = m.code.as_ref().context("Method has no code")?;
     ensure!(
@@ -130,7 +194,10 @@ pub(crate) fn analyze(
     let instructions: HashMap<_, _> = ir.instructions.iter().map(|i| (i.pc, i)).collect();
     let mut states = vec![None; cfg.blocks.len()];
     let entry = *cfg.block_at.get(&0).context("No entry block")?;
-    states[entry] = Some(vec![Constant::Unknown; code.registers as usize]);
+    states[entry] = Some(vec![
+        Constant::Unknown;
+        code.registers as usize + usize::from(provenance)
+    ]);
     let mut queue = VecDeque::from([entry]);
     let mut queued = vec![false; cfg.blocks.len()];
     queued[entry] = true;
@@ -144,7 +211,7 @@ pub(crate) fn analyze(
                 *work <= 2000000,
                 "Argument analysis exceeds request work budget"
             );
-            transfer(instructions[pc], &mut state);
+            transfer_guard(c, instructions[pc], &mut state, provenance);
         }
         for e in &cfg.blocks[b].successors {
             let incoming = if e.kind == EdgeKind::Exceptional {
@@ -231,6 +298,23 @@ pub(crate) fn analyze(
                             item["kind"] = json!("bits32");
                             item["value"] = json!(bits as i32);
                         }
+                        Constant::GuardResource { id, pc }
+                            if ty.as_ref() == "Ljava/lang/String;" =>
+                        {
+                            item["status"] = json!("api_result");
+                            item["kind"] = json!("resource_string");
+                            item["producer_method_id"] =
+                                json!("android.content.Context.getString(I)Ljava/lang/String;");
+                            item["producer_code_unit_offset"] = json!(pc);
+                            item["resource_id"] = json!(id);
+                        }
+                        Constant::GuardHost { pc } if ty.as_ref() == "Ljava/lang/String;" => {
+                            item["status"] = json!("api_result");
+                            item["kind"] = json!("uri_host");
+                            item["producer_method_id"] =
+                                json!("android.net.Uri.getHost()Ljava/lang/String;");
+                            item["producer_code_unit_offset"] = json!(pc);
+                        }
                         _ => {}
                     }
                     args.push(item);
@@ -246,7 +330,7 @@ pub(crate) fn analyze(
                 }
                 out.insert(*pc, record);
             }
-            transfer(i, &mut state);
+            transfer_guard(c, i, &mut state, provenance);
         }
     }
     Ok(out)

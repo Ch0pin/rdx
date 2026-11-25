@@ -40,9 +40,24 @@ pub(super) fn member_selector(
         }
         return Ok(id.into());
     }
-    let mut owner = resolve_class_id(project, required(args, "class_name")?)?.to_owned();
-    let name = required(args, name_key)?;
-    let descriptor = args["descriptor"].as_str();
+    named_member(
+        engine,
+        resolve_class_id(project, required(args, "class_name")?)?,
+        required(args, name_key)?,
+        args["descriptor"].as_str(),
+        method,
+    )
+}
+
+pub(super) fn named_member(
+    engine: &NativeEngine,
+    requested_owner: &str,
+    name: &str,
+    descriptor: Option<&str>,
+    method: bool,
+) -> Result<String> {
+    let id_key = if method { "method_id" } else { "field_id" };
+    let mut owner = requested_owner.to_owned();
     let mut seen = std::collections::HashSet::new();
     let mut choices = std::collections::BTreeMap::new();
     while seen.insert(owner.clone()) {
@@ -90,9 +105,17 @@ pub(super) fn member_selector(
     if matches.len() == 1 {
         return Ok(matches[0].clone());
     }
-    let candidates: Vec<_> = choices.values().take(30).collect();
+    let mut bytes = 0;
+    let candidates: Vec<_> = choices
+        .values()
+        .take(20)
+        .take_while(|id| {
+            bytes += id.len();
+            bytes <= 16_384
+        })
+        .collect();
     bail!(
-        "{}: {}; candidates={}; supply an exact descriptor or canonical {}",
+        "{}: {}; candidates={}; candidate_count={}; supply an exact descriptor or canonical {}",
         if matches.is_empty() {
             "SYMBOL_NOT_FOUND"
         } else {
@@ -100,6 +123,7 @@ pub(super) fn member_selector(
         },
         name,
         serde_json::to_string(&candidates)?,
+        choices.len(),
         id_key
     )
 }

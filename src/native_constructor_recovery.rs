@@ -1,12 +1,16 @@
 //! Exact observed forwarding constructors removed by DEX optimization.
 #[path = "native_constructor_flat_noarg.rs"]
 mod flat_noarg;
+#[path = "native_constructor_function_reference.rs"]
+mod function_reference;
 #[path = "native_constructor_platform_composition.rs"]
 mod platform_composition;
 use crate::native_dex::{DexClass, DexMethod, DexValue};
 use crate::native_ir::{DecodedMethod, ValueKind};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+
+pub(crate) use function_reference::recovered_function_reference;
 
 #[derive(Debug, Clone)]
 pub struct RecoveredConstructor {
@@ -654,7 +658,9 @@ pub(super) fn recover(
         .filter(|class| platform_composition::candidate(class, &owners, &duplicates))
         .map(|class| class.descriptor.as_ref())
         .collect();
+    let mut function_references = function_reference::Recovery::new(classes, &owners, &duplicates);
     candidates.extend(platform_leaves.iter().copied());
+    candidates.extend(function_references.owners());
     let mut platform_audit = platform_leaves.clone();
     platform_audit.extend(platform_leaves.iter().filter_map(|owner| {
         owners
@@ -740,10 +746,12 @@ pub(super) fn recover(
                         if layered_active && layered_candidate_names.contains(owner.as_ref()) {
                             layered_noarg.invalidate(owner.clone());
                         }
+                        function_references.invalidate(owner.as_ref());
                     }
                 }
                 continue;
             };
+            function_references.observe(class, method, &ir);
             let (layered_cfg, layered_bound, layered_call_at) = if layered_active {
                 match complete_layered_method_validation(class, method, &ir) {
                     Some((cfg, bound)) => {
@@ -981,6 +989,7 @@ pub(super) fn recover(
                         )
                         && ret.as_ref() == "V"
                         && let Some(leaf) = owners.get(allocated.as_ref())
+                        && !function_references.contains(&allocated)
                         && (!leaf
                             .methods
                             .iter()
@@ -1117,6 +1126,7 @@ pub(super) fn recover(
     platform_observations.commit(&owners, &duplicates, &mut result);
     commit_layered_noarg_observations(layered_noarg, &layered_candidates, &mut result);
     flat_noarg::commit(classes, &owners, &duplicates, &mut result);
+    function_references.commit(&mut result);
     result
         .into_iter()
         .map(|(owner, values)| (owner, values.into_values().collect()))

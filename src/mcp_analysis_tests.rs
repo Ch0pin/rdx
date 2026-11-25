@@ -1,6 +1,78 @@
 use super::*;
 
 #[test]
+fn guard_summary_plugin_bridge_accepts_only_exact_selector_shapes() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+    let snapshot = ProjectSnapshot::open(&input).unwrap();
+    let cancel = AtomicBool::new(false);
+    let method = "sample.Target.doubleValue(I)I";
+    let summary = plugin_query(
+        &snapshot,
+        "get_guard_summary",
+        &json!({"method_id":method}),
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(summary["status"], "unknown");
+    assert_eq!(summary["method_id"], method);
+    for arguments in [
+        json!({"method_id":method,"caller_method_id":"sample.Caller.compute()I","call_site_offset":2}),
+        json!({"caller_method_id":"sample.Caller.compute()I"}),
+        json!({"method_id":"sample.Target.doubleValue"}),
+        json!({"method_id":method,"offset":0}),
+    ] {
+        assert!(
+            plugin_query(&snapshot, "get_guard_summary", &arguments, &cancel).is_err(),
+            "{arguments}"
+        );
+    }
+}
+
+#[test]
+fn new_method_queries_advertise_and_validate_standard_aliases() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+    let snapshot = ProjectSnapshot::open(&input).unwrap();
+    let mut engine = snapshot.engine.clone();
+    let cancel = AtomicBool::new(false);
+    let id = "sample.Target.doubleValue(I)I";
+    for tool in ["get_guard_summary", "get_hook_targets"] {
+        let canonical = json!({"instance_id":"i","project_id":"p","method_id":id});
+        let expected = dispatch(&mut engine, &snapshot.project, tool, &canonical, &cancel).unwrap();
+        let schema = input_schema(tool).unwrap();
+        for alias in ["method_signature", "signature"] {
+            let mut args = json!({"instance_id":"i","project_id":"p"});
+            args[alias] = json!(id);
+            assert_eq!(schema["properties"][alias]["type"], "string");
+            assert!(
+                schema["anyOf"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!({"required":[alias]}))
+            );
+            validate(tool, &args).unwrap();
+            assert_eq!(
+                dispatch(&mut engine, &snapshot.project, tool, &args, &cancel).unwrap(),
+                expected
+            );
+            args["method_id"] = json!("sample.Caller.compute()I");
+            let error = validate(tool, &args).unwrap_err();
+            assert!(
+                error.to_string().contains("CONFLICTING_METHOD_SELECTORS"),
+                "{error}"
+            );
+        }
+    }
+    assert!(
+        validate(
+            "get_guard_summary",
+            &json!({"instance_id":"i","project_id":"p",
+        "signature":id,"caller_method_id":"sample.Caller.compute()I","call_site_offset":0})
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn class_aliases_validate_and_reject_conflicting_resolutions() {
     let mut engine = NativeEngine::default();
     let project = engine

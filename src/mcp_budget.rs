@@ -96,7 +96,10 @@ fn bound(result: &mut Value, args: &Value, budget: usize) -> Result<()> {
         continuation["depth"] = result["depth"].clone();
         continuation["offset"] = json!(0);
         continuation["limit"] = json!(100);
-        if continuation["method_id"].is_null() {
+        if ["method_id", "method_signature", "signature", "method_name"]
+            .iter()
+            .all(|key| continuation.get(*key).is_none())
+        {
             continuation["method_id"] = result["method_id"].clone();
         }
         result["continuation"] = json!({"tool":"get_call_graph","arguments":continuation,"scope":"Enumerate complete relationships as call-site pages from offset zero; graph nodes and edges are a bounded overview"});

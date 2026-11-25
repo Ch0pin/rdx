@@ -8,6 +8,7 @@ pub(crate) const OBFUSCATED_ROOT: &str = "obfuscated-root";
 /// Longest package segment still treated as an obfuscated name.
 pub(crate) const OBFUSCATED_SEGMENT_CHARS: usize = 3;
 const MAX_ENTRIES: usize = 64;
+const MAX_EXPORT_SCOPE_BYTES: usize = 16 * 1024;
 pub(crate) const OBFUSCATED_ROOT_RULE: &str = "default-package classes and classes whose every package segment has at most three characters, such as wr.b$a, tk.a or a.b.C; a superset heuristic for R8/ProGuard package renaming that also admits short conventional roots such as com.a";
 
 /// Parsed `package_prefix`: zero or more package/class prefixes matched at `.`
@@ -64,6 +65,52 @@ impl PackageScope {
             }
         }
         Ok(scope)
+    }
+
+    /// Export prefixes match DEX names literally, with the same boundary and
+    /// scalar trailing-dot normalization used by legacy checkpoints.
+    pub(crate) fn for_export(value: &Value) -> Result<Self> {
+        let mut scope = Self::default();
+        if let Some(prefix) = value.as_str() {
+            let prefix = prefix.trim_end_matches('.');
+            if !prefix.is_empty() {
+                scope.prefixes.push(prefix.to_owned());
+            }
+            return Ok(scope);
+        }
+        let entries = value
+            .as_array()
+            .context("package_prefix must be a string or a nonempty array of strings")?;
+        ensure!(
+            (1..=MAX_ENTRIES).contains(&entries.len()),
+            "package_prefix list must contain 1..={MAX_ENTRIES} entries"
+        );
+        for entry in entries {
+            let prefix = entry
+                .as_str()
+                .context("package_prefix entries must be strings")?
+                .trim_end_matches('.');
+            ensure!(
+                !prefix.is_empty(),
+                "package_prefix entries must not be empty"
+            );
+            scope.prefixes.push(prefix.to_owned());
+        }
+        scope.prefixes.sort_unstable();
+        scope.prefixes.dedup();
+        ensure!(
+            serde_json::to_vec(&scope.export_identity())?.len() <= MAX_EXPORT_SCOPE_BYTES,
+            "Normalized package_prefix list exceeds the {MAX_EXPORT_SCOPE_BYTES}-byte checkpoint allowance"
+        );
+        Ok(scope)
+    }
+
+    pub(crate) fn export_identity(&self) -> Value {
+        match self.prefixes.as_slice() {
+            [] => json!(""),
+            [one] => json!(one),
+            prefixes => json!(prefixes),
+        }
     }
     pub(crate) fn from_args(args: &Value) -> Result<Self> {
         Self::parse(&args["package_prefix"])

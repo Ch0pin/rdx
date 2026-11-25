@@ -6,7 +6,8 @@ Each plugin has its own directory containing a manifest, documentation, and any 
 | --- | --- | --- |
 | [Source statistics](https://github.com/Ch0pin/rdx/tree/main/plugins/source-stats) | Analyze the active class (protocol 1) | Bundled native `rdx-source-stats` executable |
 | [Logical WebView inventory](https://github.com/Ch0pin/rdx/tree/main/plugins/logical-webview-inventory) | Analyze the loaded project (protocol 2) | Python 3.9+; no third-party Python packages |
+| [Semantic guard summary](https://github.com/Ch0pin/rdx/tree/main/plugins/semantic-guard-summary) | Present a native DEX comparison proof (protocol 2) | Python 3.9+ standard library |
 
 Load a plugin's `plugin.json`, enable its checkbox, then run the analysis. Adding these directories does not enable or execute plugins automatically. See the [plugin protocol](https://github.com/Ch0pin/rdx/blob/main/docs/plugins.md) for developing another plugin.
 
-Release archives contain a `plugins` directory. Standalone macOS bundles also contain plugin files under `RDX.app/Contents/Resources/plugins`. RDX itself requires no Python; the WebView analyzer is an optional Python plugin.
+Release archives contain a `plugins` directory. Standalone macOS bundles also contain plugin files under `RDX.app/Contents/Resources/plugins`. The native RDX application runs independently of the optional Python plugins.

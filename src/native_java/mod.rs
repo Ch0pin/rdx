@@ -1126,10 +1126,12 @@ fn class_header_prefix(name: &str, class: &DexClass) -> Result<Output> {
         class.annotations_offset == 0 || annotation_directory(class).is_some(),
         "Annotations not reconstructed"
     );
-    ensure!(
-        class.access_flags & !0x2611 == 0,
-        "Unsupported class modifiers"
-    );
+    let class_flags = if crate::native_hierarchy::recovered_function_reference(class) {
+        class.access_flags & !0x1000
+    } else {
+        class.access_flags
+    };
+    ensure!(class_flags & !0x2611 == 0, "Unsupported class modifiers");
     ensure!(
         class.access_flags & 0x410 != 0x410,
         "Class cannot be abstract and final"
@@ -1249,6 +1251,15 @@ pub fn flat_source_prefix_authority(class: &DexClass) -> bool {
         return false;
     };
     !name.is_empty() && class_prefix(&name, class).is_ok()
+}
+
+/// Shared source-inclusion boundary for hierarchy constructor proofs.
+#[doc(hidden)]
+pub fn static_anonymous_enclosing_authority(child: &DexClass, outer: &DexClass) -> bool {
+    anonymous::metadata(child)
+        .ok()
+        .flatten()
+        .is_some_and(|nested| nested.matches_enclosing_declaration(outer))
 }
 
 /// Proves only the ordinary class declaration header and its structural

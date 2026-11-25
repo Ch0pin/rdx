@@ -267,6 +267,19 @@ fn method_source_requested_disassembly_is_distinct_from_failed_reconstruction() 
             .unwrap()
             .starts_with("// RDX Java reconstruction failed:")
     );
+    let searched = dispatch(
+        &mut engine,
+        &project,
+        "search_method_source",
+        &json!({"method_id":id,"query":r"^\s*[0-9a-f]{4}:\s+monitor-enter"}),
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(searched["source_status"], "dex_fallback");
+    assert_eq!(searched["source_hash"], auto["source_hash"]);
+    assert_eq!(searched["fallback_reason"], auto["fallback_reason"]);
+    assert_eq!(searched["coverage_complete"], true);
+    assert_eq!(searched["items"].as_array().unwrap().len(), 1);
     let requested = dispatch(
         &mut engine,
         &project,

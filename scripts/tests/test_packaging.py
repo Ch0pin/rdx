@@ -60,6 +60,9 @@ class PackagingTests(unittest.TestCase):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content)
+        real_guard_plugin = Path(__file__).resolve().parents[2] / 'plugins/semantic-guard-summary'
+        shutil.copytree(real_guard_plugin, self.root / 'plugins/semantic-guard-summary',
+                        ignore=shutil.ignore_patterns('__pycache__'))
         verifier = Path(__file__).resolve().parents[2] / 'tools/androguard-helper/package.py'
         shutil.copy2(verifier, self.root / 'tools/androguard-helper/package.py')
         self.helper = self.root / 'tools/androguard-helper/target/release/rdx-androguard-helper'
@@ -91,6 +94,10 @@ class PackagingTests(unittest.TestCase):
         self.assertTrue((resources / 'third_party/androguard/dependencies/dep/LICENSE').is_file())
         self.assertTrue((resources / 'plugins/example/main.py').is_file())
         self.assertFalse((resources / 'plugins/example/tests').exists())
+        guard_plugin = resources / 'plugins/semantic-guard-summary'
+        self.assertEqual(json.loads((guard_plugin / 'plugin.json').read_text())['args'], ['analyzer.py'])
+        self.assertTrue((guard_plugin / 'analyzer.py').is_file())
+        self.assertFalse((guard_plugin / 'tests').exists())
         info = plistlib.loads((output / 'Contents/Info.plist').read_bytes())
         self.assertEqual(info['CFBundleExecutable'], 'rdx')
         signed = [Path(call.args[0][-1]) for call in run.call_args_list if '--sign' in call.args[0]]
@@ -168,6 +175,9 @@ class PackagingTests(unittest.TestCase):
             self.assertIn(prefix + 'third_party/androguard/mpl-source/colored/src/lib.rs', archive.getnames())
             self.assertIn(prefix + 'plugins/example/main.py', archive.getnames())
             self.assertNotIn(prefix + 'plugins/example/tests/private-test.py', archive.getnames())
+            self.assertIn(prefix + 'plugins/semantic-guard-summary/plugin.json', archive.getnames())
+            self.assertIn(prefix + 'plugins/semantic-guard-summary/analyzer.py', archive.getnames())
+            self.assertFalse(any('/semantic-guard-summary/tests/' in name for name in archive.getnames()))
         self.assertTrue(path.with_name(path.name + '.sha256').is_file())
 
     def test_missing_radguard_fails_before_touching_existing_bundle(self):

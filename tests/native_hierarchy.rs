@@ -8,7 +8,7 @@ mod native_dex {
 mod native_java {
     pub(crate) use rdx::native_java::{
         flat_source_prefix_authority, ordinary_method_declaration_authority,
-        source_header_authority,
+        source_header_authority, static_anonymous_enclosing_authority,
     };
 }
 
@@ -1289,4 +1289,13 @@ fn static_parameter_throw_shape_respects_eight_bit_register_and_try_metadata() {
         method.code.as_mut().unwrap().tries = 1;
         assert!(native_hierarchy::static_parameter_throw_shape(&method).is_none());
     }
+}
+
+#[test]
+fn ordinary_class_is_not_a_recovered_function_reference() {
+    let ordinary = class("Lsample/Ordinary;", Some("Ljava/lang/Object;"), &[]);
+    assert!(!native_hierarchy::recovered_function_reference(&ordinary));
+    assert!(!native_java::static_anonymous_enclosing_authority(
+        &ordinary, &ordinary
+    ));
 }

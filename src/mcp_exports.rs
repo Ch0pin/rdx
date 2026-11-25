@@ -1,5 +1,6 @@
 //! Project-owned export jobs with durable, validated continuation checkpoints.
 use super::*;
+use crate::package_scope::PackageScope;
 use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom};
 
@@ -8,6 +9,18 @@ struct Job {
     progress: Arc<Mutex<Value>>,
     cancel: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
+}
+impl Job {
+    fn wait(&self, request_cancel: &AtomicBool) -> Result<Value> {
+        while !self.done.load(Ordering::Acquire) {
+            if request_cancel.load(Ordering::Relaxed) {
+                self.cancel.store(true, Ordering::Relaxed);
+                bail!("CANCELLED");
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        Ok(self.progress.lock().unwrap().clone())
+    }
 }
 #[derive(Default)]
 pub(super) struct Controller {
@@ -32,7 +45,12 @@ impl Controller {
         result["worker_finished"] = json!(job.done.load(Ordering::Acquire));
         Ok(result)
     }
-    pub(super) fn start(&self, project: &LoadedProject, args: &Value) -> Result<Value> {
+    pub(super) fn start(
+        &self,
+        project: &LoadedProject,
+        args: &Value,
+        wait: Option<&AtomicBool>,
+    ) -> Result<Value> {
         let mut jobs = self.jobs.lock().unwrap();
         ensure!(
             !self.stopped.load(Ordering::Acquire),
@@ -85,6 +103,7 @@ impl Controller {
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("EXPORT_WORKER_PANICKED")));
                 session.finish(outcome, &worker.cancel, Some(&worker.progress));
                 drop(session);
+                drop(engine);
                 worker.done.store(true, Ordering::Release);
             });
         if let Err(error) = started {
@@ -96,7 +115,11 @@ impl Controller {
             save(&out.join("completion.json"), &failure)?;
             bail!("Cannot start export worker: {error}");
         }
-        jobs.insert(id, job);
+        jobs.insert(id, job.clone());
+        drop(jobs);
+        if let Some(request_cancel) = wait {
+            return job.wait(request_cancel);
+        }
         Ok(snapshot)
     }
 }
@@ -128,28 +151,29 @@ fn save(path: &Path, value: &Value) -> Result<()> {
     file.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
-fn selected<'a>(project: &'a Project, args: &Value) -> Vec<&'a String> {
+fn selected<'a>(project: &'a Project, scope: &PackageScope) -> Vec<&'a String> {
     project
         .classes
         .iter()
-        .filter(|n| scan::package_matches(n, args))
+        .filter(|n| scope.matches(n))
         .collect()
 }
 struct Session {
     out: PathBuf,
     _lock: File,
     state: Value,
+    scope: PackageScope,
 }
 impl Session {
     fn open(project: &Project, args: &Value, apk_hash: &str) -> Result<Self> {
         let out = PathBuf::from(required(args, "out_path")?);
         ensure!(out.is_absolute(), "out_path must be absolute");
-        let names = selected(project, args);
+        let scope = PackageScope::for_export(&args["package_prefix"])?;
+        let names = selected(project, &scope);
         ensure!(!names.is_empty(), "No classes match package_prefix");
-        let prefix = args["package_prefix"]
-            .as_str()
-            .unwrap_or("")
-            .trim_end_matches('.');
+        let prefix = scope.export_identity();
+        // Existing single-prefix status files keep their representation.
+        let checkpoint_version = if prefix.is_array() { 2 } else { 1 };
         let selection_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&names)?));
         let renderer = build_identity()["executable_sha256"].clone();
         ensure!(
@@ -186,7 +210,7 @@ impl Session {
             );
             let state: Value = serde_json::from_reader(file)?;
             ensure!(
-                state["checkpoint_version"] == 1
+                state["checkpoint_version"] == checkpoint_version
                     && state["apk_sha256"] == apk_hash
                     && state["renderer_sha256"] == renderer
                     && state["package_prefix"] == prefix
@@ -211,7 +235,7 @@ impl Session {
                 .create_new(true)
                 .open(out.join("manifest.jsonl"))?;
             manifest.sync_all()?;
-            json!({"checkpoint_version":1,"apk_sha256":apk_hash,"renderer_sha256":renderer,
+            json!({"checkpoint_version":checkpoint_version,"apk_sha256":apk_hash,"renderer_sha256":renderer,
                 "package_prefix":prefix,"selection_hash":selection_hash,"total":names.len(),"selected":names.len(),
                 "next_class":0,"manifest_bytes":0,"exported":0,"failed":0})
         };
@@ -229,7 +253,7 @@ impl Session {
         state["manifest_sha256"] = Value::Null;
         state["updated_at_unix_ms"] = json!(unix_ms());
         state["recovery"] = json!(
-            "Resume with export_package_source(resume=true) or rdx --export-source INPUT OUTPUT --resume, keeping the APK, executable and package prefix unchanged. A persisted running status without a live job means interrupted work, not completion."
+            "Resume with export_package_source(resume=true) and the same APK, executable, output directory and package scope. Single-prefix exports also support rdx --export-source INPUT OUTPUT --resume with the original prefix. A persisted running status without a live job marks interrupted work."
         );
         save(&out.join("export-status.json"), &state)?;
         if resume {
@@ -240,6 +264,7 @@ impl Session {
             out,
             _lock: lock,
             state,
+            scope,
         })
     }
     fn publish(&mut self, progress: Option<&Mutex<Value>>) -> Result<()> {
@@ -258,7 +283,7 @@ impl Session {
         progress: Option<&Mutex<Value>>,
         verify: impl Fn() -> Result<()>,
     ) -> Result<()> {
-        let names = selected(project, &self.state);
+        let names = selected(project, &self.scope);
         let next = self.state["next_class"]
             .as_u64()
             .context("Invalid export cursor")? as usize;
@@ -428,7 +453,7 @@ pub fn export_directory(
     let loaded = LoadedProject::from_snapshot(snapshot, stop)?;
     check_project_file(&loaded)?;
     let args = json!({"out_path":output,"package_prefix":package_prefix,"resume":resume,"project_id":loaded.project_id});
-    let started = loaded.exports.start(&loaded, &args)?;
+    let started = loaded.exports.start(&loaded, &args, None)?;
     progress(&started);
     let id = required(&started, "job_id")?;
     loop {
@@ -600,10 +625,197 @@ mod tests {
         assert!(
             loaded
                 .exports
-                .start(&loaded, &args)
+                .start(&loaded, &args, None)
                 .unwrap_err()
                 .to_string()
                 .contains("EXPORT_SERVICE_STOPPED")
+        );
+    }
+
+    #[test]
+    fn package_prefix_union_deduplicates_classes_and_binds_checkpoint_scope() {
+        let (mut engine, project, hash) = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("union");
+        let mut args = json!({"out_path":out,"package_prefix":["sample.Target.","sample.","sample.Target","sample"],
+            "instance_id":"i","project_id":"p"});
+        validate("export_package_source", &args).unwrap();
+        let session = Session::open(&project, &args, &hash).unwrap();
+        assert_eq!(session.state["checkpoint_version"], 2);
+        assert_eq!(
+            session.state["package_prefix"],
+            json!(["sample", "sample.Target"])
+        );
+        assert_eq!(session.state["total"], project.classes.len());
+        drop(session);
+
+        args["resume"] = json!(true);
+        args["package_prefix"] = json!("sample");
+        assert!(
+            Session::open(&project, &args, &hash)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("EXPORT_IDENTITY_MISMATCH")
+        );
+        args["package_prefix"] = json!(["sample", "sample.Target", "sample."]);
+        let mut resumed = Session::open(&project, &args, &hash).unwrap();
+        let cancel = AtomicBool::new(false);
+        let result = resumed.run(&mut engine, &project, &cancel, None, || Ok(()));
+        resumed.finish(result, &cancel, None);
+        assert_eq!(resumed.state["status"], "complete", "{}", resumed.state);
+        let manifest = fs::read_to_string(out.join("manifest.jsonl")).unwrap();
+        let rows: Vec<Value> = manifest
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), project.classes.len());
+        for (index, (row, class)) in rows.iter().zip(&project.classes).enumerate() {
+            assert_eq!(row["class_id"], class.as_str());
+            assert_eq!(row["descriptor"], format!("L{};", class.replace('.', "/")));
+            assert_eq!(
+                row["source_path"],
+                json!(out.join(format!("class-{index:08}.txt")))
+            );
+        }
+
+        let mut legacy = json!({"out_path":tmp.path().join("legacy"),"package_prefix":"sample."});
+        let old = Session::open(&project, &legacy, &hash).unwrap();
+        assert_eq!(old.state["checkpoint_version"], 1);
+        assert_eq!(old.state["package_prefix"], "sample");
+        drop(old);
+        legacy["resume"] = json!(true);
+        legacy["package_prefix"] = json!(["sample", "sample."]);
+        let resumed = Session::open(&project, &legacy, &hash).unwrap();
+        assert_eq!(resumed.state["checkpoint_version"], 1);
+        assert_eq!(resumed.state["package_prefix"], "sample");
+    }
+
+    #[test]
+    fn export_package_prefix_validation_rejects_invalid_or_empty_unions() {
+        let mut args = json!({"instance_id":"i","project_id":"p","out_path":"/tmp/new-export"});
+        for scope in [
+            json!([]),
+            json!([""]),
+            json!(["."]),
+            json!([42]),
+            json!(vec!["sample"; 65]),
+        ] {
+            args["package_prefix"] = scope;
+            assert!(validate("export_package_source", &args).is_err(), "{args}");
+        }
+        for scope in [json!(""), json!("sample."), json!(["sample", "other"])] {
+            args["package_prefix"] = scope;
+            validate("export_package_source", &args).unwrap();
+        }
+        let (_engine, project, hash) = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("oversized");
+        args["out_path"] = json!(out);
+        args["package_prefix"] = json!(["bad, prefix"]);
+        let absent = Session::open(&project, &args, &hash)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(absent.contains("No classes match package_prefix"));
+        args["package_prefix"] = json!(["sample", &"z".repeat(16 * 1024)]);
+        let error = validate("export_package_source", &args).unwrap_err();
+        assert!(
+            error.to_string().contains("16384-byte checkpoint"),
+            "{error}"
+        );
+        assert!(Session::open(&project, &args, &hash).is_err());
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn legacy_scalar_export_prefixes_keep_literal_dex_matching() {
+        let (_, _, hash) = fixture();
+        let project = Project {
+            classes: vec![
+                "obfuscated-root.X".into(),
+                "sample.Has Space".into(),
+                "sample.Has Space.Child".into(),
+                "sample.Has Spaces".into(),
+                "tk.a".into(),
+            ],
+            resources: vec![],
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        for prefix in ["", "...", "obfuscated-root", "sample.Has Space.."] {
+            let args = json!({"package_prefix":prefix});
+            let legacy: Vec<_> = project
+                .classes
+                .iter()
+                .filter(|name| scan::package_matches(name, &args))
+                .collect();
+            let scope = PackageScope::for_export(&args["package_prefix"]).unwrap();
+            assert_eq!(selected(&project, &scope), legacy);
+        }
+        let mut args = json!({"package_prefix":"sample.Has Space.","out_path":tmp.path().join("legacy-spaces")});
+        let session = Session::open(&project, &args, &hash).unwrap();
+        assert_eq!(session.state["checkpoint_version"], 1);
+        assert_eq!(session.state["package_prefix"], "sample.Has Space");
+        assert_eq!(session.state["total"], 2);
+        drop(session);
+        args["resume"] = json!(true);
+        args["package_prefix"] = json!(["sample.Has Space", "sample.Has Space."]);
+        let session = Session::open(&project, &args, &hash).unwrap();
+        assert_eq!(session.state["checkpoint_version"], 1);
+        assert_eq!(session.state["total"], 2);
+    }
+
+    #[test]
+    fn synchronous_export_shares_worker_admission_and_forwards_cancellation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
+        let loaded = LoadedProject::from_snapshot(
+            ProjectSnapshot::open(&path).unwrap(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let pending = Job {
+            progress: Arc::new(Mutex::new(json!({"status":"running"}))),
+            cancel: Arc::new(AtomicBool::new(false)),
+            done: Arc::new(AtomicBool::new(false)),
+        };
+        // Hold an admitted job open deterministically; fixture rendering can
+        // otherwise finish before the competing request reaches admission.
+        loaded
+            .exports
+            .jobs
+            .lock()
+            .unwrap()
+            .insert("active".into(), pending.clone());
+        let out = tmp.path().join("synchronous");
+        let mut args = json!({"out_path":out,"package_prefix":["sample.Caller","sample.Target"],
+            "project_id":loaded.project_id,"instance_id":"i"});
+        let request_cancel = AtomicBool::new(false);
+        for background in [true, false] {
+            args["background"] = json!(background);
+            let error = project_request(&loaded, "export_package_source", &args, &request_cancel)
+                .unwrap_err();
+            assert!(error.to_string().contains("EXPORT_BUSY"), "{error}");
+            assert!(!out.exists());
+        }
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            pending.wait(&cancelled).unwrap_err().to_string(),
+            "CANCELLED"
+        );
+        assert!(pending.cancel.load(Ordering::Relaxed));
+        pending.done.store(true, Ordering::Release);
+
+        let complete =
+            project_request(&loaded, "export_package_source", &args, &request_cancel).unwrap();
+        assert_eq!(complete["status"], "complete", "{complete}");
+        assert_eq!(complete["exported"], 2);
+        assert_eq!(
+            loaded
+                .exports
+                .status(complete["job_id"].as_str().unwrap(), false)
+                .unwrap()["worker_finished"],
+            true
         );
     }
     #[test]

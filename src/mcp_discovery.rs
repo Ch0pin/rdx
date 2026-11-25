@@ -66,6 +66,12 @@ pub(super) fn types(
     cancel: &AtomicBool,
 ) -> Result<Value> {
     let requested = required(args, "class_name")?;
+    let compact = args["projection"] == "compact";
+    let grouped = args["group_by"] == "owner_and_kind";
+    ensure!(
+        !grouped || compact,
+        "group_by=owner_and_kind requires projection=compact"
+    );
     let name =
         if requested.starts_with('[') || (requested.starts_with('L') && requested.ends_with(';')) {
             crate::native_engine::disassembly::type_name(requested)
@@ -75,6 +81,8 @@ pub(super) fn types(
             crate::allocation_references::resolve_target(engine, project, requested, cancel)?
         };
     let mut query = args.clone();
+    query.as_object_mut().unwrap().remove("projection");
+    query.as_object_mut().unwrap().remove("group_by");
     query["query"] = json!(name);
     query["symbol_kind"] = json!("class");
     query["include_array_components"] = json!(true);
@@ -85,26 +93,44 @@ pub(super) fn types(
     // Force the complete index/streaming path here: a resumable scan cursor
     // cannot be combined with the annotation page's hit offset.
     query["search_mode"] = json!("index");
-    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
-    let limit = args["limit"].as_u64().unwrap_or(100) as usize;
-    let mut count_query = query.clone();
-    count_query["offset"] = json!(0);
-    count_query["limit"] = json!(limit);
-    let count_result = engine.search_identifiers(&count_query, cancel)?;
-    let identifier_count = count_result["total"]
-        .as_u64()
-        .context("Identifier count unavailable")? as usize;
     let mut annotation_query = json!({"annotation_type":format!("L{};",name.replace('.',"/")),
         "offset":0,"limit":1});
     if let Some(prefix) = args.get("package_prefix") {
         annotation_query["package_prefix"] = prefix.clone();
     }
+    if grouped {
+        return grouped_types(
+            engine,
+            project,
+            args,
+            &query,
+            &annotation_query,
+            &name,
+            cancel,
+        );
+    }
+    let identifier_page = |query: &Value| {
+        if compact {
+            engine.search_compact_type_references(query, cancel)
+        } else {
+            engine.search_identifiers(query, cancel)
+        }
+    };
+    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+    let limit = args["limit"].as_u64().unwrap_or(100) as usize;
+    let mut count_query = query.clone();
+    count_query["offset"] = json!(0);
+    count_query["limit"] = json!(if compact && offset > 0 { 1 } else { limit });
+    let count_result = identifier_page(&count_query)?;
+    let identifier_count = count_result["total"]
+        .as_u64()
+        .context("Identifier count unavailable")? as usize;
     let mut result = if offset == 0 || offset >= identifier_count {
         count_result
     } else {
         query["offset"] = json!(offset);
         query["limit"] = json!(limit);
-        engine.search_identifiers(&query, cancel)?
+        identifier_page(&query)?
     };
     let mut items = if offset >= identifier_count && offset != 0 {
         Vec::new()
@@ -114,8 +140,10 @@ pub(super) fn types(
             .context("Missing identifier items")?
             .clone()
     };
-    for item in &mut items {
-        item["reference_kind"] = item["context"].clone();
+    if !compact {
+        for item in &mut items {
+            item["reference_kind"] = item["context"].clone();
+        }
     }
     let include_annotations =
         items.len() < limit && offset.saturating_add(items.len()) >= identifier_count;
@@ -123,7 +151,11 @@ pub(super) fn types(
         annotation_query["offset"] = json!(offset.saturating_sub(identifier_count));
         annotation_query["limit"] = json!(limit - items.len());
     }
-    let annotations = engine.annotation_usages(project, &annotation_query, cancel)?;
+    let annotations = if compact {
+        crate::annotation_usage::search_compact(engine, project, &annotation_query, cancel)?
+    } else {
+        engine.annotation_usages(project, &annotation_query, cancel)?
+    };
     let annotation_count = annotations["total"]
         .as_u64()
         .context("Annotation count unavailable")? as usize;
@@ -134,7 +166,11 @@ pub(super) fn types(
             .as_array()
             .context("Missing annotation items")?
         {
-            items.push(annotation_type_item(&name, annotation));
+            items.push(if compact {
+                compact_annotation_type_item(&name, annotation.clone())
+            } else {
+                annotation_type_item(&name, annotation)
+            });
         }
     }
     // Both sources use a 1 MiB page budget. Apply that budget again to the
@@ -159,8 +195,131 @@ pub(super) fn types(
     result["scope"] = json!(
         "Original DEX instruction and declaration type references, followed by explicit class, field, method, and parameter annotation type references with decoded values. Annotation defaults, nested annotation value types, reflection, and runtime reachability are not inferred."
     );
+    if compact {
+        result["projection"] = json!("compact");
+        result["scope"] = json!(COMPACT_TYPE_SCOPE);
+    }
     result["requested_type"] = json!(name);
     result["xml_reference_tool"] = json!("find_layout_references");
+    Ok(result)
+}
+
+const COMPACT_TYPE_SCOPE: &str = "Original DEX type operands and declarations, followed by explicit class, field, method, and parameter annotation types. Instruction positions are in 16-bit DEX code units. Full projection provides raw words and decoded annotation values.";
+
+fn compact_annotation_type_item(name: &str, mut item: Value) -> Value {
+    item["symbol_id"] = json!(name);
+    item["reference_kind"] = json!("annotation_type");
+    item
+}
+
+struct TypeGroups {
+    page: scan::Page,
+    current: Option<Value>,
+    occurrences: usize,
+    digest: Sha256,
+}
+
+impl TypeGroups {
+    fn add(&mut self, item: Value) -> Result<()> {
+        let mut owner = serde_json::Map::new();
+        for key in [
+            "class_id",
+            "method_id",
+            "field_id",
+            "element",
+            "dex_entry",
+            "member_declaration_index",
+            "reference_kind",
+        ] {
+            if let Some(value) = item.get(key) {
+                owner.insert(key.into(), value.clone());
+            }
+        }
+        // Parameter-type declarations group by method. Parameter annotations
+        // instead have a distinct annotated owner for each parameter slot.
+        if item["element"] == "parameter" {
+            owner.insert("parameter_index".into(), item["parameter_index"].clone());
+        }
+        let owner = Value::Object(owner);
+        self.digest.update(serde_json::to_vec(&item)?);
+        self.digest.update(b"\n");
+        self.occurrences += 1;
+        if let Some(current) = self.current.as_mut()
+            && current["owner"] == owner
+        {
+            current["occurrence_count"] = json!(current["occurrence_count"].as_u64().unwrap() + 1);
+            return Ok(());
+        }
+        self.flush()?;
+        self.current = Some(json!({"owner":owner,"occurrence_count":1,"first_site":item}));
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if let Some(group) = self.current.take() {
+            self.page.add(group)?;
+        }
+        Ok(())
+    }
+}
+
+fn grouped_types(
+    engine: &NativeEngine,
+    project: &Project,
+    args: &Value,
+    query: &Value,
+    annotation_query: &Value,
+    name: &str,
+    cancel: &AtomicBool,
+) -> Result<Value> {
+    let mut groups = TypeGroups {
+        page: scan::Page::new(args)?,
+        current: None,
+        occurrences: 0,
+        digest: Sha256::new(),
+    };
+    // The streaming identifier visitor emits each class once; each class's
+    // superclass and interfaces, fields, and methods are contiguous. Within
+    // a method it emits return, parameter, and instruction sites in that
+    // order, independently of which symbol or array operand matched.
+    let mut result = engine.visit_type_references(query, cancel, |item| groups.add(item))?;
+    let identifiers = groups.occurrences;
+    // Annotation owners likewise visit one declaration/parameter slot at a
+    // time. Their distinct reference kind keeps the two phases disjoint.
+    crate::annotation_usage::visit_type_references(
+        engine,
+        project,
+        annotation_query,
+        cancel,
+        |item| groups.add(compact_annotation_type_item(name, item)),
+    )?;
+    groups.flush()?;
+    let mut page = groups.page.finish()?;
+    result
+        .as_object_mut()
+        .unwrap()
+        .append(page.as_object_mut().unwrap());
+    result["source_hash"] = json!(type_source_hash(
+        name,
+        args["package_prefix"].as_str().unwrap_or(""),
+        "owner-and-kind-v1",
+        &format!("{:x}", groups.digest.finalize()),
+    ));
+    result["projection"] = json!("compact");
+    result["group_by"] = json!("owner_and_kind");
+    result["pagination"] = json!("groups");
+    result["offset_unit"] = json!("matching owner and reference-kind groups");
+    result["exhausted"] = json!(result["next_offset"].is_null());
+    result["pagination_order"] =
+        json!("class_then_dex_declaration_order_followed_by_annotation_owners");
+    result["occurrence_total"] = json!(groups.occurrences);
+    result["annotation_reference_count"] = json!(groups.occurrences - identifiers);
+    result["requested_type"] = json!(name);
+    result["xml_reference_tool"] = json!("find_layout_references");
+    result["scope"] = json!(COMPACT_TYPE_SCOPE);
+    result["drill_down"] = json!(
+        "first_site gives one exact location for the group. For all individual sites, call find_type_references with projection=full and package_prefix set to owner.class_id, then follow the occurrence pages."
+    );
     Ok(result)
 }
 fn annotation_type_item(name: &str, annotation: &Value) -> Value {

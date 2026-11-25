@@ -2,7 +2,7 @@
 use crate::{
     annotation_values::elements_value,
     engine::{NativeEngine, Project},
-    native_dex::{DexAnnotationSet, DexClass},
+    native_dex::{DexAnnotation, DexAnnotationSet, DexClass},
     native_engine::disassembly,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -22,18 +22,51 @@ pub(crate) fn search(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
-    scan_classes(
-        project.classes.iter().map(|name| {
-            Ok((
-                name.as_str(),
-                engine
-                    .dex_class(name)
-                    .context("Missing class during annotation scan")?,
-            ))
-        }),
+    scan_classes(project_classes(engine, project), args, cancel)
+}
+
+pub(crate) fn search_compact(
+    engine: &NativeEngine,
+    project: &Project,
+    args: &Value,
+    cancel: &AtomicBool,
+) -> Result<Value> {
+    scan_classes_with_values(project_classes(engine, project), args, cancel, false)
+}
+
+pub(crate) fn visit_type_references(
+    engine: &NativeEngine,
+    project: &Project,
+    args: &Value,
+    cancel: &AtomicBool,
+    mut emit: impl FnMut(Value) -> Result<()>,
+) -> Result<()> {
+    visit_usages(
+        project_classes(engine, project),
         args,
         cancel,
-    )
+        |mut item, _, _, member| {
+            if let Some(index) = member {
+                item["member_declaration_index"] = json!(index);
+            }
+            emit(item)
+        },
+    )?;
+    Ok(())
+}
+
+fn project_classes<'a>(
+    engine: &'a NativeEngine,
+    project: &'a Project,
+) -> impl Iterator<Item = Result<(&'a str, &'a DexClass)>> {
+    project.classes.iter().map(|name| {
+        Ok((
+            name.as_str(),
+            engine
+                .dex_class(name)
+                .context("Missing class during annotation scan")?,
+        ))
+    })
 }
 
 pub(super) struct Page {
@@ -59,19 +92,25 @@ impl Page {
             hash: Sha256::new(),
         })
     }
-    pub(super) fn add(&mut self, item: Value) -> Result<()> {
+    pub(super) fn add(&mut self, mut item: Value, include_values: bool) -> Result<()> {
         let encoded = serde_json::to_vec(&item)?;
         self.hash.update(&encoded);
         self.hash.update(b"\n");
         if self.total >= self.start && self.items.len() < self.limit && !self.full {
-            if self.bytes + encoded.len() > 1024 * 1024 {
+            let size = if include_values {
+                encoded.len()
+            } else {
+                item.as_object_mut().unwrap().remove("values");
+                serde_json::to_vec(&item)?.len()
+            };
+            if self.bytes + size > 1024 * 1024 {
                 ensure!(
                     !self.items.is_empty(),
                     "RESULT_TOO_LARGE: one record exceeds 1 MiB"
                 );
                 self.full = true;
             } else {
-                self.bytes += encoded.len();
+                self.bytes += size;
                 self.items.push(item);
             }
         }
@@ -101,19 +140,20 @@ pub(super) fn package_matches(name: &str, args: &Value) -> bool {
 pub(super) fn annotation_sets(
     class: &DexClass,
     name: &str,
-    mut emit: impl FnMut(Value, &DexAnnotationSet) -> Result<()>,
+    mut emit: impl FnMut(Value, &DexAnnotationSet, Option<usize>) -> Result<()>,
 ) -> Result<()> {
     let Some(d) = class.symbols.annotations.get(&class.annotations_offset) else {
         return Ok(());
     };
     if let Some(set) = &d.class {
-        emit(json!({"class_id":name,"element":"class"}), set)?;
+        emit(json!({"class_id":name,"element":"class"}), set, None)?;
     }
     for (i, f) in class.fields.iter().enumerate() {
         if let Some(Some(set)) = d.fields.get(i) {
             emit(
                 json!({"class_id":name,"field_id":format!("{name}.{}:{}",f.name,f.field_type),"element":"field"}),
                 set,
+                Some(i),
             )?;
         }
     }
@@ -123,6 +163,7 @@ pub(super) fn annotation_sets(
             emit(
                 json!({"class_id":name,"method_id":id,"element":"method"}),
                 set,
+                Some(i),
             )?;
         }
         if let Some(params) = d.parameters.get(i) {
@@ -131,6 +172,7 @@ pub(super) fn annotation_sets(
                     emit(
                         json!({"class_id":name,"method_id":id,"element":"parameter","parameter_index":p}),
                         set,
+                        Some(i),
                     )?;
                 }
             }
@@ -223,9 +265,33 @@ pub(crate) fn scan_classes<'a>(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<Value> {
+    scan_classes_with_values(classes, args, cancel, true)
+}
+
+fn scan_classes_with_values<'a>(
+    classes: impl IntoIterator<Item = Result<(&'a str, &'a DexClass)>>,
+    args: &Value,
+    cancel: &AtomicBool,
+    include_values: bool,
+) -> Result<Value> {
+    let mut page = Page::new(args)?;
+    let details = visit_usages(classes, args, cancel, |mut item, annotation, class, _| {
+        item["values"] = elements_value(&annotation.elements, &class.symbols, &mut (256 * 1024))?;
+        page.add(item, include_values)
+    })?;
+    let mut result = page.finish()?;
+    result.as_object_mut().unwrap().extend(details);
+    Ok(result)
+}
+
+fn visit_usages<'a>(
+    classes: impl IntoIterator<Item = Result<(&'a str, &'a DexClass)>>,
+    args: &Value,
+    cancel: &AtomicBool,
+    mut emit: impl FnMut(Value, &DexAnnotation, &DexClass, Option<usize>) -> Result<()>,
+) -> Result<serde_json::Map<String, Value>> {
     let query = AnnotationQuery::parse(args)?;
     let element = args["element"].as_str().unwrap_or("all");
-    let mut page = Page::new(args)?;
     let mut seen_tables = HashSet::new();
     let mut type_present = false;
     let mut matched_types = BTreeSet::new();
@@ -241,7 +307,7 @@ pub(crate) fn scan_classes<'a>(
         if !package_matches(name, args) {
             continue;
         }
-        annotation_sets(c, name, |owner, set| {
+        annotation_sets(c, name, |owner, set, index| {
             if element != "all" && owner["element"] != element {
                 return Ok(());
             }
@@ -265,16 +331,14 @@ pub(crate) fn scan_classes<'a>(
                 let mut item = owner.clone();
                 item["annotation_type"] = json!(descriptor.as_ref());
                 item["visibility"] = json!(annotation.visibility);
-                item["values"] =
-                    elements_value(&annotation.elements, &c.symbols, &mut (256 * 1024))?;
                 item["dex_entry"] = json!(c.symbols.origin.get());
-                page.add(item)?;
+                emit(item, annotation, c, index)?;
             }
             Ok(())
         })?;
     }
     ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
-    let mut result = page.finish()?;
+    let mut result = json!({});
     result["annotation_type"] = json!(query.pattern());
     result["match_mode"] = json!(query.mode());
     result["matched_types"] = json!(matched_types);
@@ -293,5 +357,5 @@ pub(crate) fn scan_classes<'a>(
     result["scope"] = json!(
         "Complete covers explicit DEX annotation usages whose type matches match_mode (exact descriptor, simple name after the last package separator, or literal internal-name prefix) within the supplied filters, not semantic equivalents under obfuscation. Parameter_index excludes the receiver. No inherited annotations or annotation defaults inferred."
     );
-    Ok(result)
+    Ok(result.as_object_mut().map(std::mem::take).unwrap())
 }

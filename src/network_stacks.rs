@@ -5,7 +5,7 @@ use crate::{
     native_engine::disassembly::{method_id, type_name},
     native_ir::DecodedMethod,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -69,7 +69,7 @@ enum Origin {
     Entry(i32),
 }
 // Prove name/value accessor parity from original DEX, independent of method names.
-fn entry_accessor(c: &DexClass, m: &DexMethod) -> Option<i32> {
+pub(crate) fn entry_accessor(c: &DexClass, m: &DexMethod) -> Option<i32> {
     if !signature(m, &["I"], STRING) {
         return None;
     }
@@ -185,6 +185,23 @@ pub(crate) fn search(
         }
     }
     detect(&classes, args, cancel, MAX_WORK)
+}
+
+pub(crate) fn structural_hook_inventory(
+    engine: &NativeEngine,
+    project: &Project,
+    cancel: &AtomicBool,
+) -> Result<Value> {
+    let mut classes = Vec::with_capacity(project.classes.len());
+    for name in &project.classes {
+        ensure!(!cancel.load(Ordering::Relaxed), "CANCELLED");
+        classes.push(
+            engine
+                .dex_class(name)
+                .context("Missing network inventory class")?,
+        );
+    }
+    structural(&classes, &json!({"limit":100}), cancel, MAX_WORK)
 }
 /// Warn when `package_prefix` excluded Retrofit-annotated declarations, so a
 /// zero result on an obfuscated build points at the renamed packages.

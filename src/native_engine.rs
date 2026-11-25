@@ -52,6 +52,15 @@ pub struct NativeDexEngine {
     test_total_dex_limits: Option<[u64; 2]>,
 }
 impl NativeDexEngine {
+    #[cfg(test)]
+    pub(crate) fn from_test_classes(classes: BTreeMap<String, DexClass>) -> Self {
+        Self {
+            classes: Arc::new(classes),
+            opened: true,
+            ..Self::default()
+        }
+    }
+
     /// Conservative admission estimate, including nested classes rendered in this document.
     pub(crate) fn search_work_bytes(&self, name: &str) -> usize {
         let mut pending = vec![name];

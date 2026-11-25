@@ -46,6 +46,176 @@ fn fixture() -> (NativeEngine, Project) {
         .unwrap();
     (engine, project)
 }
+
+#[test]
+fn source_aliases_keep_numeric_limits_and_class_identity() {
+    let (mut engine, project) = fixture();
+    let cancel = AtomicBool::new(false);
+    let args =
+        json!({"instance_id":"i","project_id":"p","class_id":"sample.Target","max_chars":12});
+    validate("get_class_source", &args).unwrap();
+    let aliased = dispatch(&mut engine, &project, "get_class_source", &args, &cancel).unwrap();
+    let mut canonical = args.clone();
+    canonical.as_object_mut().unwrap().remove("max_chars");
+    canonical["limit"] = json!(12);
+    assert_eq!(
+        aliased,
+        dispatch(
+            &mut engine,
+            &project,
+            "get_class_source",
+            &canonical,
+            &cancel
+        )
+        .unwrap()
+    );
+    assert_eq!(aliased["next_offset"], 12);
+    let mut invalid = args.clone();
+    for value in [
+        json!(0),
+        json!(-1),
+        json!(128001),
+        json!("12"),
+        json!(1.5),
+        Value::Null,
+    ] {
+        invalid["max_chars"] = value;
+        let error = validate("get_class_source", &invalid).unwrap_err();
+        let error = error.downcast_ref::<ArgumentError>().unwrap();
+        assert_eq!(error.details["parameter"], "max_chars");
+        assert_eq!(
+            error.details["accepted_parameters"]["properties"]["max_chars"]["maximum"],
+            128000
+        );
+    }
+    let mut both = args;
+    both["limit"] = json!(13);
+    assert!(
+        validate("get_class_source", &both)
+            .unwrap_err()
+            .to_string()
+            .contains("CONFLICTING_ARGUMENTS")
+    );
+    both["limit"] = json!(12);
+    validate("get_class_source", &both).unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut export = json!({"instance_id":"i","project_id":"p","class_id":"Lsample/Target;","out_path":temp.path().join("export")});
+    validate("export_source", &export).unwrap();
+    let result = dispatch(&mut engine, &project, "export_source", &export, &cancel).unwrap();
+    assert_eq!(result["identity"]["class_id"], "sample.Target");
+    export["class_name"] = json!("sample.Caller");
+    assert!(
+        validate("export_source", &export)
+            .unwrap_err()
+            .to_string()
+            .contains("CONFLICTING_ARGUMENTS")
+    );
+    export["class_name"] = json!("Lsample/Target;");
+    validate("export_source", &export).unwrap();
+}
+
+#[test]
+fn named_call_graph_roots_keep_neighbor_filters_and_inheritance_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("inheritance.dex");
+    let mut dex = include_bytes!("../tests/fixtures/navigation.dex").to_vec();
+    let parsed = crate::native_dex::parse(&dex).unwrap();
+    let type_index = |descriptor: &str| {
+        parsed.classes[0]
+            .symbols
+            .types
+            .iter()
+            .position(|ty| ty.as_ref() == descriptor)
+            .unwrap() as u32
+    };
+    let read = |offset| u32::from_le_bytes(dex[offset..offset + 4].try_into().unwrap()) as usize;
+    let classes = read(0x64);
+    let inherited_class = type_index("Lsample/Target$Inner;") as usize;
+    let child = (0..read(0x60))
+        .map(|index| classes + 32 * index)
+        .find(|offset| read(*offset) == inherited_class)
+        .unwrap();
+    // Change only the superclass slot of the synthetic nested class.
+    dex[child + 8..child + 12].copy_from_slice(&type_index("Lsample/Target;").to_le_bytes());
+    fs::write(&path, dex).unwrap();
+    let mut engine = NativeEngine::default();
+    let project = engine.open(&path).unwrap();
+    let cancel = AtomicBool::new(false);
+    let class = "Lsample/Target$Inner;";
+    let id = "sample.Target.doubleValue(I)I";
+    let mut graph = json!({"instance_id":"i","project_id":"p","class_name":class,
+        "method_name":"doubleValue","direction":"callers","projection":"call_sites"});
+    validate("get_call_graph", &graph).unwrap();
+    let error = dispatch(&mut engine, &project, "get_call_graph", &graph, &cancel)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("AMBIGUOUS_MEMBER"), "{error}");
+    assert!(
+        error.contains(id) && error.contains("candidate_count=2"),
+        "{error}"
+    );
+
+    graph["descriptor"] = json!("(I)I");
+    let named = dispatch(&mut engine, &project, "get_call_graph", &graph, &cancel).unwrap();
+    assert_eq!(named["root_method_id"], id);
+    assert_eq!(named["method_id"], id);
+    assert_eq!(named["inherited"], true);
+    assert_eq!(named["requested_class_id"], "sample.Target$Inner");
+    assert_eq!(named["requested_class_name"], class);
+    assert_eq!(named["declaring_class_id"], "sample.Target");
+    assert!(named["filters"]["class_name"].is_null());
+    assert_eq!(named["matching_total"], 1);
+
+    graph["neighbor_class_name"] = json!("sample.Caller");
+    graph["include_const_args"] = json!(true);
+    validate("get_call_graph", &graph).unwrap();
+    let filtered = dispatch(&mut engine, &project, "get_call_graph", &graph, &cancel).unwrap();
+    let mut legacy = json!({"instance_id":"i","project_id":"p","method_signature":id,
+        "class_name":"sample.Caller","direction":"callers","projection":"call_sites","include_const_args":true});
+    validate("get_call_graph", &legacy).unwrap();
+    let legacy_sites = dispatch(&mut engine, &project, "get_call_graph", &legacy, &cancel).unwrap();
+    assert_eq!(filtered["call_sites"], legacy_sites["call_sites"]);
+    assert_eq!(filtered["filters"]["class_name"], "sample.Caller");
+    legacy["neighbor_class_name"] = json!("sample.Target");
+    assert!(
+        validate("get_call_graph", &legacy)
+            .unwrap_err()
+            .to_string()
+            .contains("CONFLICTING_ARGUMENTS")
+    );
+    graph["method_id"] = json!(id);
+    assert!(
+        validate("get_call_graph", &graph)
+            .unwrap_err()
+            .to_string()
+            .contains("CONFLICTING_METHOD_SELECTORS")
+    );
+
+    let original = json!({"class_name":class,"method_name":"doubleValue","descriptor":"(I)I"});
+    let source = dispatch(
+        &mut engine,
+        &project,
+        "get_method_source",
+        &original,
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(source["requested_selector"], original);
+    assert_eq!(source["method_id"], id);
+    assert_eq!(source["declaring_class_id"], "sample.Target");
+    assert_eq!(source["inherited"], true);
+    let exact = json!({"signature":"Lsample/Target;->doubleValue(I)I"});
+    let direct = dispatch(&mut engine, &project, "get_method_source", &exact, &cancel).unwrap();
+    assert_eq!(
+        direct["requested_selector"],
+        json!({"method_id":exact["signature"]})
+    );
+    assert_eq!(direct["method_id"], id);
+    assert_eq!(direct["inherited"], false);
+    assert_eq!(source["source_hash"], direct["source_hash"]);
+}
+
 #[test]
 fn reviewer_selectors_exports_and_schema_contracts() {
     let (mut engine, project) = fixture();
@@ -485,6 +655,212 @@ fn discovery_tools_validate_and_dispatch_without_unknown_tools() {
     let err = validate("get_method_source", &json!({"field":"x"})).unwrap_err();
     assert!(err.downcast_ref::<ArgumentError>().unwrap().details["accepted_parameters"]["properties"]["method_id"].is_object());
 }
+
+#[test]
+fn identifier_delimiter_guidance_does_not_change_source_queries() {
+    let mut args =
+        json!({"instance_id":"i","project_id":"p","query":"android.webkit.WebView;->loadUrl"});
+    validate("search_code", &args).unwrap();
+    args["mode"] = json!("source");
+    args["regex"] = json!(true);
+    validate("search_code", &args).unwrap();
+    args.as_object_mut().unwrap().remove("regex");
+    args["mode"] = json!("identifiers");
+    let error = validate("search_code", &args).unwrap_err();
+    assert!(
+        error.to_string().contains("INVALID_IDENTIFIER_QUERY"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_type_references_preserve_indexed_sites_and_group_full_occurrences() {
+    use crate::native_dex::{
+        DexAnnotation, DexAnnotationDirectory, DexAnnotationSet, DexCode, DexField, DexSymbols,
+        DexValue,
+    };
+    let owner = "example.Owner";
+    let descriptor: Arc<str> = "Lexample/Owner;".into();
+    let target: Arc<str> = "Lexample/Target;".into();
+    let array: Arc<str> = "[Lexample/Target;".into();
+    let annotation: DexAnnotationSet = vec![Arc::new(DexAnnotation {
+        visibility: 1,
+        type_idx: 0,
+        elements: vec![(0, DexValue::String(1))],
+    })]
+    .into();
+    let symbols = DexSymbols {
+        types: vec![target.clone(), array.clone()],
+        strings: vec!["value".into(), "decoded value".into()],
+        annotations: std::collections::BTreeMap::from([(
+            4,
+            Arc::new(DexAnnotationDirectory {
+                class: Some(annotation.clone()),
+                fields: vec![Some(annotation.clone())],
+                methods: vec![Some(annotation.clone())],
+                parameters: vec![vec![Some(annotation.clone()), Some(annotation)]],
+            }),
+        )]),
+        ..Default::default()
+    };
+    symbols.origin.set("classes.dex".into()).unwrap();
+    let mut class = crate::native_dex::parse(include_bytes!("../tests/fixtures/hello.dex"))
+        .unwrap()
+        .classes
+        .remove(0);
+    class.descriptor = descriptor.clone();
+    class.superclass = Some(target.clone());
+    class.annotations_offset = 4;
+    class.symbols = Arc::new(symbols);
+    class.fields.push(DexField {
+        declaring_type: descriptor.clone(),
+        name: "field".into(),
+        field_type: target.clone(),
+        access_flags: 1,
+        is_static: false,
+    });
+    let method = &mut class.methods[0];
+    method.declaring_type = descriptor;
+    method.name = "scan".into();
+    method.return_type = target.clone();
+    method.parameters = vec![target, array];
+    method.code = Some(DexCode {
+        offset: 32,
+        registers: 2,
+        ins: 2,
+        outs: 0,
+        tries: 0,
+        try_regions: vec![],
+        // Base, array, then base. The indexed path sorts by symbol first;
+        // the grouped path has to aggregate all three instruction sites.
+        instructions: vec![0x1c, 0, 0x1c, 1, 0x1c, 0],
+    });
+    let mut engine =
+        NativeEngine::from_test_classes(std::collections::BTreeMap::from([(owner.into(), class)]));
+    let project = Project {
+        classes: vec![owner.into()],
+        resources: vec![],
+    };
+    let cancel = AtomicBool::new(false);
+    let tool = "find_type_references";
+    let mut args = json!({"instance_id":"i","project_id":"p","class_name":"example.Target"});
+    let full = dispatch(&mut engine, &project, tool, &args, &cancel).unwrap();
+    assert_eq!(full["execution_mode"], "index");
+    assert_eq!(full["total"], 13);
+    assert_eq!(full["annotation_reference_count"], 5);
+    args["projection"] = json!("compact");
+    validate(tool, &args).unwrap();
+    let compact = dispatch(&mut engine, &project, tool, &args, &cancel).unwrap();
+    assert_eq!(compact["index_cached"], true);
+    assert_eq!(compact["coverage_complete"], true);
+    assert_eq!(compact["source_hash"], full["source_hash"]);
+    assert_eq!(compact["pagination_order"], full["pagination_order"]);
+    let sites = compact["items"].as_array().unwrap();
+    for (site, evidence) in sites.iter().zip(full["items"].as_array().unwrap()) {
+        for key in [
+            "symbol_id",
+            "class_id",
+            "method_id",
+            "field_id",
+            "element",
+            "parameter_index",
+            "dex_entry",
+            "reference_kind",
+            "code_unit_offset",
+            "annotation_type",
+        ] {
+            assert_eq!(site[key], evidence[key], "{key}: {site} vs {evidence}");
+        }
+        assert!(site.get("instruction_words").is_none());
+        assert!(site.get("values").is_none());
+    }
+    let mut site_page = args.clone();
+    site_page["limit"] = json!(2);
+    let mut result_sites = Vec::new();
+    loop {
+        let page = dispatch(&mut engine, &project, tool, &site_page, &cancel).unwrap();
+        result_sites.extend(page["items"].as_array().unwrap().iter().cloned());
+        if page["exhausted"] == true {
+            break;
+        }
+        site_page["offset"] = page["next_offset"].clone();
+    }
+    assert_eq!(&result_sites, sites);
+
+    args["group_by"] = json!("owner_and_kind");
+    validate(tool, &args).unwrap();
+    let grouped = dispatch(&mut engine, &project, tool, &args, &cancel).unwrap();
+    assert_eq!(grouped["total"], 10);
+    assert_eq!(grouped["occurrence_total"], full["total"]);
+    assert_eq!(grouped["annotation_reference_count"], 5);
+    assert_eq!(grouped["coverage_complete"], true);
+    assert_eq!(grouped["pagination"], "groups");
+    let groups = grouped["items"].as_array().unwrap();
+    let instruction = groups
+        .iter()
+        .find(|group| group["owner"]["reference_kind"] == "instruction")
+        .unwrap();
+    assert_eq!(instruction["occurrence_count"], 3);
+    assert_eq!(instruction["first_site"]["code_unit_offset"], 0);
+    for group in groups {
+        let identity = group["owner"].as_object().unwrap();
+        let matches = |site: &Value| {
+            identity
+                .iter()
+                .all(|(key, value)| key == "member_declaration_index" || site[key] == *value)
+        };
+        assert_eq!(
+            group["occurrence_count"],
+            sites.iter().filter(|site| matches(site)).count()
+        );
+        let mut first = group["first_site"].clone();
+        first
+            .as_object_mut()
+            .unwrap()
+            .remove("member_declaration_index");
+        assert!(sites.contains(&first), "{first}");
+    }
+    for limit in [1, 3] {
+        let mut request = args.clone();
+        request["limit"] = json!(limit);
+        let mut seen = Vec::new();
+        loop {
+            let page = dispatch(&mut engine, &project, tool, &request, &cancel).unwrap();
+            assert_eq!(page["source_hash"], grouped["source_hash"]);
+            assert_eq!(page["total"], grouped["total"]);
+            assert_eq!(page["occurrence_total"], full["total"]);
+            seen.extend(page["items"].as_array().unwrap().iter().cloned());
+            if page["exhausted"] == true {
+                break;
+            }
+            request["offset"] = page["next_offset"].clone();
+        }
+        assert_eq!(&seen, groups);
+    }
+    args["package_prefix"] = json!("example.NoMatch");
+    let none = dispatch(&mut engine, &project, tool, &args, &cancel).unwrap();
+    assert_eq!(none["total"], 0);
+    assert_eq!(none["occurrence_total"], 0);
+    assert_eq!(none["coverage_complete"], true);
+    assert_eq!(none["out_of_scope_classes"], 1);
+    args["projection"] = json!("full");
+    assert!(validate(tool, &args).is_err());
+
+    let mut array_args =
+        json!({"instance_id":"i","project_id":"p","class_name":"[Lexample/Target;"});
+    for projection in ["full", "compact"] {
+        array_args["projection"] = json!(projection);
+        let exact = dispatch(&mut engine, &project, tool, &array_args, &cancel).unwrap();
+        assert_eq!(exact["total"], 1);
+        assert_eq!(exact["items"][0]["symbol_id"], "[Lexample.Target;");
+        assert_eq!(exact["items"][0]["code_unit_offset"], 2);
+    }
+    array_args["group_by"] = json!("owner_and_kind");
+    let exact_group = dispatch(&mut engine, &project, tool, &array_args, &cancel).unwrap();
+    assert_eq!(exact_group["occurrence_total"], 1);
+    assert_eq!(exact_group["items"][0]["first_site"]["code_unit_offset"], 2);
+}
+
 #[test]
 fn exports_report_missing_parent_and_preserve_class_identity() {
     let (mut engine, project) = fixture();

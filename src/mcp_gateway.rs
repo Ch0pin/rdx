@@ -19,14 +19,24 @@ impl RequestControl {
         Ok(())
     }
     pub(super) fn read_response(&self, stream: TcpStream) -> Result<Option<Value>> {
+        self.read_response_until(stream, Instant::now() + Duration::from_secs(120))
+    }
+    pub(super) fn read_response_until(
+        &self,
+        stream: TcpStream,
+        deadline: Instant,
+    ) -> Result<Option<Value>> {
         let reader = ControlledReader {
             stream,
             control: self,
-            deadline: Instant::now() + Duration::from_secs(120),
+            deadline,
         };
         // Keep one frame parser and buffer across idle readiness probes: a
         // partial JSON response must survive until completion or cancellation.
         read_frame(&mut BufReader::new(reader))
+    }
+    pub(super) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
@@ -98,7 +108,7 @@ impl ControlledReader<'_> {
         if Instant::now() >= self.deadline {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "GUI response exceeded 120 seconds",
+                "GUI response exceeded its deadline",
             ));
         }
         Ok(())
@@ -107,6 +117,7 @@ impl ControlledReader<'_> {
 
 struct Job {
     id: Value,
+    discovery: bool,
     control: Arc<RequestControl>,
     handle: thread::JoinHandle<()>,
 }
@@ -141,18 +152,33 @@ impl Jobs {
             "INSTANCE_BUSY: eight index requests are active; retry after one completes"
         );
         validate(&name, &args)?;
-        let instance_id = required(&args, "instance_id")?;
-        let entry = registrations()?
-            .into_iter()
-            .find(|entry| entry.instance_id == instance_id)
-            .context("INSTANCE_NOT_FOUND")?;
+        let discovery = name == "resolve_instance";
+        let entry = if discovery {
+            ensure!(
+                !self.0.iter().any(|job| job.discovery),
+                "INSTANCE_BUSY: a registry resolution is active"
+            );
+            None
+        } else {
+            let instance_id = required(&args, "instance_id")?;
+            Some(
+                registrations()?
+                    .into_iter()
+                    .find(|entry| entry.instance_id == instance_id)
+                    .context("INSTANCE_NOT_FOUND")?,
+            )
+        };
         let control = Arc::new(RequestControl::default());
         let worker_control = control.clone();
         let response_id = id.clone();
         let handle = thread::Builder::new()
             .name("rdx-mcp-index-request".into())
             .spawn(move || {
-                let result = remote_controlled(&entry, &name, &args, Some(&worker_control));
+                let result = if let Some(entry) = entry {
+                    remote_controlled(&entry, &name, &args, Some(&worker_control))
+                } else {
+                    instance_discovery::resolve(&args, &worker_control)
+                };
                 // Close every socket copy on success, timeout or cancellation. EOF cancels the GUI waiter.
                 worker_control.connection.lock().unwrap().take();
                 let result = if worker_control.cancelled.load(Ordering::Acquire) {
@@ -167,6 +193,7 @@ impl Jobs {
             })?;
         self.0.push(Job {
             id,
+            discovery,
             control,
             handle,
         });
@@ -205,7 +232,24 @@ fn tool_response(result: Result<Value>) -> Value {
                 });
             }
             let data = json!({"error":detail});
-            json!({"result":{"content":[{"type":"text","text":data.to_string()}],
+            let argument = &data["error"]["details"];
+            let text = if argument["tool"]
+                .as_str()
+                .and_then(source_argument_hint)
+                .is_some()
+            {
+                let details: serde_json::Map<String, Value> = argument
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, _)| *key != "accepted_parameters")
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                json!({"error":{"code":data["error"]["code"],"message":data["error"]["message"],"details":details}}).to_string()
+            } else {
+                data.to_string()
+            };
+            json!({"result":{"content":[{"type":"text","text":text}],
                 "structuredContent":data,"isError":true}})
         }
     }
@@ -317,15 +361,19 @@ pub(super) fn run() -> Result<()> {
 fn asynchronous_tool(name: &str) -> bool {
     matches!(
         name,
-        "find_string_references"
+        "resolve_instance"
+            | "find_string_references"
             | "start_source_search"
             | "get_source_search_results"
             | "search_code"
+            | "search_method_source"
             | "resolve_switch_case_callers"
             | "find_network_stacks"
             | "find_config_key_consumers"
             | "get_call_graph"
             | "get_call_graph_batch"
+            | "get_hook_targets"
+            | "get_guard_summary"
             | "resolve_reference"
             | "find_type_references"
             | "search_kotlin_metadata"
@@ -409,6 +457,43 @@ mod controlled_reader_tests {
             let error = &response["result"]["structuredContent"]["error"];
             assert_eq!(error["code"], "TOOL_ERROR");
             assert_eq!(error["message"], message);
+        }
+    }
+
+    #[test]
+    fn source_validation_hints_keep_json_text_and_structured_schema() {
+        for (tool, args, hint, selector) in [
+            (
+                "get_class_source",
+                json!({"instance_id":"i","project_id":"p","clss_id":"sample.Target"}),
+                "max_chars",
+                "class_id",
+            ),
+            (
+                "get_class_source",
+                json!({"instance_id":"i","project_id":"p","class_id":"sample.Target","max_chars":0}),
+                "integer between 1 and 128000",
+                "max_chars",
+            ),
+            (
+                "export_source",
+                json!({"instance_id":"i","project_id":"p","class_id":"sample.Target","outpath":"/tmp/target"}),
+                "absolute out_path",
+                "class_id",
+            ),
+        ] {
+            let result = tool_response(Err(validate(tool, &args).unwrap_err()));
+            let structured = &result["result"]["structuredContent"]["error"];
+            let content = result["result"]["content"][0]["text"].as_str().unwrap();
+            let compact: Value = serde_json::from_str(content).unwrap();
+            let compact = &compact["error"];
+            assert_eq!(compact["code"], "INVALID_ARGUMENT");
+            assert_eq!(compact["message"], structured["message"]);
+            assert!(compact["details"]["hint"].as_str().unwrap().contains(hint));
+            assert!(compact["details"].get("accepted_parameters").is_none());
+            assert!(
+                structured["details"]["accepted_parameters"]["properties"][selector].is_object()
+            );
         }
     }
 

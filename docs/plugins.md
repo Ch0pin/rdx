@@ -61,7 +61,12 @@ Use a manifest with `protocol: 2` and `capability: "project.analyze"`. The GUI m
 
 The host sends `{"protocol":2,"id":1,"method":"project.analyze","project":{"apk_sha256":"...","class_count":10},"arguments":{}}`. To query the project, the plugin writes `{"protocol":2,"id":1,"method":"host.query","query_id":1,"tool":"get_method_source","arguments":{"method_id":"example.C.m()V"}}` and reads the matching response. The host returns `result` or `error`, echoing the analysis and query IDs. Query IDs must be unique positive or zero integers within an invocation.
 
-The allowlist is `get_call_graph`, `get_method_source`, `get_methods_of_class`, `get_class_hierarchy`, `find_implementations`, and `find_instantiations`. Call graphs are forced to direct, paged `call_sites`; method source is forced to original DEX. Normal MCP selector validation applies. Queries share the existing parsed project and indexes; the plugin receives no local service credentials. This query allowlist is a protocol constraint, not an OS sandbox for the trusted executable.
+The allowlist is `get_call_graph`, `get_method_source`, `get_methods_of_class`, `get_class_hierarchy`, `find_implementations`, `find_instantiations`, and `get_guard_summary`. Call graphs use direct, paged `call_sites`. Method source uses original DEX. Normal MCP selector validation applies. Queries share the existing parsed project and indexes. The plugin receives no local service credentials. Trusted executables retain their OS permissions.
+
+The bundled [Semantic guard summary](https://github.com/Ch0pin/rdx/tree/main/plugins/semantic-guard-summary)
+requests `get_guard_summary` once for an exact helper or call site. It presents
+the native proof in a human card and carries the exact JSON evidence with it.
+Enable it explicitly in **Tools → Plugins**.
 
 Finish with `{"protocol":2,"id":1,"result":{"title":"Analysis","summary":"...","items":[{"group_id":"stable-id","label":"Group","method_id":"example.C.m()V"}],"coverage":{"status":"partial"}}}`. The Plugins manager and analysis results use independent native desktop windows. The results window renders optional `human` cards (title, explanation, observations and labelled source locations), while exact evidence stays under Technical evidence and in MCP JSON. Closing either window retains completed analyses. It shares results with MCP through `list_analysis_plugins`, `run_plugin_analysis`, `get_plugin_analysis`, and `cancel_plugin_analysis`.
 

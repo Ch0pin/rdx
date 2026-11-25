@@ -469,6 +469,28 @@ pub fn export_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Export tests exercise real durable file writes. Hosted Windows I/O and
+    // concurrent fixture setup are not a useful 20-second performance bound.
+    // Keep a finite deadlock guard, with a fresh budget for each async phase.
+    const ASYNC_TEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+    fn wait_for_export(context: &str, mut poll: impl FnMut() -> Value) -> Value {
+        let deadline = Instant::now() + ASYNC_TEST_TIMEOUT;
+        loop {
+            let state = poll();
+            if state["worker_finished"] == true {
+                assert_eq!(state["status"], "complete", "{context}: {state}");
+                return state;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{context}: worker did not finish within {ASYNC_TEST_TIMEOUT:?}; last state: {state}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     fn fixture() -> (NativeEngine, Project, String) {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/navigation.apk");
         let mut engine = NativeEngine::default();
@@ -601,25 +623,17 @@ mod tests {
         request_cancel.store(true, Ordering::Relaxed);
         assert!(started["job_id"].is_string());
         let id = started["job_id"].as_str().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let result = project_request(
+        // _interactive remains held until completion, so the deadlock proof
+        // does not depend on the runner's wall-clock speed.
+        wait_for_export("export while interactive mutex is held", || {
+            project_request(
                 &loaded,
                 "get_export_status",
                 &json!({"job_id":id}),
                 &AtomicBool::new(false),
             )
-            .unwrap();
-            if result["worker_finished"] == true {
-                assert_eq!(result["status"], "complete", "{result}");
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "export blocked on interactive mutex"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
+            .unwrap()
+        });
         assert!(loaded.exports.status("missing", false).is_err());
         loaded.exports.cancel_all();
         assert!(
@@ -825,10 +839,19 @@ mod tests {
         let server = Server::start_in(path, tmp.path().to_owned(), random_id().unwrap()).unwrap();
         let registration: Registration =
             serde_json::from_slice(&fs::read(&server.registration).unwrap()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while server.status().state != "Running" {
-            assert_ne!(server.status().state, "Failed");
-            assert!(Instant::now() < deadline);
+        let deadline = Instant::now() + ASYNC_TEST_TIMEOUT;
+        loop {
+            let status = server.status();
+            if status.state == "Running" {
+                break;
+            }
+            assert_ne!(status.state, "Failed", "{}", status.last_error);
+            assert!(
+                Instant::now() < deadline,
+                "export service startup timed out: state={}, error={}",
+                status.state,
+                status.last_error
+            );
             thread::sleep(Duration::from_millis(10));
         }
         let project = server.status().project_id;
@@ -837,19 +860,14 @@ mod tests {
         let started = remote(&registration, "export_package_source", &args).unwrap();
         let poll = json!({"instance_id":server.instance_id,"project_id":project,"job_id":started["data"]["job_id"]});
         validate("get_export_status", &poll).unwrap();
-        loop {
+        wait_for_export("export over service", || {
             let state = remote(&registration, "get_export_status", &poll).unwrap();
-            if state["data"]["worker_finished"] == true {
-                assert_eq!(state["data"]["status"], "complete", "{state}");
-                break;
-            }
-            assert!(Instant::now() < deadline);
             assert_eq!(
                 remote(&registration, "get_instance_info", &json!({})).unwrap()["state"],
                 "Running"
             );
-            thread::sleep(Duration::from_millis(10));
-        }
+            state["data"].clone()
+        });
         validate("cancel_export", &poll).unwrap();
         assert_eq!(
             remote(&registration, "cancel_export", &poll).unwrap()["data"]["cancel_requested"],

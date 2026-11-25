@@ -3,6 +3,7 @@
 use super::*;
 use quick_xml::{events::Event, name::ResolveResult, reader::NsReader};
 use std::collections::BTreeMap;
+mod layers;
 const ANDROID: &str = "http://schemas.android.com/apk/res/android";
 const SIZE: u32 = 108;
 #[derive(Default)]
@@ -94,9 +95,17 @@ fn color(raw: &str, package: &str, table: &ResourceTable, depth: usize) -> Optio
         return None;
     }
     if raw.starts_with('@') {
-        let resource = table
-            .entries
-            .get(&super::resource_id(raw, package, table)?)?;
+        let resource =
+            super::resource_id(raw, package, table).and_then(|id| table.entries.get(&id));
+        let Some(resource) = resource else {
+            // Stable, non-theme Android colors from public-final.xml/colors.xml.
+            return match raw {
+                "@android:color/white" | "@0x0106000b" | "@0106000b" => Some([255; 4]),
+                "@android:color/black" | "@0x0106000c" | "@0106000c" => Some([0, 0, 0, 255]),
+                "@android:color/transparent" | "@0x0106000d" | "@0106000d" => Some([0; 4]),
+                _ => None,
+            };
+        };
         let variant = resource
             .variants
             .iter()
@@ -402,11 +411,21 @@ pub(super) fn load_reference(
 // Other shape effects remain unsupported rather than silently disappearing.
 fn shape(node: &Node, package: &str, table: &ResourceTable) -> Option<RgbaImage> {
     if !matches!(node.attr("shape").unwrap_or("0"), "0" | "0x0" | "rectangle")
-        || node.children.len() != 1
+        || node.children.iter().filter(|n| n.tag == "size").count() > 1
     {
         return None;
     }
-    let fill = &node.children[0];
+    // Size is intrinsic geometry used by a containing layer; it is not a paint.
+    for size in node.children.iter().filter(|n| n.tag == "size") {
+        for raw in size.attrs.values() {
+            layers::dimension(raw)?;
+        }
+    }
+    let mut paints = node.children.iter().filter(|n| n.tag != "size");
+    let fill = paints.next()?;
+    if paints.next().is_some() {
+        return None;
+    }
     if fill.tag == "solid" {
         return Some(RgbaImage::from_pixel(
             SIZE,
@@ -466,6 +485,9 @@ fn render_node(
     match node.tag.as_str() {
         "vector" => vector(node, package, table, Some(container), budget),
         "shape" => shape(node, package, table),
+        "layer-list" => {
+            layers::render(node, package, table, container, depth, budget, [SIZE, SIZE])
+        }
         "adaptive-icon" => {
             let mut layers = Vec::new();
             for tag in ["background", "foreground"] {

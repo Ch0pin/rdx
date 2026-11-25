@@ -473,11 +473,15 @@ mod tests {
 
     #[test]
     fn diagnostics_compact_known_unrelated_and_keep_unknown_explicit() {
+        let root = tempfile::tempdir().unwrap();
+        let target_path = root.path().join("target.apk");
+        let unrelated_path = root.path().join("elsewhere.apk");
+        assert!(target_path.is_absolute() && unrelated_path.is_absolute());
         let address = "127.0.0.1:1".parse().unwrap();
         let mut unrelated = entry(0, address);
-        unrelated.apk_path = Some(PathBuf::from("/tmp/elsewhere.apk"));
+        unrelated.apk_path = Some(unrelated_path);
         let unknown = entry(1, address);
-        let mut args = json!({"apk_path":"/tmp/target.apk","package_name":"p.target"});
+        let mut args = json!({"apk_path":target_path,"package_name":"p.target"});
         for detail in ["related", "all"] {
             args["diagnostics"] = json!(detail);
             let mut scan = Scan::new(&args);

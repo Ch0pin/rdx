@@ -1,8 +1,8 @@
 # Reviewer request priorities
 
-Reconciled: 2026-11-25. Base commit: `b303a207fbe19c225fa100cd35e9845aa2733539`, plus three approved batches implemented and independently verified on `feature/mcp-usability-batch` on 2026-11-25. Previous reconciliation baseline: `5cf161b4ffb9fc824ad9faed48d7f8b84014322f` (2026-11-16). Original implementation audit baseline: `6d6804d4434218fcd51d169c2af36d964d69baee`.
+Reconciled: 2026-11-27. Current baseline: `735e44808865c024d5e73ad6d1819f3201855246` on main. The three approved November 25 batches were merged in `1f7d6ad840519368de80c50c16d0d67734f31b68`; follow-up Windows CI corrections are included. Previous reconciliation baseline: `5cf161b4ffb9fc824ad9faed48d7f8b84014322f` (2026-11-16). Original implementation audit baseline: `6d6804d4434218fcd51d169c2af36d964d69baee`.
 
-This is the consolidated RDX backlog for the original November 1–10 notes and subsequent requests supplied through November 25. Statuses include all three verified implementation batches; deployed binaries should be checked by commit or executable hash. The reconciliation inspected source, schemas and recorded validation, and includes controlled Splitwise and exact-build Zappos reproductions below. The exact Wells Fargo constructor cases were reproduced and fixed; the Telegram Wallet case was not rerun. Medusa-specific proposals are outside this backlog. An open entry records agreed scope and priority; it does not authorize implementation.
+This is the consolidated RDX backlog for the original November 1–10 notes and subsequent requests supplied through November 27, including the Snapchat query feedback. Statuses include all three verified implementation batches; deployed binaries should be checked by commit or executable hash. The reconciliation inspected source, schemas and recorded validation, and includes controlled Splitwise and exact-build Zappos reproductions below. The exact Wells Fargo constructor cases were reproduced and fixed; the Telegram Wallet case was not rerun. Medusa-specific proposals are outside this backlog. An open entry records agreed scope and priority; it does not authorize implementation.
 
 ## Priority definitions
 
@@ -15,16 +15,17 @@ This is the consolidated RDX backlog for the original November 1–10 notes and 
 | P4 | Investigate or defer until evidence supports the investment. |
 | P5 | Decline the proposal as written; a narrower evidence-producing version may be worthwhile. |
 
-## Current P0/P1 decision — 2026-11-25
+## Current P0/P1 decision — 2026-11-27
 
 The November 16 audit reviewed all 18 RDX note blocks in `/Users/ch0pin/Desktop/Git-Projects/Agents/Codex/tooling-improvements.txt`, including the mutation-to-hook-map entry then at line 14 under the Medusa heading. Its input SHA-256 was `32ad339a695d691d53b0a88256e4de2bd812f4b1d1b384e8e03c1a7006a1fd98`. This reconciliation also covers the latest user-supplied KBC, Wells Fargo, Telegram Wallet and Splitwise notes. The external source-notes file was left unchanged.
 
 | Priority/status | Decision | Evidence and action |
 | --- | --- | --- |
 | P0 | None established | No remaining RDX report demonstrates an emergency such as data loss or a widespread unusable release. |
-| P1 implementation queue | No confirmed outstanding item | P1-01 and P1-02 are merged. The exact KBC loading failure is fixed. The reported Splitwise response mix-up is explained by inherited methods on the inspected build; see TRIAGE-02. |
+| P1 implementation queue | No confirmed outstanding item | P1-01 and P1-02 are merged. The exact KBC loading failure is fixed. The reported Splitwise response mix-up is explained by inherited methods on the inspected build; see TRIAGE-02. The Snapchat batch/single discrepancy is closed as unconsumed input-method pagination; see TRIAGE-03. |
 | Closed investigation — TRIAGE-01 | Zappos raw WebViewActivity type reference is present | Exact reported APK reproduced on 2026-11-16: 57 references, complete coverage, including ProductScreenNavigationKt at DEX offset 0x0089. No current P1 defect reproduced. Supported Compose interpretation is now available as an opt-in inventory. |
 | Closed investigation — TRIAGE-02 | Splitwise receiver queries resolve to an inherited method | Local Splitwise 26.11.1 / 972: 12 concurrent queries match serial results. Both reported subclasses inherit onReceive from ContentSharedViaBroadcastReceiver. Method-source responses now separately identify requested and declaring classes. |
+| Closed investigation — TRIAGE-03 | Snapchat batch and single call graphs agree | Exact APK and original saved response inspected on 2026-11-27. All six roots agree after pagination; the first response explicitly deferred the last two roots with next_method_offset=4. |
 | Closed loading failure — KBC | Declared trailing DEX link data | Commit bcd897f loads the exact APK with 11 DEX files and 124,733 classes under Standard limits. General acceptance of undeclared trailing bytes is outside this fix. |
 | Closed P1 — P1-01 | Missing call-graph roots | Merged in `b5c40975a5be954f35efe76734dd97a42055bd2f`; single and batch queries explicitly report invalid loaded-method signatures. |
 | Closed P1 — P1-02 | Headless large-APK loading | Merged in the same commit; `open_apk(headless=true, load_profile="large")` is supported, with explicit limits and request identity checks. |
@@ -56,6 +57,16 @@ The same probe found 219 class-level `dev.enro.annotations.NavigationDestination
 
 Evidence: `/Users/ch0pin/Desktop/Git-Projects/rdx/target/validation/reviewer-audit-20261125/report.json` and `/Users/ch0pin/Desktop/Git-Projects/rdx/target/validation/reviewer-audit-20261125/probe.py`. Baseline implementation: [method selector](https://github.com/Ch0pin/rdx/blob/b303a207fbe19c225fa100cd35e9845aa2733539/src/mcp_review.rs), [annotation values](https://github.com/Ch0pin/rdx/blob/b303a207fbe19c225fa100cd35e9845aa2733539/src/annotation_values.rs), [export admission](https://github.com/Ch0pin/rdx/blob/b303a207fbe19c225fa100cd35e9845aa2733539/src/mcp_exports.rs), and [discovery selection](https://github.com/Ch0pin/rdx/blob/b303a207fbe19c225fa100cd35e9845aa2733539/src/mcp_feedback.rs).
 
+### TRIAGE-03 — Snapchat call-graph batch parity
+
+The reported Snapchat 14.33.1.0 / 329222 APK has SHA-256 `6a8a0d169fe62602d54ef5a7e79ac287e56bbc5efb6a7b29c50c6f5a9ab0a43a`. Reused the existing loaded instance `f4ac1ed7c5b0567a5103773736cd7b12e3cd4bd9a77efe2784ef17ce43e3bd5c`, project `5a90bb2acfee13a24c11a19905b6f3ebf052a8199e1248babfdb58372bc2dbb5`, with executable SHA-256 `91a15b9aec632358a7d2ed3096d54b8032316f1b6e8a04a0ada5a6e229951911`. No additional project was loaded and no app/device state was changed.
+
+The original saved response at `/Users/ch0pin/.claude/projects/-Users-ch0pin-Desktop-Git-Projects-Agents-Codex/6e9b9921-54ce-405a-81e5-206a026cc48f/tool-results/mcp-rdx-get_call_graph_batch-1795730685953-n4p8i6.txt` contains four roots, `complete=false`, `next_method_offset=4`, and zero failed queries. It does not contain zero-result records for the other two roots. The handoff treated unprocessed roots as empty results.
+
+Repeated the original six fully qualified selectors with callers/depth 2, followed the input-method continuation, and compared complete call-site arrays against single queries with identical options. Results were identical for all roots: u8g0.a=7, bnb.K=4, ev80.r=20, p9x0.a=6, ckl0.a=2, m9x0.invoke=0. Both batch pages reported successful root resolution and complete DEX traversal; every per-root next_offset was null. A zero direct-call result does not establish runtime unreachability through interface or callback dispatch.
+
+Disposition: no P1 graph-correctness defect reproduced; no production change required. Improve compact presentation and explicit per-root processed/pending status under CORE-20. Evidence with exact selectors, options, response arrays and identity: `/Users/ch0pin/Desktop/Git-Projects/rdx/target/validation/snapchat-batch-parity-20261127/report.json` and `/Users/ch0pin/Desktop/Git-Projects/rdx/target/validation/snapchat-batch-parity-20261127/responses.json`.
+
 ### Why the other requests stay below P1
 
 | Notes | Priority retained | Reason |
@@ -64,7 +75,7 @@ Evidence: `/Users/ch0pin/Desktop/Git-Projects/rdx/target/validation/reviewer-aud
 | Source-search 20-second budget (R6) | Implemented | Existing synchronous cursor paging remains available. On-demand start_source_search now automatically consumes source pages with live progress, cancellation, bounded disk-backed results and cumulative coverage diagnostics. Storage limits return an exact first-unpublished-page continuation. |
 | Stripped Retrofit, all native transports, complete mutation write-surface mapping | P3/P4 for bounded inventories; P5 for completeness guarantees | Missing Java hooks or decompiler annotations do not establish all runtime paths or a static engine defect. The mutation request is captured as ANALYSIS-11 below. |
 
-The initial reconciliation changed only this document; all thirteen approved items across three batches have now been implemented and locally verified, and their entries have been removed. Local library, GUI, MCP/CLI regressions, linting and a release build passed. Cross-platform CI is pending for the combined implementation commit. Zappos, KBC and Splitwise evidence retains its explicit build and date boundaries. Other APK-specific reports remain unverified where stated.
+The initial reconciliation changed only this document; all thirteen approved items across three batches have now been implemented and locally verified, and their entries have been removed. Local library, GUI, MCP/CLI regressions, linting and a release build passed. Cross-platform CI passed for main commit 735e448: https://github.com/Ch0pin/rdx/actions/runs/45663319203. Zappos, KBC and Splitwise evidence retains its explicit build and date boundaries. Other APK-specific reports remain unverified where stated.
 
 ## Current implementation foundations
 
@@ -139,6 +150,8 @@ Baseline evidence: https://github.com/Ch0pin/rdx/blob/6d6804d4434218fcd51d169c2a
 
 Already-supported annotation values, method-ID echoing and empty-export errors are recorded in the foundations/TRIAGE-02 sections. They are not duplicate implementation tasks. The open entries below describe only remaining work.
 
+The November 27 argument-schema requests are already supported or documented: get_method_source advertises format=auto|dex in its input schema; get_dex_strings is explicitly scoped to the DEX containing a selected class. For APK-wide literal references use find_string_references; search_code(mode=source, regex=true) searches reconstructed text and does not enumerate the raw DEX string pool. These are not duplicate implementation tasks. Parent-directory convenience remains CORE-22.
+
 ## Remaining core backlog
 
 | ID | Priority | Request | Status and decision |
@@ -149,6 +162,10 @@ Already-supported annotation values, method-ID echoing and empty-export errors a
 | CORE-10 | P3 | Multi-query asset search | Missing. Scan each asset once, group hits by query and share coverage/diagnostics. |
 | CORE-11 | P3 | Class-literal search guidance | Add targeted guidance toward find_type_references for X.class/const-class queries. Existing type-reference indexing needs no replacement. |
 | CORE-17 | P3 | Suggestions for an empty export scope | Current export already rejects zero matching classes. Add bounded package counts and manifest component-package suggestions to the error, labelled as candidate scopes. An applicationId is not necessarily a Java package prefix; never silently broaden an export. |
+| CORE-19 | P2 | Recommended candidate pin and reachable-match count | Add recommended_pin and reachable_exact_match_count with explicit inspected-registration scope, readiness and supplied-identity strength. Preserve exact_match_unique and discovery_complete independently. A sole package-only or first-page candidate is not proof of global uniqueness or an installed APK match. Existing resolve_instance(package_name, apk_sha256) already handles strict selection. |
+| CORE-20 | P2 | Compact batch call graphs and explicit per-root summaries | Add a compact caller/callee/depth projection and concise per-root counts, resolution, error and processed/pending status without implying that a withheld root has zero edges. Preserve DEX call-site multiplicity or explicitly label grouped/deduplicated edges. Existing matching_total, root_resolution_complete, per-root next_offset, next_method_offset and serialized-data budgets remain authoritative. Document the exact .data.results[].data.call_sites[] envelope and both continuation levels; correct the stale 2 MiB paragraph to the implemented default 65,536-byte data budget and distinguish MCP/client framing. |
+| CORE-21 | P3 | Exact declared-method filter for implementations | Optional declares_method (name plus full descriptor) or equivalent compact match flag over loaded declarations. Keep declared-on-class semantics distinct from inherited implementation resolution and expose incomplete coverage. get_hook_targets already resolves exact virtual method selectors into concrete declaring targets and receiver pairs, avoiding per-class method-list fan-out for runtime hook mapping. |
+| CORE-22 | P3 | Optional export parent creation | Add an explicit create_parents option for export_source, preserving new output-directory semantics, no-overwrite checks and clear errors for invalid parents. Current errors already identify the missing parent path. Do not reinterpret an out_path ending in source.txt as a single-file export without an explicit API contract. |
 
 ## Bounded analysis-plugin backlog
 
@@ -182,9 +199,9 @@ Constructor-argument staging must preserve observable order. Java allocates the 
 
 ## Remaining implementation order
 
-The thirteen approved items across three batches were removed after implementation, supervising inspection and independent public-MCP verification. No confirmed outstanding P0/P1 is established. There are no pending P2 entries. The remaining inventory contains 15 P3 entries and 2 P4 entries. Completed CORE-12 is excluded.
+The thirteen approved items across three batches were removed after implementation, supervising inspection and independent public-MCP verification. No confirmed outstanding P0/P1 is established. The Snapchat P1 investigation is closed by exact parity evidence. The remaining inventory contains 2 P2 entries, 17 P3 entries and 2 P4 entries. Completed CORE-12 is excluded.
 
-Remaining P3/P4 entries retain their scope; Enro and remote-web features remain separately scoped plugin/workflow work. These remaining entries require separate implementation authorization.
+Prioritize CORE-19 and CORE-20 for the new usability work. Remaining P3/P4 entries retain their scope; Enro and remote-web features remain separately scoped plugin/workflow work. These remaining entries require separate implementation authorization.
 
 Verification evidence for the removed batch: `/Users/ch0pin/Desktop/Git-Projects/rdx/target/validation/mcp-usability-20261125/root-review/candidate.json`. On the pinned Splitwise APK, alias exports matched byte-for-byte, graph filters retained their behavior, inherited owners were explicit, compact/grouped references agreed, 219 annotation class owners were retained, and a three-class prefix-union export preserved its manifest mapping and enforced resume identity. Equal-sized warm queries measured 1.031 seconds for full and 1.005 seconds for compact output; eight site records shrank from 5,448 to 3,511 JSON bytes. The corrected array-component matcher accounts for the additional site versus the previous seven-site result. Grouped pages explicitly stream the requested scope; ordinary compact pages reuse the existing index or its established bounded streaming fallback.
 
@@ -194,7 +211,7 @@ Second-batch local validation passed 938 library tests, 196 GUI tests, 3 CLI exp
 
 Final P2 evidence: `/Users/ch0pin/Desktop/Git-Projects/rdx/target/validation/p2-final-20261125/root-review/public-api-report.json` verifies method search against the original DEX text (36 matching lines across 13 pages, cache reuse and changed-query cursor rejection) and exact Zappos navigation. Nine registrations include WebView route ID -787805064, target WebViewActivity, url/sizing arguments, and ProductScreenDestination graph ID 874828579. IDs use the bundled descriptor hash; modeled serializer bindings, observed Bundle copying, incomplete outer-graph relationships and external reachability remain explicit.
 
-`/Users/ch0pin/Desktop/Git-Projects/rdx/target/validation/p2-final-20261125/core18/final-report.json` pins Wells Fargo APK SHA-256 `57dee92a1510f99747b1ff3767fcf1a03749a63eb0fd0f0ea4cf51a6c914d944`. Both g91.invokeSuspend and NavigationActivity.r0 changed from allocation-constructor mismatch fallback to native Java with no fallback reason. The cause was an erased Kotlin adapter constructor and a direct superclass initializer, rather than unsupported argument effects alone. Executed generated-Java fixtures verify class-initialization/getter/constructor order, thrown-object identity and alias identity; malformed/escaping/boundary-crossing variants are rejected. Local library, GUI, native reconstruction, MCP/CLI, plugin, packaging, strict lint and release checks passed. Cross-platform CI remains pending until the combined implementation commit is pushed.
+`/Users/ch0pin/Desktop/Git-Projects/rdx/target/validation/p2-final-20261125/core18/final-report.json` pins Wells Fargo APK SHA-256 `57dee92a1510f99747b1ff3767fcf1a03749a63eb0fd0f0ea4cf51a6c914d944`. Both g91.invokeSuspend and NavigationActivity.r0 changed from allocation-constructor mismatch fallback to native Java with no fallback reason. The cause was an erased Kotlin adapter constructor and a direct superclass initializer, rather than unsupported argument effects alone. Executed generated-Java fixtures verify class-initialization/getter/constructor order, thrown-object identity and alias identity; malformed/escaping/boundary-crossing variants are rejected. Local library, GUI, native reconstruction, MCP/CLI, plugin, packaging, strict lint and release checks passed. Cross-platform CI subsequently passed at main commit 735e448: https://github.com/Ch0pin/rdx/actions/runs/45663319203.
 
 ## P1 validation record — 2026-11-15
 
